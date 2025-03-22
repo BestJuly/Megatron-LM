@@ -15,7 +15,10 @@ from torch import Tensor, nn
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
+from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import TENorm
+from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols as LayerSymbols
 from megatron.core.ssm.mamba_hybrid_layer_allocation import allocate_layers
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
@@ -258,19 +261,43 @@ class MambaStack(MegatronModule):
             inference_params.max_seqlen = inference_params.max_sequence_length
             inference_params.seqlen_offset = inference_params.sequence_len_offset
 
-        for layer in self.layers:
-            hidden_states = layer(
-                hidden_states,
-                attention_mask,
-                inference_params=inference_params,
-                rotary_pos_emb=rotary_pos_emb,
-            )
+        # If fp8_recipe is delayed, wrap the entire pass with get_fp8_context(),
+        # otherwise do nothing extra at the outer level
+        # if we are using other fp8 recipes, then the context manager enter&exit are free
+        # we can wrap fp8_context within the for loop over layers, so that we can fine-grained
+        # control which layer will be fp8 or bf16
+        use_outer_fp8_context = self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed
+        use_inner_fp8_context = self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed
+        outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
 
-            # The attention layer (currently a simplified transformer layer)
-            # outputs a tuple of (hidden_states, context). Context is intended
-            # for cross-attention, and is not needed in our model.
-            if isinstance(hidden_states, tuple):
-                hidden_states = hidden_states[0]
+        with outer_fp8_context:
+            for layer in self.layers:
+                inner_fp8_context = (
+                    get_fp8_context(self.config, layer.layer_number - 1)
+                    if use_inner_fp8_context
+                    else nullcontext()
+                )
+                with inner_fp8_context:
+                    if isinstance(layer, TransformerLayer):
+                        hidden_states, _ = layer(
+                            hidden_states=hidden_states,
+                            attention_mask=attention_mask,
+                            inference_context=inference_context,
+                            rotary_pos_emb=rotary_pos_emb,
+                            sequence_len_offset=sequence_len_offset,
+                        )
+                    else:  # MambaLayer
+                        hidden_states = layer(
+                            hidden_states=hidden_states,
+                            attention_mask=attention_mask,
+                            inference_context=inference_context,
+                        )
+
+                # The attention layer (currently a simplified transformer layer)
+                # outputs a tuple of (hidden_states, context). Context is intended
+                # for cross-attention, and is not needed in our model.
+                if isinstance(hidden_states, tuple):
+                    hidden_states = hidden_states[0]
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:
