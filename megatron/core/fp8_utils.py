@@ -19,27 +19,40 @@ except (ImportError, ModuleNotFoundError):
     # Transformer Engine not found
     pass
 
-# Check if Transformer Engine has Float8Tensor class
-# Float8Tensor is used in delayed scaling before TE2.1
-# Float8Tensor is used in delayed scaling and current scaling after TE2.1
-HAVE_TE_FLOAT8TENSOR = False
+# Check if Transformer Engine has class for fp8 tensors.
+HAVE_TE_FP8_TENSOR_CLASS = False
 try:
     if is_te_min_version("2.0"):
         # In TE2.x, QuantizedTensor is the base class for all different type of fp8 tensors,
         # including fp8 tensor for delayed scaling, current scaling and mxfp8, etc.
-        from transformer_engine.pytorch.tensor import QuantizedTensor as Float8Tensor
+        from transformer_engine.pytorch.tensor import QuantizedTensor as FP8_TENSOR_CLASS
     else:
-        from transformer_engine.pytorch.float8_tensor import Float8Tensor
+        from transformer_engine.pytorch.float8_tensor import Float8Tensor as FP8_TENSOR_CLASS
 
-    HAVE_TE_FLOAT8TENSOR = True
+    HAVE_TE_FP8_TENSOR_CLASS = True
 except (ImportError, ModuleNotFoundError):
-    # Float8Tensor not found
+    # FP8 tensor class not found
     pass
 
 
 def is_float8tensor(tensor: torch.Tensor) -> bool:
-    """Check if a tensor is a Transformer Engine Float8Tensor"""
-    return HAVE_TE_FLOAT8TENSOR and isinstance(tensor, Float8Tensor)
+    """Check if a tensor is a Transformer Engine Float8Tensor
+
+    Note that In TE2.x, in order to support more recipes, the design of fp8 tensor class has
+    changed. Now Float8Tensor is only used for current scaling and delayed scaling. And mxfp8
+    and blockwise scaling have their own fp8 tensor classes. These different fp8 tensor classes
+    are both inherited from QuantizedTensor. So, for TE1.x, FP8_TENSOR_CLASS is Float8Tensor,
+    and for TE2.x, FP8_TENSOR_CLASS is QuantizedTensor.
+    """
+    return HAVE_TE_FP8_TENSOR_CLASS and isinstance(tensor, FP8_TENSOR_CLASS)
+
+
+def dequantize_fp8_tensor(fp8_tensor: torch.Tensor) -> torch.Tensor:
+    """Dequantize a fp8 tensor to a higher precision tensor"""
+    if is_te_min_version("2.0"):
+        return fp8_tensor.dequantize()
+    else:
+        return fp8_tensor.from_float8()
 
 
 """
@@ -373,9 +386,32 @@ if HAVE_TE:
             else:
                 raise ValueError("E4M3 and HYBRID are the only supported FP8 formats.")
 
-            # Select fp8 recipe (TE version >= 2.1.0).
             fp8_recipe = None
-            if is_te_min_version("2.1.0"):
+            if is_te_min_version("2.2.0"):
+                if config.fp8_recipe == Fp8Recipe.delayed:
+                    fp8_recipe = TEDelayedScaling(
+                        config=config,
+                        fp8_format=fp8_format,
+                        override_linear_precision=(False, False, not config.fp8_wgrad),
+                    )
+                elif config.fp8_recipe == Fp8Recipe.tensorwise:
+                    fp8_recipe = transformer_engine.common.recipe.Float8CurrentScaling(
+                        fp8_format=fp8_format
+                    )
+                elif config.fp8_recipe == Fp8Recipe.mxfp8:
+                    fp8_recipe = transformer_engine.common.recipe.MXFP8BlockScaling(
+                        fp8_format=fp8_format
+                    )
+                elif config.fp8_recipe == Fp8Recipe.blockwise:
+                    fp8_recipe = transformer_engine.common.recipe.Float8BlockScaling(
+                        fp8_format=fp8_format
+                    )
+                else:
+                    raise ValueError(
+                        "Float8CurrentScaling, MXFP8BlockScaling, DelayedScaling and "
+                        "BlockwiseScaling are the only supported FP8 recipes."
+                    )
+            elif is_te_min_version("2.1.0"):
                 if config.fp8_recipe == Fp8Recipe.delayed:
                     fp8_recipe = TEDelayedScaling(
                         config=config,

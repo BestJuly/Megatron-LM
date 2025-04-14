@@ -804,14 +804,18 @@ def validate_args(args, defaults={}):
             args.no_load_rng = True
             print('Warning: disabling --no-load-rng for upcycling.')
 
-    # MoE loss and include embedding and loss layer check
-    if args.num_experts is not None:
-        if args.moe_router_load_balancing_type != "none" or args.moe_z_loss_coeff is not None:
-            assert not args.account_for_embedding_in_pipeline_split, \
-                "Cannot support load balancing loss and z loss with --account-for-embedding-in-pipeline-split"
-            assert not args.account_for_loss_in_pipeline_split, \
-                "Cannot support load balancing loss and z loss with --account-for-loss-in-pipeline-split"
-                
+    # Optimizer CPU offload check
+    if args.optimizer_cpu_offload:
+        assert args.use_precision_aware_optimizer, (
+            "The optimizer cpu offload must be used in conjunction with `--use-precision-aware-optimizer`, "
+            "as the hybrid device optimizer reuses the code path of this flag."
+        )
+
+    if args.fp8_recipe != "delayed":
+        assert not (args.fp8_param_gather and args.use_precision_aware_optimizer), (
+            "Currently only delayed scaling is supported to use precision-aware optimizer and fp8 "
+            "params at the same time."
+        )
 
     if args.non_persistent_ckpt_type == "local":
         assert args.non_persistent_local_ckpt_dir is not None, "Tried to use local checkpointing without specifying --local-ckpt-dir!"
@@ -2335,4 +2339,11 @@ def _add_experimental_args(parser):
                        help='Dtype of exp_avg when enabling precision-aware-optimizer')
     group.add_argument('--exp-avg-sq-dtype', default='fp32', choices=['fp32', 'fp16', 'fp8'],
                        help='Dtype of exp_avg_sq when enabling precision-aware-optimizer')
+    return parser
+
+
+def _add_msc_args(parser):
+    group = parser.add_argument_group(title="msc")
+    group.add_argument('--disable-msc', default=True, action='store_false', dest='enable_msc',
+                       help='Disable the usage of Multi-Storage Client (MSC) in Megatron Core.')
     return parser
