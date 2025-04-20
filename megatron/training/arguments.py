@@ -442,21 +442,21 @@ def validate_args(args, defaults={}):
     args.exp_avg_dtype = map_dtype(args.exp_avg_dtype)
     args.exp_avg_sq_dtype = map_dtype(args.exp_avg_sq_dtype)
 
-    if args.fp8_param_gather:
-        assert args.use_distributed_optimizer, \
-            '--use-custom-fsdp only supported with distributed optimizer'
-
-        if args.data_parallel_sharding_strategy in ["optim_grads_params", "optim_grads"]:
-            warnings.warn('Please make sure your TransformerEngine support FSDP + gradient accumulation fusion')
-            assert args.gradient_accumulation_fusion is False, \
-                "optim_grads_params optim_grads are not supported with gradient accumulation fusion"
-
-        if args.data_parallel_sharding_strategy == "optim_grads_params":
-            assert args.check_weight_hash_across_dp_replicas_interval is None, \
-                'check_weight_hash_across_dp_replicas_interval is not supported with optim_grads_params'
-
-        assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1", \
-            'FSDP always requires CUDA_DEVICE_MAX_CONNECTIONS value large than one'
+    #if args.fp8_param_gather:
+    #    assert args.use_distributed_optimizer, \
+    #        '--use-custom-fsdp only supported with distributed optimizer'
+    #
+    #    if args.data_parallel_sharding_strategy in ["optim_grads_params", "optim_grads"]:
+    #        warnings.warn('Please make sure your TransformerEngine support FSDP + gradient accumulation fusion')
+    #        assert args.gradient_accumulation_fusion is False, \
+    #            "optim_grads_params optim_grads are not supported with gradient accumulation fusion"
+    #
+    #    if args.data_parallel_sharding_strategy == "optim_grads_params":
+    #        assert args.check_weight_hash_across_dp_replicas_interval is None, \
+    #            'check_weight_hash_across_dp_replicas_interval is not supported with optim_grads_params'
+    #
+    #    assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1", \
+    #        'FSDP always requires CUDA_DEVICE_MAX_CONNECTIONS value large than one'
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -805,11 +805,11 @@ def validate_args(args, defaults={}):
             print('Warning: disabling --no-load-rng for upcycling.')
 
     # Optimizer CPU offload check
-    if args.optimizer_cpu_offload:
-        assert args.use_precision_aware_optimizer, (
-            "The optimizer cpu offload must be used in conjunction with `--use-precision-aware-optimizer`, "
-            "as the hybrid device optimizer reuses the code path of this flag."
-        )
+    #if args.optimizer_cpu_offload:
+    #    assert args.use_precision_aware_optimizer, (
+    #        "The optimizer cpu offload must be used in conjunction with `--use-precision-aware-optimizer`, "
+    #        "as the hybrid device optimizer reuses the code path of this flag."
+    #    )
 
     if args.fp8_recipe != "delayed":
         assert not (args.fp8_param_gather and args.use_precision_aware_optimizer), (

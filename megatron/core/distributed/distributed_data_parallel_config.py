@@ -47,3 +47,27 @@ class DistributedDataParallelConfig:
     fp8_param_gather: bool = False
     """If true, keep the compute param in fp8 (do not use any other intermediate dtype) and
        perform the param all-gather in fp8."""
+   
+    use_custom_fsdp: bool = False
+    """If true, use the FSDP code path for DDP."""
+
+    data_parallel_sharding_strategy: str = 'no_shard'
+    """Sharding strategy for FSDP. Valid values are 'no_shard', 'optim',
+        'optim_grads', 'optim_grads_params'."""
+
+    gradient_reduce_div_fusion: bool = True
+    """If true, perform gradient reduce and division fusion."""
+
+    suggested_communication_unit_size: int = None
+    """Specifies the number of elements to communicate at once during
+      FSDP (Fully Sharded Data Parallel) operations. 
+      This flag also affects FSDP all-gather prefetch behavior. Setting a larger
+      value increases the communication buffer size, while a smaller value
+      disables prefetching and may degrade performance. Adjust this value
+      based on your system's memory and performance requirements."""
+
+    preserve_fp32_weights: bool = True
+    """If true, preserve fp32 weights in the custom FSDP ParamAndGradBuffer."""
+
+    keep_fp8_transpose_cache_when_using_custom_fsdp: bool = False
+    """If true, keep the fp8 transpose cache when using custom FSDP."""

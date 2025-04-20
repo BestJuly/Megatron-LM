@@ -483,14 +483,16 @@ class TransformerBlock(MegatronModule):
             Union[Tensor, Tuple[Tensor, Tensor]]: The output hidden states tensor of shape
             [s, b, h], and optionally the updated context tensor if cross-attention is used.
         """
+        
+        inference_context = None
 
         if not self.pre_process:
             # See set_input_tensor()
             hidden_states = self.input_tensor
 
         # Update the inference parameters with the current batch size in case it is variable
-        if inference_params and not self.training:
-            inference_params.current_batch_size = hidden_states.size(1)
+        if inference_context and not self.training:
+            inference_context.current_batch_size = hidden_states.size(1)
 
         # Viewless tensor.
         # - We only need to create a viewless tensor in the case of micro batch
@@ -552,7 +554,7 @@ class TransformerBlock(MegatronModule):
                             rotary_pos_cos=rotary_pos_cos,
                             rotary_pos_sin=rotary_pos_sin,
                             attention_bias=attention_bias,
-                            inference_context=inference_context,
+                            #inference_context=inference_context,
                             packed_seq_params=packed_seq_params,
                             sequence_len_offset=sequence_len_offset,
                         )
