@@ -660,7 +660,7 @@ class TEGroupedMLP(MegatronModule):
             output (torch.Tensor): The output of the local experts.
         """
         if self.config.moe_use_device_initiated_grouped_gemm:
-            tokens_per_expert = tokens_per_expert.long().cuda()
+            tokens_per_expert = tokens_per_expert.long().to("cuda", non_blocking=True)
         else:
             tokens_per_expert = tokens_per_expert.long().cpu().tolist()
         
