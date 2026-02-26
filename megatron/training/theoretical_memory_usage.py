@@ -9,23 +9,138 @@ from .utils import print_rank_0
 NUM_BYTES_IN_MEGABYTE = 1024 * 1024
 
 
-def compute_weight_and_optimizer_memory(args, verbose=False):
-    # Attention projection size.
+# ────────────────────────────────────────────────────────────────────────────
+# Attention-variant parameter helpers
+# ────────────────────────────────────────────────────────────────────────────
+
+def _compute_standard_attention_params(args, H, norm_multiplier):
+    """Standard GQA / MHA attention: QKV + output projection, optional output gate, QK layernorm."""
+    if args.multi_latent_attention:
+        assert not args.group_query_attention
+        if args.q_lora_rank is None:
+            q_term = H * args.num_attention_heads * (
+                args.qk_head_dim + args.qk_pos_emb_head_dim
+            )
+        else:
+            q_term = args.q_lora_rank * (
+                H + args.num_attention_heads * (
+                    args.qk_head_dim + args.qk_pos_emb_head_dim
+                ) + 1
+            )
+        return (
+            q_term
+            + args.kv_lora_rank * (
+                H + args.num_attention_heads * (args.qk_head_dim + args.v_head_dim) + 1
+            )
+            + H * args.qk_pos_emb_head_dim
+            + (args.num_attention_heads * args.v_head_dim) * H
+        )
+
     query_projection_size = args.kv_channels * args.num_attention_heads
-    query_projection_to_hidden_size_ratio = query_projection_size / args.hidden_size
+    kv_projection_size = args.kv_channels * args.num_query_groups
+
+    qkv_out_dim = query_projection_size + 2 * kv_projection_size
+    if getattr(args, 'attention_output_gate', False):
+        qkv_out_dim += query_projection_size  # gate has same dim as Q
+
+    params = H * qkv_out_dim                  # QKV (+ gate) projection
+    params += query_projection_size * H       # output projection
+
+    if getattr(args, 'qk_layernorm', False):
+        params += 2 * args.kv_channels * norm_multiplier
+
+    return params
+
+
+def _compute_gdn_attention_params(args, H, norm_multiplier):
+    """Gated Delta Net (GDN) linear attention: in_proj, conv1d, SSM, output norm + projection."""
+    qk_dim = args.linear_key_head_dim * args.linear_num_key_heads
+    v_dim = args.linear_value_head_dim * args.linear_num_value_heads
+
+    # in_proj: H -> (q, k, v, gate, beta, alpha)
+    in_proj_out_dim = qk_dim * 2 + v_dim * 2 + args.linear_num_value_heads * 2
+    params = H * in_proj_out_dim
+
+    # Depthwise Conv1d on (q, k, v)
+    conv_dim = qk_dim * 2 + v_dim
+    params += conv_dim * args.linear_conv_kernel_dim
+
+    # SSM scalars: dt_bias + A_log
+    params += 2 * args.linear_num_value_heads
+
+    # Output norm (RMSNorm with hidden_size=value_head_dim)
+    params += args.linear_value_head_dim * norm_multiplier
+
+    # Output projection: v_dim -> H
+    params += v_dim * H
+
+    return params
+
+
+def _get_experimental_attention_pattern(args):
+    """Per-layer pattern for experimental attention variants (1 = variant, 0 = standard).
+
+    Returns (has_variant, pattern) where *pattern* has the same length as args.num_layers.
+    To add a new variant, extend the dispatch in this function and add a corresponding
+    ``_compute_<variant>_attention_params`` helper above.
+    """
+    variant = getattr(args, 'experimental_attention_variant', None)
+    freq = getattr(args, 'linear_attention_freq', None)
+
+    if variant == 'gated_delta_net' and freq is not None:
+        if isinstance(freq, int):
+            pattern = [0 if ((i + 1) % freq == 0) else 1 for i in range(args.num_layers)]
+        elif isinstance(freq, list):
+            pattern = freq
+        else:
+            pattern = [0] * args.num_layers
+        return True, pattern
+
+    # Future variants can be added here with elif branches.
+
+    return False, [0] * args.num_layers
+
+
+def _compute_experimental_attention_params(args, H, norm_multiplier):
+    """Dispatch to the correct experimental attention variant parameter counter.
+
+    To add a new variant, implement ``_compute_<variant>_attention_params(args, H, norm_multiplier)``
+    and add a branch here.
+    """
+    variant = getattr(args, 'experimental_attention_variant', None)
+    if variant == 'gated_delta_net':
+        return _compute_gdn_attention_params(args, H, norm_multiplier)
+    # Future variants can be added here with elif branches.
+    return 0
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Main parameter-counting entry point
+# ────────────────────────────────────────────────────────────────────────────
+
+def compute_weight_and_optimizer_memory(args, verbose=False):
+    H = args.hidden_size
+
     # Group Query Attention.
     if not args.group_query_attention:
         args.num_query_groups = args.num_attention_heads
+
+    # Normalization: RMSNorm has weight only; LayerNorm has weight + bias.
+    normalization = getattr(args, 'normalization', 'LayerNorm')
+    norm_multiplier = 1 if normalization == 'RMSNorm' else 2
+    layernorm_params_per_layer = 2 * H * norm_multiplier  # input_layernorm + pre_mlp_layernorm
+
     # MoE.
     num_experts = 1 if args.num_experts is None else args.num_experts
     gated_linear_multiplier = 3 / 2 if args.swiglu else 1
-    
+
     shared_expert_ffn_hidden_size = (
         0
         if args.moe_shared_expert_intermediate_size is None
         else args.moe_shared_expert_intermediate_size
     )
 
+    # --- MoE layer pattern ---
     if args.num_experts is not None:
         if isinstance(args.moe_layer_freq, int):
             moe_layer_pattern = [
@@ -38,96 +153,72 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
                 f"expected {args.num_layers}, "
                 f"current moe layer pattern: {args.moe_layer_freq}"
             )
-
-        num_dense_layers = args.num_layers - sum(moe_layer_pattern)
-        num_moe_layers = sum(moe_layer_pattern)
         moe_ffn_hidden_size = args.moe_ffn_hidden_size
     else:
         moe_layer_pattern = [0] * args.num_layers
-        num_dense_layers = args.num_layers
-        num_moe_layers = 0
         moe_ffn_hidden_size = 0
-    assert num_dense_layers + num_moe_layers == args.num_layers
-    if args.mtp_num_layers is not None:
-        mtp_layer_is_moe = moe_layer_pattern[-1]
-        mtp_num_moe_layers = mtp_layer_is_moe * args.mtp_num_layers
-        mtp_num_dense_layers = (1 - mtp_layer_is_moe) * args.mtp_num_layers
-    else:
-        mtp_num_moe_layers = 0
-        mtp_num_dense_layers = 0
 
-    if args.multi_latent_attention:
-        assert not args.group_query_attention
-        if args.q_lora_rank is None:
-            q_term = args.hidden_size * args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
-        else:
-            ## q lora + rope + q norm
-            q_term = args.q_lora_rank * (args.hidden_size + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim) + 1) 
-        
-        self_attn_term = (
-            q_term
+    # --- Attention variant pattern ---
+    has_variant, variant_pattern = _get_experimental_attention_pattern(args)
 
-            ## kv lora + rope + kv norm
-            + args.kv_lora_rank
-            * (args.hidden_size + args.num_attention_heads * (args.qk_head_dim + args.v_head_dim) + 1)
-            + args.hidden_size * args.qk_pos_emb_head_dim
-
-            ## o proj
-            + (args.num_attention_heads * args.v_head_dim) * args.hidden_size
-        )
-    else:
-        self_attn_term = (
-            2
-            * args.hidden_size
-            * args.hidden_size
-            * (
-                # Attention.
-                (
-                    (1 + (args.num_query_groups / args.num_attention_heads))
-                    * query_projection_to_hidden_size_ratio
-                )
-            )
-        )
-
-    num_parameters_in_transformer_layer_dense = (
-        2
-        * args.hidden_size
-        * (
-            # Dense MoE MLP.
-            (args.ffn_hidden_size * gated_linear_multiplier)
-            # Transformer layernorms.
-            + (2)
-        )
-        + self_attn_term
+    # --- Attention terms ---
+    full_attn_term = _compute_standard_attention_params(args, H, norm_multiplier)
+    variant_attn_term = (
+        _compute_experimental_attention_params(args, H, norm_multiplier) if has_variant else 0
     )
-    num_parameters_in_transformer_layer_moe = (
-        2
-        * args.hidden_size
-        * (
-            # MoE MLP.
-            + (moe_ffn_hidden_size * num_experts * gated_linear_multiplier)
-            # Shared MoE MLP.
-            + (shared_expert_ffn_hidden_size * gated_linear_multiplier)
-            # Transformer layernorms.
-            + (2)
-        )
-        + self_attn_term
+
+    # --- MLP terms ---
+    dense_mlp_term = 2 * H * args.ffn_hidden_size * gated_linear_multiplier
+
+    moe_mlp_term = (
+        2 * H * moe_ffn_hidden_size * num_experts * gated_linear_multiplier  # routed experts
+        + 2 * H * shared_expert_ffn_hidden_size * gated_linear_multiplier    # shared expert
+        + num_experts * H                                                     # router weights
     )
-    embedding_size = args.hidden_size * args.padded_vocab_size
-    final_layernorm = 2 * args.hidden_size
+    if getattr(args, 'moe_shared_expert_gate', False) and shared_expert_ffn_hidden_size > 0:
+        moe_mlp_term += H  # shared expert gate: Linear(H, 1, bias=False)
+
+    # --- Per-layer parameter counts for (is_variant_attn, is_moe) combos ---
+    layer_params = {
+        (False, False): full_attn_term    + dense_mlp_term + layernorm_params_per_layer,
+        (False, True):  full_attn_term    + moe_mlp_term   + layernorm_params_per_layer,
+        (True,  False): variant_attn_term + dense_mlp_term + layernorm_params_per_layer,
+        (True,  True):  variant_attn_term + moe_mlp_term   + layernorm_params_per_layer,
+    }
+
+    layer_type_counts = {k: 0 for k in layer_params}
+    for i in range(args.num_layers):
+        key = (variant_pattern[i] == 1, moe_layer_pattern[i] == 1)
+        layer_type_counts[key] += 1
+
+    # --- Transformer block ---
+    final_layernorm = H * norm_multiplier
+    num_parameters_in_transformer_block = final_layernorm
+    for key, count in layer_type_counts.items():
+        num_parameters_in_transformer_block += layer_params[key] * count
+
+    # --- MTP block ---
+    if args.mtp_num_layers is not None and args.mtp_num_layers > 0:
+        last_layer_key = (variant_pattern[-1] == 1, moe_layer_pattern[-1] == 1)
+        mtp_transformer_layer_params = layer_params[last_layer_key]
+        mtp_overhead = (
+            2 * H * norm_multiplier  # enorm + hnorm
+            + 2 * H * H             # eh_proj: Linear(2*H -> H, bias=False)
+            + H * norm_multiplier    # final_layernorm
+        )
+        num_parameters_in_mtp_block = (
+            (mtp_transformer_layer_params + mtp_overhead) * args.mtp_num_layers
+        )
+    else:
+        num_parameters_in_mtp_block = 0
+
+    # --- Embeddings ---
+    embedding_size = H * args.padded_vocab_size
     if args.untie_embeddings_and_output_weights:
         num_parameters_in_embedding_layers = 2 * embedding_size
     else:
         num_parameters_in_embedding_layers = embedding_size
-    num_parameters_in_transformer_block = (
-        num_parameters_in_transformer_layer_dense * num_dense_layers
-        + num_parameters_in_transformer_layer_moe * num_moe_layers
-        + final_layernorm
-    )
-    num_parameters_in_mtp_block = (
-        num_parameters_in_transformer_layer_dense * mtp_num_dense_layers
-        + num_parameters_in_transformer_layer_moe * mtp_num_moe_layers
-    )
+
     num_total_parameters = (
         num_parameters_in_transformer_block
         + num_parameters_in_mtp_block
@@ -138,6 +229,11 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
             f"Number of parameters in transformer block in billions: "
             f"{num_parameters_in_transformer_block / 10**9: .2f}"
         )
+        if has_variant:
+            variant_name = args.experimental_attention_variant
+            n_var = layer_type_counts[(True, False)] + layer_type_counts[(True, True)]
+            n_full = layer_type_counts[(False, False)] + layer_type_counts[(False, True)]
+            print(f"  ({n_var} {variant_name} layers, {n_full} full attention layers)")
         if args.mtp_num_layers is not None:
             print(
                 f"Number of parameters in mtp block in billions: "
