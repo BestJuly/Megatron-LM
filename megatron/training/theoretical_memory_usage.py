@@ -247,16 +247,17 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
     else:
         num_parameters_in_embedding_layers = embedding_size
 
-    num_total_parameters = (
-        num_parameters_in_transformer_block
-        + num_parameters_in_mtp_block
-        + num_parameters_in_embedding_layers
+    num_base_parameters = (
+        num_parameters_in_transformer_block + num_parameters_in_embedding_layers
     )
-    num_activated_parameters = (
-        num_activated_in_transformer_block
-        + num_activated_in_mtp_block
-        + num_parameters_in_embedding_layers
+    num_base_activated = (
+        num_activated_in_transformer_block + num_parameters_in_embedding_layers
     )
+    num_total_parameters = num_base_parameters + num_parameters_in_mtp_block
+    num_activated_parameters = num_base_activated + num_activated_in_mtp_block
+
+    has_mtp = args.mtp_num_layers is not None and args.mtp_num_layers > 0
+
     if verbose:
         print(
             f"Number of parameters in transformer block in billions: "
@@ -267,20 +268,41 @@ def compute_weight_and_optimizer_memory(args, verbose=False):
             n_var = layer_type_counts[(True, False)] + layer_type_counts[(True, True)]
             n_full = layer_type_counts[(False, False)] + layer_type_counts[(False, True)]
             print(f"  ({n_var} {variant_name} layers, {n_full} full attention layers)")
-        if args.mtp_num_layers is not None:
+        if has_mtp:
+            mtp_is_moe = last_layer_key[1]
             print(
                 f"Number of parameters in mtp block in billions: "
                 f"{num_parameters_in_mtp_block / 10**9: .2f}"
+                f"  ({'MoE' if mtp_is_moe else 'dense'} MLP, "
+                f"{args.mtp_num_layers} layer{'s' if args.mtp_num_layers > 1 else ''})"
             )
         print(
             f"Number of parameters in embedding layers in billions: "
             f"{num_parameters_in_embedding_layers / 10**9:.2f}"
         )
-        print(f"Total number of parameters in billions: {num_total_parameters / 10**9:.2f}")
-        print(
-            f"Number of activated parameters per token in billions: "
-            f"{num_activated_parameters / 10**9:.2f}"
-        )
+        if has_mtp:
+            print(
+                f"Total number of parameters in billions (base model): "
+                f"{num_base_parameters / 10**9:.2f}"
+            )
+            print(
+                f"Total number of parameters in billions (with MTP):   "
+                f"{num_total_parameters / 10**9:.2f}"
+            )
+            print(
+                f"Activated parameters per token in billions (base model): "
+                f"{num_base_activated / 10**9:.2f}"
+            )
+            print(
+                f"Activated parameters per token in billions (with MTP):   "
+                f"{num_activated_parameters / 10**9:.2f}"
+            )
+        else:
+            print(f"Total number of parameters in billions: {num_total_parameters / 10**9:.2f}")
+            print(
+                f"Activated parameters per token in billions: "
+                f"{num_activated_parameters / 10**9:.2f}"
+            )
 
     # Most loaded model shard has (1/pp_size transformer layers + 1 mtp block + 1 embedding layer) / tp_size.
     num_parameters_on_most_loaded_model_shard = (
