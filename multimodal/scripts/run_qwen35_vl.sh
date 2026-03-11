@@ -6,7 +6,7 @@
 #   ./multimodal/scripts/run_qwen35_vl.sh
 #
 # Environment variables:
-#   MODEL_VARIANT: proxy (default), 9b, 397b_a17b
+#   MODEL_VARIANT: proxy (default), 9b, 35b_a3b, 397b_a17b
 #   TP, EP, PP: parallelism sizes
 #   MBS, GBS: micro/global batch sizes
 #   NUM_LAYERS, NUM_EXPERTS: override for proxy testing
@@ -38,29 +38,62 @@ TP=${TP:-1}
 EP=${EP:-2}
 PP=${PP:-1}
 
-# Variant-aware defaults for NUM_LAYERS and NUM_EXPERTS.
+# Variant-aware architecture defaults.
 # The model provider builds configs from the variant dict, but Megatron also uses
 # these CLI args internally (PP splits, param counting). They must match the variant.
 case "$MODEL_VARIANT" in
     proxy)
+        # 397B-A17B dims, reduced to 4 layers / 16 experts for single-node 8xH100 testing.
         NUM_LAYERS=${NUM_LAYERS:-4}
-        NUM_EXPERTS=${NUM_EXPERTS:-4}
+        NUM_EXPERTS=${NUM_EXPERTS:-16}
+        HIDDEN_SIZE=4096
+        FFN_HIDDEN_SIZE=10240  # moe_ffn_hidden_size*topk: 1024*2 (same convention as 397b)
+        NUM_ATTN_HEADS=32
+        NUM_QUERY_GROUPS=2
+        LINEAR_NUM_VALUE_HEADS=64
         ;;
     9b)
-        NUM_LAYERS=${NUM_LAYERS:-60}
+        # Dense Qwen3.5-9B: 32 layers, hidden=4096, intermediate=12288, 16 heads, 4 kv-heads.
+        NUM_LAYERS=${NUM_LAYERS:-32}
         NUM_EXPERTS=${NUM_EXPERTS:-0}  # dense (no MoE)
+        HIDDEN_SIZE=4096
+        FFN_HIDDEN_SIZE=12288
+        NUM_ATTN_HEADS=16
+        NUM_QUERY_GROUPS=4   # num_key_value_heads=4
+        LINEAR_NUM_VALUE_HEADS=32
+        ;;
+    35b_a3b)
+        # MoE Qwen3.5-35B-A3B: 40 layers, hidden=2048, 256 experts top-8.
+        NUM_LAYERS=${NUM_LAYERS:-40}
+        NUM_EXPERTS=${NUM_EXPERTS:-256}
+        HIDDEN_SIZE=2048
+        FFN_HIDDEN_SIZE=4096  # moe_ffn_hidden_size*topk: 512*8
+        NUM_ATTN_HEADS=16
+        NUM_QUERY_GROUPS=2
+        LINEAR_NUM_VALUE_HEADS=32
         ;;
     397b_a17b)
+        # MoE Qwen3.5-397B-A17B: 60 layers, hidden=4096, 512 experts top-10.
         NUM_LAYERS=${NUM_LAYERS:-60}
         NUM_EXPERTS=${NUM_EXPERTS:-512}
+        HIDDEN_SIZE=4096
+        FFN_HIDDEN_SIZE=10240  # moe_ffn_hidden_size*topk: 1024*10
+        NUM_ATTN_HEADS=32
+        NUM_QUERY_GROUPS=2
+        LINEAR_NUM_VALUE_HEADS=64
         ;;
     *)
         # Unknown variant — fall back to env vars, fail if not set
         : "${NUM_LAYERS:?NUM_LAYERS must be set for MODEL_VARIANT=$MODEL_VARIANT}"
         : "${NUM_EXPERTS:?NUM_EXPERTS must be set for MODEL_VARIANT=$MODEL_VARIANT}"
+        : "${HIDDEN_SIZE:?HIDDEN_SIZE must be set for MODEL_VARIANT=$MODEL_VARIANT}"
+        : "${FFN_HIDDEN_SIZE:?FFN_HIDDEN_SIZE must be set for MODEL_VARIANT=$MODEL_VARIANT}"
+        : "${NUM_ATTN_HEADS:?NUM_ATTN_HEADS must be set for MODEL_VARIANT=$MODEL_VARIANT}"
+        : "${NUM_QUERY_GROUPS:?NUM_QUERY_GROUPS must be set for MODEL_VARIANT=$MODEL_VARIANT}"
+        : "${LINEAR_NUM_VALUE_HEADS:?LINEAR_NUM_VALUE_HEADS must be set for MODEL_VARIANT=$MODEL_VARIANT}"
         ;;
 esac
-SEQ_LEN=${SEQ_LEN:-1024}
+SEQ_LEN=${SEQ_LEN:-4096}
 
 WANDB_PROJECT='multimodal-qwen35-vl'
 EXP_NAME="qwen35vl_${MODEL_VARIANT}_tp${TP}_ep${EP}_pp${PP}"
@@ -178,14 +211,14 @@ MULTIMODAL_ARGS=(
     --image-seq-length 256
 )
 
-# --- Qwen3-Next Decoder Architecture ---
+# --- Qwen3.5 Decoder Architecture (variant-specific dims set above) ---
 GPT_MODEL_ARGS=(
     --num-layers "$NUM_LAYERS"
-    --hidden-size 4096
-    --ffn-hidden-size 10240
-    --num-attention-heads 32
+    --hidden-size "$HIDDEN_SIZE"
+    --ffn-hidden-size "$FFN_HIDDEN_SIZE"
+    --num-attention-heads "$NUM_ATTN_HEADS"
     --group-query-attention
-    --num-query-groups 2
+    --num-query-groups "$NUM_QUERY_GROUPS"
     --kv-channels 256
     --max-position-embeddings 262144
     --seq-length "$SEQ_LEN"
@@ -209,34 +242,41 @@ GPT_MODEL_ARGS=(
     --linear-key-head-dim 128
     --linear-value-head-dim 128
     --linear-num-key-heads 16
-    --linear-num-value-heads 64
+    --linear-num-value-heads "$LINEAR_NUM_VALUE_HEADS"
     --make-vocab-size-divisible-by 485
 )
 
 # --- MoE args (MoE variants only) ---
+# topk and expert sizes must match the variant config in qwen35_vl.py
 MOE_ARGS=()
 case "$MODEL_VARIANT" in
-    proxy|397b_a17b)
-        # topk: proxy=2, 397b=10 — must match the variant config in qwen35_vl.py
-        MOE_TOPK=2
-        [ "$MODEL_VARIANT" = "397b_a17b" ] && MOE_TOPK=10
-        MOE_ARGS=(
-            --num-experts "$NUM_EXPERTS"
-            --moe-ffn-hidden-size 1024
-            --moe-shared-expert-intermediate-size 1024
-            --moe-shared-expert-gate
-            --moe-router-load-balancing-type aux_loss
-            --moe-router-topk "$MOE_TOPK"
-            --moe-grouped-gemm
-            --moe-aux-loss-coeff 1e-3
-            --moe-token-dispatcher-type alltoall
-            --moe-router-dtype fp32
-        )
+    proxy)
+        MOE_TOPK=2; MOE_FFN_HIDDEN=1024; MOE_SHARED_HIDDEN=1024
+        ;;
+    35b_a3b)
+        MOE_TOPK=8; MOE_FFN_HIDDEN=512;  MOE_SHARED_HIDDEN=512
+        ;;
+    397b_a17b)
+        MOE_TOPK=10; MOE_FFN_HIDDEN=1024; MOE_SHARED_HIDDEN=1024
         ;;
     9b)
         # Dense model — no MoE args
         ;;
 esac
+if [ "$MODEL_VARIANT" != "9b" ]; then
+    MOE_ARGS=(
+        --num-experts "$NUM_EXPERTS"
+        --moe-ffn-hidden-size "$MOE_FFN_HIDDEN"
+        --moe-shared-expert-intermediate-size "$MOE_SHARED_HIDDEN"
+        --moe-shared-expert-gate
+        --moe-router-load-balancing-type aux_loss
+        --moe-router-topk "$MOE_TOPK"
+        --moe-grouped-gemm
+        --moe-aux-loss-coeff 1e-3
+        --moe-token-dispatcher-type alltoall
+        --moe-router-dtype fp32
+    )
+fi
 
 # --- Recompute ---
 RECOMPUTE_ARGS=(

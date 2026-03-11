@@ -9,9 +9,10 @@ Architecture:
     - Position encoding: MRoPE with sections [11, 11, 10] and partial_rotary_factor=0.25
 
 Supported variants:
-    - "9b": Dense 9B model
-    - "397b_a17b": MoE 397B-A17B model (512 experts top-2)
-    - "proxy": Small proxy model for testing (4 layers, 4 experts)
+    - "9b": Dense 9B model (32 layers)
+    - "35b_a3b": MoE 35B-A3B model (40 layers, 256 experts top-8)
+    - "397b_a17b": MoE 397B-A17B model (60 layers, 512 experts top-10)
+    - "proxy": Reduced proxy based on 397B (4 layers, 16 experts) for single-node testing
 """
 
 from typing import List, Optional, Tuple
@@ -74,38 +75,62 @@ VISION_KWARGS = {
 # ---------------------------------------------------------------------------
 
 _VARIANT_CONFIGS = {
+    # Dense 9B model (Qwen3.5-9B)
+    # Ref: https://huggingface.co/Qwen/Qwen3.5-9B/blob/main/config.json
     "9b": {
-        "num_layers": 60,
+        "num_layers": 32,
         "hidden_size": 4096,
         "ffn_hidden_size": 12288,
         "num_attention_heads": 16,
-        "num_query_groups": 4,
-        "kv_channels": 256,
+        "num_query_groups": 4,   # num_key_value_heads=4
+        "kv_channels": 256,      # head_dim=256
+        "linear_num_value_heads": 32,
         "num_moe_experts": None,  # dense
         "moe_router_topk": None,
         "moe_ffn_hidden_size": None,
         "moe_shared_expert_intermediate_size": None,
     },
+    # MoE 35B-A3B model (Qwen3.5-35B-A3B)
+    # Ref: https://huggingface.co/Qwen/Qwen3.5-35B-A3B/blob/main/config.json
+    "35b_a3b": {
+        "num_layers": 40,
+        "hidden_size": 2048,
+        "ffn_hidden_size": 4096,  # moe_ffn_hidden_size * topk: 512*8=4096
+        "num_attention_heads": 16,
+        "num_query_groups": 2,   # num_key_value_heads=2
+        "kv_channels": 256,      # head_dim=256 (expanded; q_proj=16*256=4096=2*hidden)
+        "linear_num_value_heads": 32,
+        "num_moe_experts": 256,
+        "moe_router_topk": 8,
+        "moe_ffn_hidden_size": 512,
+        "moe_shared_expert_intermediate_size": 512,
+    },
+    # MoE 397B-A17B model (Qwen3.5-397B-A17B)
+    # Ref: https://huggingface.co/Qwen/Qwen3.5-397B-A17B/blob/main/config.json
     "397b_a17b": {
         "num_layers": 60,
         "hidden_size": 4096,
-        "ffn_hidden_size": 10240,
+        "ffn_hidden_size": 10240,  # moe_ffn_hidden_size * topk: 1024*10=10240
         "num_attention_heads": 32,
-        "num_query_groups": 2,
-        "kv_channels": 256,
+        "num_query_groups": 2,   # num_key_value_heads=2
+        "kv_channels": 256,      # head_dim=256
+        "linear_num_value_heads": 64,
         "num_moe_experts": 512,
         "moe_router_topk": 10,
         "moe_ffn_hidden_size": 1024,
         "moe_shared_expert_intermediate_size": 1024,
     },
+    # Proxy model: 397B architecture reduced to 4 layers / 16 experts for single-node testing.
+    # Keeps 397B dims (hidden=4096, heads=32) so parallelism configs transfer directly.
     "proxy": {
         "num_layers": 4,
         "hidden_size": 4096,
-        "ffn_hidden_size": 10240,
+        "ffn_hidden_size": 10240,  # same as 397b_a17b
         "num_attention_heads": 32,
         "num_query_groups": 2,
         "kv_channels": 256,
-        "num_moe_experts": 4,
+        "linear_num_value_heads": 64,
+        "num_moe_experts": 16,
         "moe_router_topk": 2,
         "moe_ffn_hidden_size": 1024,
         "moe_shared_expert_intermediate_size": 1024,
@@ -120,7 +145,7 @@ def get_qwen35_vl_language_config(
     """TransformerConfig for Qwen3.5-VL language decoder.
 
     Args:
-        variant: One of "9b", "397b_a17b", "proxy".
+        variant: One of "9b", "35b_a3b", "397b_a17b", "proxy".
         **overrides: Override any config field.
 
     Returns:
@@ -164,7 +189,7 @@ def get_qwen35_vl_language_config(
         linear_key_head_dim=128,
         linear_value_head_dim=128,
         linear_num_key_heads=16,
-        linear_num_value_heads=64,
+        linear_num_value_heads=v["linear_num_value_heads"],
         # Kernel / TE fusions
         bias_activation_fusion=True,
         masked_softmax_fusion=True,
