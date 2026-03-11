@@ -123,47 +123,37 @@ class PatchMerger(nn.Module):
 
 
 class VisionRotaryEmbedding(nn.Module):
-    """2D rotary position embedding for vision transformer.
+    """1D rotary position frequency table for the vision transformer.
+
+    Generates a lookup table of RoPE frequencies for integer positions 0..seqlen-1.
+    Use VisionEncoder._compute_rotary_pos_emb to map per-patch 2D (row, col)
+    positions to embeddings via table lookup.
+
+    Matches HF Qwen3_5VisionRotaryEmbedding exactly.
 
     Args:
-        hidden_size: Per-head dimension for computing rotary embeddings.
-        theta: Base frequency for rotary embeddings.
+        dim: Frequency dimension (= head_dim // 2).
+        theta: RoPE base frequency.
     """
 
-    def __init__(self, hidden_size: int, theta: float = 10000.0):
+    def __init__(self, dim: int, theta: float = 10000.0):
         super().__init__()
-        self.dim = hidden_size // 2  # half for cos, half for sin
+        self.dim = dim
         self.theta = theta
-        inv_freq = 1.0 / (
-            theta ** (torch.arange(0, self.dim, 2, dtype=torch.float32) / self.dim)
-        )
+        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-    def forward(self, grid_thw: torch.Tensor) -> torch.Tensor:
-        """Compute 2D rotary position embeddings from grid dimensions.
+    def forward(self, seqlen: int) -> torch.Tensor:
+        """Return a frequency lookup table for positions 0..seqlen-1.
 
         Args:
-            grid_thw: [num_images, 3] with (temporal, height, width) per image.
+            seqlen: Number of positions (typically max(height, width) across all images).
 
         Returns:
-            Rotary embeddings [total_patches, dim].
+            freqs: [seqlen, dim // 2]
         """
-        all_pos = []
-        for t, h, w in grid_thw.tolist():
-            t, h, w = int(t), int(h), int(w)
-            # Create 2D position grid
-            hpos = torch.arange(h, device=grid_thw.device).unsqueeze(1).expand(-1, w)
-            wpos = torch.arange(w, device=grid_thw.device).unsqueeze(0).expand(h, -1)
-            # Stack and repeat for temporal dimension
-            hpos = hpos.reshape(-1).repeat(t)
-            wpos = wpos.reshape(-1).repeat(t)
-            # Compute rotary embeddings for h and w separately
-            inv_freq = self.inv_freq.to(grid_thw.device)
-            h_emb = hpos.float().unsqueeze(1) @ inv_freq.unsqueeze(0)
-            w_emb = wpos.float().unsqueeze(1) @ inv_freq.unsqueeze(0)
-            pos_emb = torch.cat([h_emb, w_emb], dim=-1)
-            all_pos.append(pos_emb)
-        return torch.cat(all_pos, dim=0)
+        seq = torch.arange(seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+        return torch.outer(seq, self.inv_freq)  # [seqlen, dim // 2]
 
 
 class VisionEncoder(MegatronModule):
@@ -171,7 +161,7 @@ class VisionEncoder(MegatronModule):
 
     Processes image/video inputs through:
     1. PatchEmbed3D (Linear projection of pre-extracted flat patches)
-    2. Learned absolute position embeddings
+    2. 2D Vision RoPE from (row, col) patch positions
     3. TransformerBlock (N layers of ViT)
     4. PatchMerger (spatial merge to reduce tokens)
 
@@ -212,12 +202,10 @@ class VisionEncoder(MegatronModule):
             temporal_patch_size=temporal_patch_size,
         )
 
-        # Learned absolute position embeddings
-        self.pos_embed = nn.Embedding(max_num_positions, config.hidden_size)
-
-        # Vision rotary embeddings
+        # Vision rotary embeddings: freq table for positions 0..max_hw-1.
+        # dim = head_dim // 2 so that row + col frequencies combine to head_dim.
         head_dim = config.hidden_size // config.num_attention_heads
-        self.rot_pos_emb = VisionRotaryEmbedding(head_dim)
+        self.rot_pos_emb = VisionRotaryEmbedding(head_dim // 2)
 
         # Transformer blocks
         if transformer_layer_spec is None:
@@ -237,6 +225,59 @@ class VisionEncoder(MegatronModule):
             spatial_merge_size=spatial_merge_size,
         )
 
+    def _compute_rotary_pos_emb(self, grid_thw: torch.Tensor) -> torch.Tensor:
+        """Compute 2D Vision RoPE frequencies for all patches.
+
+        Patches are ordered in block-merge order so that spatial_merge_size ×
+        spatial_merge_size blocks of patches are grouped together, matching the
+        layout expected by PatchMerger and the HF processor output.
+
+        Matches HF Qwen3_5VisionModel.rot_pos_emb exactly.
+
+        Args:
+            grid_thw: [num_images, 3] with (temporal, height, width) per image.
+
+        Returns:
+            rot_freqs: [total_patches, head_dim] raw frequencies for mcore RoPE.
+                Pass as rotary_pos_emb after unsqueezing to [seq, 1, 1, head_dim].
+        """
+        merge = self.spatial_merge_size
+        max_hw = int(grid_thw[:, 1:].max().item())
+        freq_table = self.rot_pos_emb(max_hw)  # [max_hw, head_dim // 4]
+
+        pos_ids_list = []
+        for t, h, w in grid_thw.tolist():
+            t, h, w = int(t), int(h), int(w)
+            device = freq_table.device
+            # Block-merge ordered row indices: merge×merge blocks are grouped
+            hpos = (
+                torch.arange(h, device=device)
+                .unsqueeze(1)
+                .expand(h, w)
+                .reshape(h * w)
+                .reshape(h // merge, merge, w // merge, merge)
+                .permute(0, 2, 1, 3)
+                .flatten()
+            )
+            # Block-merge ordered col indices
+            wpos = (
+                torch.arange(w, device=device)
+                .unsqueeze(0)
+                .expand(h, w)
+                .reshape(h * w)
+                .reshape(h // merge, merge, w // merge, merge)
+                .permute(0, 2, 1, 3)
+                .flatten()
+            )
+            # Stack (row, col) and repeat for temporal frames
+            pos_ids = torch.stack([hpos, wpos], dim=-1).repeat(t, 1)  # [t*h*w, 2]
+            pos_ids_list.append(pos_ids)
+
+        pos_ids = torch.cat(pos_ids_list, dim=0)  # [total_patches, 2]
+        embeddings = freq_table[pos_ids]           # [total_patches, 2, head_dim // 4]
+        embeddings = embeddings.flatten(1)         # [total_patches, head_dim // 2]
+        return torch.cat((embeddings, embeddings), dim=-1)  # [total_patches, head_dim]
+
     def forward(
         self,
         pixel_values: torch.Tensor,
@@ -255,25 +296,18 @@ class VisionEncoder(MegatronModule):
         # 1. Patch embedding
         hidden_states = self.patch_embed(pixel_values)
 
-        # 2. Position embeddings (learned absolute, interpolated if needed)
-        seq_len = hidden_states.shape[0]
-        if seq_len <= self.pos_embed.num_embeddings:
-            pos_ids = torch.arange(seq_len, device=hidden_states.device)
-            hidden_states = hidden_states + self.pos_embed(pos_ids)
+        # 2. Compute 2D Vision RoPE frequencies for all patches
+        rot_freqs = self._compute_rotary_pos_emb(grid_thw)  # [seq, head_dim]
+        rot_freqs = rot_freqs.unsqueeze(1).unsqueeze(1)      # [seq, 1, 1, head_dim]
 
-        # 3. ViT transformer blocks
-        # Vision RoPE (VisionRotaryEmbedding) uses a (cos, sin) tuple format that
-        # differs from what mcore's ViT TransformerBlock expects for rotary_pos_emb
-        # (a raw frequency tensor). Passing None here uses the learned absolute
-        # position embeddings from step 2. Vision RoPE can be wired in once E2E
-        # is confirmed working.
-        hidden_states = hidden_states.unsqueeze(1)  # [seq, 1, hidden]
+        # 3. ViT transformer blocks with Vision RoPE
+        hidden_states = hidden_states.unsqueeze(1)           # [seq, 1, hidden]
         hidden_states = self.blocks(
             hidden_states=hidden_states,
             attention_mask=None,
-            rotary_pos_emb=None,
+            rotary_pos_emb=rot_freqs,
         )
-        hidden_states = hidden_states.squeeze(1)  # [seq, hidden]
+        hidden_states = hidden_states.squeeze(1)             # [seq, hidden]
 
         # 4. Patch merger
         merged = self.merger(hidden_states, grid_thw)

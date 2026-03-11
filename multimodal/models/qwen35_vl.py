@@ -52,6 +52,7 @@ def get_qwen35_vl_vision_config() -> TransformerConfig:
         activation_func=torch.nn.functional.gelu,
         bias_activation_fusion=False,
         apply_query_key_layer_scaling=False,
+        apply_rope_fusion=False,  # use unfused RoPE; TE fused kernel unsupported for ViT
         bf16=True,
     )
 
@@ -290,16 +291,17 @@ def compute_mrope_position_ids(
     if image_grid_thw is None or image_grid_thw.numel() == 0:
         return mrope_ids
 
+    # img_idx is a global counter across all samples (not reset per sample).
+    # image_grid_thw is ordered: all images from sample 0, then sample 1, etc.
+    # This matches HF's iter(image_grid_thw) approach in get_rope_index.
+    img_idx = 0
+
     # Process each sample in the batch
     for b in range(B):
         image_mask = (input_ids[b] == image_token_id)
         if not image_mask.any():
             continue
 
-        image_positions = image_mask.nonzero(as_tuple=True)[0]
-
-        # Track which image we're processing
-        img_idx = 0
         pos_offset = 0
         text_pos = 0
 
