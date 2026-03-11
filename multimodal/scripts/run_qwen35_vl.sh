@@ -10,6 +10,8 @@
 #   TP, EP, PP: parallelism sizes
 #   MBS, GBS: micro/global batch sizes
 #   NUM_LAYERS, NUM_EXPERTS: override for proxy testing
+#   PROFILE: set to 1 to enable Nsight Systems profiling (default: 0)
+#   PROFILE_STEP_START/PROFILE_STEP_END: profiled iteration window (default: 4-5)
 
 set -euo pipefail
 
@@ -20,6 +22,10 @@ export NVTE_FUSED_ATTN=1
 DRY_RUN=${DRY_RUN:-false}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 NUM_NODES=${NNODES:-1}
+PROFILE=${PROFILE:-0}
+PROFILE_STEP_START=${PROFILE_STEP_START:-4}
+PROFILE_STEP_END=${PROFILE_STEP_END:-5}
+PROFILE_RANKS=${PROFILE_RANKS:-0}
 
 MODEL_VARIANT=${MODEL_VARIANT:-proxy}
 
@@ -114,6 +120,30 @@ TRAINING_ARGS=(
     --manual-gc-interval 5
 )
 
+PROFILE_ARGS=()
+NSYS_CMD=()
+if [ "$PROFILE" = "1" ]; then
+    PROFILE_ARGS=(
+        --profile
+        --profile-step-start "$PROFILE_STEP_START"
+        --profile-step-end "$PROFILE_STEP_END"
+        --profile-ranks "$PROFILE_RANKS"
+    )
+
+    NSYS_OUTPUT_DIR="${CHECKPOINT_STORE_PATH}/nsys"
+    mkdir -p "$NSYS_OUTPUT_DIR"
+    NSYS_CMD=(
+        nsys profile
+        --sample=none
+        --cpuctxsw=none
+        --trace=cuda,nvtx,cublas,cudnn
+        --force-overwrite=true
+        --capture-range=cudaProfilerApi
+        --capture-range-end=stop
+        -o "${NSYS_OUTPUT_DIR}/${EXP_NAME}_rank%q{RANK}"
+    )
+fi
+
 # --- Logging & Checkpointing ---
 EVAL_AND_LOGGING_ARGS=(
     --log-interval 1
@@ -129,9 +159,12 @@ EVAL_AND_LOGGING_ARGS=(
 )
 
 # --- Tokenizer ---
+# For mock-data runs: NullTokenizer with the real Qwen3.5 vocab size avoids
+# requiring the HF tokenizer weights to be downloaded locally.
+# Switch to HuggingFaceTokenizer + tokenizer-model for real-data runs.
 TOKENIZER_ARGS=(
-    --tokenizer-type HuggingFaceTokenizer
-    --tokenizer-model 'Qwen/Qwen3.5-397B-A17B'
+    --tokenizer-type NullTokenizer
+    --vocab-size 248320
 )
 
 # --- Multimodal-specific ---
@@ -218,12 +251,18 @@ echo "  GPUs per node: $GPUS_PER_NODE"
 echo "  Num nodes:     $NUM_NODES"
 echo "  TP=$TP  EP=$EP  PP=$PP  CP=1"
 echo "  MBS=$MBS  GBS=$GBS"
+echo "  PROFILE:       $PROFILE"
+if [ "$PROFILE" = "1" ]; then
+    echo "  Profile steps: ${PROFILE_STEP_START}-${PROFILE_STEP_END}"
+    echo "  Profile ranks: $PROFILE_RANKS"
+fi
 echo "================================================================"
 
 if [ "$DRY_RUN" = true ]; then
     echo "=== DRY RUN ==="
-    echo "torchrun ${DISTRIBUTED_ARGS[@]} multimodal/pretrain_multimodal.py" \
+    echo "${NSYS_CMD[@]} torchrun ${DISTRIBUTED_ARGS[@]} multimodal/pretrain_multimodal.py" \
         "${TRAINING_ARGS[@]}" \
+        "${PROFILE_ARGS[@]}" \
         "${MODEL_PARALLEL_ARGS[@]}" \
         "${EVAL_AND_LOGGING_ARGS[@]}" \
         "${TOKENIZER_ARGS[@]}" \
@@ -233,8 +272,9 @@ if [ "$DRY_RUN" = true ]; then
         "${RECOMPUTE_ARGS[@]}"
     echo "=== End of DRY RUN ==="
 else
-    torchrun "${DISTRIBUTED_ARGS[@]}" multimodal/pretrain_multimodal.py \
+    "${NSYS_CMD[@]}" torchrun "${DISTRIBUTED_ARGS[@]}" multimodal/pretrain_multimodal.py \
         "${TRAINING_ARGS[@]}" \
+        "${PROFILE_ARGS[@]}" \
         "${MODEL_PARALLEL_ARGS[@]}" \
         "${EVAL_AND_LOGGING_ARGS[@]}" \
         "${TOKENIZER_ARGS[@]}" \

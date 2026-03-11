@@ -12,7 +12,6 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_src_rank,
 )
-from megatron.training import get_args
 
 
 def _broadcast_tensor(tensor, src, group, device):
@@ -132,7 +131,6 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
     Returns:
         Batch dict or None if iterator is exhausted.
     """
-    args = get_args()
     device = "cuda"
 
     # Only TP rank 0 reads data
@@ -155,6 +153,28 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
         return None
 
     batch = broadcast_data_batch(data, device=device)
+
+    # Fix shapes produced by PyTorch default_collate (stacks on dim=0).
+    # position_ids: per-sample [3, S] → collated [B, 3, S] → need [3, B, S]
+    # Use shape[1]==3 to detect [B,3,S] format (avoids false-negative when B==3).
+    if "position_ids" in batch and batch["position_ids"] is not None:
+        p = batch["position_ids"]
+        if p.dim() == 3 and p.shape[1] == 3:
+            batch["position_ids"] = p.permute(1, 0, 2).contiguous()
+
+    # pixel_values: per-sample [patches, D] → collated [B, patches, D] → need [B*patches, D]
+    if "pixel_values" in batch and batch["pixel_values"] is not None:
+        pv = batch["pixel_values"]
+        if pv.dim() == 3:
+            B, P, D = pv.shape
+            batch["pixel_values"] = pv.reshape(B * P, D)
+
+    # image_grid_thw: per-sample [1, 3] → collated [B, 1, 3] → need [B, 3]
+    if "image_grid_thw" in batch and batch["image_grid_thw"] is not None:
+        g = batch["image_grid_thw"]
+        if g.dim() == 3:
+            batch["image_grid_thw"] = g.squeeze(1)
+
     return batch
 
 
@@ -201,13 +221,17 @@ def forward_step(data_iterator, model):
             image_grid_thw=batch.get("image_grid_thw", None),
         )
 
+    pixel_values = batch.get("pixel_values", None)
+    if pixel_values is not None and pixel_values.is_floating_point() and pixel_values.dtype == torch.float32:
+        pixel_values = pixel_values.bfloat16()
+
     output_tensor = model(
         input_ids=batch["input_ids"],
         position_ids=position_ids,
         attention_mask=batch.get("attention_mask", None),
         labels=batch.get("labels", None),
         loss_mask=batch.get("loss_mask", None),
-        pixel_values=batch.get("pixel_values", None),
+        pixel_values=pixel_values,
         image_grid_thw=batch.get("image_grid_thw", None),
     )
 

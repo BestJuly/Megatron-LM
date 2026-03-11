@@ -16,8 +16,10 @@ import sys
 # Add repo root to path for multimodal imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+from megatron.core import parallel_state
 from megatron.core.enums import ModelType
 from megatron.training import get_args, pretrain
+from megatron.training.arguments import core_transformer_config_from_args
 
 from multimodal.arguments import add_multimodal_args
 from multimodal.forward_step import forward_step
@@ -26,16 +28,17 @@ from multimodal.forward_step import forward_step
 def model_provider(
     pre_process: bool = True,
     post_process: bool = True,
-    add_encoder: bool = True,
-    add_decoder: bool = True,
+    **kwargs,
 ):
     """Model provider for multimodal training.
 
     Builds the model based on --model-arch and --model-variant CLI args.
+    The language TransformerConfig is built from CLI args so that parallelism
+    settings (TP, PP, SP), precision (bf16/fp16), and fusion flags are
+    correctly inherited.
     """
     args = get_args()
     model_arch = getattr(args, "model_arch", "qwen35_vl")
-    model_variant = getattr(args, "model_variant", "proxy")
 
     from multimodal.models import MODEL_REGISTRY
 
@@ -47,30 +50,40 @@ def model_provider(
 
     registry = MODEL_REGISTRY[model_arch]
     model_class = registry["model_class"]
-    language_config_fn = registry["language_config_fn"]
     language_spec_fn = registry["language_spec_fn"]
     vision_config_fn = registry["vision_config_fn"]
 
-    # Build configs
-    language_config = language_config_fn(variant=model_variant)
+    # Build language config from CLI args (picks up TP, PP, SP, bf16,
+    # MoE, hybrid-attention, cross-entropy fusion, etc.)
+    language_config = core_transformer_config_from_args(args)
+    # MRoPE section is architecture-specific and not a CLI arg.
+    language_config.mrope_section = [11, 11, 10]
+
+    # Vision config: architecture-specific values, not from CLI.
+    # Inherit precision from the language config.
     vision_config = vision_config_fn()
+    vision_config.bf16 = language_config.bf16
+    vision_config.fp16 = language_config.fp16
 
     # Build language spec (supports PP slicing)
-    pp_rank = None
-    vp_stage = None
     language_spec = language_spec_fn(
         config=language_config,
-        vp_stage=vp_stage,
-        pp_rank=pp_rank,
+        vp_stage=kwargs.get("vp_stage", None),
+        pp_rank=None,
     )
+
+    # Determine which pipeline components to build.
+    # Megatron does NOT pass add_encoder/add_decoder; compute from PP rank.
+    add_encoder = parallel_state.is_pipeline_first_stage()
+    add_decoder = True
 
     # Build model
     model = model_class(
         language_config=language_config,
         language_spec=language_spec,
         vision_config=vision_config,
-        vocab_size=getattr(args, "padded_vocab_size", 248320),
-        max_sequence_length=getattr(args, "max_position_embeddings", 262144),
+        vocab_size=args.padded_vocab_size,
+        max_sequence_length=args.max_position_embeddings,
         image_token_id=getattr(args, "image_token_id", 248056),
         pre_process=pre_process,
         post_process=post_process,
