@@ -11,6 +11,7 @@ from typing import Dict, Optional
 import torch
 from torch import Tensor
 
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.models.gpt import GPTModel
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -151,21 +152,38 @@ class MultimodalModel(MegatronModule):
 
         Args:
             input_ids: [B, S] token IDs.
-            text_embeddings: [S, B, D] text embeddings from the decoder embedding layer.
+            text_embeddings: [S, B, D] or [S/TP, B, D] (with SP) text embeddings.
             vision_embeddings: [num_visual_tokens, D] visual embeddings.
 
         Returns:
-            Combined embeddings [S, B, D].
+            Combined embeddings [S, B, D] or [S/TP, B, D] (with SP), matching input shape.
         """
-        # Create mask for image token positions: [B, S]
-        image_mask = (input_ids == self.image_token_id)
+        sp = (
+            self.config.sequence_parallel
+            and parallel_state.get_tensor_model_parallel_world_size() > 1
+        )
 
-        # text_embeddings is [S, B, D], transpose to [B, S, D] for scatter
+        if sp:
+            # embedding() already scattered to [S/TP, B, D].
+            # Gather back to full [S, B, D] so image_mask [B, S] aligns with the sequence dim.
+            # tensor_parallel_output_grad=False: backward splits the gradient (inverse of gather),
+            # which is correct because the computation between gather and re-scatter is replicated.
+            text_embeddings = tensor_parallel.gather_from_sequence_parallel_region(
+                text_embeddings, tensor_parallel_output_grad=False
+            )
+
+        # text_embeddings: [S, B, D] — transpose to [B, S, D] for masked_scatter
         combined = text_embeddings.transpose(0, 1).contiguous()
-        # image_mask: [B, S] -> [B, S, 1] for broadcasting
+        image_mask = (input_ids == self.image_token_id)           # [B, S]
         mask_expanded = image_mask.unsqueeze(-1).expand_as(combined)
         combined = combined.masked_scatter(mask_expanded, vision_embeddings)
-        return combined.transpose(0, 1).contiguous()
+        combined = combined.transpose(0, 1).contiguous()          # [S, B, D]
+
+        if sp:
+            # Re-scatter to [S/TP, B, D] before the transformer layers.
+            combined = tensor_parallel.scatter_to_sequence_parallel_region(combined)
+
+        return combined
 
     def compute_position_ids(
         self,
