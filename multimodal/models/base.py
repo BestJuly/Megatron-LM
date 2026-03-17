@@ -69,6 +69,7 @@ class MultimodalModel(MegatronModule):
         rotary_percent: float = 1.0,
         rotary_base: int = 10000,
         mrope_section: list = None,
+        mtp_block_spec: ModuleSpec = None,
         vision_kwargs: dict = None,
         pre_process: bool = True,
         post_process: bool = True,
@@ -110,6 +111,7 @@ class MultimodalModel(MegatronModule):
                 position_embedding_type=position_embedding_type,
                 rotary_percent=rotary_percent,
                 rotary_base=rotary_base,
+                mtp_block_spec=mtp_block_spec,
             )
 
         # For receiving encoder hidden state across PP stages
@@ -255,7 +257,7 @@ class MultimodalModel(MegatronModule):
         # --- Language model forward ---
         if self.language_model is not None:
             output = self.language_model(
-                input_ids=None,  # Already embedded
+                input_ids=input_ids,
                 position_ids=position_ids,
                 attention_mask=attention_mask,
                 decoder_input=decoder_input,

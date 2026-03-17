@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
 from megatron.training import get_args, pretrain
 from megatron.training.arguments import core_transformer_config_from_args
 
@@ -73,6 +74,15 @@ def model_provider(
         vp_stage=kwargs.get("vp_stage", None),
         pp_rank=None,
     )
+    mtp_block_spec = None
+    if getattr(args, "mtp_num_layers", None):
+        mtp_block_spec = get_gpt_mtp_block_spec(
+            config=language_config,
+            spec=language_spec,
+            use_transformer_engine=(args.transformer_impl == "transformer_engine"),
+            vp_stage=kwargs.get("vp_stage", None),
+            pp_rank=None,
+        )
 
     # Determine which pipeline components to build.
     # Megatron does NOT pass add_encoder/add_decoder; compute from PP rank.
@@ -87,6 +97,7 @@ def model_provider(
         vocab_size=args.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
         image_token_id=getattr(args, "image_token_id", 248056),
+        mtp_block_spec=mtp_block_spec,
         pre_process=pre_process,
         post_process=post_process,
         add_encoder=add_encoder,

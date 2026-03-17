@@ -157,8 +157,8 @@ TRAINING_ARGS=(
     --enable-experimental
     --manual-gc
     --manual-gc-interval 5
-    #--mtp-num-layers 1
-    #--mtp-loss-scaling-factor 0.1
+    --mtp-num-layers 1
+    --mtp-loss-scaling-factor 0.1
 )
 
 PROFILE_ARGS=()
