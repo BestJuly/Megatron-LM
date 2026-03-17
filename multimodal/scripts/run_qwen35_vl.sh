@@ -28,6 +28,7 @@ PROFILE_STEP_END=${PROFILE_STEP_END:-5}
 PROFILE_RANKS=${PROFILE_RANKS:-0}
 
 MODEL_VARIANT=${MODEL_VARIANT:-proxy}
+VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-}
 
 # Batch sizes
 MBS=${MBS:-1}
@@ -51,6 +52,7 @@ case "$MODEL_VARIANT" in
         NUM_ATTN_HEADS=32
         NUM_QUERY_GROUPS=2
         LINEAR_NUM_VALUE_HEADS=64
+        VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-2}
         ;;
     9b)
         # Dense Qwen3.5-9B: 32 layers, hidden=4096, intermediate=12288, 16 heads, 4 kv-heads.
@@ -61,6 +63,7 @@ case "$MODEL_VARIANT" in
         NUM_ATTN_HEADS=16
         NUM_QUERY_GROUPS=4   # num_key_value_heads=4
         LINEAR_NUM_VALUE_HEADS=32
+        VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-27}
         ;;
     35b_a3b)
         # MoE Qwen3.5-35B-A3B: 40 layers, hidden=2048, 256 experts top-8.
@@ -71,6 +74,7 @@ case "$MODEL_VARIANT" in
         NUM_ATTN_HEADS=16
         NUM_QUERY_GROUPS=2
         LINEAR_NUM_VALUE_HEADS=32
+        VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-27}
         ;;
     397b_a17b)
         # MoE Qwen3.5-397B-A17B: 60 layers, hidden=4096, 512 experts top-10.
@@ -81,6 +85,7 @@ case "$MODEL_VARIANT" in
         NUM_ATTN_HEADS=32
         NUM_QUERY_GROUPS=2
         LINEAR_NUM_VALUE_HEADS=64
+        VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-27}
         ;;
     *)
         # Unknown variant — fall back to env vars, fail if not set
@@ -91,6 +96,7 @@ case "$MODEL_VARIANT" in
         : "${NUM_ATTN_HEADS:?NUM_ATTN_HEADS must be set for MODEL_VARIANT=$MODEL_VARIANT}"
         : "${NUM_QUERY_GROUPS:?NUM_QUERY_GROUPS must be set for MODEL_VARIANT=$MODEL_VARIANT}"
         : "${LINEAR_NUM_VALUE_HEADS:?LINEAR_NUM_VALUE_HEADS must be set for MODEL_VARIANT=$MODEL_VARIANT}"
+        VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-27}
         ;;
 esac
 SEQ_LEN=${SEQ_LEN:-4096}
@@ -151,6 +157,8 @@ TRAINING_ARGS=(
     --enable-experimental
     --manual-gc
     --manual-gc-interval 5
+    #--mtp-num-layers 1
+    #--mtp-loss-scaling-factor 0.1
 )
 
 PROFILE_ARGS=()
@@ -173,7 +181,7 @@ if [ "$PROFILE" = "1" ]; then
         --force-overwrite=true
         --capture-range=cudaProfilerApi
         --capture-range-end=stop
-        -o "${NSYS_OUTPUT_DIR}/${EXP_NAME}_$(date +%Y%m%d_%H%M%S)}"
+        -o "${NSYS_OUTPUT_DIR}/${EXP_NAME}_$(date +%Y%m%d_%H%M%S)"
     )
 fi
 
@@ -209,6 +217,7 @@ MULTIMODAL_ARGS=(
     --image-size 224
     --total-seq-length "$SEQ_LEN"
     --image-seq-length 256
+    --vision-num-layers "$VISION_NUM_LAYERS"
 )
 
 # --- Qwen3.5 Decoder Architecture (variant-specific dims set above) ---
@@ -309,6 +318,7 @@ fi
 echo "================================================================"
 echo "Qwen3.5-VL Multimodal Training (mcore)"
 echo "  Variant:       $MODEL_VARIANT"
+echo "  Vision layers: $VISION_NUM_LAYERS"
 echo "  GPUs per node: $GPUS_PER_NODE"
 echo "  Num nodes:     $NUM_NODES"
 echo "  TP=$TP  EP=$EP  PP=$PP  CP=1"

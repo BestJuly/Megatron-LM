@@ -37,10 +37,17 @@ from multimodal.models.base import MultimodalModel
 # Vision config
 # ---------------------------------------------------------------------------
 
-def get_qwen35_vl_vision_config() -> TransformerConfig:
-    """TransformerConfig for the Qwen3.5-VL vision encoder (27-layer ViT)."""
+def get_qwen35_vl_vision_config(
+    num_layers_override: Optional[int] = None,
+) -> TransformerConfig:
+    """TransformerConfig for the Qwen3.5-VL vision encoder.
+
+    Args:
+        num_layers_override: Optional override for vision backbone depth.
+            Intended for lightweight proxy/perf runs.
+    """
     return TransformerConfig(
-        num_layers=27,
+        num_layers=27 if num_layers_override is None else num_layers_override,
         hidden_size=1152,
         num_attention_heads=16,
         kv_channels=72,  # 1152 / 16

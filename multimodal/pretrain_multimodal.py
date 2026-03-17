@@ -61,7 +61,9 @@ def model_provider(
 
     # Vision config: architecture-specific values, not from CLI.
     # Inherit precision from the language config.
-    vision_config = vision_config_fn()
+    vision_config = vision_config_fn(
+        num_layers_override=getattr(args, "vision_num_layers", None)
+    )
     vision_config.bf16 = language_config.bf16
     vision_config.fp16 = language_config.fp16
 

@@ -199,17 +199,39 @@ class VisionRotaryEmbedding(MegatronModule):
         inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-    def forward(self, seqlen: int) -> torch.Tensor:
+    def _get_inv_freq(self, device: torch.device) -> torch.Tensor:
+        """Return `inv_freq` on the requested device.
+
+        When the model is initialized with `--init-model-with-meta-device`, this
+        non-persistent buffer may remain on `meta`. In that case we rebuild it
+        directly on the runtime device instead of relying on `.to(...)`.
+        """
+        if self.inv_freq.device.type == "meta":
+            return 1.0 / (
+                self.theta
+                ** (torch.arange(0, self.dim, 2, dtype=torch.float32, device=device) / self.dim)
+            )
+        return self.inv_freq.to(device=device)
+
+    def forward(self, seqlen: int, device: Optional[torch.device] = None) -> torch.Tensor:
         """Return a frequency lookup table for positions 0..seqlen-1.
 
         Args:
             seqlen: Number of positions (typically max(height, width) across all images).
+            device: Runtime device for the lookup table. Required for meta-init safety.
 
         Returns:
             freqs: [seqlen, dim // 2]
         """
-        seq = torch.arange(seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
-        return torch.outer(seq, self.inv_freq)  # [seqlen, dim // 2]
+        if device is None:
+            if self.inv_freq.device.type != "meta":
+                device = self.inv_freq.device
+            else:
+                device = torch.device("cuda", torch.cuda.current_device())
+
+        inv_freq = self._get_inv_freq(device)
+        seq = torch.arange(seqlen, device=device, dtype=inv_freq.dtype)
+        return torch.outer(seq, inv_freq)  # [seqlen, dim // 2]
 
 
 class VisionEncoder(MegatronModule):
@@ -301,7 +323,7 @@ class VisionEncoder(MegatronModule):
         """
         merge = self.spatial_merge_size
         max_hw = int(grid_thw[:, 1:].max().item())
-        freq_table = self.rot_pos_emb(max_hw)  # [max_hw, head_dim // 4]
+        freq_table = self.rot_pos_emb(max_hw, device=grid_thw.device)  # [max_hw, head_dim // 4]
 
         pos_ids_list = []
         for t, h, w in grid_thw.tolist():

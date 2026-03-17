@@ -49,5 +49,11 @@ def add_multimodal_args(parser):
         default=256,
         help="Number of image tokens in mock data",
     )
+    group.add_argument(
+        "--vision-num-layers",
+        type=int,
+        default=None,
+        help="Optional override for vision backbone depth. Useful for proxy perf runs.",
+    )
 
     return parser
