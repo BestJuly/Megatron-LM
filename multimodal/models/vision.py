@@ -10,27 +10,39 @@ import math
 from typing import Optional
 
 import torch
-import torch.nn as nn
 
 from megatron.core.models.vision.vit_layer_specs import (
     get_vit_layer_with_transformer_engine_spec,
 )
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 
+try:
+    import transformer_engine  # pylint: disable=unused-import
 
-class PatchEmbed3D(nn.Module):
+    from megatron.core.extensions.transformer_engine import TENorm
+
+    NORM_IMPL = TENorm
+except ImportError:
+    from megatron.core.transformer.torch_norm import WrappedTorchNorm
+
+    NORM_IMPL = WrappedTorchNorm
+
+
+class PatchEmbed3D(MegatronModule):
     """Patch embedding for pre-extracted patches (matches HF Qwen3.5-VL format).
 
     The HF processor (and our mock data) produces pixel_values as pre-extracted
     flat patches of shape [total_patches, C * temporal_patch_size * patch_h * patch_w].
     This is mathematically identical to Conv3d on the raw image, but the input
-    is already flattened so we use nn.Linear (same weight structure, different input
-    layout).
+    is already flattened so we use ColumnParallelLinear (TP-sharded, gather_output=True
+    so the full hidden_size is available for the subsequent TransformerBlock).
 
     Args:
+        config: TransformerConfig (provides TP settings and init_method).
         in_channels: Number of input channels (3 for RGB).
         hidden_size: Output embedding dimension.
         patch_size: Spatial patch size.
@@ -39,16 +51,25 @@ class PatchEmbed3D(nn.Module):
 
     def __init__(
         self,
+        config: TransformerConfig,
         in_channels: int = 3,
         hidden_size: int = 1152,
         patch_size: int = 16,
         temporal_patch_size: int = 2,
     ):
-        super().__init__()
+        super().__init__(config=config)
         self.patch_size = patch_size
         self.temporal_patch_size = temporal_patch_size
         patch_dim = in_channels * temporal_patch_size * patch_size * patch_size
-        self.proj = nn.Linear(patch_dim, hidden_size, bias=False)
+        self.proj = build_module(
+            ColumnParallelLinear,
+            patch_dim,
+            hidden_size,
+            config=config,
+            init_method=config.init_method,
+            bias=False,
+            gather_output=True,
+        )
 
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         """Forward pass.
@@ -59,15 +80,21 @@ class PatchEmbed3D(nn.Module):
         Returns:
             Patch embeddings [total_patches, hidden_size].
         """
-        return self.proj(pixel_values)
+        output, _ = self.proj(pixel_values)
+        return output
 
 
-class PatchMerger(nn.Module):
+class PatchMerger(MegatronModule):
     """Spatial patch merger that reduces the number of visual tokens.
 
-    Merges spatial_merge_size^2 adjacent patches into one token.
+    Merges spatial_merge_size^2 adjacent patches into one token via a two-layer
+    MLP: LayerNorm → ColumnParallelLinear → GELU → RowParallelLinear.
+    The column-then-row pattern is the standard mcore TP sharding for MLPs:
+    fc1 keeps output sharded (gather_output=False), fc2 all-reduces to produce
+    the full out_hidden_size output.
 
     Args:
+        config: TransformerConfig (provides TP settings and init_method).
         hidden_size: Input hidden size from ViT.
         out_hidden_size: Output hidden size (should match language model hidden_size).
         spatial_merge_size: Number of patches to merge per spatial dimension.
@@ -75,18 +102,38 @@ class PatchMerger(nn.Module):
 
     def __init__(
         self,
+        config: TransformerConfig,
         hidden_size: int = 1152,
         out_hidden_size: int = 3584,
         spatial_merge_size: int = 2,
     ):
-        super().__init__()
+        super().__init__(config=config)
         self.spatial_merge_size = spatial_merge_size
         merge_dim = hidden_size * (spatial_merge_size ** 2)
-        self.ln = nn.LayerNorm(merge_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(merge_dim, out_hidden_size, bias=True),
-            nn.GELU(),
-            nn.Linear(out_hidden_size, out_hidden_size, bias=True),
+        self.ln = build_module(
+            NORM_IMPL,
+            config=config,
+            hidden_size=merge_dim,
+            eps=config.layernorm_epsilon,
+        )
+        self.fc1 = build_module(
+            ColumnParallelLinear,
+            merge_dim,
+            out_hidden_size,
+            config=config,
+            init_method=config.init_method,
+            bias=True,
+            gather_output=False,
+        )
+        self.fc2 = build_module(
+            RowParallelLinear,
+            out_hidden_size,
+            out_hidden_size,
+            config=config,
+            init_method=config.output_layer_init_method,
+            bias=True,
+            input_is_parallel=True,
+            skip_bias_add=False,
         )
 
     def forward(
@@ -119,10 +166,14 @@ class PatchMerger(nn.Module):
             offset += num_patches
 
         merged = torch.cat(outputs, dim=0)
-        return self.mlp(self.ln(merged))
+        merged = self.ln(merged)
+        merged, _ = self.fc1(merged)
+        merged = torch.nn.functional.gelu(merged)
+        merged, _ = self.fc2(merged)
+        return merged
 
 
-class VisionRotaryEmbedding(nn.Module):
+class VisionRotaryEmbedding(MegatronModule):
     """1D rotary position frequency table for the vision transformer.
 
     Generates a lookup table of RoPE frequencies for integer positions 0..seqlen-1.
@@ -136,8 +187,13 @@ class VisionRotaryEmbedding(nn.Module):
         theta: RoPE base frequency.
     """
 
-    def __init__(self, dim: int, theta: float = 10000.0):
-        super().__init__()
+    def __init__(
+        self,
+        dim: int,
+        theta: float = 10000.0,
+        config: Optional[TransformerConfig] = None,
+    ):
+        super().__init__(config=config)
         self.dim = dim
         self.theta = theta
         inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
@@ -196,6 +252,7 @@ class VisionEncoder(MegatronModule):
 
         # Patch embedding
         self.patch_embed = PatchEmbed3D(
+            config=config,
             in_channels=in_channels,
             hidden_size=config.hidden_size,
             patch_size=patch_size,
@@ -220,6 +277,7 @@ class VisionEncoder(MegatronModule):
 
         # Patch merger
         self.merger = PatchMerger(
+            config=config,
             hidden_size=config.hidden_size,
             out_hidden_size=out_hidden_size,
             spatial_merge_size=spatial_merge_size,

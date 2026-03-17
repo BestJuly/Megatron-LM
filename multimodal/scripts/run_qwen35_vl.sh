@@ -173,7 +173,7 @@ if [ "$PROFILE" = "1" ]; then
         --force-overwrite=true
         --capture-range=cudaProfilerApi
         --capture-range-end=stop
-        -o "${NSYS_OUTPUT_DIR}/${EXP_NAME}_rank%q{RANK}"
+        -o "${NSYS_OUTPUT_DIR}/${EXP_NAME}_$(date +%Y%m%d_%H%M%S)}"
     )
 fi
 
@@ -279,10 +279,32 @@ if [ "$MODEL_VARIANT" != "9b" ]; then
 fi
 
 # --- Recompute ---
-RECOMPUTE_ARGS=(
-    --recompute-granularity selective
-    --recompute-modules moe_act shared_experts layernorm
-)
+RECOMPUTE=${RECOMPUTE:-0}
+if [ "$RECOMPUTE" -eq 1 ]; then
+    RECOMPUTE_ARGS=(
+        --recompute-granularity selective
+        --recompute-modules moe_act shared_experts layernorm
+    )
+else
+    RECOMPUTE_ARGS=()
+fi
+
+# --- FSDP ---
+USE_FSDP=${USE_FSDP:-1}
+if [ "$USE_FSDP" -eq 1 ]; then
+    FSDP_ARGS=(        
+        --use-megatron-fsdp
+        --data-parallel-sharding-strategy optim_grads_params
+        --no-gradient-accumulation-fusion
+        --init-model-with-meta-device
+        --use-distributed-optimizer
+        --ckpt-format fsdp_dtensor
+    )
+    # FSDP requires CUDA_DEVICE_MAX_CONNECTIONS >1
+    export CUDA_DEVICE_MAX_CONNECTIONS=8
+else
+    FSDP_ARGS=()
+fi
 
 echo "================================================================"
 echo "Qwen3.5-VL Multimodal Training (mcore)"
@@ -298,28 +320,23 @@ if [ "$PROFILE" = "1" ]; then
 fi
 echo "================================================================"
 
+cmd=( "${NSYS_CMD[@]}" torchrun "${DISTRIBUTED_ARGS[@]}" multimodal/pretrain_multimodal.py \
+    "${TRAINING_ARGS[@]}" \
+    "${PROFILE_ARGS[@]}" \
+    "${MODEL_PARALLEL_ARGS[@]}" \
+    "${EVAL_AND_LOGGING_ARGS[@]}" \
+    "${TOKENIZER_ARGS[@]}" \
+    "${MULTIMODAL_ARGS[@]}" \
+    "${GPT_MODEL_ARGS[@]}" \
+    "${MOE_ARGS[@]}" \
+    "${RECOMPUTE_ARGS[@]}" \
+    "${FSDP_ARGS[@]}" )
+
+echo "${cmd[@]}"
+
 if [ "$DRY_RUN" = true ]; then
     echo "=== DRY RUN ==="
-    echo "${NSYS_CMD[@]} torchrun ${DISTRIBUTED_ARGS[@]} multimodal/pretrain_multimodal.py" \
-        "${TRAINING_ARGS[@]}" \
-        "${PROFILE_ARGS[@]}" \
-        "${MODEL_PARALLEL_ARGS[@]}" \
-        "${EVAL_AND_LOGGING_ARGS[@]}" \
-        "${TOKENIZER_ARGS[@]}" \
-        "${MULTIMODAL_ARGS[@]}" \
-        "${GPT_MODEL_ARGS[@]}" \
-        "${MOE_ARGS[@]}" \
-        "${RECOMPUTE_ARGS[@]}"
-    echo "=== End of DRY RUN ==="
+    exit 0
 else
-    "${NSYS_CMD[@]}" torchrun "${DISTRIBUTED_ARGS[@]}" multimodal/pretrain_multimodal.py \
-        "${TRAINING_ARGS[@]}" \
-        "${PROFILE_ARGS[@]}" \
-        "${MODEL_PARALLEL_ARGS[@]}" \
-        "${EVAL_AND_LOGGING_ARGS[@]}" \
-        "${TOKENIZER_ARGS[@]}" \
-        "${MULTIMODAL_ARGS[@]}" \
-        "${GPT_MODEL_ARGS[@]}" \
-        "${MOE_ARGS[@]}" \
-        "${RECOMPUTE_ARGS[@]}"
+    "${cmd[@]}"
 fi
