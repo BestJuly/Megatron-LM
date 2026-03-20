@@ -11,6 +11,7 @@ Architecture:
 Supported variants:
     - "9b": Dense 9B model (32 layers)
     - "35b_a3b": MoE 35B-A3B model (40 layers, 256 experts top-8)
+    - "35b_a3b_light": Reduced 35B-A3B config (20 decoder layers, 14 ViT layers)
     - "397b_a17b": MoE 397B-A17B model (60 layers, 512 experts top-10)
     - "proxy": Reduced proxy based on 397B (4 layers, 16 experts) for single-node testing
 """
@@ -113,6 +114,21 @@ _VARIANT_CONFIGS = {
         "moe_ffn_hidden_size": 512,
         "moe_shared_expert_intermediate_size": 512,
     },
+    # Light 35B-A3B config for single-node bring-up.
+    # Keeps hidden/expert topology identical to 35b_a3b, but halves decoder depth.
+    "35b_a3b_light": {
+        "num_layers": 20,
+        "hidden_size": 2048,
+        "ffn_hidden_size": 4096,  # moe_ffn_hidden_size * topk: 512*8=4096
+        "num_attention_heads": 16,
+        "num_query_groups": 2,   # num_key_value_heads=2
+        "kv_channels": 256,      # head_dim=256 (expanded; q_proj=16*256=4096=2*hidden)
+        "linear_num_value_heads": 32,
+        "num_moe_experts": 256,
+        "moe_router_topk": 8,
+        "moe_ffn_hidden_size": 512,
+        "moe_shared_expert_intermediate_size": 512,
+    },
     # MoE 397B-A17B model (Qwen3.5-397B-A17B)
     # Ref: https://huggingface.co/Qwen/Qwen3.5-397B-A17B/blob/main/config.json
     "397b_a17b": {
@@ -153,7 +169,7 @@ def get_qwen35_vl_language_config(
     """TransformerConfig for Qwen3.5-VL language decoder.
 
     Args:
-        variant: One of "9b", "35b_a3b", "397b_a17b", "proxy".
+        variant: One of "9b", "35b_a3b", "35b_a3b_light", "397b_a17b", "proxy".
         **overrides: Override any config field.
 
     Returns:

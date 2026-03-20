@@ -6,13 +6,16 @@
 #   ./multimodal/scripts/run_qwen35_vl.sh
 #
 # Environment variables:
-#   MODEL_VARIANT: proxy (default), 9b, 35b_a3b, 397b_a17b
+#   MODEL_VARIANT: proxy (default), 9b, 35b_a3b, 35b_a3b_light, 397b_a17b
 #   TP, EP, PP: parallelism sizes
 #   MBS, GBS: micro/global batch sizes
 #   NUM_LAYERS, NUM_EXPERTS: override for proxy testing
 #   PROFILE: set to 1 to enable Nsight Systems profiling (default: 0)
 #   PROFILE_STEP_START/PROFILE_STEP_END: profiled iteration window (default: 4-5)
 
+
+# issue: layer is not 4x, MTP will raise error. need to fix.
+# issue: CUDA graph is not supported.
 set -euo pipefail
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -75,6 +78,17 @@ case "$MODEL_VARIANT" in
         NUM_QUERY_GROUPS=2
         LINEAR_NUM_VALUE_HEADS=32
         VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-27}
+        ;;
+    35b_a3b_light)
+        # Reduced 35B-A3B bring-up config: halve decoder and ViT depth.
+        NUM_LAYERS=${NUM_LAYERS:-12}
+        NUM_EXPERTS=${NUM_EXPERTS:-128}
+        HIDDEN_SIZE=2048
+        FFN_HIDDEN_SIZE=4096  # moe_ffn_hidden_size*topk: 512*8
+        NUM_ATTN_HEADS=16
+        NUM_QUERY_GROUPS=2
+        LINEAR_NUM_VALUE_HEADS=32
+        VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-7}
         ;;
     397b_a17b)
         # MoE Qwen3.5-397B-A17B: 60 layers, hidden=4096, 512 experts top-10.
@@ -159,7 +173,11 @@ TRAINING_ARGS=(
     --manual-gc-interval 5
     --mtp-num-layers 1
     --mtp-loss-scaling-factor 0.1
+    # --use-precision-aware-optimizer
+    # --exp-avg-dtype bf16
+    # --exp-avg-sq-dtype bf16
 )
+# issue: not compatible with precision-aware optimizer
 
 PROFILE_ARGS=()
 NSYS_CMD=()
@@ -262,7 +280,7 @@ case "$MODEL_VARIANT" in
     proxy)
         MOE_TOPK=2; MOE_FFN_HIDDEN=1024; MOE_SHARED_HIDDEN=1024
         ;;
-    35b_a3b)
+    35b_a3b|35b_a3b_light)
         MOE_TOPK=8; MOE_FFN_HIDDEN=512;  MOE_SHARED_HIDDEN=512
         ;;
     397b_a17b)
@@ -292,7 +310,7 @@ RECOMPUTE=${RECOMPUTE:-0}
 if [ "$RECOMPUTE" -eq 1 ]; then
     RECOMPUTE_ARGS=(
         --recompute-granularity selective
-        --recompute-modules moe_act shared_experts layernorm
+        --recompute-modules moe_act shared_experts layernorm moe
     )
 else
     RECOMPUTE_ARGS=()
