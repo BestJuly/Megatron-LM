@@ -132,7 +132,7 @@ else
 fi
 
 # --- Qwen3-Next Decoder Architecture ---
-# These must match configs/qwen35_vlm.py::get_qwen35_language_model_config
+# These must match multimodal_v2/models/qwen35_vl/configuration.py (397b_a17b variant)
 GPT_MODEL_ARGS=(
     # Network size
     --num-layers 60
