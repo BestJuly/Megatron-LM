@@ -137,6 +137,24 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
     # so we do a broadcast of the schema followed by a broadcast of the actual data
     # check broadcast_nested_data_batch for more details
     batch = broadcast_nested_data_batch(data)
+
+    input_ids = batch.get("input_ids")
+    expected_seq_len = getattr(args, "seq_length", None)
+    if (
+        getattr(args, "dataset_provider", None) == "mock"
+        and input_ids is not None
+        and expected_seq_len is not None
+    ):
+        actual_seq_len = input_ids.size(1)
+        if actual_seq_len != expected_seq_len:
+            raise ValueError(
+                "Decoder seq length mismatch: "
+                f"actual batch seq_len={actual_seq_len}, "
+                f"but --seq-length={expected_seq_len}. "
+                "Ensure the dataset provider emits fixed-length sequences "
+                "that match the configured decoder sequence length."
+            )
+
     return batch
 
 def loss_func(loss_mask, output_tensor):

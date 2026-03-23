@@ -29,6 +29,7 @@ fi
 # Batch sizes
 MBS=${MBS:-1}
 GBS=${GBS:-64}
+SEQ_LEN=${SEQ_LEN:-4096}
 
 # Parallelism — MIMO requires PP=1, CP=1
 TP=${TP:-8}
@@ -121,6 +122,7 @@ if [ "$DATASET_PATH" = "mock" ]; then
     DATASET_ARGS=(
         --dataset-provider mock
         --image-token-id 248056
+        --total-seq-length "$SEQ_LEN"
     )
 else
     DATASET_ARGS=(
@@ -143,8 +145,8 @@ GPT_MODEL_ARGS=(
     --num-query-groups 2
     --kv-channels 256
     --max-position-embeddings 262144
-    --seq-length 4096
-    --encoder-seq-length 4096
+    --seq-length "$SEQ_LEN"
+    --encoder-seq-length "$SEQ_LEN"
 
     # Normalization & activation
     --normalization RMSNorm
