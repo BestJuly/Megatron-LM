@@ -28,6 +28,27 @@ from multimodal_v2.arguments import add_multimodal_args
 from multimodal_v2.forward_step import forward_step
 
 
+def _set_vision_flops_metadata(args, model_arch, language_config, vision_config):
+    """Expose vision-model dimensions for training FLOPs estimation."""
+    if model_arch != "qwen35_vl":
+        return
+
+    from multimodal_v2.models.qwen35_vl.configuration import VISION_KWARGS
+
+    args.count_vision_model_flops = True
+    args.vision_flops_variant = "qwen35_vl_v2"
+    args.vision_num_layers = vision_config.num_layers
+    args.vision_hidden_size = vision_config.hidden_size
+    args.vision_ffn_hidden_size = vision_config.ffn_hidden_size
+    args.vision_num_attention_heads = vision_config.num_attention_heads
+    args.vision_kv_channels = vision_config.kv_channels
+    args.vision_in_channels = VISION_KWARGS["in_channels"]
+    args.vision_patch_size = VISION_KWARGS["patch_size"]
+    args.vision_temporal_patch_size = VISION_KWARGS["temporal_patch_size"]
+    args.vision_spatial_merge_size = VISION_KWARGS["spatial_merge_size"]
+    args.vision_out_hidden_size = language_config.hidden_size
+
+
 def model_provider(
     pre_process: bool = True,
     post_process: bool = True,
@@ -62,6 +83,12 @@ def model_provider(
     )
     vision_config.bf16 = language_config.bf16
     vision_config.fp16 = language_config.fp16
+    _set_vision_flops_metadata(
+        args=args,
+        model_arch=model_arch,
+        language_config=language_config,
+        vision_config=vision_config,
+    )
 
     language_spec = language_spec_fn(
         config=language_config,
