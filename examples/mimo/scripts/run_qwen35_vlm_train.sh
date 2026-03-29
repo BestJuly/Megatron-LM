@@ -1,19 +1,40 @@
 #!/bin/bash
 
-# Launch script for Qwen3.5-397B-A17B VLM training via MIMO.
+# Launch script for Qwen3.5-VL MIMO training.
 #
 # Usage (from the Megatron-LM repo root):
-#   ./examples/mimo/scripts/run_qwen35_vlm_train.sh /path/to/dataset [/path/to/llm/checkpoint]
+#   # Quick proxy test (2 GPUs, no real data needed):
+#   MODEL_VARIANT=proxy GPUS_PER_NODE=2 EP=2 \
+#       ./examples/mimo/scripts/run_qwen35_vlm_train.sh
 #
-# NOTE: MIMO currently requires PP=1 and CP=1. For the full 397B model,
-# use large TP and EP to distribute across GPUs.
+#   # Proxy with explicit mock data:
+#   MODEL_VARIANT=proxy GPUS_PER_NODE=2 EP=2 \
+#       ./examples/mimo/scripts/run_qwen35_vlm_train.sh mock
+#
+#   # Full 397B production run:
+#   ./examples/mimo/scripts/run_qwen35_vlm_train.sh /path/to/dataset [/path/to/llm/ckpt]
+#
+# MODEL_VARIANT choices:
+#   proxy       (default for quick testing) 4 layers, 16 experts
+#   397b_a17b   production: 60 layers, 512 experts
+#   9b          dense 9B model
+#   35b_a3b     MoE 35B-A3B
+#   35b_a3b_light  reduced 35B-A3B for single-node
+#
+# NOTE: MIMO currently requires PP=1 and CP=1.
 
 set -euo pipefail
+
+# Repo root must be on PYTHONPATH for megatron and multimodal_v2 imports.
+# Assumes the script is run from the repo root: ./examples/mimo/scripts/run_qwen35_vlm_train.sh
+REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:$PYTHONPATH}"
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_IB_SL=1
 export NVTE_FUSED_ATTN=1
 
+MODEL_VARIANT=${MODEL_VARIANT:-397b_a17b}
 DRY_RUN=${DRY_RUN:-false}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 NUM_NODES=${NNODES:-1}
@@ -28,15 +49,22 @@ fi
 
 # Batch sizes
 MBS=${MBS:-1}
-GBS=${GBS:-64}
 SEQ_LEN=${SEQ_LEN:-4096}
 
 # Parallelism — MIMO requires PP=1, CP=1
-TP=${TP:-8}
-EP=${EP:-32}
+# Proxy defaults: TP=1, EP=2 so 2 GPUs suffice
+if [ "$MODEL_VARIANT" = "proxy" ]; then
+    TP=${TP:-1}
+    EP=${EP:-2}
+    GBS=${GBS:-4}
+else
+    TP=${TP:-8}
+    EP=${EP:-32}
+    GBS=${GBS:-64}
+fi
 
 WANDB_PROJECT='mimo-qwen35-vlm'
-EXP_NAME="qwen35_397b_vlm_mbs_${MBS}_gbs_${GBS}_tp${TP}_ep${EP}"
+EXP_NAME="qwen35_${MODEL_VARIANT}_mbs_${MBS}_gbs_${GBS}_tp${TP}_ep${EP}"
 
 ROOT_DIR='./local/'
 CHECKPOINT_STORE_PATH="${ROOT_DIR}${EXP_NAME}"
@@ -85,6 +113,7 @@ TRAINING_ARGS=(
     --auto-detect-ckpt-format
     --accumulate-allreduce-grads-in-fp32
     --model-provider qwen35_vlm
+    --model-variant "$MODEL_VARIANT"
     --bf16
     --use-mcore-models
     --use-flash-attn
@@ -111,16 +140,25 @@ EVAL_AND_LOGGING_ARGS=(
     "${LANGUAGE_MODEL_CKPT_ARG[@]}"
 )
 
-# --- Tokenizer ---
-TOKENIZER_ARGS=(
-    --tokenizer-type HuggingFaceTokenizer
-    --tokenizer-model 'Qwen/Qwen3.5-397B-A17B'
-)
+# --- Tokenizer (variant-specific) ---
+# Proxy uses NullTokenizer (no HF download required).
+# Production variants use the real HuggingFace tokenizer.
+if [ "$MODEL_VARIANT" = "proxy" ]; then
+    TOKENIZER_ARGS=(
+        --tokenizer-type NullTokenizer
+        --vocab-size 248320
+    )
+else
+    TOKENIZER_ARGS=(
+        --tokenizer-type HuggingFaceTokenizer
+        --tokenizer-model 'Qwen/Qwen3.5-397B-A17B'
+    )
+fi
 
 # --- Dataset ---
 if [ "$DATASET_PATH" = "mock" ]; then
     DATASET_ARGS=(
-        --dataset-provider mock
+        --dataset-provider qwen35_vlm
         --image-token-id 248056
         --total-seq-length "$SEQ_LEN"
     )
@@ -133,96 +171,152 @@ else
     )
 fi
 
-# --- Qwen3-Next Decoder Architecture ---
-# These must match multimodal_v2/models/qwen35_vl/configuration.py (397b_a17b variant)
-GPT_MODEL_ARGS=(
-    # Network size
-    --num-layers 60
-    --hidden-size 4096
-    --ffn-hidden-size 10240
-    --num-attention-heads 32
-    --group-query-attention
-    --num-query-groups 2
-    --kv-channels 256
-    --max-position-embeddings 262144
-    --seq-length "$SEQ_LEN"
-    --encoder-seq-length "$SEQ_LEN"
+# --- Qwen3-Next Decoder Architecture (variant-specific) ---
+# Architecture values must match multimodal_v2/models/qwen35_vl/configuration.py.
+if [ "$MODEL_VARIANT" = "proxy" ]; then
+    # Proxy: 4 layers, 16 experts (same hidden dims as 397b_a17b for TP compatibility)
+    GPT_MODEL_ARGS=(
+        --num-layers 4
+        --hidden-size 4096
+        --ffn-hidden-size 10240
+        --num-attention-heads 32
+        --group-query-attention
+        --num-query-groups 2
+        --kv-channels 256
+        --max-position-embeddings 262144
+        --seq-length "$SEQ_LEN"
+        --normalization RMSNorm
+        --apply-layernorm-1p
+        --norm-epsilon 1e-06
+        --swiglu
+        --disable-bias-linear
+        --untie-embeddings-and-output-weights
+        --position-embedding-type rope
+        --rotary-percent 0.25
+        --rotary-base 10000000
+        --rotary-seq-len-interpolation-factor 1
+        --qk-layernorm
+        --attention-output-gate
+        --attention-dropout 0.0
+        --hidden-dropout 0.0
+        --experimental-attention-variant gated_delta_net
+        --linear-attention-freq 4
+        --linear-conv-kernel-dim 4
+        --linear-key-head-dim 128
+        --linear-value-head-dim 128
+        --linear-num-key-heads 16
+        --linear-num-value-heads 64
+        --num-experts 16
+        --moe-ffn-hidden-size 1024
+        --moe-shared-expert-intermediate-size 1024
+        --moe-shared-expert-gate
+        --moe-router-load-balancing-type aux_loss
+        --moe-router-topk 2
+        --moe-grouped-gemm
+        --moe-aux-loss-coeff 1e-3
+        --moe-token-dispatcher-type alltoall
+        --moe-router-dtype fp32
+        --make-vocab-size-divisible-by 485
+    )
+    RECOMPUTE_ARGS=(
+        --recompute-granularity selective
+        --recompute-modules moe_act shared_experts layernorm
+    )
+    MTP_ARGS=()
 
-    # Normalization & activation
-    --normalization RMSNorm
-    --apply-layernorm-1p
-    --norm-epsilon 1e-06
-    --swiglu
-    --disable-bias-linear
-    --untie-embeddings-and-output-weights
+else
+    # Full 397B-A17B production model
+    GPT_MODEL_ARGS=(
+        --num-layers 60
+        --hidden-size 4096
+        --ffn-hidden-size 10240
+        --num-attention-heads 32
+        --group-query-attention
+        --num-query-groups 2
+        --kv-channels 256
+        --max-position-embeddings 262144
+        --seq-length "$SEQ_LEN"
+        --normalization RMSNorm
+        --apply-layernorm-1p
+        --norm-epsilon 1e-06
+        --swiglu
+        --disable-bias-linear
+        --untie-embeddings-and-output-weights
+        --position-embedding-type rope
+        --rotary-percent 0.25
+        --rotary-base 10000000
+        --rotary-seq-len-interpolation-factor 1
+        --qk-layernorm
+        --attention-output-gate
+        --attention-dropout 0.0
+        --hidden-dropout 0.0
+        --experimental-attention-variant gated_delta_net
+        --linear-attention-freq 4
+        --linear-conv-kernel-dim 4
+        --linear-key-head-dim 128
+        --linear-value-head-dim 128
+        --linear-num-key-heads 16
+        --linear-num-value-heads 64
+        --num-experts 512
+        --moe-ffn-hidden-size 1024
+        --moe-shared-expert-intermediate-size 1024
+        --moe-shared-expert-gate
+        --moe-router-load-balancing-type aux_loss
+        --moe-router-topk 10
+        --moe-grouped-gemm
+        --moe-aux-loss-coeff 1e-3
+        --moe-token-dispatcher-type flex
+        --moe-router-dtype fp32
+        --make-vocab-size-divisible-by 485
+    )
+    RECOMPUTE_ARGS=(
+        --recompute-granularity selective
+        --recompute-modules moe_act shared_experts layernorm
+    )
+    MTP_ARGS=(
+        --mtp-num-layers 1
+        --mtp-loss-scaling-factor 0.1
+    )
+fi
 
-    # Position embeddings
-    --position-embedding-type rope
-    --rotary-percent 0.25
-    --rotary-base 10000000
-    --rotary-seq-len-interpolation-factor 1
-
-    # Attention
-    --qk-layernorm
-    --attention-output-gate
-    --attention-dropout 0.0
-    --hidden-dropout 0.0
-
-    # Gated Delta Net (hybrid linear + full attention)
-    --experimental-attention-variant gated_delta_net
-    --linear-attention-freq 4
-    --linear-conv-kernel-dim 4
-    --linear-key-head-dim 128
-    --linear-value-head-dim 128
-    --linear-num-key-heads 16
-    --linear-num-value-heads 64
-
-    # MoE
-    --num-experts 512
-    --moe-ffn-hidden-size 1024
-    --moe-shared-expert-intermediate-size 1024
-    --moe-shared-expert-gate
-    --moe-router-load-balancing-type aux_loss
-    --moe-router-topk 10
-    --moe-router-pre-softmax false
-    --moe-grouped-gemm true
-    --moe-aux-loss-coeff 1e-3
-    --moe-token-dispatcher-type flex
-    --moe-router-dtype fp32
-
-    # MTP (Multi-Token Prediction)
-    --mtp-num-layers 1
-    --mtp-loss-scaling-factor 0.1
-
-    # Vocab
-    --make-vocab-size-divisible-by 485
-)
-
-# --- Recompute (for memory savings) ---
-RECOMPUTE_ARGS=(
-    --recompute-granularity selective
-    --recompute-modules moe_act shared_experts layernorm
-)
+# --- FSDP ---
+USE_FSDP=${USE_FSDP:-1}
+if [ "$USE_FSDP" -eq 1 ]; then
+    FSDP_ARGS=(
+        --use-megatron-fsdp
+        --data-parallel-sharding-strategy optim_grads_params
+        --no-gradient-accumulation-fusion
+        --init-model-with-meta-device
+        --use-distributed-optimizer
+        --ckpt-format fsdp_dtensor
+    )
+    export CUDA_DEVICE_MAX_CONNECTIONS=8
+else
+    FSDP_ARGS=()
+fi
 
 echo "================================================================"
-echo "Qwen3.5-397B-A17B VLM MIMO Training"
+echo "Qwen3.5-VL MIMO Training  [variant: $MODEL_VARIANT]"
 echo "  GPUs per node: $GPUS_PER_NODE"
 echo "  Num nodes:     $NUM_NODES"
 echo "  TP=$TP  EP=$EP  PP=1  CP=1"
-echo "  MBS=$MBS  GBS=$GBS"
+echo "  MBS=$MBS  GBS=$GBS  SEQ=$SEQ_LEN"
 echo "  Dataset:       $DATASET_PATH"
+echo "  FSDP:          $USE_FSDP"
 echo "================================================================"
 
 if [ "$DRY_RUN" = true ]; then
     echo "=== DRY RUN ==="
-    echo "torchrun ${DISTRIBUTED_ARGS[@]} examples/mimo/train.py" \
-        "${TRAINING_ARGS[@]}" \
-        "${MODEL_PARALLEL_ARGS[@]}" \
-        "${EVAL_AND_LOGGING_ARGS[@]}" \
-        "${TOKENIZER_ARGS[@]}" \
-        "${GPT_MODEL_ARGS[@]}" \
-        "${DATASET_ARGS[@]}" \
-        "${RECOMPUTE_ARGS[@]}"
+    echo "torchrun ${DISTRIBUTED_ARGS[*]} examples/mimo/train.py" \
+        "${TRAINING_ARGS[*]}" \
+        "${MODEL_PARALLEL_ARGS[*]}" \
+        "${EVAL_AND_LOGGING_ARGS[*]}" \
+        "${TOKENIZER_ARGS[*]}" \
+        "${GPT_MODEL_ARGS[*]}" \
+        "${DATASET_ARGS[*]}" \
+        "${RECOMPUTE_ARGS[*]}" \
+        "${MTP_ARGS[*]}" \
+        "${FSDP_ARGS[*]}"
     echo "=== End of DRY RUN ==="
 else
     torchrun "${DISTRIBUTED_ARGS[@]}" examples/mimo/train.py \
@@ -232,5 +326,7 @@ else
         "${TOKENIZER_ARGS[@]}" \
         "${GPT_MODEL_ARGS[@]}" \
         "${DATASET_ARGS[@]}" \
-        "${RECOMPUTE_ARGS[@]}"
+        "${RECOMPUTE_ARGS[@]}" \
+        "${MTP_ARGS[@]}" \
+        "${FSDP_ARGS[@]}"
 fi

@@ -10,6 +10,7 @@
 #   TP, EP, PP: parallelism sizes
 #   MBS, GBS: micro/global batch sizes
 #   NUM_LAYERS, NUM_EXPERTS: override for proxy testing
+#   LAUNCHER: torchrun (default) or python
 #   PROFILE: set to 1 to enable Nsight Systems profiling (default: 0)
 #   PROFILE_STEP_START/PROFILE_STEP_END: profiled iteration window (default: 4-5)
 
@@ -18,14 +19,20 @@ set -euo pipefail
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_IB_SL=1
 export NVTE_FUSED_ATTN=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-DRY_RUN=${DRY_RUN:-false}
+DRY_RUN=${DRY_RUN:-1}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
-NUM_NODES=${NNODES:-1}
+if [ -n "${SLURM_JOB_NUM_NODES:-}" ]; then
+    NUM_NODES="$SLURM_JOB_NUM_NODES"
+else
+    NUM_NODES=${NNODES:-1}
+fi
 PROFILE=${PROFILE:-0}
 PROFILE_STEP_START=${PROFILE_STEP_START:-4}
 PROFILE_STEP_END=${PROFILE_STEP_END:-5}
 PROFILE_RANKS=${PROFILE_RANKS:-0}
+LAUNCHER=${LAUNCHER:-torchrun}
 
 MODEL_VARIANT=${MODEL_VARIANT:-proxy}
 VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-}
@@ -110,11 +117,21 @@ SEQ_LEN=${SEQ_LEN:-4096}
 WANDB_PROJECT='multimodal-v2-qwen35-vl'
 EXP_NAME="qwen35vl_${MODEL_VARIANT}_tp${TP}_ep${EP}_pp${PP}"
 
-ROOT_DIR='./local/'
+RECOMPUTE_VISION=${RECOMPUTE_VISION:-0}
+if [ "$RECOMPUTE_VISION" -eq 1 ]; then
+    EXP_NAME+="_recompute_encoder"
+fi
+RECOMPUTE=${RECOMPUTE:-0}
+if [ "$RECOMPUTE" -eq 1 ]; then
+    EXP_NAME+="_recompute_decoder"
+fi
+
+MEGATRON_LM_PATH='/lustre/fs1/portfolios/coreai/users/lit/workspace/dev-project/Megatron-LM'
+ROOT_DIR='/lustre/fs1/portfolios/coreai/users/lit/workspace/dev-project/Megatron-LM/local/'
 CHECKPOINT_STORE_PATH="${ROOT_DIR}${EXP_NAME}"
 mkdir -p "$CHECKPOINT_STORE_PATH"
 
-TENSORBOARD_LOGS_PATH='./logs'
+TENSORBOARD_LOGS_PATH='/lustre/fs1/portfolios/coreai/users/lit/workspace/dev-project/Megatron-LM/logs'
 mkdir -p "$TENSORBOARD_LOGS_PATH"
 
 DISTRIBUTED_ARGS=(
@@ -257,6 +274,7 @@ GPT_MODEL_ARGS=(
     --linear-num-key-heads 16
     --linear-num-value-heads "$LINEAR_NUM_VALUE_HEADS"
     --make-vocab-size-divisible-by 485
+    --moe-router-force-load-balancing
 )
 
 # --- MoE args (MoE variants only) ---
@@ -291,13 +309,22 @@ fi
 
 # --- Recompute ---
 RECOMPUTE=${RECOMPUTE:-0}
+RECOMPUTE_VISION=${RECOMPUTE_VISION:-0}
 if [ "$RECOMPUTE" -eq 1 ]; then
     RECOMPUTE_ARGS=(
-        --recompute-granularity selective
-        --recompute-modules moe_act shared_experts layernorm moe
+        --recompute-granularity full
+        --recompute-method uniform
+        --recompute-num-layers 1
     )
+    # RECOMPUTE_ARGS=(
+    #     --recompute-granularity selective
+    #     --recompute-modules moe_act shared_experts layernorm moe
+    # )
 else
     RECOMPUTE_ARGS=()
+fi
+if [ "$RECOMPUTE_VISION" -eq 1 ]; then
+    RECOMPUTE_ARGS+=( --recompute-vision )
 fi
 
 # --- FSDP ---
@@ -324,6 +351,7 @@ echo "  GPUs per node: $GPUS_PER_NODE"
 echo "  Num nodes:     $NUM_NODES"
 echo "  TP=$TP  EP=$EP  PP=$PP  CP=1"
 echo "  MBS=$MBS  GBS=$GBS"
+echo "  Launcher:      $LAUNCHER"
 echo "  PROFILE:       $PROFILE"
 if [ "$PROFILE" = "1" ]; then
     echo "  Profile steps: ${PROFILE_STEP_START}-${PROFILE_STEP_END}"
@@ -331,7 +359,16 @@ if [ "$PROFILE" = "1" ]; then
 fi
 echo "================================================================"
 
-cmd=( "${NSYS_CMD[@]}" torchrun "${DISTRIBUTED_ARGS[@]}" multimodal_v2/pretrain_multimodal.py \
+if [ "$LAUNCHER" = "python" ]; then
+    LAUNCH_CMD=( python $MEGATRON_LM_PATH/multimodal_v2/pretrain_multimodal.py )
+elif [ "$LAUNCHER" = "torchrun" ]; then
+    LAUNCH_CMD=( torchrun "${DISTRIBUTED_ARGS[@]}" $MEGATRON_LM_PATH/multimodal_v2/pretrain_multimodal.py )
+else
+    echo "Unsupported LAUNCHER=$LAUNCHER (expected torchrun or python)" >&2
+    exit 1
+fi
+
+cmd=( "${NSYS_CMD[@]}" "${LAUNCH_CMD[@]}" \
     "${TRAINING_ARGS[@]}" \
     "${PROFILE_ARGS[@]}" \
     "${MODEL_PARALLEL_ARGS[@]}" \
@@ -345,7 +382,7 @@ cmd=( "${NSYS_CMD[@]}" torchrun "${DISTRIBUTED_ARGS[@]}" multimodal_v2/pretrain_
 
 echo "${cmd[@]}"
 
-if [ "$DRY_RUN" = true ]; then
+if [ "$DRY_RUN" -eq 1 ]; then
     echo "=== DRY RUN ==="
     exit 0
 else

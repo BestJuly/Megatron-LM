@@ -60,5 +60,15 @@ def add_multimodal_args(parser):
             "Useful for proxy perf runs."
         ),
     )
+    group.add_argument(
+        "--recompute-vision",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable full activation recomputation for vision encoder layers. "
+            "Uses uniform method and recomputes every layer. "
+            "Independent of the decoder --recompute-* flags."
+        ),
+    )
 
     return parser

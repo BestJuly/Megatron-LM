@@ -83,6 +83,11 @@ def model_provider(
     )
     vision_config.bf16 = language_config.bf16
     vision_config.fp16 = language_config.fp16
+
+    if getattr(args, "recompute_vision", False):
+        vision_config.recompute_granularity = "full"
+        vision_config.recompute_method = "uniform"
+        vision_config.recompute_num_layers = 1
     _set_vision_flops_metadata(
         args=args,
         model_arch=model_arch,
