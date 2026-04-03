@@ -40,8 +40,12 @@ from data.mock import (
 from data.qwen35_vlm_mock import (
     train_valid_test_datasets_provider as qwen35_vlm_train_valid_test_datasets_provider,
 )
+from data.kimi_k25_vlm_mock import (
+    train_valid_test_datasets_provider as kimi_k25_vlm_train_valid_test_datasets_provider,
+)
 from model_providers.mock import model_provider_mock_vlm_single_encoder
 from model_providers.qwen35.vlm import model_provider_qwen35_vlm
+from model_providers.kimi_k25.vlm import model_provider_kimi_k25_vlm
 from utils.data_helpers import broadcast_nested_data_batch
 
 from megatron.core.enums import ModelType
@@ -50,10 +54,12 @@ from megatron.training import get_args, pretrain
 _MODEL_PROVIDERS = {
     "mock": model_provider_mock_vlm_single_encoder,
     "qwen35_vlm": model_provider_qwen35_vlm,
+    "kimi_k25_vlm": model_provider_kimi_k25_vlm,
 }
 _DATASET_PROVIDERS = {
     "mock": mock_train_valid_test_datasets_provider,
     "qwen35_vlm": qwen35_vlm_train_valid_test_datasets_provider,
+    "kimi_k25_vlm": kimi_k25_vlm_train_valid_test_datasets_provider,
 }
 
 # Energon-dependent providers registered only when the library is available
@@ -163,7 +169,7 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
     input_ids = batch.get("input_ids")
     expected_seq_len = getattr(args, "seq_length", None)
     if (
-        getattr(args, "dataset_provider", None) in ("mock", "qwen35_vlm")
+        getattr(args, "dataset_provider", None) in ("mock", "qwen35_vlm", "kimi_k25_vlm")
         and input_ids is not None
         and expected_seq_len is not None
     ):
@@ -278,6 +284,10 @@ def model_provider(
     elif name == "qwen35_vlm":
         kwargs = {
             "image_special_token_id": getattr(runtime_args, "image_token_id", 248056),
+        }
+    elif name == "kimi_k25_vlm":
+        kwargs = {
+            "image_special_token_id": getattr(runtime_args, "image_token_id", 163605),
         }
     elif name == "mock":
         kwargs = {"special_token_id": image_special_token_id}
