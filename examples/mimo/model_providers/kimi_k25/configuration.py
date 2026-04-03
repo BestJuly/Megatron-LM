@@ -28,52 +28,60 @@ KIMI_K25_BOS_TOKEN_ID: int = 163584
 KIMI_K25_EOS_TOKEN_ID: int = 163585
 KIMI_K25_PAD_TOKEN_ID: int = 163839
 
-# Vocabulary size (must be divisible by make_vocab_size_divisible_by=1280)
-KIMI_K25_VOCAB_SIZE: int = 164480  # 163839 rounded up to nearest multiple of 1280
+# Vocabulary size from HF config (163840), rounded up for divisibility
+KIMI_K25_VOCAB_SIZE: int = 163840
 
 # ---------------------------------------------------------------------------
 # Language config variants
 # ---------------------------------------------------------------------------
 
-# Kimi K2 / K2.5 architecture values.
-# The "full" variant matches the Kimi K2.5 VL production model:
-#   61 decoder layers (first 2 dense, rest MoE), 256 routed experts,
-#   MLA with q_lora_rank=1536, kv_lora_rank=512.
-# The "proxy" variant shrinks to 4 layers / 16 experts for quick testing.
+# Kimi K2 / K2.5 architecture values (from HF config: moonshotai/Kimi-K2.5).
+#
+# HF config → MCore mapping:
+#   hidden_size=7168, intermediate_size=18432, num_attention_heads=64,
+#   num_key_value_heads=64, q_lora_rank=1536, kv_lora_rank=512,
+#   qk_nope_head_dim=128, qk_rope_head_dim=64, v_head_dim=128,
+#   n_routed_experts=384, num_experts_per_tok=8, moe_intermediate_size=2048,
+#   n_shared_experts=1, first_k_dense_replace=1, vocab_size=163840,
+#   rope_theta=50000, rope_scaling=yarn(factor=64).
+#
+# The "full" variant matches the Kimi K2.5 VL production model.
+# The "proxy" variant shrinks layers/experts for quick testing while
+# keeping the same hidden_size and MLA config.
 _VARIANT_CONFIGS = {
     "proxy": {
         "num_layers": 4,
-        "hidden_size": 4096,
-        "ffn_hidden_size": 12288,
-        "num_attention_heads": 32,
-        "num_query_groups": 32,
+        "hidden_size": 7168,
+        "ffn_hidden_size": 1024,
+        "num_attention_heads": 64,
+        "num_query_groups": 64,
         "q_lora_rank": 1536,
         "kv_lora_rank": 512,
         "qk_head_dim": 128,
         "qk_pos_emb_head_dim": 64,
         "v_head_dim": 128,
         "num_moe_experts": 16,
-        "moe_router_topk": 4,
-        "moe_ffn_hidden_size": 1536,
-        "moe_shared_expert_intermediate_size": 1536,
+        "moe_router_topk": 8,
+        "moe_ffn_hidden_size": 64,
+        "moe_shared_expert_intermediate_size": 2048,
         "first_k_dense_replace": 1,
     },
     "full": {
         "num_layers": 61,
-        "hidden_size": 4096,
-        "ffn_hidden_size": 12288,
-        "num_attention_heads": 32,
-        "num_query_groups": 32,
+        "hidden_size": 7168,
+        "ffn_hidden_size": 18432,
+        "num_attention_heads": 64,
+        "num_query_groups": 64,
         "q_lora_rank": 1536,
         "kv_lora_rank": 512,
         "qk_head_dim": 128,
         "qk_pos_emb_head_dim": 64,
         "v_head_dim": 128,
-        "num_moe_experts": 256,
+        "num_moe_experts": 384,
         "moe_router_topk": 8,
-        "moe_ffn_hidden_size": 1536,
-        "moe_shared_expert_intermediate_size": 1536,
-        "first_k_dense_replace": 2,
+        "moe_ffn_hidden_size": 2048,
+        "moe_shared_expert_intermediate_size": 2048,
+        "first_k_dense_replace": 1,
     },
 }
 
@@ -120,7 +128,7 @@ def get_kimi_k25_language_config(
         v_head_dim=v["v_head_dim"],
         # Normalization & activation
         normalization="RMSNorm",
-        layernorm_epsilon=1e-6,
+        layernorm_epsilon=1e-5,
         gated_linear_unit=True,
         activation_func=torch.nn.functional.silu,
         # Attention
@@ -128,16 +136,16 @@ def get_kimi_k25_language_config(
         attention_dropout=0.0,
         hidden_dropout=0.0,
         add_bias_linear=False,
-        # RoPE — Kimi K2 uses YaRN RoPE
+        # RoPE — Kimi K2.5 uses YaRN RoPE with factor=64
         # NOTE: position_embedding_type is set on GPTModel, not TransformerConfig
         rope_type="yarn",
-        rotary_base=10000,
-        rotary_scaling_factor=40,
+        rotary_base=50000,
+        rotary_scaling_factor=64,
         original_max_position_embeddings=4096,
         beta_fast=32,
         beta_slow=1,
         mscale=1.0,
-        mscale_all_dim=0.0,
+        mscale_all_dim=1.0,
         # MoE
         num_moe_experts=v["num_moe_experts"],
         moe_router_topk=v["moe_router_topk"],
@@ -151,8 +159,10 @@ def get_kimi_k25_language_config(
         moe_shared_expert_overlap=True,
         moe_router_enable_expert_bias=True,
         moe_router_score_function="sigmoid",
+        moe_router_topk_scaling_factor=2.827,
         moe_router_dtype="fp32",
         moe_aux_loss_coeff=1e-3,
+        moe_router_bias_update_rate=1e-3,
         # Kernel / TE fusions
         apply_rope_fusion=False,
         bias_activation_fusion=True,

@@ -22,6 +22,7 @@ import torch
 
 from examples.mimo.utils.logging import print_mimo_structure
 from examples.mimo.utils.model_helpers import load_submodule_ckpt
+from megatron.core import dist_checkpointing
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.mimo import MimoModel, MimoModelConfig
 from megatron.core.models.mimo.submodules.vision import (
@@ -119,6 +120,65 @@ def _get_hf_model_path() -> str:
     return _DEFAULT_HF_MODEL_PATH
 
 
+def load_bridge_checkpoint(mimo_model: MimoModel, ckpt_dir: str):
+    """Load a Megatron-Bridge Kimi K2.5 VL checkpoint into a MIMO model.
+
+    The Bridge saves keys as:
+        language_model.*  /  vision_tower.*  /  mm_projector.*
+    The MIMO model expects:
+        language_model.*  (same)
+        modality_submodules.images.encoders.kimi_k25_vision.vision_tower.*
+        modality_submodules.images.encoders.kimi_k25_vision.mm_projector.*
+
+    This function builds a sharded state dict with remapped keys so
+    dist_checkpointing can load the Bridge checkpoint directly.
+    """
+    VISION_PREFIX = "modality_submodules.images.encoders.kimi_k25_vision."
+
+    # Build sharded state dict from the MIMO model
+    full_sd = mimo_model.sharded_state_dict(prefix="")
+
+    # Remap: for any MIMO key starting with the vision prefix,
+    # create a mapping to the Bridge key (without the prefix).
+    remapped_sd = {}
+    for mimo_key, tensor_or_sharded in full_sd.items():
+        if "extra_state" in mimo_key:
+            # Skip fp8 extra states — may not exist in Bridge checkpoint
+            continue
+
+        if mimo_key.startswith(VISION_PREFIX):
+            # Map MIMO vision key -> Bridge vision key
+            bridge_key = mimo_key[len(VISION_PREFIX):]
+            # Update the ShardedTensor's key to match Bridge checkpoint
+            if hasattr(tensor_or_sharded, 'key'):
+                tensor_or_sharded.key = bridge_key
+            remapped_sd[mimo_key] = tensor_or_sharded
+        else:
+            remapped_sd[mimo_key] = tensor_or_sharded
+
+    # Wrap in state_dict as dist_checkpointing expects
+    wrapper = {"state_dict": remapped_sd}
+
+    loaded = dist_checkpointing.load(
+        sharded_state_dict=wrapper,
+        checkpoint_dir=ckpt_dir,
+    )
+
+    # Load into model
+    cleaned = {}
+    for k, v in loaded["state_dict"].items():
+        cleaned[k] = v
+
+    incompatible = mimo_model.load_state_dict(cleaned, strict=False)
+    unexpected = [k for k in incompatible.unexpected_keys if "extra_state" not in k]
+    missing = [k for k in incompatible.missing_keys if "extra_state" not in k]
+    if unexpected:
+        print(f"[load_bridge_checkpoint] Unexpected keys: {unexpected[:10]}...")
+    if missing:
+        print(f"[load_bridge_checkpoint] Missing keys: {missing[:10]}...")
+    print(f"[load_bridge_checkpoint] Successfully loaded Bridge checkpoint from {ckpt_dir}")
+
+
 def model_provider_kimi_k25_vlm(
     pre_process: bool = True,
     post_process: bool = True,
@@ -202,20 +262,44 @@ def model_provider_kimi_k25_vlm(
     print_mimo_structure(mimo_model)
     print("*" * 100)
 
-    # --- Load language model checkpoint (optional) ---
+    # --- Load checkpoint (optional) ---
+    # --language-model-checkpoint can point to either:
+    #   (a) A Bridge checkpoint (has vision_tower.* keys) -> load_bridge_checkpoint
+    #   (b) A language-only checkpoint -> load_submodule_ckpt
     try:
         from megatron.training import get_args
 
         _args = get_args()
         if _args.language_model_checkpoint is not None:
-            load_submodule_ckpt(
-                mimo_model.language_model,
-                _args.language_model_checkpoint,
-            )
-            print(
-                "Successfully loaded language model checkpoint "
-                f"from {_args.language_model_checkpoint}"
-            )
+            ckpt_path = _args.language_model_checkpoint
+            # Detect Bridge checkpoint by checking for vision_tower keys
+            try:
+                from torch.distributed.checkpoint import FileSystemReader
+                import os
+                # Find the iteration directory
+                ckpt_iter_dir = ckpt_path
+                if os.path.exists(os.path.join(ckpt_path, "latest_checkpointed_iteration.txt")):
+                    with open(os.path.join(ckpt_path, "latest_checkpointed_iteration.txt")) as f:
+                        iteration = f.read().strip()
+                    ckpt_iter_dir = os.path.join(ckpt_path, f"iter_{int(iteration):07d}")
+
+                reader = FileSystemReader(ckpt_iter_dir)
+                md = reader.read_metadata()
+                has_vision = any(k.startswith("vision_tower.") for k in md.state_dict_metadata.keys())
+            except Exception:
+                has_vision = False
+
+            if has_vision:
+                load_bridge_checkpoint(mimo_model, ckpt_iter_dir)
+            else:
+                load_submodule_ckpt(
+                    mimo_model.language_model,
+                    ckpt_path,
+                )
+                print(
+                    "Successfully loaded language model checkpoint "
+                    f"from {ckpt_path}"
+                )
     except (ModuleNotFoundError, AssertionError):
         pass
 
