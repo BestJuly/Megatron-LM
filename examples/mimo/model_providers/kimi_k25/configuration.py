@@ -136,17 +136,16 @@ def get_kimi_k25_language_config(
         attention_dropout=0.0,
         hidden_dropout=0.0,
         add_bias_linear=False,
-        # RoPE — Bridge uses YaRN with scaling_factor=40, mscale_all_dim=0.0
-        # (AutoBridge sets these via MLA_ROPE_SCALING_MAPPING from HF config)
+        # RoPE — YaRN params from HF config rope_scaling dict
         # NOTE: position_embedding_type is set on GPTModel, not TransformerConfig
         rope_type="yarn",
         rotary_base=50000,
-        rotary_scaling_factor=40,
+        rotary_scaling_factor=64,
         original_max_position_embeddings=4096,
         beta_fast=32,
         beta_slow=1,
         mscale=1.0,
-        mscale_all_dim=0.0,
+        mscale_all_dim=1.0,
         # MoE
         num_moe_experts=v["num_moe_experts"],
         moe_router_topk=v["moe_router_topk"],
@@ -177,7 +176,6 @@ def get_kimi_k25_language_config(
         cross_entropy_fusion_impl="te",
         moe_permute_fusion=True,
         gradient_accumulation_fusion=True,
-        async_tensor_model_parallel_allreduce=True,
         # Misc
         # NOTE: share_embeddings_and_output_weights is set on GPTModel, not TransformerConfig
         attention_softmax_in_fp32=False,

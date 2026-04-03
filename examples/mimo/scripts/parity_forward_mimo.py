@@ -16,8 +16,10 @@ import sys
 
 import torch
 
-# Add repo root to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+# Add repo root and examples/mimo to path
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_script_dir, "..", "..", ".."))
+sys.path.insert(0, os.path.join(_script_dir, ".."))
 
 
 def make_deterministic_batch(
