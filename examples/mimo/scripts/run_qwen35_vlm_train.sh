@@ -8,8 +8,7 @@
 #       ./examples/mimo/scripts/run_qwen35_vlm_train.sh
 #
 #   # Proxy with explicit mock data:
-#   MODEL_VARIANT=proxy GPUS_PER_NODE=2 EP=2 \
-#       ./examples/mimo/scripts/run_qwen35_vlm_train.sh mock
+#   MODEL_VARIANT=proxy GPUS_PER_NODE=2 EP=2        ./examples/mimo/scripts/run_qwen35_vlm_train.sh mock
 #
 #   # Full 397B production run:
 #   ./examples/mimo/scripts/run_qwen35_vlm_train.sh /path/to/dataset [/path/to/llm/ckpt]
@@ -168,6 +167,7 @@ EVAL_AND_LOGGING_ARGS=(
     --wandb-project "$WANDB_PROJECT"
     --wandb-exp-name "$EXP_NAME"
     --wandb-save-dir "$CHECKPOINT_STORE_PATH"
+    --wandb-entity "wplf"
     --log-throughput
     "${LANGUAGE_MODEL_CKPT_ARG[@]}"
 )

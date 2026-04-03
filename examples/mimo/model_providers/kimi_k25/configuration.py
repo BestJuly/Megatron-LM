@@ -136,16 +136,17 @@ def get_kimi_k25_language_config(
         attention_dropout=0.0,
         hidden_dropout=0.0,
         add_bias_linear=False,
-        # RoPE — Kimi K2.5 uses YaRN RoPE with factor=64
+        # RoPE — Bridge uses YaRN with scaling_factor=40, mscale_all_dim=0.0
+        # (AutoBridge sets these via MLA_ROPE_SCALING_MAPPING from HF config)
         # NOTE: position_embedding_type is set on GPTModel, not TransformerConfig
         rope_type="yarn",
         rotary_base=50000,
-        rotary_scaling_factor=64,
+        rotary_scaling_factor=40,
         original_max_position_embeddings=4096,
         beta_fast=32,
         beta_slow=1,
         mscale=1.0,
-        mscale_all_dim=1.0,
+        mscale_all_dim=0.0,
         # MoE
         num_moe_experts=v["num_moe_experts"],
         moe_router_topk=v["moe_router_topk"],
@@ -163,17 +164,26 @@ def get_kimi_k25_language_config(
         moe_router_dtype="fp32",
         moe_aux_loss_coeff=1e-3,
         moe_router_bias_update_rate=1e-3,
-        # Kernel / TE fusions
+        # MoE routing extra fields (match Bridge defaults)
+        moe_router_num_groups=1,
+        moe_router_group_topk=1,
+        # Kernel / TE fusions (must match Bridge for bitwise parity)
         apply_rope_fusion=False,
         bias_activation_fusion=True,
         masked_softmax_fusion=True,
         persist_layer_norm=True,
         bias_dropout_fusion=True,
+        cross_entropy_loss_fusion=True,
+        cross_entropy_fusion_impl="te",
+        moe_permute_fusion=True,
+        gradient_accumulation_fusion=True,
+        async_tensor_model_parallel_allreduce=True,
         # Misc
         # NOTE: share_embeddings_and_output_weights is set on GPTModel, not TransformerConfig
         attention_softmax_in_fp32=False,
         # Precision
         bf16=True,
+        params_dtype=torch.bfloat16,
     )
 
     kwargs.update(overrides)
