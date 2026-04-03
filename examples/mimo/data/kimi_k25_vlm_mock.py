@@ -33,23 +33,23 @@ from torch.utils.data import Dataset
 
 from model_providers.kimi_k25 import KIMI_K25_IMAGE_TOKEN_ID, KIMI_K25_VOCAB_SIZE
 
-# Vision geometry constants (for 224-px input)
+# Vision geometry constants (for 224-px input with MoonViT3d config)
+# MoonViT3d uses Conv2d with patch_size=14 (not Conv3d like Qwen)
 _TEMPORAL = 1
-_HEIGHT_PATCHES = 14        # 224 // patch_size (16)
-_WIDTH_PATCHES = 14         # 224 // patch_size (16)
-_MERGE_SIZE = 2
+_PATCH_SIZE = 14            # MoonViT3d patch_size
+_HEIGHT_PATCHES = 16        # 224 // patch_size (14) = 16
+_WIDTH_PATCHES = 16         # 224 // patch_size (14) = 16
+_MERGE_SIZE = 2             # spatial downsample factor (sd2_tpool)
 _IN_CHANNELS = 3
-_TEMPORAL_PATCH_SIZE = 2
-_PATCH_SIZE = 16
 
 # Derived constants
-_TOTAL_RAW_PATCHES = _TEMPORAL * _HEIGHT_PATCHES * _WIDTH_PATCHES           # 196
+_TOTAL_RAW_PATCHES = _TEMPORAL * _HEIGHT_PATCHES * _WIDTH_PATCHES           # 256
+# After sd2_tpool merge: spatial 2x downsample + temporal pool
 _MERGED_PATCHES = (
     _TEMPORAL
     * (_HEIGHT_PATCHES // _MERGE_SIZE)
     * (_WIDTH_PATCHES // _MERGE_SIZE)
-)  # 49
-_PER_PATCH_DIM = _IN_CHANNELS * _TEMPORAL_PATCH_SIZE * _PATCH_SIZE * _PATCH_SIZE  # 1536
+)  # 64
 
 
 class MockKimiK25VLDataset(Dataset):
@@ -108,9 +108,12 @@ class MockKimiK25VLDataset(Dataset):
         loss_mask[input_ids == self.pad_token_id] = 0.0
         loss_mask[input_ids == self.image_token_id] = 0.0
 
-        # pixel_values: zero-filled flat patches [total_raw_patches, per_patch_dim]
+        # pixel_values: MoonViT3d expects (total_patches, C, pH, pW) but
+        # TP broadcast only supports up to 3D tensors, so we flatten to
+        # (total_patches, C * pH * pW) and reshape in the vision encoder.
+        _per_patch_dim = _IN_CHANNELS * _PATCH_SIZE * _PATCH_SIZE  # 588
         pixel_values = torch.zeros(
-            _TOTAL_RAW_PATCHES, _PER_PATCH_DIM, dtype=torch.float32
+            _TOTAL_RAW_PATCHES, _per_patch_dim, dtype=torch.float32,
         )
 
         # grid_thw: [num_images=1, 3] with (T, H, W) in patch-grid units
@@ -139,7 +142,7 @@ def _collate_fn(batch: List[Dict]) -> Dict:
     labels = torch.stack([s["labels"] for s in batch])           # [B, S]
     loss_mask = torch.stack([s["loss_mask"] for s in batch])     # [B, S]
 
-    # pixel_values: concat across batch
+    # pixel_values: [B*256, 3, 14, 14] (all images concatenated)
     pixel_values = torch.cat(
         [s["modality_inputs"]["images"]["kimi_k25_vision"]["pixel_values"] for s in batch],
         dim=0,

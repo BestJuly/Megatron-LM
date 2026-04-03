@@ -138,7 +138,25 @@ class KimiK25VisionEncoder(nn.Module):
             Projected visual embeddings of shape
             ``[total_merged_patches, language_hidden_size]``.
         """
+        # Ensure grid_thw is 2D [num_images, 3] — broadcast may add a batch dim
+        if grid_thw.ndim == 3:
+            grid_thw = grid_thw.reshape(-1, grid_thw.shape[-1])
+
+        # Reshape from flat to 4D (total_patches, C, pH, pW) for Conv2d.
+        # TP broadcast only supports up to 3D, so data arrives as
+        # (batch, total_patches, C*pH*pW) or (total_patches, C*pH*pW).
+        # MoonViT3d's Conv2d needs (total_patches, C, pH, pW).
+        patch_size = self.vision_tower.patch_embed.proj.kernel_size[0]
+        in_channels = self.vision_tower.patch_embed.proj.in_channels
+        expected_flat_dim = in_channels * patch_size * patch_size
+        if pixel_values.shape[-1] == expected_flat_dim and pixel_values.ndim <= 3:
+            pixel_values = pixel_values.reshape(-1, in_channels, patch_size, patch_size)
+
         pixel_values = pixel_values.to(self.dtype)
         image_features = self.vision_tower(pixel_values, grid_thw)
         projected = self.mm_projector(image_features)
+        # MoonViT3d may return a list of tensors (one per image);
+        # MIMO VisionModalitySubmodules expects a single tensor.
+        if isinstance(projected, (list, tuple)):
+            projected = torch.cat(projected, dim=0)
         return projected

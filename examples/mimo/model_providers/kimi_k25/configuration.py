@@ -129,7 +129,7 @@ def get_kimi_k25_language_config(
         hidden_dropout=0.0,
         add_bias_linear=False,
         # RoPE — Kimi K2 uses YaRN RoPE
-        position_embedding_type="rope",
+        # NOTE: position_embedding_type is set on GPTModel, not TransformerConfig
         rope_type="yarn",
         rotary_base=10000,
         rotary_scaling_factor=40,
@@ -160,7 +160,7 @@ def get_kimi_k25_language_config(
         persist_layer_norm=True,
         bias_dropout_fusion=True,
         # Misc
-        share_embeddings_and_output_weights=False,
+        # NOTE: share_embeddings_and_output_weights is set on GPTModel, not TransformerConfig
         attention_softmax_in_fp32=False,
         # Precision
         bf16=True,
