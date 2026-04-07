@@ -19,6 +19,11 @@ from multimodal_v2.models.qwen35_vl.configuration import (
     get_qwen35_vl_language_config,
     get_qwen35_vl_vision_config,
 )
+from multimodal_v2.models.qwen35_vl.factory import (
+    build_model,
+    post_language_config,
+    set_vision_flops_metadata,
+)
 from multimodal_v2.models.qwen35_vl.model import Qwen35VLModel
 from multimodal_v2.models.qwen35_vl.mrope import compute_mrope_position_ids
 from multimodal_v2.models.qwen35_vl.specs import (
@@ -35,6 +40,10 @@ from multimodal_v2.models.qwen35_vl.vision_encoder import (
 __all__ = [
     # Model class
     "Qwen35VLModel",
+    # Factory functions
+    "build_model",
+    "post_language_config",
+    "set_vision_flops_metadata",
     # Vision encoder
     "Qwen35VLVisionEncoder",
     "Qwen35VLPatchEmbed",

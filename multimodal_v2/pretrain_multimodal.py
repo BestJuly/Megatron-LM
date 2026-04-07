@@ -2,15 +2,28 @@
 
 """Standalone entry point for multimodal_v2 model training (FSDP + EP).
 
+This entry point is **model-agnostic**.  All model-specific logic (layer
+specs, model construction, FLOPs metadata, dataset generation) is
+delegated to factory functions registered in
+:data:`multimodal_v2.models.MODEL_REGISTRY`.
+
+Adding a new architecture only requires:
+
+1. Creating a new model package under ``multimodal_v2/models/<arch>/``
+   with the appropriate factory functions.
+2. Registering an entry in ``MODEL_REGISTRY``.
+
+No changes to this file are necessary.
+
 Usage::
 
     torchrun --nproc_per_node=8 multimodal_v2/pretrain_multimodal.py \\
         --model-arch qwen35_vl \\
-        --model-variant proxy \\
         --dataset-provider mock \\
         ... (other megatron args)
 """
 
+import importlib
 import os
 import sys
 
@@ -20,7 +33,6 @@ sys.path.insert(
 )
 
 from megatron.core.enums import ModelType
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
 from megatron.training import get_args, pretrain
 from megatron.training.arguments import core_transformer_config_from_args
 
@@ -28,36 +40,17 @@ from multimodal_v2.arguments import add_multimodal_args
 from multimodal_v2.forward_step import forward_step
 
 
-def _set_vision_flops_metadata(args, model_arch, language_config, vision_config):
-    """Expose vision-model dimensions for training FLOPs estimation."""
-    if model_arch != "qwen35_vl":
-        return
-
-    from multimodal_v2.models.qwen35_vl.configuration import VISION_KWARGS
-
-    args.count_vision_model_flops = True
-    args.vision_flops_variant = "qwen35_vl_v2"
-    args.vision_num_layers = vision_config.num_layers
-    args.vision_hidden_size = vision_config.hidden_size
-    args.vision_ffn_hidden_size = vision_config.ffn_hidden_size
-    args.vision_num_attention_heads = vision_config.num_attention_heads
-    args.vision_kv_channels = vision_config.kv_channels
-    args.vision_in_channels = VISION_KWARGS["in_channels"]
-    args.vision_patch_size = VISION_KWARGS["patch_size"]
-    args.vision_temporal_patch_size = VISION_KWARGS["temporal_patch_size"]
-    args.vision_spatial_merge_size = VISION_KWARGS["spatial_merge_size"]
-    args.vision_out_hidden_size = language_config.hidden_size
-
-
 def model_provider(
     pre_process: bool = True,
     post_process: bool = True,
     **kwargs,
 ):
-    """Build a multimodal model from ``--model-arch`` / ``--model-variant``.
+    """Build a multimodal model from ``--model-arch``.
 
     The language ``TransformerConfig`` is built from CLI args so that
     parallelism settings, precision, and fusion flags are inherited.
+    Model-specific post-processing and construction are delegated to the
+    registry factory functions.
     """
     args = get_args()
     model_arch = getattr(args, "model_arch", "qwen35_vl")
@@ -71,14 +64,15 @@ def model_provider(
         )
 
     registry = MODEL_REGISTRY[model_arch]
-    model_class = registry["model_class"]
-    language_spec_fn = registry["language_spec_fn"]
-    vision_config_fn = registry["vision_config_fn"]
 
+    # --- language config (generic + model-specific post-processing) ---
     language_config = core_transformer_config_from_args(args)
-    language_config.mrope_section = [11, 11, 10]
+    post_language_config_fn = registry.get("post_language_config_fn")
+    if post_language_config_fn is not None:
+        post_language_config_fn(language_config, args)
 
-    vision_config = vision_config_fn(
+    # --- vision config ---
+    vision_config = registry["vision_config_fn"](
         num_layers_override=getattr(args, "vision_num_layers", None),
     )
     vision_config.bf16 = language_config.bf16
@@ -88,59 +82,62 @@ def model_provider(
         vision_config.recompute_granularity = "full"
         vision_config.recompute_method = "uniform"
         vision_config.recompute_num_layers = 1
-    _set_vision_flops_metadata(
+
+    # --- vision FLOPs metadata ---
+    vision_flops_fn = registry.get("vision_flops_fn")
+    if vision_flops_fn is not None:
+        vision_flops_fn(args, language_config, vision_config)
+
+    # --- build model (fully delegated to the arch factory) ---
+    model = registry["model_factory_fn"](
         args=args,
-        model_arch=model_arch,
         language_config=language_config,
         vision_config=vision_config,
-    )
-
-    language_spec = language_spec_fn(
-        config=language_config,
-        vp_stage=kwargs.get("vp_stage", None),
-        pp_rank=None,
-    )
-
-    mtp_block_spec = None
-    if getattr(args, "mtp_num_layers", None):
-        mtp_block_spec = get_gpt_mtp_block_spec(
-            config=language_config,
-            spec=language_spec,
-            use_transformer_engine=(
-                args.transformer_impl == "transformer_engine"
-            ),
-            vp_stage=kwargs.get("vp_stage", None),
-            pp_rank=None,
-        )
-
-    model = model_class(
-        language_config=language_config,
-        language_spec=language_spec,
-        vision_config=vision_config,
-        vocab_size=args.padded_vocab_size,
-        max_sequence_length=args.max_position_embeddings,
-        image_token_id=getattr(args, "image_token_id", 248056),
-        mtp_block_spec=mtp_block_spec,
-        parallel_output=True,
+        **kwargs,
     )
 
     return model
 
 
+def _resolve_provider_fn(provider_fn):
+    """Resolve a provider that may be a dotted import path string."""
+    if isinstance(provider_fn, str):
+        module_path, func_name = provider_fn.rsplit(".", 1)
+        provider_fn = getattr(
+            importlib.import_module(module_path), func_name,
+        )
+    return provider_fn
+
+
 def datasets_provider(train_val_test_num_samples):
-    """Dataset provider dispatcher."""
+    """Dataset provider dispatcher.
+
+    Routes to the dataset factory registered for the current
+    ``(--model-arch, --dataset-provider)`` combination.
+    """
     args = get_args()
+    model_arch = getattr(args, "model_arch", "qwen35_vl")
     provider = getattr(args, "dataset_provider", "mock")
 
-    if provider == "mock":
-        from multimodal_v2.data.mock import (
-            train_valid_test_datasets_provider,
-        )
-        return train_valid_test_datasets_provider(
-            train_val_test_num_samples,
+    from multimodal_v2.models import MODEL_REGISTRY
+
+    if model_arch not in MODEL_REGISTRY:
+        raise ValueError(
+            f"Unknown model arch '{model_arch}'. "
+            f"Available: {list(MODEL_REGISTRY.keys())}"
         )
 
-    raise ValueError(f"Unknown dataset provider: {provider}")
+    registry = MODEL_REGISTRY[model_arch]
+    available = registry.get("dataset_providers", {})
+
+    if provider not in available:
+        raise ValueError(
+            f"Unknown dataset provider '{provider}' for arch "
+            f"'{model_arch}'. Available: {list(available.keys())}"
+        )
+
+    provider_fn = _resolve_provider_fn(available[provider])
+    return provider_fn(train_val_test_num_samples)
 
 
 if __name__ == "__main__":
