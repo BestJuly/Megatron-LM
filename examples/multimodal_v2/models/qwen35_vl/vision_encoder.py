@@ -316,7 +316,7 @@ class Qwen35VLVisionEncoder(VisionModule):
 
         # --- Transformer blocks ---
         if transformer_layer_spec is None:
-            from multimodal_v2.models.qwen35_vl.specs import (
+            from examples.multimodal_v2.models.qwen35_vl.specs import (
                 get_qwen35_vl_vision_spec,
             )
             transformer_layer_spec = get_qwen35_vl_vision_spec()

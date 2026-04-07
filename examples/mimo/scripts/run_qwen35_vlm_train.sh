@@ -25,7 +25,7 @@
 
 set -euo pipefail
 
-# Repo root must be on PYTHONPATH for megatron and multimodal_v2 imports.
+# Repo root must be on PYTHONPATH for megatron and examples.multimodal_v2 imports.
 # Assumes the script is run from the repo root: ./examples/mimo/scripts/run_qwen35_vlm_train.sh
 REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:$PYTHONPATH}"
@@ -172,7 +172,7 @@ else
 fi
 
 # --- Qwen3-Next Decoder Architecture (variant-specific) ---
-# Architecture values must match multimodal_v2/models/qwen35_vl/configuration.py.
+# Architecture values must match examples/multimodal_v2/models/qwen35_vl/configuration.py.
 if [ "$MODEL_VARIANT" = "proxy" ]; then
     # Proxy: 4 layers, 16 experts (same hidden dims as 397b_a17b for TP compatibility)
     GPT_MODEL_ARGS=(

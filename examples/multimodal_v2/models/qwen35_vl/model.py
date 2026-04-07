@@ -14,8 +14,8 @@ from torch import Tensor
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 
-from multimodal_v2.models.base import MultimodalModel
-from multimodal_v2.models.qwen35_vl.configuration import (
+from examples.multimodal_v2.models.base import MultimodalModel
+from examples.multimodal_v2.models.qwen35_vl.configuration import (
     MROPE_SECTION,
     QWEN35_VL_IMAGE_TOKEN_ID,
     QWEN35_VL_VOCAB_SIZE,
@@ -23,9 +23,9 @@ from multimodal_v2.models.qwen35_vl.configuration import (
     ROTARY_PERCENT,
     VISION_KWARGS,
 )
-from multimodal_v2.models.qwen35_vl.mrope import compute_mrope_position_ids
-from multimodal_v2.models.qwen35_vl.specs import get_qwen35_vl_vision_spec
-from multimodal_v2.models.qwen35_vl.vision_encoder import (
+from examples.multimodal_v2.models.qwen35_vl.mrope import compute_mrope_position_ids
+from examples.multimodal_v2.models.qwen35_vl.specs import get_qwen35_vl_vision_spec
+from examples.multimodal_v2.models.qwen35_vl.vision_encoder import (
     Qwen35VLVisionEncoder,
 )
 

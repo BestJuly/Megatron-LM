@@ -1,34 +1,38 @@
 #!/bin/bash
 
-# Launch script for Qwen3.5-VL training with pure mcore implementation.
+# Launch script for Qwen3.5-VL training via multimodal_v2 (FSDP + EP).
 #
-# Usage (from Megatron-LM repo root):
-#   ./multimodal/scripts/run_qwen35_vl.sh
+# Usage (from the Megatron-LM repo root):
+#   ./examples/multimodal_v2/scripts/run_qwen35_vl.sh
 #
 # Environment variables:
 #   MODEL_VARIANT: proxy (default), 9b, 35b_a3b, 35b_a3b_light, 397b_a17b
 #   TP, EP, PP: parallelism sizes
 #   MBS, GBS: micro/global batch sizes
 #   NUM_LAYERS, NUM_EXPERTS: override for proxy testing
+#   LAUNCHER: torchrun (default) or python
 #   PROFILE: set to 1 to enable Nsight Systems profiling (default: 0)
 #   PROFILE_STEP_START/PROFILE_STEP_END: profiled iteration window (default: 4-5)
 
-
-# issue: layer is not 4x, MTP will raise error. need to fix.
-# issue: CUDA graph is not supported.
 set -euo pipefail
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_IB_SL=1
 export NVTE_FUSED_ATTN=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-DRY_RUN=${DRY_RUN:-false}
+DRY_RUN=${DRY_RUN:-1}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
-NUM_NODES=${NNODES:-1}
+if [ -n "${SLURM_JOB_NUM_NODES:-}" ]; then
+    NUM_NODES="$SLURM_JOB_NUM_NODES"
+else
+    NUM_NODES=${NNODES:-1}
+fi
 PROFILE=${PROFILE:-0}
 PROFILE_STEP_START=${PROFILE_STEP_START:-4}
 PROFILE_STEP_END=${PROFILE_STEP_END:-5}
 PROFILE_RANKS=${PROFILE_RANKS:-0}
+LAUNCHER=${LAUNCHER:-torchrun}
 
 MODEL_VARIANT=${MODEL_VARIANT:-proxy}
 VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-}
@@ -43,66 +47,61 @@ EP=${EP:-2}
 PP=${PP:-1}
 
 # Variant-aware architecture defaults.
-# The model provider builds configs from the variant dict, but Megatron also uses
-# these CLI args internally (PP splits, param counting). They must match the variant.
+# The model provider builds configs from the variant dict in
+# multimodal_v2/models/qwen35_vl/configuration.py, but Megatron also
+# uses these CLI args internally (PP splits, param counting).
 case "$MODEL_VARIANT" in
     proxy)
-        # 397B-A17B dims, reduced to 4 layers / 16 experts for single-node 8xH100 testing.
         NUM_LAYERS=${NUM_LAYERS:-4}
         NUM_EXPERTS=${NUM_EXPERTS:-16}
         HIDDEN_SIZE=4096
-        FFN_HIDDEN_SIZE=10240  # moe_ffn_hidden_size*topk: 1024*2 (same convention as 397b)
+        FFN_HIDDEN_SIZE=10240
         NUM_ATTN_HEADS=32
         NUM_QUERY_GROUPS=2
         LINEAR_NUM_VALUE_HEADS=64
         VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-2}
         ;;
     9b)
-        # Dense Qwen3.5-9B: 32 layers, hidden=4096, intermediate=12288, 16 heads, 4 kv-heads.
         NUM_LAYERS=${NUM_LAYERS:-32}
-        NUM_EXPERTS=${NUM_EXPERTS:-0}  # dense (no MoE)
+        NUM_EXPERTS=${NUM_EXPERTS:-0}
         HIDDEN_SIZE=4096
         FFN_HIDDEN_SIZE=12288
         NUM_ATTN_HEADS=16
-        NUM_QUERY_GROUPS=4   # num_key_value_heads=4
+        NUM_QUERY_GROUPS=4
         LINEAR_NUM_VALUE_HEADS=32
         VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-27}
         ;;
     35b_a3b)
-        # MoE Qwen3.5-35B-A3B: 40 layers, hidden=2048, 256 experts top-8.
         NUM_LAYERS=${NUM_LAYERS:-40}
         NUM_EXPERTS=${NUM_EXPERTS:-256}
         HIDDEN_SIZE=2048
-        FFN_HIDDEN_SIZE=4096  # moe_ffn_hidden_size*topk: 512*8
+        FFN_HIDDEN_SIZE=4096
         NUM_ATTN_HEADS=16
         NUM_QUERY_GROUPS=2
         LINEAR_NUM_VALUE_HEADS=32
         VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-27}
         ;;
     35b_a3b_light)
-        # Reduced 35B-A3B bring-up config: halve decoder and ViT depth.
         NUM_LAYERS=${NUM_LAYERS:-12}
         NUM_EXPERTS=${NUM_EXPERTS:-128}
         HIDDEN_SIZE=2048
-        FFN_HIDDEN_SIZE=4096  # moe_ffn_hidden_size*topk: 512*8
+        FFN_HIDDEN_SIZE=4096
         NUM_ATTN_HEADS=16
         NUM_QUERY_GROUPS=2
         LINEAR_NUM_VALUE_HEADS=32
         VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-7}
         ;;
     397b_a17b)
-        # MoE Qwen3.5-397B-A17B: 60 layers, hidden=4096, 512 experts top-10.
         NUM_LAYERS=${NUM_LAYERS:-60}
         NUM_EXPERTS=${NUM_EXPERTS:-512}
         HIDDEN_SIZE=4096
-        FFN_HIDDEN_SIZE=10240  # moe_ffn_hidden_size*topk: 1024*10
+        FFN_HIDDEN_SIZE=10240
         NUM_ATTN_HEADS=32
         NUM_QUERY_GROUPS=2
         LINEAR_NUM_VALUE_HEADS=64
         VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-27}
         ;;
     *)
-        # Unknown variant — fall back to env vars, fail if not set
         : "${NUM_LAYERS:?NUM_LAYERS must be set for MODEL_VARIANT=$MODEL_VARIANT}"
         : "${NUM_EXPERTS:?NUM_EXPERTS must be set for MODEL_VARIANT=$MODEL_VARIANT}"
         : "${HIDDEN_SIZE:?HIDDEN_SIZE must be set for MODEL_VARIANT=$MODEL_VARIANT}"
@@ -115,14 +114,24 @@ case "$MODEL_VARIANT" in
 esac
 SEQ_LEN=${SEQ_LEN:-4096}
 
-WANDB_PROJECT='multimodal-qwen35-vl'
+WANDB_PROJECT='multimodal-v2-qwen35-vl'
 EXP_NAME="qwen35vl_${MODEL_VARIANT}_tp${TP}_ep${EP}_pp${PP}"
 
-ROOT_DIR='./local/'
+RECOMPUTE_VISION=${RECOMPUTE_VISION:-0}
+if [ "$RECOMPUTE_VISION" -eq 1 ]; then
+    EXP_NAME+="_recompute_encoder"
+fi
+RECOMPUTE=${RECOMPUTE:-0}
+if [ "$RECOMPUTE" -eq 1 ]; then
+    EXP_NAME+="_recompute_decoder"
+fi
+
+MEGATRON_LM_PATH="${MEGATRON_LM_PATH:-$(cd "$(dirname "$0")/../../.." && pwd)}"
+ROOT_DIR="${ROOT_DIR:-${MEGATRON_LM_PATH}/local/}"
 CHECKPOINT_STORE_PATH="${ROOT_DIR}${EXP_NAME}"
 mkdir -p "$CHECKPOINT_STORE_PATH"
 
-TENSORBOARD_LOGS_PATH='./logs'
+TENSORBOARD_LOGS_PATH="${TENSORBOARD_LOGS_PATH:-${MEGATRON_LM_PATH}/logs}"
 mkdir -p "$TENSORBOARD_LOGS_PATH"
 
 DISTRIBUTED_ARGS=(
@@ -173,11 +182,7 @@ TRAINING_ARGS=(
     --manual-gc-interval 5
     --mtp-num-layers 1
     --mtp-loss-scaling-factor 0.1
-    # --use-precision-aware-optimizer
-    # --exp-avg-dtype bf16
-    # --exp-avg-sq-dtype bf16
 )
-# issue: not compatible with precision-aware optimizer
 
 PROFILE_ARGS=()
 NSYS_CMD=()
@@ -218,9 +223,6 @@ EVAL_AND_LOGGING_ARGS=(
 )
 
 # --- Tokenizer ---
-# For mock-data runs: NullTokenizer with the real Qwen3.5 vocab size avoids
-# requiring the HF tokenizer weights to be downloaded locally.
-# Switch to HuggingFaceTokenizer + tokenizer-model for real-data runs.
 TOKENIZER_ARGS=(
     --tokenizer-type NullTokenizer
     --vocab-size 248320
@@ -239,6 +241,7 @@ MULTIMODAL_ARGS=(
 )
 
 # --- Qwen3.5 Decoder Architecture (variant-specific dims set above) ---
+# These must match examples/multimodal_v2/models/qwen35_vl/configuration.py
 GPT_MODEL_ARGS=(
     --num-layers "$NUM_LAYERS"
     --hidden-size "$HIDDEN_SIZE"
@@ -271,10 +274,10 @@ GPT_MODEL_ARGS=(
     --linear-num-key-heads 16
     --linear-num-value-heads "$LINEAR_NUM_VALUE_HEADS"
     --make-vocab-size-divisible-by 485
+    --moe-router-force-load-balancing
 )
 
 # --- MoE args (MoE variants only) ---
-# topk and expert sizes must match the variant config in qwen35_vl.py
 MOE_ARGS=()
 case "$MODEL_VARIANT" in
     proxy)
@@ -287,7 +290,6 @@ case "$MODEL_VARIANT" in
         MOE_TOPK=10; MOE_FFN_HIDDEN=1024; MOE_SHARED_HIDDEN=1024
         ;;
     9b)
-        # Dense model — no MoE args
         ;;
 esac
 if [ "$MODEL_VARIANT" != "9b" ]; then
@@ -307,19 +309,28 @@ fi
 
 # --- Recompute ---
 RECOMPUTE=${RECOMPUTE:-0}
+RECOMPUTE_VISION=${RECOMPUTE_VISION:-0}
 if [ "$RECOMPUTE" -eq 1 ]; then
     RECOMPUTE_ARGS=(
-        --recompute-granularity selective
-        --recompute-modules moe_act shared_experts layernorm moe
+        --recompute-granularity full
+        --recompute-method uniform
+        --recompute-num-layers 1
     )
+    # RECOMPUTE_ARGS=(
+    #     --recompute-granularity selective
+    #     --recompute-modules moe_act shared_experts layernorm moe
+    # )
 else
     RECOMPUTE_ARGS=()
+fi
+if [ "$RECOMPUTE_VISION" -eq 1 ]; then
+    RECOMPUTE_ARGS+=( --recompute-vision )
 fi
 
 # --- FSDP ---
 USE_FSDP=${USE_FSDP:-1}
 if [ "$USE_FSDP" -eq 1 ]; then
-    FSDP_ARGS=(        
+    FSDP_ARGS=(
         --use-megatron-fsdp
         --data-parallel-sharding-strategy optim_grads_params
         --no-gradient-accumulation-fusion
@@ -327,20 +338,20 @@ if [ "$USE_FSDP" -eq 1 ]; then
         --use-distributed-optimizer
         --ckpt-format fsdp_dtensor
     )
-    # FSDP requires CUDA_DEVICE_MAX_CONNECTIONS >1
     export CUDA_DEVICE_MAX_CONNECTIONS=8
 else
     FSDP_ARGS=()
 fi
 
 echo "================================================================"
-echo "Qwen3.5-VL Multimodal Training (mcore)"
+echo "Qwen3.5-VL Multimodal Training (multimodal_v2)"
 echo "  Variant:       $MODEL_VARIANT"
 echo "  Vision layers: $VISION_NUM_LAYERS"
 echo "  GPUs per node: $GPUS_PER_NODE"
 echo "  Num nodes:     $NUM_NODES"
 echo "  TP=$TP  EP=$EP  PP=$PP  CP=1"
 echo "  MBS=$MBS  GBS=$GBS"
+echo "  Launcher:      $LAUNCHER"
 echo "  PROFILE:       $PROFILE"
 if [ "$PROFILE" = "1" ]; then
     echo "  Profile steps: ${PROFILE_STEP_START}-${PROFILE_STEP_END}"
@@ -348,7 +359,16 @@ if [ "$PROFILE" = "1" ]; then
 fi
 echo "================================================================"
 
-cmd=( "${NSYS_CMD[@]}" torchrun "${DISTRIBUTED_ARGS[@]}" multimodal/pretrain_multimodal.py \
+if [ "$LAUNCHER" = "python" ]; then
+    LAUNCH_CMD=( python $MEGATRON_LM_PATH/examples/multimodal_v2/pretrain_multimodal.py )
+elif [ "$LAUNCHER" = "torchrun" ]; then
+    LAUNCH_CMD=( torchrun "${DISTRIBUTED_ARGS[@]}" $MEGATRON_LM_PATH/examples/multimodal_v2/pretrain_multimodal.py )
+else
+    echo "Unsupported LAUNCHER=$LAUNCHER (expected torchrun or python)" >&2
+    exit 1
+fi
+
+cmd=( "${NSYS_CMD[@]}" "${LAUNCH_CMD[@]}" \
     "${TRAINING_ARGS[@]}" \
     "${PROFILE_ARGS[@]}" \
     "${MODEL_PARALLEL_ARGS[@]}" \
@@ -362,7 +382,7 @@ cmd=( "${NSYS_CMD[@]}" torchrun "${DISTRIBUTED_ARGS[@]}" multimodal/pretrain_mul
 
 echo "${cmd[@]}"
 
-if [ "$DRY_RUN" = true ]; then
+if [ "$DRY_RUN" -eq 1 ]; then
     echo "=== DRY RUN ==="
     exit 0
 else

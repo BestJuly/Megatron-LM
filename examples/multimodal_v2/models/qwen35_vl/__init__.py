@@ -6,7 +6,7 @@ Both the standalone ``multimodal_v2`` training path and the MIMO path
 import from here.
 """
 
-from multimodal_v2.models.qwen35_vl.configuration import (
+from examples.multimodal_v2.models.qwen35_vl.configuration import (
     MROPE_SECTION,
     QWEN35_VL_IMAGE_TOKEN_ID,
     QWEN35_VL_VIDEO_TOKEN_ID,
@@ -19,18 +19,18 @@ from multimodal_v2.models.qwen35_vl.configuration import (
     get_qwen35_vl_language_config,
     get_qwen35_vl_vision_config,
 )
-from multimodal_v2.models.qwen35_vl.factory import (
+from examples.multimodal_v2.models.qwen35_vl.factory import (
     build_model,
     post_language_config,
     set_vision_flops_metadata,
 )
-from multimodal_v2.models.qwen35_vl.model import Qwen35VLModel
-from multimodal_v2.models.qwen35_vl.mrope import compute_mrope_position_ids
-from multimodal_v2.models.qwen35_vl.specs import (
+from examples.multimodal_v2.models.qwen35_vl.model import Qwen35VLModel
+from examples.multimodal_v2.models.qwen35_vl.mrope import compute_mrope_position_ids
+from examples.multimodal_v2.models.qwen35_vl.specs import (
     get_qwen35_vl_language_spec,
     get_qwen35_vl_vision_spec,
 )
-from multimodal_v2.models.qwen35_vl.vision_encoder import (
+from examples.multimodal_v2.models.qwen35_vl.vision_encoder import (
     Qwen35VLPatchEmbed,
     Qwen35VLPatchMerger,
     Qwen35VLVisionEncoder,

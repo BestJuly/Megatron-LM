@@ -29,15 +29,15 @@ import sys
 
 sys.path.insert(
     0,
-    os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")),
 )
 
 from megatron.core.enums import ModelType
 from megatron.training import get_args, pretrain
 from megatron.training.arguments import core_transformer_config_from_args
 
-from multimodal_v2.arguments import add_multimodal_args
-from multimodal_v2.forward_step import forward_step
+from examples.multimodal_v2.arguments import add_multimodal_args
+from examples.multimodal_v2.forward_step import forward_step
 
 
 def model_provider(
@@ -55,7 +55,7 @@ def model_provider(
     args = get_args()
     model_arch = getattr(args, "model_arch", "qwen35_vl")
 
-    from multimodal_v2.models import MODEL_REGISTRY
+    from examples.multimodal_v2.models import MODEL_REGISTRY
 
     if model_arch not in MODEL_REGISTRY:
         raise ValueError(
@@ -119,7 +119,7 @@ def datasets_provider(train_val_test_num_samples):
     model_arch = getattr(args, "model_arch", "qwen35_vl")
     provider = getattr(args, "dataset_provider", "mock")
 
-    from multimodal_v2.models import MODEL_REGISTRY
+    from examples.multimodal_v2.models import MODEL_REGISTRY
 
     if model_arch not in MODEL_REGISTRY:
         raise ValueError(

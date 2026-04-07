@@ -10,7 +10,7 @@ vision encoder, 3D MRoPE position IDs, and shifted labels.
 import torch
 from torch.utils.data import Dataset
 
-from multimodal_v2.models.qwen35_vl.mrope import compute_mrope_position_ids
+from examples.multimodal_v2.models.qwen35_vl.mrope import compute_mrope_position_ids
 
 
 class MockQwen35VLDataset(Dataset):

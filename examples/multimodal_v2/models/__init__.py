@@ -33,10 +33,10 @@ Registry entry fields
     ``(train_val_test_num_samples) -> (train_ds, val_ds, test_ds)``.
 """
 
-from multimodal_v2.models.qwen35_vl.configuration import (
+from examples.multimodal_v2.models.qwen35_vl.configuration import (
     get_qwen35_vl_vision_config,
 )
-from multimodal_v2.models.qwen35_vl.factory import (
+from examples.multimodal_v2.models.qwen35_vl.factory import (
     build_model as _build_qwen35_vl_model,
     post_language_config as _qwen35_vl_post_language_config,
     set_vision_flops_metadata as _qwen35_vl_vision_flops,
@@ -50,7 +50,7 @@ MODEL_REGISTRY = {
         "vision_flops_fn": _qwen35_vl_vision_flops,
         "dataset_providers": {
             "mock": (
-                "multimodal_v2.data.mock"
+                "examples.multimodal_v2.data.mock"
                 ".train_valid_test_datasets_provider"
             ),
         },

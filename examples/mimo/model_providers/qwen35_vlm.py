@@ -18,7 +18,7 @@ from megatron.core.models.mimo.submodules.vision import (
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
 
-from multimodal_v2.models.qwen35_vl import (
+from examples.multimodal_v2.models.qwen35_vl import (
     QWEN35_VL_IMAGE_TOKEN_ID,
     QWEN35_VL_VOCAB_SIZE,
     ROTARY_BASE,

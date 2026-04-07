@@ -6,7 +6,7 @@ Encapsulates all Qwen3.5-VL-specific logic needed by ``pretrain_multimodal.py``
 so that the training entry point remains model-agnostic.
 """
 
-from multimodal_v2.models.qwen35_vl.configuration import (
+from examples.multimodal_v2.models.qwen35_vl.configuration import (
     MROPE_SECTION,
     VISION_KWARGS,
 )
@@ -57,8 +57,8 @@ def build_model(args, language_config, vision_config, **kwargs):
         get_gpt_mtp_block_spec,
     )
 
-    from multimodal_v2.models.qwen35_vl.model import Qwen35VLModel
-    from multimodal_v2.models.qwen35_vl.specs import (
+    from examples.multimodal_v2.models.qwen35_vl.model import Qwen35VLModel
+    from examples.multimodal_v2.models.qwen35_vl.specs import (
         get_qwen35_vl_language_spec,
     )
 
