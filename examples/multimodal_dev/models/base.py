@@ -23,6 +23,35 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
+def _cp_split_tensor(tensor, seq_dim, cp_size, cp_rank):
+    """Zigzag-split *tensor* along *seq_dim* for context parallelism.
+
+    Splits the sequence into ``2 * cp_size`` equal chunks, then selects
+    chunks ``[cp_rank, 2*cp_size - cp_rank - 1]`` and concatenates them.
+    This mirrors ``megatron.core.utils.get_batch_on_this_cp_rank``.
+    """
+    S = tensor.shape[seq_dim]
+    assert S % (2 * cp_size) == 0, (
+        f"seq_len {S} not divisible by 2*cp_size={2 * cp_size}"
+    )
+    tensor = tensor.view(
+        *tensor.shape[:seq_dim],
+        2 * cp_size,
+        S // (2 * cp_size),
+        *tensor.shape[seq_dim + 1 :],
+    )
+    index = torch.zeros(2, dtype=torch.int64, device=tensor.device)
+    index[0] = cp_rank
+    index[1] = 2 * cp_size - cp_rank - 1
+    tensor = tensor.index_select(seq_dim, index)
+    tensor = tensor.view(
+        *tensor.shape[:seq_dim],
+        -1,
+        *tensor.shape[seq_dim + 2 :],
+    )
+    return tensor
+
+
 class MultimodalModel(MegatronModule):
     """Base class for multimodal vision-language models.
 
@@ -212,6 +241,44 @@ class MultimodalModel(MegatronModule):
                 )
             else:
                 decoder_input = text_embeddings
+
+        # --- Context Parallelism: split along sequence dimension ---
+        # position_ids is NOT split here — the MRoPE embedding layer
+        # handles CP slicing of rotary embeddings internally via
+        # ``get_pos_emb_on_this_cp_rank()``.
+        cp_size = parallel_state.get_context_parallel_world_size()
+        if cp_size > 1:
+            cp_rank = parallel_state.get_context_parallel_rank()
+            # decoder_input: [S, B, H] — split along dim 0
+            if decoder_input is not None:
+                decoder_input = _cp_split_tensor(
+                    decoder_input, seq_dim=0,
+                    cp_size=cp_size, cp_rank=cp_rank,
+                )
+            # input_ids: [B, S] — split for MTP which re-embeds from input_ids
+            if input_ids is not None:
+                input_ids = _cp_split_tensor(
+                    input_ids, seq_dim=1,
+                    cp_size=cp_size, cp_rank=cp_rank,
+                )
+            # labels: [B, S] — split along dim 1
+            if labels is not None:
+                labels = _cp_split_tensor(
+                    labels, seq_dim=1,
+                    cp_size=cp_size, cp_rank=cp_rank,
+                )
+            # loss_mask: [B, S] — split along dim 1
+            if loss_mask is not None:
+                loss_mask = _cp_split_tensor(
+                    loss_mask, seq_dim=1,
+                    cp_size=cp_size, cp_rank=cp_rank,
+                )
+            # attention_mask: [B, S] — split along dim 1
+            if attention_mask is not None:
+                attention_mask = _cp_split_tensor(
+                    attention_mask, seq_dim=1,
+                    cp_size=cp_size, cp_rank=cp_rank,
+                )
 
         output = self.language_model(
             input_ids=input_ids,

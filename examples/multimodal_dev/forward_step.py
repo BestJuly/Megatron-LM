@@ -9,9 +9,11 @@ import torch
 
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
+    get_context_parallel_world_size,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_src_rank,
+    get_tensor_model_parallel_world_size,
 )
 from megatron.core.utils import unwrap_model
 
@@ -332,6 +334,91 @@ def _pack_batch(batch: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # -------------------------------------------------------------------
+# CP padding
+# -------------------------------------------------------------------
+
+def _pad_batch_for_cp(batch):
+    """Pad batch tensors so sequence length is divisible by the CP alignment factor.
+
+    CP uses zigzag splitting that divides the sequence into ``2 * cp_size``
+    equal chunks.  When sequence parallelism (SP) is also active the
+    alignment factor becomes ``tp_size * cp_size * 2``.
+    """
+    cp_size = get_context_parallel_world_size()
+    if cp_size <= 1:
+        return batch
+
+    tp_size = get_tensor_model_parallel_world_size()
+    # Check if SP is active: SP requires TP > 1 and is enabled via config.
+    # We infer SP from the same condition used elsewhere in this codebase.
+    has_sp = tp_size > 1  # conservative: pad for SP whenever TP > 1
+    if has_sp:
+        divisible_by = tp_size * cp_size * 2
+    else:
+        divisible_by = cp_size * 2
+
+    # Determine current sequence length from input_ids [B, S].
+    input_ids = batch.get("input_ids")
+    if input_ids is None:
+        return batch
+    seq_len = input_ids.shape[1]
+
+    padding = int(
+        (seq_len + divisible_by - 1) // divisible_by * divisible_by
+    ) - seq_len
+    if padding == 0:
+        return batch
+
+    device = input_ids.device
+    B = input_ids.shape[0]
+
+    # --- input_ids [B, S] ---
+    batch["input_ids"] = torch.nn.functional.pad(
+        input_ids, (0, padding), value=0,
+    )
+
+    # --- labels [B, S] ---
+    if batch.get("labels") is not None:
+        batch["labels"] = torch.nn.functional.pad(
+            batch["labels"], (0, padding), value=-100,
+        )
+
+    # --- loss_mask [B, S] ---
+    if batch.get("loss_mask") is not None:
+        batch["loss_mask"] = torch.nn.functional.pad(
+            batch["loss_mask"], (0, padding), value=0,
+        )
+
+    # --- attention_mask [B, S] ---
+    if batch.get("attention_mask") is not None:
+        batch["attention_mask"] = torch.nn.functional.pad(
+            batch["attention_mask"], (0, padding), value=0,
+        )
+
+    # --- position_ids: [3, B, S] (MRoPE) or [B, S] ---
+    if batch.get("position_ids") is not None:
+        pos = batch["position_ids"]
+        if pos.dim() == 3:
+            # MRoPE [3, B, S] — pad along last dim with last_value + 1, +2, ...
+            last_vals = pos[:, :, -1:]  # [3, B, 1]
+            offsets = torch.arange(
+                1, padding + 1, device=device, dtype=pos.dtype,
+            ).view(1, 1, -1)  # [1, 1, padding]
+            pad_vals = last_vals + offsets  # [3, B, padding]
+            batch["position_ids"] = torch.cat([pos, pad_vals], dim=2)
+        else:
+            # Standard [B, S]
+            last_vals = pos[:, -1:]  # [B, 1]
+            offsets = torch.arange(
+                1, padding + 1, device=device, dtype=pos.dtype,
+            ).view(1, -1)
+            pad_vals = last_vals + offsets  # [B, padding]
+            batch["position_ids"] = torch.cat([pos, pad_vals], dim=1)
+
+    return batch
+
+
+# -------------------------------------------------------------------
 # get_batch
 # -------------------------------------------------------------------
 
@@ -382,6 +469,9 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
         g = batch["image_grid_thw"]
         if g.dim() == 3:
             batch["image_grid_thw"] = g.squeeze(1)
+
+    # Pad for CP alignment (no-op when CP <= 1).
+    batch = _pad_batch_for_cp(batch)
 
     return batch
 
@@ -465,6 +555,19 @@ def forward_step(data_iterator, model):
     if loss_mask is None:
         loss_mask = torch.ones_like(
             batch["input_ids"], dtype=torch.float,
+        )
+
+    # CP-split loss_mask to match the model output (which is CP-split
+    # inside base.py::forward()).
+    cp_size = get_context_parallel_world_size()
+    if cp_size > 1:
+        from megatron.core.parallel_state import get_context_parallel_rank
+        from examples.multimodal_dev.models.base import _cp_split_tensor
+
+        loss_mask = _cp_split_tensor(
+            loss_mask, seq_dim=1,
+            cp_size=cp_size,
+            cp_rank=get_context_parallel_rank(),
         )
 
     return output_tensor, partial(loss_func, loss_mask)
