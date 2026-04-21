@@ -271,11 +271,17 @@ class TestPadBatchForCp:
         assert padded["input_ids"].shape == original_shape
 
     def test_padding_with_tp_sp(self, monkeypatch):
-        """When TP>1 (SP inferred), alignment includes tp_size."""
+        """When SP is enabled, alignment includes tp_size."""
         import examples.multimodal_dev.forward_step as fs
+        import megatron.training as mt
 
         monkeypatch.setattr(fs, "get_context_parallel_world_size", lambda: 2)
         monkeypatch.setattr(fs, "get_tensor_model_parallel_world_size", lambda: 4)
+        monkeypatch.setattr(
+            mt,
+            "get_args",
+            lambda: type("Args", (), {"sequence_parallel": True})(),
+        )
 
         # divisible_by = tp_size * cp_size * 2 = 4 * 2 * 2 = 16
         batch = self._make_batch(B=1, S=10)

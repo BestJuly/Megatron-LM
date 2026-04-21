@@ -216,6 +216,14 @@ def main():
             )
         dist.destroy_process_group()
         sys.exit(0)
+    if world_size % target_cp != 0:
+        if rank == 0:
+            print(
+                f"SKIP: world_size={world_size} is not divisible by cp_size={target_cp}.",
+                flush=True,
+            )
+        dist.destroy_process_group()
+        sys.exit(0)
 
     vocab_size = 1024
 

@@ -349,9 +349,15 @@ def _pad_batch_for_cp(batch):
         return batch
 
     tp_size = get_tensor_model_parallel_world_size()
-    # Check if SP is active: SP requires TP > 1 and is enabled via config.
-    # We infer SP from the same condition used elsewhere in this codebase.
-    has_sp = tp_size > 1  # conservative: pad for SP whenever TP > 1
+    # SP is an explicit runtime option; TP>1 does not imply SP is enabled.
+    try:
+        from megatron.training import get_args
+
+        has_sp = bool(get_args().sequence_parallel)
+    except Exception:
+        # Keep this helper robust in lightweight unit tests where global args
+        # may not be initialized.
+        has_sp = False
     if has_sp:
         divisible_by = tp_size * cp_size * 2
     else:
