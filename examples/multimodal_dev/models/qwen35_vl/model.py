@@ -31,6 +31,7 @@ from examples.multimodal_dev.models.qwen35_vl.vision_encoder import (
     Qwen35VLVisionEncoder,
 )
 
+from megatron.core.packed_seq_params import PackedSeqParams
 
 class Qwen35VLModel(MultimodalModel):
     """Qwen3.5-VL multimodal model.
@@ -109,6 +110,7 @@ class Qwen35VLModel(MultimodalModel):
         self,
         input_ids: Tensor,
         image_grid_thw: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ) -> Tensor:
         """Compute 3D MRoPE position IDs for Qwen3.5-VL.
 
@@ -122,5 +124,6 @@ class Qwen35VLModel(MultimodalModel):
             vision_start_token_id=self.vision_start_token_id,
             input_ids=input_ids,
             image_grid_thw=image_grid_thw,
+            packed_seq_params=packed_seq_params,
         )
         return position_ids
