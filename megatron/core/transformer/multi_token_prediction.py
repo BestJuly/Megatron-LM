@@ -1070,22 +1070,42 @@ class MultiTokenPredictionLayer(MegatronModule):
         return hidden_states
 
     def _checkpointed_forward(self, forward_func, *args, **kwargs):
+        # tensor_parallel.checkpoint stores its forward args via autograd's
+        # ``save_for_backward``, which only accepts tensors and ``None``.
+        # Non-tensor kwargs such as ``packed_seq_params`` (PackedSeqParams)
+        # therefore need to be captured by closure rather than forwarded
+        # positionally. Mirrors transformer_block._checkpointed_forward.
+        closure_kwargs = {
+            k: v for k, v in kwargs.items()
+            if v is not None and not torch.is_tensor(v)
+        }
+        forward_kwargs = {k: v for k, v in kwargs.items() if k not in closure_kwargs}
+        forward_keys = list(forward_kwargs.keys())
+
+        def wrapped_forward(*tensor_or_none_args):
+            return forward_func(
+                *args,
+                **dict(zip(forward_keys, tensor_or_none_args)),
+                **closure_kwargs,
+            )
+
         def checkpoint_handler():
             """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
             if self.config.fp8:
                 from megatron.core.extensions.transformer_engine import te_checkpoint
 
                 return te_checkpoint(
-                    forward_func,
+                    wrapped_forward,
                     self.config.distribute_saved_activations,
                     tensor_parallel.random.get_cuda_rng_tracker,
                     parallel_state.get_tensor_model_parallel_group(),
-                    *args,
-                    **kwargs,
+                    *forward_kwargs.values(),
                 )
             else:
                 return tensor_parallel.checkpoint(
-                    forward_func, self.config.distribute_saved_activations, *args, *kwargs.values()
+                    wrapped_forward,
+                    self.config.distribute_saved_activations,
+                    *forward_kwargs.values(),
                 )
 
         if self.config.recompute_method == 'uniform':
