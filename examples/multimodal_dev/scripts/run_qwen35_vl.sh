@@ -277,6 +277,7 @@ fi
 
 # --- Logging & Checkpointing ---
 SAVE_INTERVAL=${SAVE_INTERVAL:-500}
+USE_WANDB=${USE_WANDB:-1}
 EVAL_AND_LOGGING_ARGS=(
     --log-interval 1
     --save-interval "$SAVE_INTERVAL"
@@ -284,11 +285,15 @@ EVAL_AND_LOGGING_ARGS=(
     --save "$CHECKPOINT_STORE_PATH"
     --eval-iters 10
     --tensorboard-dir "$TENSORBOARD_LOGS_PATH"
-    --wandb-project "$WANDB_PROJECT"
-    --wandb-exp-name "$EXP_NAME"
-    --wandb-save-dir "$CHECKPOINT_STORE_PATH"
     --log-throughput
 )
+if [ "$USE_WANDB" -eq 1 ]; then
+    EVAL_AND_LOGGING_ARGS+=(
+        --wandb-project "$WANDB_PROJECT"
+        --wandb-exp-name "$EXP_NAME"
+        --wandb-save-dir "$CHECKPOINT_STORE_PATH"
+    )
+fi
 
 # --- Tokenizer ---
 TOKENIZER_MODEL=${TOKENIZER_MODEL:-Qwen/Qwen3.5-397B-A17B}
@@ -298,11 +303,13 @@ TOKENIZER_ARGS=(
 )
 
 # --- Multimodal-specific ---
+DATASET_PROVIDER=${DATASET_PROVIDER:-cord_v2}
+HF_PROCESSOR_PATH=${HF_PROCESSOR_PATH:-Qwen/Qwen3.5-397B-A17B}
 MULTIMODAL_ARGS=(
     --model-arch qwen35_vl
     --model-variant "$MODEL_VARIANT"
-    --dataset-provider cord_v2
-    --hf-processor-path Qwen/Qwen3.5-397B-A17B
+    --dataset-provider "$DATASET_PROVIDER"
+    --hf-processor-path "$HF_PROCESSOR_PATH"
     --use-vanilla-collate-fn
     --image-token-id 248056
     --image-size 224
@@ -419,13 +426,15 @@ CKPT_FORMAT=${CKPT_FORMAT:-}
 CKPT_RESUME=${CKPT_RESUME:-0}
 CKPT_OVERRIDE_SCHEDULER=${CKPT_OVERRIDE_SCHEDULER:-0}
 CKPT_ARGS=()
+# CKPT_FORMAT applies to both save and load when set; the FSDP block
+# below pins ``fsdp_dtensor`` and would override anything specified here.
+if [ -n "$CKPT_FORMAT" ]; then
+    CKPT_ARGS+=( --ckpt-format "$CKPT_FORMAT" )
+fi
 if [ -n "$CKPT_LOAD" ]; then
     CKPT_ARGS+=( --load "$CKPT_LOAD" )
     if [ "$CKPT_RESUME" -eq 0 ]; then
         CKPT_ARGS+=( --finetune --no-load-optim --no-load-rng )
-    fi
-    if [ -n "$CKPT_FORMAT" ]; then
-        CKPT_ARGS+=( --ckpt-format "$CKPT_FORMAT" )
     fi
     if [ "$CKPT_OVERRIDE_SCHEDULER" -eq 1 ]; then
         CKPT_ARGS+=( --override-opt-param-scheduler )
@@ -434,6 +443,11 @@ fi
 
 # --- FSDP ---
 USE_FSDP=${USE_FSDP:-1}
+# FSDP and PP are mutually exclusive in Megatron's standard path.
+if [ "$PP" -gt 1 ] && [ "$USE_FSDP" -eq 1 ]; then
+    echo "[run_qwen35_vl] PP=${PP} > 1 -> forcing USE_FSDP=0"
+    USE_FSDP=0
+fi
 if [ "$USE_FSDP" -eq 1 ]; then
     FSDP_ARGS=(
         --use-megatron-fsdp

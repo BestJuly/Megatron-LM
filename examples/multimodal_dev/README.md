@@ -34,6 +34,15 @@ torchrun --nproc_per_node=8 multimodal_dev/pretrain_multimodal.py \
     ... # other Megatron args (--num-layers, --hidden-size, etc.)
 ```
 
+Pipeline parallelism (vision encoder is fused into the first PP stage; the
+language decoder spans all PP stages following standard Megatron PP layout
+flags). FSDP and PP are mutually exclusive in Megatron's standard path —
+the launcher script auto-disables FSDP when ``PP>1``:
+
+```bash
+PP=2 GPUS_PER_NODE=4 ./examples/multimodal_dev/scripts/run_qwen35_vl.sh
+```
+
 ## Architecture
 
 `pretrain_multimodal.py` is **model-agnostic**. All model-specific logic

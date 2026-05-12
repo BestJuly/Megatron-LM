@@ -17,6 +17,8 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_src_rank,
+    is_pipeline_first_stage,
+    is_pipeline_last_stage,
 )
 from megatron.training import get_args
 
@@ -370,7 +372,15 @@ def forward_step(data_iterator, model):
     if batch is None:
         return None, None
 
-    pixel_values = batch.get("pixel_values", None)
+    # ``pixel_values`` is the heavy vision tensor and is only consumed
+    # on the first PP stage; drop it elsewhere.  ``image_grid_thw`` is
+    # small and is needed on every PP stage by ``compute_position_ids``
+    # (MRoPE freqs are computed per-stage from position_ids).
+    is_first = is_pipeline_first_stage()
+    is_last = is_pipeline_last_stage()
+
+    pixel_values = batch.get("pixel_values", None) if is_first else None
+    image_grid_thw = batch.get("image_grid_thw", None)
     if (
         pixel_values is not None
         and pixel_values.is_floating_point()
@@ -386,7 +396,7 @@ def forward_step(data_iterator, model):
         labels=batch.get("labels", None),
         loss_mask=batch.get("loss_mask", None),
         pixel_values=pixel_values,
-        image_grid_thw=batch.get("image_grid_thw", None),
+        image_grid_thw=image_grid_thw,
         packed_seq_params=batch.get("packed_seq_params", None),
     )
 
@@ -396,12 +406,12 @@ def forward_step(data_iterator, model):
             batch["input_ids"], dtype=torch.float,
         )
 
-    # CP-split loss_mask to match the model output (which is CP-split
-    # inside MultimodalModel.forward / Qwen35VLModel.forward).
-    # THD: use the same TE-based per-sample partition index as the model.
-    # BSHD: use the matching zigzag split.
+    # The PP scheduler only invokes the loss closure on the last PP
+    # stage, so on non-last stages we leave loss_mask untouched.  On the
+    # last stage we mirror the model-side per-sample CP partition so the
+    # loss tensor and loss_mask align.
     cp_size = get_context_parallel_world_size()
-    if cp_size > 1:
+    if cp_size > 1 and is_last:
         from megatron.core.parallel_state import get_context_parallel_rank
 
         from examples.multimodal_dev.models.base import (
