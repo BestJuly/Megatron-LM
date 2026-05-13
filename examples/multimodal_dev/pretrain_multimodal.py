@@ -32,12 +32,12 @@ sys.path.insert(
     os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")),
 )
 
-from megatron.core.enums import ModelType
-from megatron.training import get_args, pretrain
-from megatron.training.arguments import core_transformer_config_from_args
-
 from examples.multimodal_dev.arguments import add_multimodal_args
 from examples.multimodal_dev.forward_step import forward_step
+from megatron.core.enums import ModelType
+from megatron.training import get_args, pretrain
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 
 
 def model_provider(
@@ -144,11 +144,15 @@ def datasets_provider(train_val_test_num_samples):
 if __name__ == "__main__":
     datasets_provider.is_distributed = True
 
+    args = parse_and_validate_args(
+        extra_args_provider=add_multimodal_args,
+        args_defaults={},
+    )
+    full_config = pretrain_cfg_container_from_args(args)
     pretrain(
+        full_config,
         datasets_provider,
         model_provider,
         ModelType.encoder_or_decoder,
         forward_step,
-        args_defaults={},
-        extra_args_provider=add_multimodal_args,
     )
