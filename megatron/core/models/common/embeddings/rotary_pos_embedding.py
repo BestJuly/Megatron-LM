@@ -341,6 +341,7 @@ class MultimodalRotaryEmbedding(nn.Module):
         position_ids: torch.Tensor,
         mrope_section: List[int],
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
+        return_raw_freqs: bool = False,
     ) -> Tensor:
         """Forward pass of multimodal RoPE embedding.
 
@@ -350,9 +351,12 @@ class MultimodalRotaryEmbedding(nn.Module):
                 height and width in rope calculation.
             cp_group (torch.distributed.ProcessGroup, optional): Context parallel group.
                 Defaults to None.
+            return_raw_freqs (bool, optional): If True, return the raw per-axis frequencies with
+                shape [3, batchsize, seqlens, dim / 2] for fused mRoPE application.
 
         Returns:
-            Tensor: Embeddings after applying RoPE.
+            Tensor: Embeddings after applying RoPE, or raw per-axis frequencies when
+            return_raw_freqs is True.
         """
         seq = position_ids.to(device=self.inv_freq.device, dtype=self.inv_freq.dtype)
 
@@ -366,6 +370,13 @@ class MultimodalRotaryEmbedding(nn.Module):
         # shape (3, bs, seq_length, dim)
         freqs = (inv_freq_expanded @ seq_expanded).transpose(2, 3)
 
+        if cp_group is None:
+            cp_group = self.cp_group
+        if return_raw_freqs:
+            if cp_group is not None and cp_group.size() > 1:
+                freqs = get_pos_emb_on_this_cp_rank(freqs, 2, cp_group)
+            return freqs.contiguous()
+
         # first part even vector components, second part odd vector components,
         #  2 * dim in dimension size
         if self.interleaved_mrope:
@@ -377,7 +388,7 @@ class MultimodalRotaryEmbedding(nn.Module):
             else:
                 bs = freqs.shape[0]
                 emb = torch.stack(
-                    (freqs.view(bs, -1, 1), freqs.view(bs, -1, 1)), dim=-1
+                    (freqs.reshape(bs, -1, 1), freqs.reshape(bs, -1, 1)), dim=-1
                 ).view(bs, freqs.shape[1], -1)
         else:
             # Original section-based layout (Qwen2-VL style).
@@ -386,8 +397,8 @@ class MultimodalRotaryEmbedding(nn.Module):
             else:
                 bs = freqs.shape[1]
                 emb = torch.stack(
-                    (freqs.view(3, bs, -1, 1), freqs.view(3, bs, -1, 1)), dim=-1
-                ).view(3, bs, freqs.shape[0], -1)
+                    (freqs.reshape(3, bs, -1, 1), freqs.reshape(3, bs, -1, 1)), dim=-1
+                ).view(3, bs, freqs.shape[2], -1)
             # generate freqs with mrope_section: cycle T/H/W per section chunk
             mrope_section_doubled = list(mrope_section) * 2
             emb = torch.cat(
@@ -397,8 +408,6 @@ class MultimodalRotaryEmbedding(nn.Module):
 
         # shape (seq_length, bs, 1, 2 * dim)
         emb = emb[..., None, :].transpose(0, 1).contiguous()
-        if cp_group is None:
-            cp_group = self.cp_group
         if cp_group is not None and cp_group.size() > 1:
             # slice rotary_pos_emb along sequence dimension and select the parition of the current
             # CP rank

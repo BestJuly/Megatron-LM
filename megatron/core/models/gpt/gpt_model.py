@@ -402,10 +402,16 @@ class GPTModel(LanguageModule):
                 )
         elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
             if self.training or not self.config.flash_decode:
+                use_fused_mrope = (
+                    self.training
+                    and self.config.apply_rope_fusion
+                    and (packed_seq_params is None or packed_seq_params.qkv_format != 'thd')
+                )
                 rotary_pos_emb = self.rotary_pos_emb(
                     position_ids,
                     self.mrope_section,
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
+                    return_raw_freqs=use_fused_mrope,
                 )
             else:
                 # Flash decoding uses precomputed cos and sin for RoPE

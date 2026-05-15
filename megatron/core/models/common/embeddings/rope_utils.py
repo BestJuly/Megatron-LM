@@ -30,6 +30,18 @@ except ImportError:
 
 
 try:
+    from megatron.core.fusions.fused_mrope import (
+        fused_apply_mrope,
+        is_fused_mrope_available,
+        mrope_freqs_to_rotary_emb,
+    )
+except ImportError:
+    fused_apply_mrope = None
+    is_fused_mrope_available = None
+    mrope_freqs_to_rotary_emb = None
+
+
+try:
     from flash_attn.layers.rotary import apply_rotary_emb as apply_rotary_emb_flash
 except ImportError:
     apply_rotary_emb_flash = None
@@ -41,8 +53,31 @@ __all__ = [
     'apply_rotary_pos_emb_with_cos_sin',
     'fused_apply_rotary_pos_emb',
     'fused_apply_rotary_pos_emb_thd',
+    'fused_apply_mrope',
     'get_pos_emb_on_this_cp_rank',
 ]
+
+
+def _is_raw_mrope_freqs(t: Tensor, freqs: Tensor, config: TransformerConfig) -> bool:
+    """Return whether freqs is the raw 3-axis mRoPE tensor for fused apply."""
+    return (
+        config.mrope_section is not None
+        and freqs.dim() == 4
+        and freqs.shape[0] == 3
+        and freqs.shape[1] == t.shape[1]
+        and freqs.shape[2] == t.shape[0]
+        and freqs.shape[-1] * 2 <= t.shape[-1]
+    )
+
+
+def _raw_mrope_freqs_to_emb(freqs: Tensor, config: TransformerConfig) -> Tensor:
+    assert mrope_freqs_to_rotary_emb is not None, "mRoPE frequency conversion is unavailable."
+    return mrope_freqs_to_rotary_emb(
+        freqs,
+        config.mrope_section,
+        interleaved_mrope=config.mrope_interleaved,
+        rotary_interleaved=config.rotary_interleaved,
+    )
 
 
 def get_pos_emb_on_this_cp_rank(
@@ -311,15 +346,59 @@ def apply_rotary_pos_emb(
     if cp_group is None:
         cp_group = parallel_state.get_context_parallel_group()
 
+    is_raw_mrope_freqs = _is_raw_mrope_freqs(t, freqs, config)
+
     if config.apply_rope_fusion:
         if cu_seqlens is None:
+            if is_raw_mrope_freqs:
+                use_fused_mrope = (
+                    fused_apply_mrope is not None
+                    and is_fused_mrope_available is not None
+                    and is_fused_mrope_available()
+                    and mscale == 1.0
+                    and not mla_rotary_interleaved
+                    and not inverse
+                    and not config.rotary_interleaved
+                )
+                if use_fused_mrope:
+                    return fused_apply_mrope(
+                        t,
+                        freqs,
+                        config.mrope_section,
+                        interleaved_mrope=config.mrope_interleaved,
+                        rotary_interleaved=config.rotary_interleaved,
+                    )
+
+                if mscale != 1.0:
+                    warnings.warn(
+                        f"mscale={mscale} is not supported by Triton fused mRoPE. "
+                        "Using unfused implementation."
+                    )
+                if mla_rotary_interleaved:
+                    warnings.warn(
+                        "Triton fused mRoPE does not support MLA-style interleaving in RoPE. "
+                        "Using unfused implementation."
+                    )
+                if inverse:
+                    warnings.warn(
+                        "inverse RoPE is not supported by Triton fused mRoPE. "
+                        "Using unfused implementation."
+                    )
+                if config.rotary_interleaved:
+                    warnings.warn(
+                        "Triton fused mRoPE currently supports rotary_interleaved=False. "
+                        "Using unfused implementation."
+                    )
+                freqs = _raw_mrope_freqs_to_emb(freqs, config)
+                is_raw_mrope_freqs = False
+
             # NOTE: TE backends do not support mRoPE in bshd format when bs > 1.
             use_unfused = False
             if config.mrope_section is not None and freqs.shape[1] > 1:
                 # TODO: Add a check in TransformerConfig and remove this unfused implementation.
                 warnings.warn(
-                    "apply_rope_fusion does not support mRoPE in bshd format when bs > 1. "
-                    "Please set apply_rope_fusion to false. This will become an error in v0.16."
+                    "Transformer Engine fused RoPE does not support mRoPE in bshd format when "
+                    "bs > 1 without raw mRoPE freqs. Using unfused implementation."
                 )
                 use_unfused = True
             if mscale != 1.0:
@@ -354,6 +433,9 @@ def apply_rotary_pos_emb(
                 interleaved=config.rotary_interleaved,
             )
     # use unfused implementation
+    if is_raw_mrope_freqs:
+        freqs = _raw_mrope_freqs_to_emb(freqs, config)
+
     if cu_seqlens is None:
         return _apply_rotary_pos_emb_bshd(
             t,
