@@ -16,6 +16,7 @@ from torch import Tensor
 from megatron.core import parallel_state
 
 logger = logging.getLogger(__name__)
+_ROPE_FUSION_FALLBACK_WARNINGS: set[str] = set()
 
 try:
     from megatron.core.extensions.transformer_engine import fused_apply_rotary_pos_emb
@@ -54,6 +55,8 @@ __all__ = [
     'fused_apply_rotary_pos_emb',
     'fused_apply_rotary_pos_emb_thd',
     'fused_apply_mrope',
+    'is_fused_mrope_available',
+    'mrope_freqs_to_rotary_emb',
     'get_pos_emb_on_this_cp_rank',
 ]
 
@@ -78,6 +81,13 @@ def _raw_mrope_freqs_to_emb(freqs: Tensor, config: TransformerConfig) -> Tensor:
         interleaved_mrope=config.mrope_interleaved,
         rotary_interleaved=config.rotary_interleaved,
     )
+
+
+def _warn_rope_fusion_fallback_once(key: str, message: str) -> None:
+    if key in _ROPE_FUSION_FALLBACK_WARNINGS:
+        return
+    _ROPE_FUSION_FALLBACK_WARNINGS.add(key)
+    warnings.warn(message, stacklevel=2)
 
 
 def get_pos_emb_on_this_cp_rank(
@@ -370,24 +380,28 @@ def apply_rotary_pos_emb(
                     )
 
                 if mscale != 1.0:
-                    warnings.warn(
+                    _warn_rope_fusion_fallback_once(
+                        "triton-mrope-mscale",
                         f"mscale={mscale} is not supported by Triton fused mRoPE. "
-                        "Using unfused implementation."
+                        "Using unfused implementation.",
                     )
                 if mla_rotary_interleaved:
-                    warnings.warn(
+                    _warn_rope_fusion_fallback_once(
+                        "triton-mrope-mla-rotary-interleaved",
                         "Triton fused mRoPE does not support MLA-style interleaving in RoPE. "
-                        "Using unfused implementation."
+                        "Using unfused implementation.",
                     )
                 if inverse:
-                    warnings.warn(
+                    _warn_rope_fusion_fallback_once(
+                        "triton-mrope-inverse",
                         "inverse RoPE is not supported by Triton fused mRoPE. "
-                        "Using unfused implementation."
+                        "Using unfused implementation.",
                     )
                 if config.rotary_interleaved:
-                    warnings.warn(
+                    _warn_rope_fusion_fallback_once(
+                        "triton-mrope-rotary-interleaved",
                         "Triton fused mRoPE currently supports rotary_interleaved=False. "
-                        "Using unfused implementation."
+                        "Using unfused implementation.",
                     )
                 freqs = _raw_mrope_freqs_to_emb(freqs, config)
                 is_raw_mrope_freqs = False
@@ -396,27 +410,31 @@ def apply_rotary_pos_emb(
             use_unfused = False
             if config.mrope_section is not None and freqs.shape[1] > 1:
                 # TODO: Add a check in TransformerConfig and remove this unfused implementation.
-                warnings.warn(
+                _warn_rope_fusion_fallback_once(
+                    "te-mrope-bshd-batch",
                     "Transformer Engine fused RoPE does not support mRoPE in bshd format when "
-                    "bs > 1 without raw mRoPE freqs. Using unfused implementation."
+                    "bs > 1 without raw mRoPE freqs. Using unfused implementation.",
                 )
                 use_unfused = True
             if mscale != 1.0:
-                warnings.warn(
+                _warn_rope_fusion_fallback_once(
+                    "te-rope-mscale",
                     f"mscale={mscale} is not supported by TE's fused RoPE. "
-                    "Using unfused implementation."
+                    "Using unfused implementation.",
                 )
                 use_unfused = True
             if mla_rotary_interleaved:
-                warnings.warn(
-                    "apply_rope_fusion does not support MLA-style interleaving in RoPE."
-                    "Using unfused implementation."
+                _warn_rope_fusion_fallback_once(
+                    "te-rope-mla-rotary-interleaved",
+                    "apply_rope_fusion does not support MLA-style interleaving in RoPE. "
+                    "Using unfused implementation.",
                 )
                 use_unfused = True
             if inverse:
-                warnings.warn(
+                _warn_rope_fusion_fallback_once(
+                    "te-rope-inverse",
                     "inverse RoPE is not supported by TE's fused RoPE. "
-                    "Using unfused implementation."
+                    "Using unfused implementation.",
                 )
                 use_unfused = True
             if not use_unfused:

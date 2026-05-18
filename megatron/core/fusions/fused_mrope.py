@@ -181,8 +181,7 @@ def _fused_mrope_kernel(
 
     freqs_offset = axis * f_s_axis + batch_idx * f_s_batch + seq_idx * f_s_seq + k * f_s_dim
     freqs = tl.load(FREQS + freqs_offset, mask=mask, other=0.0)
-    # Match PyTorch pointwise dtype semantics: trig uses fp32 angles, then
-    # rotation intermediates are cast to the tensor element dtype.
+    # Match PyTorch pointwise dtype semantics: cast cos/sin before the multiply.
     cos_v = tl.cos(freqs).to(OUT.dtype.element_ty)
     sin_v = tl.sin(freqs).to(OUT.dtype.element_ty)
     if INVERSE:
@@ -296,6 +295,7 @@ class _FusedMRoPE(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, t, freqs, mrope_section, interleaved_mrope, rotary_interleaved):
+        assert not freqs.requires_grad, "fused mRoPE expects non-gradient raw frequency tensors"
         ctx.mrope_section = tuple(int(section) for section in mrope_section)
         ctx.interleaved_mrope = bool(interleaved_mrope)
         ctx.rotary_interleaved = bool(rotary_interleaved)

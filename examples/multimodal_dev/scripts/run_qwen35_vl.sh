@@ -19,7 +19,9 @@
 #   NO_ROPE_FUSION: set to 1 to pass --no-rope-fusion for baseline profiling
 #   SAVE_CHECKPOINTS: set to 0 to skip checkpoint saves in short profiling runs
 #   LAUNCHER: torchrun (default) or python
+#   TORCHRUN_PYTHON: Python executable for LAUNCHER=torchrun (default: python)
 #   PROFILE: set to 1 to enable Nsight Systems profiling (default: 0)
+#   NVTX_RANGES: set to 1 to emit Megatron custom NVTX ranges when PROFILE=1 (default: 1)
 #   PROFILE_STEP_START/PROFILE_STEP_END: profiled iteration window (default: 4-5)
 
 # example script: 
@@ -42,10 +44,12 @@ else
     NUM_NODES=${NNODES:-1}
 fi
 PROFILE=${PROFILE:-0}
+NVTX_RANGES=${NVTX_RANGES:-1}
 PROFILE_STEP_START=${PROFILE_STEP_START:-4}
 PROFILE_STEP_END=${PROFILE_STEP_END:-5}
 PROFILE_RANKS=${PROFILE_RANKS:-0}
 LAUNCHER=${LAUNCHER:-torchrun}
+TORCHRUN_PYTHON=${TORCHRUN_PYTHON:-python}
 NO_ROPE_FUSION=${NO_ROPE_FUSION:-0}
 
 MODEL_VARIANT=${MODEL_VARIANT:-proxy}
@@ -276,6 +280,9 @@ if [ "$PROFILE" = "1" ]; then
         --profile-step-end "$PROFILE_STEP_END"
         --profile-ranks "$PROFILE_RANKS"
     )
+    if [ "$NVTX_RANGES" -eq 1 ]; then
+        PROFILE_ARGS+=( --nvtx-ranges )
+    fi
 
     NSYS_OUTPUT_DIR="${CHECKPOINT_STORE_PATH}/nsys"
     mkdir -p "$NSYS_OUTPUT_DIR"
@@ -494,6 +501,9 @@ echo "  MBS=$MBS  GBS=$GBS"
 echo "  MTP layers:    $MTP_NUM_LAYERS"
 echo "  Linear attn freq: $LINEAR_ATTENTION_FREQ"
 echo "  Launcher:      $LAUNCHER"
+if [ "$LAUNCHER" = "torchrun" ]; then
+    echo "  Torchrun py:   $TORCHRUN_PYTHON"
+fi
 echo "  FSDP:          $USE_FSDP"
 echo "  PROFILE:       $PROFILE"
 echo "  RoPE fusion:   $([ "$NO_ROPE_FUSION" -eq 1 ] && echo off || echo on)"
@@ -508,13 +518,18 @@ fi
 if [ "$PROFILE" = "1" ]; then
     echo "  Profile steps: ${PROFILE_STEP_START}-${PROFILE_STEP_END}"
     echo "  Profile ranks: $PROFILE_RANKS"
+    echo "  NVTX ranges:   $([ "$NVTX_RANGES" -eq 1 ] && echo on || echo off)"
 fi
 echo "================================================================"
 
 if [ "$LAUNCHER" = "python" ]; then
     LAUNCH_CMD=( python $MEGATRON_LM_PATH/examples/multimodal_dev/pretrain_multimodal.py )
 elif [ "$LAUNCHER" = "torchrun" ]; then
-    LAUNCH_CMD=( torchrun "${DISTRIBUTED_ARGS[@]}" $MEGATRON_LM_PATH/examples/multimodal_dev/pretrain_multimodal.py )
+    LAUNCH_CMD=(
+        "$TORCHRUN_PYTHON" -m torch.distributed.run
+        "${DISTRIBUTED_ARGS[@]}"
+        $MEGATRON_LM_PATH/examples/multimodal_dev/pretrain_multimodal.py
+    )
 else
     echo "Unsupported LAUNCHER=$LAUNCHER (expected torchrun or python)" >&2
     exit 1

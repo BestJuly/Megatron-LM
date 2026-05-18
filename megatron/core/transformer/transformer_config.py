@@ -2113,6 +2113,8 @@ class TransformerConfig(ModelParallelConfig):
                 )
             else:
                 fused_mrope_available = False
+                # Triton fused mRoPE supports split-half RoPE only. Keep rotary_interleaved
+                # configs on the TE validation path so the TE >= 2.3 check still applies.
                 if self.mrope_section is not None and not self.rotary_interleaved:
                     try:
                         from megatron.core.fusions.fused_mrope import is_fused_mrope_available
