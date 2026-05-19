@@ -94,6 +94,8 @@ def model_provider(
         args=args,
         language_config=language_config,
         vision_config=vision_config,
+        pre_process=pre_process,
+        post_process=post_process,
         **kwargs,
     )
 

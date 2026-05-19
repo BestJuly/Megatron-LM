@@ -434,6 +434,11 @@ fi
 
 # --- FSDP ---
 USE_FSDP=${USE_FSDP:-1}
+# FSDP and PP are mutually exclusive in Megatron's standard path.
+if [ "$PP" -gt 1 ] && [ "$USE_FSDP" -eq 1 ]; then
+    echo "[run_qwen35_vl] PP=${PP} > 1 -> forcing USE_FSDP=0"
+    USE_FSDP=0
+fi
 if [ "$USE_FSDP" -eq 1 ]; then
     FSDP_ARGS=(
         --use-megatron-fsdp
