@@ -402,11 +402,19 @@ class GPTModel(LanguageModule):
                 )
         elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
             if self.training or not self.config.flash_decode:
-                use_fused_mrope = (
+                use_fused_mrope = False
+                if (
                     self.training
                     and self.config.apply_rope_fusion
+                    and not self.config.rotary_interleaved
                     and (packed_seq_params is None or packed_seq_params.qkv_format != 'thd')
-                )
+                ):
+                    try:
+                        from megatron.core.fusions.fused_mrope import is_fused_mrope_available
+
+                        use_fused_mrope = is_fused_mrope_available()
+                    except ImportError:
+                        use_fused_mrope = False
                 rotary_pos_emb = self.rotary_pos_emb(
                     position_ids,
                     self.mrope_section,

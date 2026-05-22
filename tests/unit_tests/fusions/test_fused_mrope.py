@@ -8,6 +8,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.fusions.fused_mrope import (
     fused_apply_mrope,
+    get_fused_mrope_unavailable_reason,
     is_fused_mrope_available,
     mrope_freqs_to_rotary_emb,
 )
@@ -43,12 +44,13 @@ def _make_inputs(
     head_dim=20,
     rotary_dim=16,
     mrope_section=None,
+    interleaved_mrope=False,
 ):
     seq = 32
     batch = 2
     heads = 3
     if mrope_section is None:
-        mrope_section = [2, 3, 3]
+        mrope_section = [3, 3, 2] if interleaved_mrope else [2, 3, 3]
 
     generator = torch.Generator(device="cuda").manual_seed(1234)
     t = torch.randn(
@@ -81,7 +83,9 @@ def _make_position_ids(seq, batch):
 @pytest.mark.parametrize("interleaved_mrope", [False, True])
 @pytest.mark.parametrize("head_dim", [16, 20])
 def test_fused_mrope_matches_unfused_forward_backward(interleaved_mrope, head_dim):
-    t_ref, freqs, mrope_section = _make_inputs(requires_grad=True, head_dim=head_dim)
+    t_ref, freqs, mrope_section = _make_inputs(
+        requires_grad=True, head_dim=head_dim, interleaved_mrope=interleaved_mrope
+    )
     t_fused = t_ref.detach().clone().requires_grad_(True)
 
     emb = mrope_freqs_to_rotary_emb(
@@ -136,11 +140,60 @@ def test_apply_rotary_pos_emb_raw_mrope_fallbacks_match_unfused(
     torch.testing.assert_close(ref.float(), out_again.float(), **_dtype_tols(t.dtype))
 
 
+def test_interleaved_mrope_rejects_inconsistent_sections():
+    freqs = torch.randn(3, 2, 8, 8, dtype=torch.float32)
+
+    with pytest.raises(AssertionError, match="interleaved mRoPE"):
+        mrope_freqs_to_rotary_emb(freqs, [2, 3, 3], interleaved_mrope=True)
+
+
+def test_raw_mrope_cpu_falls_back_to_unfused():
+    t = torch.randn(8, 1, 3, 20, dtype=torch.float32)
+    freqs = torch.randn(3, 1, 8, 8, dtype=torch.float32)
+    mrope_section = [2, 3, 3]
+    config = TransformerConfig(
+        num_attention_heads=t.shape[2],
+        num_layers=1,
+        apply_rope_fusion=True,
+        mrope_section=mrope_section,
+    )
+
+    _ROPE_FUSION_FALLBACK_WARNINGS.clear()
+    assert "CUDA tensors" in get_fused_mrope_unavailable_reason(t, freqs)
+    with pytest.warns(UserWarning, match="CUDA tensors.*Using unfused implementation"):
+        out = apply_rotary_pos_emb(t, freqs, config, cp_group=FakeCPGroup())
+
+    emb = mrope_freqs_to_rotary_emb(freqs, mrope_section, rotary_interleaved=False)
+    ref = _apply_rotary_pos_emb_bshd(t, emb, rotary_interleaved=False)
+    torch.testing.assert_close(ref, out)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not is_fused_mrope_available(), reason="Triton fused mRoPE not available")
+def test_raw_mrope_unsupported_dtype_falls_back_to_unfused():
+    t, freqs, mrope_section = _make_inputs(dtype=torch.float64)
+    config = TransformerConfig(
+        num_attention_heads=t.shape[2],
+        num_layers=1,
+        apply_rope_fusion=True,
+        mrope_section=mrope_section,
+    )
+
+    _ROPE_FUSION_FALLBACK_WARNINGS.clear()
+    assert "dtype" in get_fused_mrope_unavailable_reason(t, freqs)
+    with pytest.warns(UserWarning, match="dtype.*Using unfused implementation"):
+        out = apply_rotary_pos_emb(t, freqs, config, cp_group=FakeCPGroup())
+
+    emb = mrope_freqs_to_rotary_emb(freqs, mrope_section, rotary_interleaved=False)
+    ref = _apply_rotary_pos_emb_bshd(t, emb, rotary_interleaved=False)
+    torch.testing.assert_close(ref, out)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.skipif(not is_fused_mrope_available(), reason="Triton fused mRoPE not available")
 @pytest.mark.parametrize("interleaved_mrope", [False, True])
 def test_apply_rotary_pos_emb_dispatches_raw_mrope(interleaved_mrope):
-    t, freqs, mrope_section = _make_inputs()
+    t, freqs, mrope_section = _make_inputs(interleaved_mrope=interleaved_mrope)
     config = TransformerConfig(
         num_attention_heads=t.shape[2],
         num_layers=1,
@@ -171,7 +224,7 @@ def test_raw_mrope_fusion_matches_unfused_with_context_parallel(interleaved_mrop
         heads = 3
         head_dim = 20
         rotary_dim = 16
-        mrope_section = [2, 3, 3]
+        mrope_section = [3, 3, 2] if interleaved_mrope else [2, 3, 3]
         position_ids = _make_position_ids(seq, batch)
 
         rope = MultimodalRotaryEmbedding(

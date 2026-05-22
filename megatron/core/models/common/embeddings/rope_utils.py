@@ -32,12 +32,16 @@ except ImportError:
 
 try:
     from megatron.core.fusions.fused_mrope import (
+        can_launch_fused_mrope,
         fused_apply_mrope,
+        get_fused_mrope_unavailable_reason,
         is_fused_mrope_available,
         mrope_freqs_to_rotary_emb,
     )
 except ImportError:
+    can_launch_fused_mrope = None
     fused_apply_mrope = None
+    get_fused_mrope_unavailable_reason = None
     is_fused_mrope_available = None
     mrope_freqs_to_rotary_emb = None
 
@@ -54,7 +58,9 @@ __all__ = [
     'apply_rotary_pos_emb_with_cos_sin',
     'fused_apply_rotary_pos_emb',
     'fused_apply_rotary_pos_emb_thd',
+    'can_launch_fused_mrope',
     'fused_apply_mrope',
+    'get_fused_mrope_unavailable_reason',
     'is_fused_mrope_available',
     'mrope_freqs_to_rotary_emb',
     'get_pos_emb_on_this_cp_rank',
@@ -360,15 +366,25 @@ def apply_rotary_pos_emb(
 
     if config.apply_rope_fusion:
         if cu_seqlens is None:
+            force_unfused_mrope = False
             if is_raw_mrope_freqs:
+                unavailable_reason = None
+                if (
+                    get_fused_mrope_unavailable_reason is not None
+                    and not mla_rotary_interleaved
+                    and not inverse
+                    and mscale == 1.0
+                ):
+                    unavailable_reason = get_fused_mrope_unavailable_reason(
+                        t, freqs, config.rotary_interleaved
+                    )
                 use_fused_mrope = (
                     fused_apply_mrope is not None
-                    and is_fused_mrope_available is not None
-                    and is_fused_mrope_available()
+                    and can_launch_fused_mrope is not None
+                    and can_launch_fused_mrope(t, freqs, config.rotary_interleaved)
                     and mscale == 1.0
                     and not mla_rotary_interleaved
                     and not inverse
-                    and not config.rotary_interleaved
                 )
                 if use_fused_mrope:
                     return fused_apply_mrope(
@@ -379,6 +395,13 @@ def apply_rotary_pos_emb(
                         rotary_interleaved=config.rotary_interleaved,
                     )
 
+                if unavailable_reason is not None:
+                    _warn_rope_fusion_fallback_once(
+                        f"triton-mrope-unavailable-{unavailable_reason}",
+                        f"Triton fused mRoPE is unavailable: {unavailable_reason}. "
+                        "Using unfused implementation.",
+                    )
+                    force_unfused_mrope = True
                 if mscale != 1.0:
                     _warn_rope_fusion_fallback_once(
                         "triton-mrope-mscale",
@@ -405,6 +428,16 @@ def apply_rotary_pos_emb(
                     )
                 freqs = _raw_mrope_freqs_to_emb(freqs, config)
                 is_raw_mrope_freqs = False
+                if force_unfused_mrope:
+                    return _apply_rotary_pos_emb_bshd(
+                        t,
+                        freqs,
+                        rotary_interleaved=config.rotary_interleaved,
+                        mla_rotary_interleaved=mla_rotary_interleaved,
+                        mscale=mscale,
+                        inverse=inverse,
+                        mla_output_remove_interleaving=mla_output_remove_interleaving,
+                    )
 
             # NOTE: TE backends do not support mRoPE in bshd format when bs > 1.
             use_unfused = False

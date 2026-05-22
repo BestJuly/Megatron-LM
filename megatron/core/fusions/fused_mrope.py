@@ -38,8 +38,39 @@ def _smallest_power_of_2_at_least(x: int) -> int:
     return block
 
 
+def _expected_interleaved_mrope_section(half_rotary_dim: int) -> tuple[int, int, int]:
+    return ((half_rotary_dim + 2) // 3, (half_rotary_dim + 1) // 3, half_rotary_dim // 3)
+
+
+def _validate_mrope_section(
+    mrope_section: List[int],
+    half_rotary_dim: int,
+    interleaved_mrope: bool,
+) -> tuple[int, int, int]:
+    assert len(mrope_section) == 3, f"mrope_section must have length 3, got {mrope_section}"
+
+    sec_t, sec_h, sec_w = (int(section) for section in mrope_section)
+    assert (
+        min(sec_t, sec_h, sec_w) >= 0
+    ), f"mrope_section values must be non-negative, got {mrope_section}"
+    assert half_rotary_dim > 0, "raw mRoPE rotary dim must be greater than 0"
+    assert (
+        sec_t + sec_h + sec_w == half_rotary_dim
+    ), f"mrope_section {mrope_section} must sum to rotary_dim / 2 = {half_rotary_dim}"
+    if interleaved_mrope:
+        expected = _expected_interleaved_mrope_section(half_rotary_dim)
+        assert (sec_t, sec_h, sec_w) == expected, (
+            f"interleaved mRoPE with rotary_dim / 2 = {half_rotary_dim} requires "
+            f"mrope_section {list(expected)}, got {mrope_section}"
+        )
+    return sec_t, sec_h, sec_w
+
+
 def _validate_mrope_inputs(
-    t: torch.Tensor, freqs: torch.Tensor, mrope_section: List[int]
+    t: torch.Tensor,
+    freqs: torch.Tensor,
+    mrope_section: List[int],
+    interleaved_mrope: bool,
 ) -> tuple[int, int, int, int, int, int, int, int]:
     assert t.dim() == 4, f"t must have shape [seq, batch, heads, head_dim], got {t.shape}"
     assert freqs.dim() == 4, (
@@ -52,18 +83,64 @@ def _validate_mrope_inputs(
     assert (
         freq_batch == batch and freq_seq == seq
     ), f"freqs shape {tuple(freqs.shape)} is incompatible with t shape {tuple(t.shape)}"
-    assert len(mrope_section) == 3, f"mrope_section must have length 3, got {mrope_section}"
 
-    sec_t, sec_h, sec_w = (int(section) for section in mrope_section)
-    assert (
-        sec_t + sec_h + sec_w == half_rotary_dim
-    ), f"mrope_section {mrope_section} must sum to rotary_dim / 2 = {half_rotary_dim}"
+    sec_t, sec_h, sec_w = _validate_mrope_section(
+        mrope_section, half_rotary_dim, interleaved_mrope
+    )
 
     rotary_dim = half_rotary_dim * 2
     assert (
         rotary_dim <= head_dim
     ), f"raw mRoPE rotary dim {rotary_dim} exceeds input head dim {head_dim}"
     return seq, batch, heads, head_dim, half_rotary_dim, sec_t, sec_h, sec_w
+
+
+def get_fused_mrope_unavailable_reason(
+    t: Optional[torch.Tensor] = None,
+    freqs: Optional[torch.Tensor] = None,
+    rotary_interleaved: bool = False,
+) -> Optional[str]:
+    """Return why fused mRoPE cannot run, or None when it is launchable."""
+    if not HAVE_TRITON:
+        return "Triton is not available"
+    if rotary_interleaved:
+        return "rotary_interleaved=True is not supported"
+    if t is None or freqs is None:
+        return None
+    if not t.is_cuda or not freqs.is_cuda:
+        return "Triton fused mRoPE requires CUDA tensors"
+    if t.device != freqs.device:
+        return (
+            "Triton fused mRoPE requires t and freqs on the same device, "
+            f"got {t.device} and {freqs.device}"
+        )
+    if freqs.dtype != torch.float32:
+        return f"raw mRoPE freqs must be float32, got {freqs.dtype}"
+    if t.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        return f"input dtype {t.dtype} is not supported"
+    if t.stride(-1) != 1:
+        return f"input head dimension must be contiguous, got stride {t.stride()}"
+    try:
+        capability = torch.cuda.get_device_capability(t.device)
+    except RuntimeError as exc:
+        return f"could not query CUDA device capability: {exc}"
+    if capability < (7, 0):
+        return f"requires CUDA compute capability >= 7.0, got {capability[0]}.{capability[1]}"
+    if t.dtype == torch.bfloat16 and capability < (8, 0):
+        return (
+            "requires CUDA compute capability >= 8.0 for bfloat16 inputs, "
+            f"got {capability[0]}.{capability[1]}"
+        )
+    return None
+
+
+def can_launch_fused_mrope(
+    t: Optional[torch.Tensor] = None,
+    freqs: Optional[torch.Tensor] = None,
+    rotary_interleaved: bool = False,
+) -> bool:
+    """Return whether the Triton fused mRoPE kernel can be launched."""
+    return get_fused_mrope_unavailable_reason(t, freqs, rotary_interleaved) is None
 
 
 def mrope_freqs_to_rotary_emb(
@@ -92,11 +169,10 @@ def mrope_freqs_to_rotary_emb(
     assert freqs.size(0) == 3, f"raw mRoPE freqs first dimension must be 3, got {freqs.size(0)}"
     assert len(mrope_section) == 3, f"mrope_section must have length 3, got {mrope_section}"
 
-    sec_t, sec_h, sec_w = (int(section) for section in mrope_section)
     half_rotary_dim = freqs.size(-1)
-    assert (
-        sec_t + sec_h + sec_w == half_rotary_dim
-    ), f"mrope_section {mrope_section} must sum to rotary_dim / 2 = {half_rotary_dim}"
+    sec_t, sec_h, sec_w = _validate_mrope_section(
+        mrope_section, half_rotary_dim, interleaved_mrope
+    )
 
     if interleaved_mrope:
         freqs_out = freqs[0].clone()
@@ -232,14 +308,12 @@ def _launch_fused_mrope(
     inverse: bool,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    assert HAVE_TRITON, "fused mRoPE requires Triton"
-    assert freqs.dtype == torch.float32, f"raw mRoPE freqs must be float32, got {freqs.dtype}"
-    assert not rotary_interleaved, "fused mRoPE currently supports rotary_interleaved=False"
+    unavailable_reason = get_fused_mrope_unavailable_reason(t, freqs, rotary_interleaved)
+    assert unavailable_reason is None, unavailable_reason
 
     seq, batch, heads, head_dim, half_rotary_dim, sec_t, sec_h, sec_w = _validate_mrope_inputs(
-        t, freqs, mrope_section
+        t, freqs, mrope_section, interleaved_mrope
     )
-    assert t.stride(-1) == 1, f"fused mRoPE requires contiguous head dimension, got {t.stride()}"
 
     if out is None:
         out = torch.empty_like(t)
@@ -349,4 +423,4 @@ def fused_apply_mrope(
 
 def is_fused_mrope_available() -> bool:
     """Return whether the Triton mRoPE fusion can be launched."""
-    return bool(HAVE_TRITON)
+    return can_launch_fused_mrope()
