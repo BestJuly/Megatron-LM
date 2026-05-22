@@ -142,6 +142,7 @@ class MultimodalModel(MegatronModule):
         self.image_token_id = image_token_id
         self.pre_process = pre_process
         self.post_process = post_process
+        self.vp_stage = vp_stage
         # Surfaced for ``finalize_model_grads._allreduce_word_embedding_grads``
         # which inspects the outer module (not the wrapped GPTModel) when
         # PP > 1 and either tied embeddings or MTP layers are in use.
