@@ -9,6 +9,7 @@ Install `mcore_gdn_opt` and FLA in editable mode before running it.
 import argparse
 import os
 import statistics
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import torch
@@ -28,6 +29,7 @@ FLAGS = (
     "FLA_CUTE_FWD_H",
     "CHUNK_DELTA_FWD_USE_BWD_PORT",
     "FLA_CUTE_WY_BWD",
+    "FLA_CUTE_BWD_DV_DHU",
     "FLA_CUTE_BWD_DHU",
     "FLA_CUTE_BWD_DQKWG",
     "FLA_CUTE_BWD_DHU_DQKWG",
@@ -39,6 +41,7 @@ FLAGS = (
 SCENARIOS = {
     "baseline": ("Triton baseline", {}),
     "wy": ("CUDA wy_bwd", {"FLA_CUTE_WY_BWD": "1"}),
+    "dv_dhu": ("CUDA dv_local+delta_h fused", {"FLA_CUTE_BWD_DV_DHU": "1"}),
     "dhu": ("CUDA delta_h", {"FLA_CUTE_BWD_DHU": "1"}),
     "dqkwg": ("CUDA dqkwg", {"FLA_CUTE_BWD_DQKWG": "1"}),
     "fused": (
@@ -49,6 +52,10 @@ SCENARIOS = {
         "CUDA all three separate",
         {"FLA_CUTE_WY_BWD": "1", "FLA_CUTE_BWD_DHU": "1", "FLA_CUTE_BWD_DQKWG": "1"},
     ),
+    "dv_dhu_dqkwg": (
+        "CUDA dv_local+delta_h fused + dqkwg",
+        {"FLA_CUTE_BWD_DV_DHU": "1", "FLA_CUTE_BWD_DQKWG": "1"},
+    ),
     "all_four": (
         "CUDA all four",
         {
@@ -56,6 +63,16 @@ SCENARIOS = {
             "CHUNK_DELTA_FWD_USE_BWD_PORT": "1",
             "FLA_CUTE_WY_BWD": "1",
             "FLA_CUTE_BWD_DHU": "1",
+            "FLA_CUTE_BWD_DQKWG": "1",
+        },
+    ),
+    "all_four_dv_dhu": (
+        "CUDA fwd_h+wy+dv_dhu+dqkwg",
+        {
+            "FLA_CUTE_FWD_H": "1",
+            "CHUNK_DELTA_FWD_USE_BWD_PORT": "1",
+            "FLA_CUTE_WY_BWD": "1",
+            "FLA_CUTE_BWD_DV_DHU": "1",
             "FLA_CUTE_BWD_DQKWG": "1",
         },
     ),
@@ -86,6 +103,17 @@ def set_env(overrides):
     for flag in FLAGS:
         os.environ.pop(flag, None)
     os.environ.update(overrides)
+
+
+def nvtx_range(label, enabled=True):
+    if enabled and torch.cuda.is_available():
+        return torch.cuda.nvtx.range(label)
+    return nullcontext()
+
+
+def scenario_label(index, name):
+    safe_name = name.replace(" ", "_").replace("+", "plus").replace("/", "_")
+    return f"gdn_only/{index:02d}_{safe_name}"
 
 
 def make_model(dtype):
@@ -144,12 +172,13 @@ def compute_loss(output, loss):
     raise ValueError(f"unknown loss: {loss}")
 
 
-def run_once(model, x, env, loss):
+def run_once(model, x, env, loss, nvtx_label=None, use_nvtx=True):
     set_env(env)
     zero_grads(model)
     inp = x.detach().clone().requires_grad_(True)
-    out, _ = model(inp, attention_mask=None)
-    compute_loss(out, loss).backward()
+    with nvtx_range(nvtx_label, enabled=use_nvtx and nvtx_label is not None):
+        out, _ = model(inp, attention_mask=None)
+        compute_loss(out, loss).backward()
     torch.cuda.synchronize()
     grads = {
         name: param.grad.detach().float().clone().cpu()
@@ -169,12 +198,15 @@ def allclose(actual, expected, atol, rtol):
     )
 
 
-def check_accuracy(model, x, scenario_items, loss, atol, rtol):
+def check_accuracy(model, x, scenario_items, loss, atol, rtol, use_nvtx=True):
     base_name, base_env = SCENARIOS["baseline"]
-    base_out, base_grad, base_params = run_once(model, x, base_env, loss)
+    base_out, base_grad, base_params = run_once(
+        model, x, base_env, loss, "gdn_only/00_accuracy_reference/Triton_baseline", use_nvtx
+    )
     rows = []
-    for _, (name, env) in scenario_items:
-        out, grad, params = run_once(model, x, env, loss)
+    for scenario_idx, (_, (name, env)) in enumerate(scenario_items, start=1):
+        label = f"{scenario_label(scenario_idx, name)}/accuracy"
+        out, grad, params = run_once(model, x, env, loss, label, use_nvtx)
         output_ok = allclose(out, base_out, atol, rtol)
         grad_ok = allclose(grad, base_grad, atol, rtol)
         worst_param = ""
@@ -200,29 +232,32 @@ def check_accuracy(model, x, scenario_items, loss, atol, rtol):
     return rows
 
 
-def fwd_bwd(model, x, env, loss):
+def fwd_bwd(model, x, env, loss, nvtx_label=None, use_nvtx=True):
     set_env(env)
     zero_grads(model)
     inp = x.detach().requires_grad_(True)
-    out, _ = model(inp, attention_mask=None)
-    compute_loss(out, loss).backward()
+    with nvtx_range(nvtx_label, enabled=use_nvtx and nvtx_label is not None):
+        out, _ = model(inp, attention_mask=None)
+        compute_loss(out, loss).backward()
 
 
-def benchmark(model, x, scenario_items, loss, warmup, repeats, rounds):
+def benchmark(model, x, scenario_items, loss, warmup, repeats, rounds, use_nvtx=True):
     rows = []
     baseline_us = None
-    for _, (name, env) in scenario_items:
-        for _ in range(warmup):
-            fwd_bwd(model, x, env, loss)
+    for scenario_idx, (_, (name, env)) in enumerate(scenario_items, start=1):
+        base_label = scenario_label(scenario_idx, name)
+        for warmup_idx in range(warmup):
+            fwd_bwd(model, x, env, loss, f"{base_label}/warmup_{warmup_idx:02d}", use_nvtx)
         torch.cuda.synchronize()
         samples = []
-        for _ in range(rounds):
+        for round_idx in range(rounds):
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            for _ in range(repeats):
-                fwd_bwd(model, x, env, loss)
-            end.record()
+            with nvtx_range(f"{base_label}/round_{round_idx:02d}/measured_{repeats}iters", enabled=use_nvtx):
+                start.record()
+                for iter_idx in range(repeats):
+                    fwd_bwd(model, x, env, loss, f"{base_label}/round_{round_idx:02d}/iter_{iter_idx:02d}", use_nvtx)
+                end.record()
             torch.cuda.synchronize()
             samples.append(start.elapsed_time(end) * 1000.0 / repeats)
         mean_us = statistics.mean(samples)
@@ -244,7 +279,7 @@ def benchmark(model, x, scenario_items, loss, warmup, repeats, rounds):
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
-    parser.add_argument("--loss", choices=("sum", "square_mean"), default="sum")
+    parser.add_argument("--loss", choices=("sum", "square_mean"), default="square_mean")
     parser.add_argument("--scenarios", default="baseline,fused,separate,all_four")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=20)
@@ -252,6 +287,7 @@ def parse_args():
     parser.add_argument("--atol", type=float, default=5e-3)
     parser.add_argument("--rtol", type=float, default=5e-3)
     parser.add_argument("--fail-on-accuracy", action="store_true")
+    parser.add_argument("--no-nvtx", dest="use_nvtx", action="store_false", default=True)
     return parser.parse_args()
 
 
@@ -275,7 +311,7 @@ def main():
     try:
         model = make_model(dtype).eval()
         x = torch.randn(8192, 2, 128, device="cuda", dtype=dtype)
-        accuracy_rows = check_accuracy(model, x, scenario_items, args.loss, args.atol, args.rtol)
+        accuracy_rows = check_accuracy(model, x, scenario_items, args.loss, args.atol, args.rtol, args.use_nvtx)
         for row in accuracy_rows:
             print(
                 f"ACCURACY name={row.name!r} status={row.status} "
@@ -284,7 +320,7 @@ def main():
                 f"worst_param={row.worst_param} "
                 f"worst_param_max_abs={row.worst_param_max_abs:.9f}"
             )
-        perf_rows = benchmark(model, x, scenario_items, args.loss, args.warmup, args.repeats, args.rounds)
+        perf_rows = benchmark(model, x, scenario_items, args.loss, args.warmup, args.repeats, args.rounds, args.use_nvtx)
         for row in perf_rows:
             print(
                 f"PERF name={row.name!r} mean_us={row.mean_us:.3f} "
