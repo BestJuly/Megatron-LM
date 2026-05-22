@@ -422,5 +422,10 @@ def fused_apply_mrope(
 
 
 def is_fused_mrope_available() -> bool:
-    """Return whether the Triton mRoPE fusion can be launched."""
+    """Return whether the Triton mRoPE fusion is importable.
+
+    This does not check tensor device, dtype, stride, or CUDA capability. Use
+    ``can_launch_fused_mrope`` or ``get_fused_mrope_unavailable_reason`` with
+    tensors before dispatching to the fused kernel.
+    """
     return can_launch_fused_mrope()

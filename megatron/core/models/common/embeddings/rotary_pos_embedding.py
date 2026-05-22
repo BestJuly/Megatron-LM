@@ -342,6 +342,7 @@ class MultimodalRotaryEmbedding(nn.Module):
         mrope_section: List[int],
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
         return_raw_freqs: bool = False,
+        packed_seq: bool = False,
     ) -> Tensor:
         """Forward pass of multimodal RoPE embedding.
 
@@ -353,6 +354,8 @@ class MultimodalRotaryEmbedding(nn.Module):
                 Defaults to None.
             return_raw_freqs (bool, optional): If True, return the raw per-axis frequencies with
                 shape [3, batchsize, seqlens, dim / 2] for fused mRoPE application.
+            packed_seq (bool, optional): Whether the sequence uses THD packing. Packed sequences
+                keep full position frequencies because THD RoPE applies CP partitioning later.
 
         Returns:
             Tensor: Embeddings after applying RoPE, or raw per-axis frequencies when
@@ -373,7 +376,7 @@ class MultimodalRotaryEmbedding(nn.Module):
         if cp_group is None:
             cp_group = self.cp_group
         if return_raw_freqs:
-            if cp_group is not None and cp_group.size() > 1:
+            if cp_group is not None and cp_group.size() > 1 and not packed_seq:
                 freqs = get_pos_emb_on_this_cp_rank(freqs, 2, cp_group)
             return freqs.contiguous()
 
@@ -408,7 +411,7 @@ class MultimodalRotaryEmbedding(nn.Module):
 
         # shape (seq_length, bs, 1, 2 * dim)
         emb = emb[..., None, :].transpose(0, 1).contiguous()
-        if cp_group is not None and cp_group.size() > 1:
+        if cp_group is not None and cp_group.size() > 1 and not packed_seq:
             # slice rotary_pos_emb along sequence dimension and select the parition of the current
             # CP rank
             emb = get_pos_emb_on_this_cp_rank(emb, 0, cp_group)
