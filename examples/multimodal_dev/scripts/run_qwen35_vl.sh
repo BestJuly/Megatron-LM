@@ -6,12 +6,17 @@
 #   ./examples/multimodal_dev/scripts/run_qwen35_vl.sh
 #
 # Environment variables:
-#   MODEL_VARIANT: proxy (default), 0.8b, 2b, 4b, 9b, 27b, 35b_a3b, 122b_a10b, 397b_a17b, 35b_a3b_light
+#   MODEL_VARIANT: proxy (default), pp_proxy, 0.8b, 2b, 4b, 9b, 27b, 35b_a3b, 122b_a10b, 397b_a17b, 35b_a3b_light
 #   CKPT_LOAD: path to a pre-converted checkpoint to load (enables --load + --finetune)
 #   CKPT_FORMAT: checkpoint format override (e.g. torch_dist); auto-detected when empty
 #   TP, EP, PP: parallelism sizes
 #   MBS, GBS: micro/global batch sizes
-#   NUM_LAYERS, NUM_EXPERTS: override for proxy testing
+#   DATASET_PROVIDER: cord_v2 (default) or mock
+#   TOKENIZER_TYPE: HuggingFaceTokenizer (default) or NullTokenizer
+#   VOCAB_SIZE: required for NullTokenizer
+#   NUM_LAYERS, NUM_EXPERTS: override for proxy/custom testing
+#   MTP_NUM_LAYERS: set to 0 to disable MTP for proxy PP testing
+#   SAVE_CHECKPOINT: set to 0 to skip --save/--save-interval
 #   LAUNCHER: torchrun (default) or python
 #   PROFILE: set to 1 to enable Nsight Systems profiling (default: 0)
 #   PROFILE_STEP_START/PROFILE_STEP_END: profiled iteration window (default: 4-5)
@@ -43,6 +48,28 @@ LAUNCHER=${LAUNCHER:-torchrun}
 
 MODEL_VARIANT=${MODEL_VARIANT:-proxy}
 VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-}
+DATASET_PROVIDER=${DATASET_PROVIDER:-cord_v2}
+HF_PROCESSOR_PATH=${HF_PROCESSOR_PATH:-}
+if [ -z "$HF_PROCESSOR_PATH" ] && [ "$DATASET_PROVIDER" = "cord_v2" ]; then
+    HF_PROCESSOR_PATH=Qwen/Qwen3.5-397B-A17B
+fi
+TOKENIZER_TYPE=${TOKENIZER_TYPE:-HuggingFaceTokenizer}
+TOKENIZER_MODEL=${TOKENIZER_MODEL:-Qwen/Qwen3.5-397B-A17B}
+VOCAB_SIZE=${VOCAB_SIZE:-}
+IMAGE_SIZE=${IMAGE_SIZE:-224}
+IMAGE_SEQ_LENGTH=${IMAGE_SEQ_LENGTH:-256}
+IMAGE_TOKEN_ID=${IMAGE_TOKEN_ID:-248056}
+MTP_NUM_LAYERS=${MTP_NUM_LAYERS:-1}
+MTP_LOSS_SCALING_FACTOR=${MTP_LOSS_SCALING_FACTOR:-0.1}
+SAVE_CHECKPOINT=${SAVE_CHECKPOINT:-1}
+MAKE_VOCAB_SIZE_DIVISIBLE_BY=${MAKE_VOCAB_SIZE_DIVISIBLE_BY:-485}
+KV_CHANNELS=${KV_CHANNELS:-256}
+EXPERIMENTAL_ATTENTION_VARIANT=${EXPERIMENTAL_ATTENTION_VARIANT:-gated_delta_net}
+LINEAR_ATTENTION_FREQ=${LINEAR_ATTENTION_FREQ:-4}
+LINEAR_CONV_KERNEL_DIM=${LINEAR_CONV_KERNEL_DIM:-4}
+LINEAR_KEY_HEAD_DIM=${LINEAR_KEY_HEAD_DIM:-128}
+LINEAR_VALUE_HEAD_DIM=${LINEAR_VALUE_HEAD_DIM:-128}
+LINEAR_NUM_KEY_HEADS=${LINEAR_NUM_KEY_HEADS:-}
 
 # Batch sizes
 MBS=${MBS:-2}
@@ -98,6 +125,20 @@ case "$MODEL_VARIANT" in
         NUM_QUERY_GROUPS=2
         LINEAR_NUM_VALUE_HEADS=64
         VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-2}
+        ;;
+    pp_proxy)
+        NUM_LAYERS=${NUM_LAYERS:-4}
+        NUM_EXPERTS=${NUM_EXPERTS:-4}
+        HIDDEN_SIZE=${HIDDEN_SIZE:-512}
+        FFN_HIDDEN_SIZE=${FFN_HIDDEN_SIZE:-2048}
+        NUM_ATTN_HEADS=${NUM_ATTN_HEADS:-2}
+        NUM_QUERY_GROUPS=${NUM_QUERY_GROUPS:-1}
+        LINEAR_NUM_KEY_HEADS=${LINEAR_NUM_KEY_HEADS:-2}
+        LINEAR_NUM_VALUE_HEADS=${LINEAR_NUM_VALUE_HEADS:-4}
+        VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-1}
+        MOE_TOPK=${MOE_TOPK:-2}
+        MOE_FFN_HIDDEN=${MOE_FFN_HIDDEN:-256}
+        MOE_SHARED_HIDDEN=${MOE_SHARED_HIDDEN:-256}
         ;;
     9b)
         NUM_LAYERS=${NUM_LAYERS:-32}
@@ -168,8 +209,12 @@ case "$MODEL_VARIANT" in
         : "${NUM_QUERY_GROUPS:?NUM_QUERY_GROUPS must be set for MODEL_VARIANT=$MODEL_VARIANT}"
         : "${LINEAR_NUM_VALUE_HEADS:?LINEAR_NUM_VALUE_HEADS must be set for MODEL_VARIANT=$MODEL_VARIANT}"
         VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-27}
+        MOE_TOPK=${MOE_TOPK:-2}
+        MOE_FFN_HIDDEN=${MOE_FFN_HIDDEN:-1024}
+        MOE_SHARED_HIDDEN=${MOE_SHARED_HIDDEN:-1024}
         ;;
 esac
+LINEAR_NUM_KEY_HEADS=${LINEAR_NUM_KEY_HEADS:-16}
 SEQ_LEN=${SEQ_LEN:-4096}
 
 WANDB_PROJECT=${WANDB_PROJECT:-'qwen35-vl-0524'}
@@ -243,13 +288,17 @@ TRAINING_ARGS=(
     --enable-experimental
     --manual-gc
     --manual-gc-interval 5
-    --mtp-num-layers 1
-    --mtp-loss-scaling-factor 0.1
     --sft
     --use-flash-attn
     # --attention-backend flash
     --calculate-per-token-loss
 )
+if [ "$MTP_NUM_LAYERS" -gt 0 ]; then
+    TRAINING_ARGS+=(
+        --mtp-num-layers "$MTP_NUM_LAYERS"
+        --mtp-loss-scaling-factor "$MTP_LOSS_SCALING_FACTOR"
+    )
+fi
 
 PROFILE_ARGS=()
 NSYS_CMD=()
@@ -279,9 +328,7 @@ fi
 SAVE_INTERVAL=${SAVE_INTERVAL:-500}
 EVAL_AND_LOGGING_ARGS=(
     --log-interval 1
-    --save-interval "$SAVE_INTERVAL"
     --eval-interval 500
-    --save "$CHECKPOINT_STORE_PATH"
     --eval-iters 10
     --tensorboard-dir "$TENSORBOARD_LOGS_PATH"
     --wandb-project "$WANDB_PROJECT"
@@ -289,27 +336,42 @@ EVAL_AND_LOGGING_ARGS=(
     --wandb-save-dir "$CHECKPOINT_STORE_PATH"
     --log-throughput
 )
+if [ "$SAVE_CHECKPOINT" -eq 1 ]; then
+    EVAL_AND_LOGGING_ARGS+=(
+        --save-interval "$SAVE_INTERVAL"
+        --save "$CHECKPOINT_STORE_PATH"
+    )
+fi
 
 # --- Tokenizer ---
-TOKENIZER_MODEL=${TOKENIZER_MODEL:-Qwen/Qwen3.5-397B-A17B}
 TOKENIZER_ARGS=(
-    --tokenizer-type HuggingFaceTokenizer
-    --tokenizer-model "$TOKENIZER_MODEL"
+    --tokenizer-type "$TOKENIZER_TYPE"
 )
+if [ "$TOKENIZER_TYPE" = "NullTokenizer" ] || [ "$TOKENIZER_TYPE" = "NullMultimodalTokenizer" ]; then
+    : "${VOCAB_SIZE:?VOCAB_SIZE must be set when TOKENIZER_TYPE=$TOKENIZER_TYPE}"
+    TOKENIZER_ARGS+=( --vocab-size "$VOCAB_SIZE" )
+else
+    TOKENIZER_ARGS+=( --tokenizer-model "$TOKENIZER_MODEL" )
+    if [ -n "$VOCAB_SIZE" ]; then
+        TOKENIZER_ARGS+=( --vocab-size "$VOCAB_SIZE" )
+    fi
+fi
 
 # --- Multimodal-specific ---
 MULTIMODAL_ARGS=(
     --model-arch qwen35_vl
     --model-variant "$MODEL_VARIANT"
-    --dataset-provider cord_v2
-    --hf-processor-path Qwen/Qwen3.5-397B-A17B
+    --dataset-provider "$DATASET_PROVIDER"
     --use-vanilla-collate-fn
-    --image-token-id 248056
-    --image-size 224
+    --image-token-id "$IMAGE_TOKEN_ID"
+    --image-size "$IMAGE_SIZE"
     --total-seq-length "$SEQ_LEN"
-    --image-seq-length 256
+    --image-seq-length "$IMAGE_SEQ_LENGTH"
     --vision-num-layers "$VISION_NUM_LAYERS"
 )
+if [ -n "$HF_PROCESSOR_PATH" ]; then
+    MULTIMODAL_ARGS+=( --hf-processor-path "$HF_PROCESSOR_PATH" )
+fi
 
 if [ "$USE_PACKED_SEQUENCE" -eq 1 ]; then
     MULTIMODAL_ARGS+=( --use-packed-sequence )
@@ -324,7 +386,7 @@ GPT_MODEL_ARGS=(
     --num-attention-heads "$NUM_ATTN_HEADS"
     --group-query-attention
     --num-query-groups "$NUM_QUERY_GROUPS"
-    --kv-channels 256
+    --kv-channels "$KV_CHANNELS"
     --max-position-embeddings 262144
     --seq-length "$SEQ_LEN"
     --normalization RMSNorm
@@ -340,16 +402,20 @@ GPT_MODEL_ARGS=(
     --attention-output-gate
     --attention-dropout 0.0
     --hidden-dropout 0.0
-    --experimental-attention-variant gated_delta_net
-    --linear-attention-freq 4
-    --linear-conv-kernel-dim 4
-    --linear-key-head-dim 128
-    --linear-value-head-dim 128
-    --linear-num-key-heads 16
+    --linear-attention-freq "$LINEAR_ATTENTION_FREQ"
+    --linear-conv-kernel-dim "$LINEAR_CONV_KERNEL_DIM"
+    --linear-key-head-dim "$LINEAR_KEY_HEAD_DIM"
+    --linear-value-head-dim "$LINEAR_VALUE_HEAD_DIM"
+    --linear-num-key-heads "$LINEAR_NUM_KEY_HEADS"
     --linear-num-value-heads "$LINEAR_NUM_VALUE_HEADS"
-    --make-vocab-size-divisible-by 485
+    --make-vocab-size-divisible-by "$MAKE_VOCAB_SIZE_DIVISIBLE_BY"
     --moe-router-force-load-balancing
 )
+if [ "$EXPERIMENTAL_ATTENTION_VARIANT" != "none" ]; then
+    GPT_MODEL_ARGS+=(
+        --experimental-attention-variant "$EXPERIMENTAL_ATTENTION_VARIANT"
+    )
+fi
 
 # --- Tied / untied embeddings ---
 # 0.8B, 2B, 4B use tied embeddings; all other variants untie them.
@@ -373,10 +439,18 @@ case "$MODEL_VARIANT" in
     397b_a17b)
         MOE_TOPK=10; MOE_FFN_HIDDEN=1024; MOE_SHARED_HIDDEN=1024
         ;;
+    pp_proxy)
+        MOE_TOPK=${MOE_TOPK:-2}
+        MOE_FFN_HIDDEN=${MOE_FFN_HIDDEN:-256}
+        MOE_SHARED_HIDDEN=${MOE_SHARED_HIDDEN:-256}
+        ;;
     0.8b|2b|4b|9b|27b)
         ;;
 esac
 if [ "${NUM_EXPERTS:-0}" -gt 0 ]; then
+    : "${MOE_TOPK:?MOE_TOPK must be set when NUM_EXPERTS > 0}"
+    : "${MOE_FFN_HIDDEN:?MOE_FFN_HIDDEN must be set when NUM_EXPERTS > 0}"
+    : "${MOE_SHARED_HIDDEN:?MOE_SHARED_HIDDEN must be set when NUM_EXPERTS > 0}"
     MOE_ARGS=(
         --num-experts "$NUM_EXPERTS"
         --moe-ffn-hidden-size "$MOE_FFN_HIDDEN"
@@ -463,6 +537,10 @@ echo "  TP=$TP  EP=$EP  PP=$PP  CP=$CP"
 echo "  MBS=$MBS  GBS=$GBS"
 echo "  Launcher:      $LAUNCHER"
 echo "  FSDP:          $USE_FSDP"
+echo "  Dataset:       $DATASET_PROVIDER"
+echo "  Tokenizer:     $TOKENIZER_TYPE"
+echo "  MTP layers:    $MTP_NUM_LAYERS"
+echo "  Save ckpt:     $SAVE_CHECKPOINT"
 echo "  PROFILE:       $PROFILE"
 if [ -n "$CKPT_LOAD" ]; then
     echo "  CKPT_LOAD:     $CKPT_LOAD"
