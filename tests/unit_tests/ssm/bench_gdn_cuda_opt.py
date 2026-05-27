@@ -7,7 +7,9 @@ Install `mcore_gdn_opt` and FLA in editable mode before running it.
 """
 
 import argparse
+import importlib.util
 import os
+from pathlib import Path
 import statistics
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -26,6 +28,15 @@ from tests.unit_tests.test_utilities import Utils
 
 
 FLAGS = (
+    "MCORE_GDN_USE_OPT_WRAPPER",
+    "MCORE_GDN_OPT_BACKEND",
+    "MCORE_GDN_OPT_WARN_FALLBACK",
+    "MCORE_GDN_OPT_ENABLE_FWD_H",
+    "MCORE_GDN_OPT_ENABLE_WY_BWD",
+    "MCORE_GDN_OPT_ENABLE_DV_DHU",
+    "MCORE_GDN_OPT_ENABLE_DHU",
+    "MCORE_GDN_OPT_ENABLE_DQKWG",
+    "MCORE_GDN_OPT_ENABLE_DHU_DQKWG",
     "FLA_CUTE_FWD_H",
     "CHUNK_DELTA_FWD_USE_BWD_PORT",
     "FLA_CUTE_WY_BWD",
@@ -40,6 +51,18 @@ FLAGS = (
 
 SCENARIOS = {
     "baseline": ("Triton baseline", {}),
+    "wrapper_fla": (
+        "MCore wrapper forced FLA",
+        {"MCORE_GDN_USE_OPT_WRAPPER": "1", "MCORE_GDN_OPT_BACKEND": "fla"},
+    ),
+    "wrapper_auto": (
+        "MCore wrapper auto",
+        {"MCORE_GDN_USE_OPT_WRAPPER": "1", "MCORE_GDN_OPT_BACKEND": "auto"},
+    ),
+    "wrapper_cuda": (
+        "MCore wrapper forced CUDA",
+        {"MCORE_GDN_USE_OPT_WRAPPER": "1", "MCORE_GDN_OPT_BACKEND": "cuda"},
+    ),
     "wy": ("CUDA wy_bwd", {"FLA_CUTE_WY_BWD": "1"}),
     "dv_dhu": ("CUDA dv_local+delta_h fused", {"FLA_CUTE_BWD_DV_DHU": "1"}),
     "dhu": ("CUDA delta_h", {"FLA_CUTE_BWD_DHU": "1"}),
@@ -79,6 +102,17 @@ SCENARIOS = {
 }
 
 
+FLAG_SOURCES = {
+    "FLA_CUTE_FWD_H": "fla.ops.common.chunk_delta_h",
+    "FLA_CUTE_WY_BWD": "fla.ops.gated_delta_rule.wy_fast",
+    "FLA_CUTE_BWD_DV_DHU": "fla.ops.gated_delta_rule.chunk",
+    "FLA_CUTE_BWD_DHU": "fla.ops.common.chunk_delta_h",
+    "FLA_CUTE_BWD_DQKWG": "fla.ops.common.chunk_o",
+    "FLA_CUTE_BWD_DHU_DQKWG": "fla.ops.gated_delta_rule.chunk",
+    "FLA_CUTE_BWD_DHU_DQKWG_KERNEL": "fla.ops.gated_delta_rule.chunk",
+}
+
+
 @dataclass
 class AccuracyRow:
     name: str
@@ -102,7 +136,55 @@ class PerfRow:
 def set_env(overrides):
     for flag in FLAGS:
         os.environ.pop(flag, None)
+    if "MCORE_GDN_USE_OPT_WRAPPER" not in overrides:
+        os.environ["MCORE_GDN_USE_OPT_WRAPPER"] = "0"
+    if "MCORE_GDN_OPT_BACKEND" not in overrides:
+        os.environ["MCORE_GDN_OPT_BACKEND"] = "fla"
     os.environ.update(overrides)
+
+
+def validate_fla_dispatch_sources(scenario_items):
+    required_flags = {
+        flag
+        for _, (_, env) in scenario_items
+        for flag, value in env.items()
+        if value == "1" and flag in FLAG_SOURCES
+    }
+    checked = {}
+    missing = []
+    for flag in sorted(required_flags):
+        module_name = FLAG_SOURCES[flag]
+        if module_name not in checked:
+            spec = importlib.util.find_spec(module_name)
+            if spec is None or spec.origin is None:
+                raise RuntimeError(f"cannot locate required FLA module {module_name!r}")
+            source = Path(spec.origin)
+            checked[module_name] = (source, source.read_text())
+        source, text = checked[module_name]
+        if flag not in text:
+            missing.append((flag, module_name, source))
+    for module_name, (source, _) in checked.items():
+        print(f"FLA_DISPATCH_SOURCE module={module_name} path={source}", flush=True)
+    if missing:
+        details = "\n".join(
+            f"  {flag} missing from {module_name} at {source}" for flag, module_name, source in missing
+        )
+        raise RuntimeError(
+            "Requested CUDA optimization flags are not implemented by the imported FLA sources.\n"
+            f"{details}\n"
+            "Check PYTHONPATH. The patched flash-linear-attention tree must appear before "
+            "the unpatched vendored FLA tree; otherwise optimized scenarios silently run "
+            "the baseline Triton path."
+        )
+    if any("MCORE_GDN_OPT_BACKEND" in env for _, (_, env) in scenario_items):
+        for module_name in (
+            "mcore_gdn_opt.gated_delta_rule.chunk",
+            "mcore_gdn_opt.gated_delta_rule.backward",
+        ):
+            spec = importlib.util.find_spec(module_name)
+            if spec is None or spec.origin is None:
+                raise RuntimeError(f"cannot locate required mcore_gdn_opt module {module_name!r}")
+            print(f"MCORE_GDN_OPT_DISPATCH_SOURCE module={module_name} path={spec.origin}", flush=True)
 
 
 def nvtx_range(label, enabled=True):
@@ -174,6 +256,13 @@ def compute_loss(output, loss):
 
 def run_once(model, x, env, loss, nvtx_label=None, use_nvtx=True):
     set_env(env)
+    print(
+        "RUN_ONCE "
+        f"label={nvtx_label or 'none'} "
+        f"use_wrapper={os.environ.get('MCORE_GDN_USE_OPT_WRAPPER', '')} "
+        f"backend={os.environ.get('MCORE_GDN_OPT_BACKEND', '')}",
+        flush=True,
+    )
     zero_grads(model)
     inp = x.detach().clone().requires_grad_(True)
     with nvtx_range(nvtx_label, enabled=use_nvtx and nvtx_label is not None):
@@ -300,6 +389,7 @@ def main():
     if unknown:
         raise ValueError(f"unknown scenarios: {unknown}; choices={sorted(SCENARIOS)}")
     scenario_items = [(key, SCENARIOS[key]) for key in keys]
+    validate_fla_dispatch_sources(scenario_items)
     dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
 
     torch.manual_seed(123)
