@@ -71,32 +71,28 @@ gradients. Treat `loss=sum` as the stricter correctness signal.
 
 ## E2E Pytest
 
-This runs the Megatron GPT layer path and then prints the GDN benchmark table
-from `tests/unit_tests/ssm/test_gated_delta_net.py`.
+This runs the focused GDN CUDA optimization pytest path. It checks correctness
+by default and can print the benchmark table when `MCORE_GDN_UNIT_TEST_PERF=1`.
 
 ```bash
-FLA_CUTE_WY_BWD=1 \
-FLA_CUTE_BWD_DHU_DQKWG=1 \
-MCORE_GDN_BENCH_ONLY=wy+dhu+dqkwg \
-MCORE_GDN_BENCH_WARMUP=5 \
-MCORE_GDN_BENCH_REPEATS=20 \
-pytest -s tests/unit_tests/ssm/test_gated_delta_net.py::test_parallel_gated_delta_net_correctness -k bf16
+MCORE_GDN_UNIT_TEST_SCENARIOS=baseline,all_four_dv_dhu \
+pytest -s tests/unit_tests/ssm/test_gated_delta_net_cuda_opt.py::test_gated_delta_net_cuda_opt_correctness_and_optional_perf -k bf16
 ```
 
-To generate the five-scenario E2E table with NVTX labels:
+To generate the E2E benchmark table with NVTX labels:
 
 ```bash
-MCORE_GDN_BENCH_FIVE_SCENARIOS=1 \
-MCORE_GDN_BENCH_NVTX_MEASURE_ONLY=1 \
-MCORE_GDN_BENCH_WARMUP=5 \
-MCORE_GDN_BENCH_REPEATS=10 \
-pytest -s tests/unit_tests/ssm/test_gated_delta_net.py::test_parallel_gated_delta_net_correctness -k bf16
+MCORE_GDN_UNIT_TEST_SCENARIOS=baseline,wy,dhu,dqkwg,fused,separate,all_four,all_four_dv_dhu \
+MCORE_GDN_UNIT_TEST_PERF=1 \
+MCORE_GDN_UNIT_TEST_WARMUP=5 \
+MCORE_GDN_UNIT_TEST_REPEATS=20 \
+MCORE_GDN_UNIT_TEST_ROUNDS=3 \
+pytest -s tests/unit_tests/ssm/test_gated_delta_net_cuda_opt.py::test_gated_delta_net_cuda_opt_correctness_and_optional_perf -k bf16
 ```
 
-Current B200 status: the fused E2E pytest fails the `input_grad` close check for
-`loss=sum` by a small number of elements. The latest observed failure was
-`2 / 2,097,152` mismatched elements with max absolute difference `0.00732421875`
-for tolerance `0.005`.
+Latest GB200 targeted validation for `loss=sum` passed correctness for
+`CUDA all four` and `CUDA fwd_h+wy+dv_dhu+dqkwg`. Observed speedups were
+`1.172x` and `1.195x` respectively versus the Triton baseline.
 
 ## Nsight Systems
 
@@ -104,18 +100,19 @@ Use the E2E pytest command above under `nsys profile`. The benchmark emits NVTX
 labels in this format:
 
 ```text
-scenario/<index>_<scenario_name>/T=<sequence_length>/<dtype>/iter
+gdn_only/<index>_<scenario_name>/round_<round>/iter_<iter>
 ```
 
 Example:
 
 ```bash
-MCORE_GDN_BENCH_FIVE_SCENARIOS=1 \
-MCORE_GDN_BENCH_NVTX_MEASURE_ONLY=1 \
-MCORE_GDN_BENCH_WARMUP=5 \
-MCORE_GDN_BENCH_REPEATS=10 \
+MCORE_GDN_UNIT_TEST_SCENARIOS=baseline,all_four_dv_dhu \
+MCORE_GDN_UNIT_TEST_PERF=1 \
+MCORE_GDN_UNIT_TEST_WARMUP=5 \
+MCORE_GDN_UNIT_TEST_REPEATS=20 \
+MCORE_GDN_UNIT_TEST_ROUNDS=3 \
 nsys profile -f true -o gdn_e2e_b200 \
-  pytest -s tests/unit_tests/ssm/test_gated_delta_net.py::test_parallel_gated_delta_net_correctness -k bf16
+  pytest -s tests/unit_tests/ssm/test_gated_delta_net_cuda_opt.py::test_gated_delta_net_cuda_opt_correctness_and_optional_perf -k bf16
 ```
 
 Profiler outputs (`*.nsys-rep`, `*.sqlite`, `*.qdrep`) and local run directories
