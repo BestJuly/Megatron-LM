@@ -25,7 +25,7 @@ def _scenario_items():
     keys = [
         key.strip()
         for key in os.environ.get(
-            "MCORE_GDN_UNIT_TEST_SCENARIOS", "baseline,all_four_dv_dhu"
+            "MCORE_GDN_UNIT_TEST_SCENARIOS", "baseline,fwd_h_wy_dv_dhu_dqkwg"
         ).split(",")
         if key.strip()
     ]
@@ -43,7 +43,7 @@ def _scenario_items():
 @pytest.mark.internal
 def test_gated_delta_net_cuda_opt_correctness_and_optional_perf(dtype):
     scenario_items = _scenario_items()
-    runner.validate_fla_dispatch_sources(scenario_items)
+    runner.validate_dispatch_sources(scenario_items)
 
     torch.manual_seed(123)
     runner.set_env({})

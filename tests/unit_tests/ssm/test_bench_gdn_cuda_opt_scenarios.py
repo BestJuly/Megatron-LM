@@ -22,11 +22,10 @@ def test_optimized_scenarios_route_through_mcore_wrapper():
         "dv_dhu",
         "dhu",
         "dqkwg",
-        "fused",
         "separate",
         "dv_dhu_dqkwg",
         "all_four",
-        "all_four_dv_dhu",
+        "fwd_h_wy_dv_dhu_dqkwg",
     ]
 
     for key in optimized:

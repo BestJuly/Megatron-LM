@@ -110,17 +110,6 @@ SCENARIOS = {
             "MCORE_GDN_OPT_ENABLE_DHU_DQKWG": "0",
         },
     ),
-    "fused": (
-        "CUDA wy+dhu+dqkwg fused",
-        {
-            "MCORE_GDN_USE_OPT_WRAPPER": "1",
-            "MCORE_GDN_OPT_BACKEND": "cuda",
-            "MCORE_GDN_OPT_ENABLE_FWD_H": "0",
-            "MCORE_GDN_OPT_ENABLE_DV_DHU": "0",
-            "MCORE_GDN_OPT_ENABLE_DHU": "0",
-            "MCORE_GDN_OPT_ENABLE_DQKWG": "0",
-        },
-    ),
     "separate": (
         "CUDA all three separate",
         {
@@ -132,7 +121,7 @@ SCENARIOS = {
         },
     ),
     "dv_dhu_dqkwg": (
-        "CUDA dv_local+delta_h fused + dqkwg",
+        "CUDA fused_dv_dhu+dqkwg",
         {
             "MCORE_GDN_USE_OPT_WRAPPER": "1",
             "MCORE_GDN_OPT_BACKEND": "cuda",
@@ -143,7 +132,7 @@ SCENARIOS = {
         },
     ),
     "all_four": (
-        "CUDA all four",
+        "CUDA fwd_h+wy_bwd+dhu+dqkwg",
         {
             "MCORE_GDN_USE_OPT_WRAPPER": "1",
             "MCORE_GDN_OPT_BACKEND": "cuda",
@@ -151,8 +140,8 @@ SCENARIOS = {
             "MCORE_GDN_OPT_ENABLE_DHU_DQKWG": "0",
         },
     ),
-    "all_four_dv_dhu": (
-        "CUDA fwd_h+wy+dv_dhu+dqkwg",
+    "fwd_h_wy_dv_dhu_dqkwg": (
+        "CUDA fwd_h+wy_bwd+fused_dv_dhu+dqkwg",
         {
             "MCORE_GDN_USE_OPT_WRAPPER": "1",
             "MCORE_GDN_OPT_BACKEND": "cuda",
@@ -398,7 +387,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
     parser.add_argument("--loss", choices=("sum", "square_mean"), default="square_mean")
-    parser.add_argument("--scenarios", default="baseline,fused,separate,all_four")
+    parser.add_argument("--scenarios", default="baseline,separate,all_four,fwd_h_wy_dv_dhu_dqkwg")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=20)
     parser.add_argument("--rounds", type=int, default=3)
