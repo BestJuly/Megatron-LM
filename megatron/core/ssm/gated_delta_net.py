@@ -43,6 +43,7 @@ from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx
 try:
     from fla.modules.convolution import causal_conv1d
     from fla.modules.l2norm import l2norm
+
     if os.environ.get("MCORE_GDN_USE_OPT_WRAPPER", "0") == "1":
         try:
             from mcore_gdn_opt.gated_delta_rule import chunk_gated_delta_rule

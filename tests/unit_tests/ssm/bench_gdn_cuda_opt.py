@@ -25,7 +25,6 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
-
 FLAGS = (
     "MCORE_GDN_USE_OPT_WRAPPER",
     "MCORE_GDN_OPT_BACKEND",
@@ -188,7 +187,9 @@ def validate_dispatch_sources(scenario_items):
             spec = importlib.util.find_spec(module_name)
             if spec is None or spec.origin is None:
                 raise RuntimeError(f"cannot locate required mcore_gdn_opt module {module_name!r}")
-            print(f"MCORE_GDN_OPT_DISPATCH_SOURCE module={module_name} path={spec.origin}", flush=True)
+            print(
+                f"MCORE_GDN_OPT_DISPATCH_SOURCE module={module_name} path={spec.origin}", flush=True
+            )
 
 
 def nvtx_range(label, enabled=True):
@@ -233,17 +234,21 @@ def make_model(dtype):
         transformer_impl="transformer_engine",
     )
     submodules = get_experimental_attention_variant_module_spec(config=cfg).submodules
-    return GatedDeltaNet(
-        cfg,
-        submodules=submodules,
-        layer_number=1,
-        bias=False,
-        conv_bias=False,
-        conv_init=1.0,
-        use_qk_l2norm=True,
-        A_init_range=(1, 16),
-        pg_collection=pg_collection,
-    ).cuda().to(dtype)
+    return (
+        GatedDeltaNet(
+            cfg,
+            submodules=submodules,
+            layer_number=1,
+            bias=False,
+            conv_bias=False,
+            conv_init=1.0,
+            use_qk_l2norm=True,
+            A_init_range=(1, 16),
+            pg_collection=pg_collection,
+        )
+        .cuda()
+        .to(dtype)
+    )
 
 
 def zero_grads(model):
@@ -348,10 +353,19 @@ def benchmark(model, x, scenario_items, loss, warmup, repeats, rounds, use_nvtx=
         for round_idx in range(rounds):
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
-            with nvtx_range(f"{base_label}/round_{round_idx:02d}/measured_{repeats}iters", enabled=use_nvtx):
+            with nvtx_range(
+                f"{base_label}/round_{round_idx:02d}/measured_{repeats}iters", enabled=use_nvtx
+            ):
                 start.record()
                 for iter_idx in range(repeats):
-                    fwd_bwd(model, x, env, loss, f"{base_label}/round_{round_idx:02d}/iter_{iter_idx:02d}", use_nvtx)
+                    fwd_bwd(
+                        model,
+                        x,
+                        env,
+                        loss,
+                        f"{base_label}/round_{round_idx:02d}/iter_{iter_idx:02d}",
+                        use_nvtx,
+                    )
                 end.record()
             torch.cuda.synchronize()
             samples.append(start.elapsed_time(end) * 1000.0 / repeats)
@@ -407,7 +421,9 @@ def main():
     try:
         model = make_model(dtype).eval()
         x = torch.randn(8192, 2, 128, device="cuda", dtype=dtype)
-        accuracy_rows = check_accuracy(model, x, scenario_items, args.loss, args.atol, args.rtol, args.use_nvtx)
+        accuracy_rows = check_accuracy(
+            model, x, scenario_items, args.loss, args.atol, args.rtol, args.use_nvtx
+        )
         for row in accuracy_rows:
             print(
                 f"ACCURACY name={row.name!r} status={row.status} "
@@ -416,7 +432,16 @@ def main():
                 f"worst_param={row.worst_param} "
                 f"worst_param_max_abs={row.worst_param_max_abs:.9f}"
             )
-        perf_rows = benchmark(model, x, scenario_items, args.loss, args.warmup, args.repeats, args.rounds, args.use_nvtx)
+        perf_rows = benchmark(
+            model,
+            x,
+            scenario_items,
+            args.loss,
+            args.warmup,
+            args.repeats,
+            args.rounds,
+            args.use_nvtx,
+        )
         for row in perf_rows:
             print(
                 f"PERF name={row.name!r} mean_us={row.mean_us:.3f} "

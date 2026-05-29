@@ -1,7 +1,6 @@
 import ast
 from pathlib import Path
 
-
 BENCH = Path(__file__).with_name("bench_gdn_cuda_opt.py")
 
 
