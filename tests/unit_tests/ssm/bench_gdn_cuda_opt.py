@@ -35,16 +35,12 @@ FLAGS = (
     "MCORE_GDN_OPT_ENABLE_DV_DHU",
     "MCORE_GDN_OPT_ENABLE_DHU",
     "MCORE_GDN_OPT_ENABLE_DQKWG",
-    "MCORE_GDN_OPT_ENABLE_DHU_DQKWG",
     "FLA_CUTE_FWD_H",
     "CHUNK_DELTA_FWD_USE_BWD_PORT",
     "FLA_CUTE_WY_BWD",
     "FLA_CUTE_BWD_DV_DHU",
     "FLA_CUTE_BWD_DHU",
     "FLA_CUTE_BWD_DQKWG",
-    "FLA_CUTE_BWD_DHU_DQKWG",
-    "FLA_CUTE_BWD_DHU_DQKWG_KERNEL",
-    "FLA_CUTE_BWD_DHU_DQKWG_DIRECT",
 )
 
 
@@ -71,7 +67,6 @@ SCENARIOS = {
             "MCORE_GDN_OPT_ENABLE_DV_DHU": "0",
             "MCORE_GDN_OPT_ENABLE_DHU": "0",
             "MCORE_GDN_OPT_ENABLE_DQKWG": "0",
-            "MCORE_GDN_OPT_ENABLE_DHU_DQKWG": "0",
         },
     ),
     "dv_dhu": (
@@ -83,7 +78,6 @@ SCENARIOS = {
             "MCORE_GDN_OPT_ENABLE_WY_BWD": "0",
             "MCORE_GDN_OPT_ENABLE_DHU": "0",
             "MCORE_GDN_OPT_ENABLE_DQKWG": "0",
-            "MCORE_GDN_OPT_ENABLE_DHU_DQKWG": "0",
         },
     ),
     "dhu": (
@@ -95,7 +89,6 @@ SCENARIOS = {
             "MCORE_GDN_OPT_ENABLE_WY_BWD": "0",
             "MCORE_GDN_OPT_ENABLE_DV_DHU": "0",
             "MCORE_GDN_OPT_ENABLE_DQKWG": "0",
-            "MCORE_GDN_OPT_ENABLE_DHU_DQKWG": "0",
         },
     ),
     "dqkwg": (
@@ -107,7 +100,6 @@ SCENARIOS = {
             "MCORE_GDN_OPT_ENABLE_WY_BWD": "0",
             "MCORE_GDN_OPT_ENABLE_DV_DHU": "0",
             "MCORE_GDN_OPT_ENABLE_DHU": "0",
-            "MCORE_GDN_OPT_ENABLE_DHU_DQKWG": "0",
         },
     ),
     "separate": (
@@ -117,7 +109,6 @@ SCENARIOS = {
             "MCORE_GDN_OPT_BACKEND": "cuda",
             "MCORE_GDN_OPT_ENABLE_FWD_H": "0",
             "MCORE_GDN_OPT_ENABLE_DV_DHU": "0",
-            "MCORE_GDN_OPT_ENABLE_DHU_DQKWG": "0",
         },
     ),
     "dv_dhu_dqkwg": (
@@ -128,7 +119,6 @@ SCENARIOS = {
             "MCORE_GDN_OPT_ENABLE_FWD_H": "0",
             "MCORE_GDN_OPT_ENABLE_WY_BWD": "0",
             "MCORE_GDN_OPT_ENABLE_DHU": "0",
-            "MCORE_GDN_OPT_ENABLE_DHU_DQKWG": "0",
         },
     ),
     "all_four": (
@@ -137,7 +127,6 @@ SCENARIOS = {
             "MCORE_GDN_USE_OPT_WRAPPER": "1",
             "MCORE_GDN_OPT_BACKEND": "cuda",
             "MCORE_GDN_OPT_ENABLE_DV_DHU": "0",
-            "MCORE_GDN_OPT_ENABLE_DHU_DQKWG": "0",
         },
     ),
     "fwd_h_wy_dv_dhu_dqkwg": (
@@ -146,7 +135,6 @@ SCENARIOS = {
             "MCORE_GDN_USE_OPT_WRAPPER": "1",
             "MCORE_GDN_OPT_BACKEND": "cuda",
             "MCORE_GDN_OPT_ENABLE_DHU": "0",
-            "MCORE_GDN_OPT_ENABLE_DHU_DQKWG": "0",
         },
     ),
 }
