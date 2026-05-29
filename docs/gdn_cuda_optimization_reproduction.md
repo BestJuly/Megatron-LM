@@ -56,18 +56,26 @@ Use `--loss square_mean` to reproduce the earlier loss used during debugging,
 and add `--fail-on-accuracy` when the command should return non-zero on any
 accuracy mismatch.
 
-Latest B200 observation for `B=2,T=8192,H=64,D=128,bf16,loss=sum`:
+Latest B200 spot check for
+`B=2,T=8192,H=64,D=128,bf16,loss=sum,warmup=3,repeats=10,rounds=3`
+on Megatron-LM `c42dc298a`, `mcore_gdn_opt@9121702`, and
+`gated_delta_rule_bwd@949c959`:
 
 | Scenario | Accuracy vs Triton | Mean us | Speedup |
 |---|---:|---:|---:|
-| Triton baseline | PASS | 16740.830 | 1.000x |
-| CUDA `wy+dhu+dqkwg fused` | FAIL | 13706.724 | 1.221x |
-| CUDA all three separate | FAIL | 13642.510 | 1.227x |
-| CUDA all four | FAIL | 28586.833 | 0.586x |
+| Triton baseline | PASS | 15220.135 | 1.000x |
+| CUDA `wy+dhu+dqkwg fused` | FAIL | 13470.359 | 1.130x |
+| CUDA all three separate | FAIL | 13420.346 | 1.134x |
+| CUDA all four | FAIL | 12875.528 | 1.182x |
 
-With `--loss square_mean`, the fused case matched the Triton baseline in the
-sanity run, but that does not prove correctness for arbitrary upstream
-gradients. Treat `loss=sum` as the stricter correctness signal.
+For this direct `loss=sum` GDN-only check, the optimized scenarios still fail
+the strict gradient comparison against the Triton baseline. The current
+production workflow is validated with `loss=square_mean`; the latest B200 full
+workflow validation passed all requested scenarios and measured `CUDA all four`
+at `12895.830 us` (`1.182x`) and `CUDA fwd_h+wy+dv_dhu+dqkwg` at
+`12732.651 us` (`1.197x`). Fresh logs:
+`third_party/gdn_doc_loss_sum_20260528_205336.log` and
+`third_party/gdn_full_validation_cb51345_20260528_204219.log`.
 
 ## E2E Pytest
 
@@ -90,9 +98,11 @@ MCORE_GDN_UNIT_TEST_ROUNDS=3 \
 pytest -s tests/unit_tests/ssm/test_gated_delta_net_cuda_opt.py::test_gated_delta_net_cuda_opt_correctness_and_optional_perf -k bf16
 ```
 
-Latest GB200 targeted validation for `loss=sum` passed correctness for
-`CUDA all four` and `CUDA fwd_h+wy+dv_dhu+dqkwg`. Observed speedups were
-`1.172x` and `1.195x` respectively versus the Triton baseline.
+Latest B200 full workflow validation for `loss=square_mean` passed correctness
+for wrapper forced FLA, wrapper auto, wrapper forced CUDA, `CUDA all four`, and
+`CUDA fwd_h+wy+dv_dhu+dqkwg`. Observed speedups were `1.198x` for wrapper auto,
+`1.182x` for `CUDA all four`, and `1.197x` for
+`CUDA fwd_h+wy+dv_dhu+dqkwg` versus the Triton baseline.
 
 ## Nsight Systems
 
