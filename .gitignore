@@ -25,13 +25,3 @@ docs/apidocs
 
 # Git worktrees
 .worktrees/
-
-# Local GDN/CUDA test scripts, profiling outputs, and logs
-debug_runs/
-perf_runs/
-profiling_runs/
-skills/
-debug.log
-*.nsys-rep
-*.sqlite
-*.qdrep
