@@ -54,3 +54,12 @@ def test_benchmark_does_not_expose_dhu_dqkwg_wrapper_path():
     assert forbidden.isdisjoint(flags)
     for key, (_label, env) in scenarios.items():
         assert forbidden.isdisjoint(env), key
+
+
+def test_split_in_proj_is_construction_flag_not_scenario_flag():
+    scenarios = _literal_assignment("SCENARIOS")
+    flags = _literal_assignment("FLAGS")
+
+    assert "MCORE_GDN_SPLIT_IN_PROJ" in flags
+    for key, (_label, env) in scenarios.items():
+        assert "MCORE_GDN_SPLIT_IN_PROJ" not in env, key

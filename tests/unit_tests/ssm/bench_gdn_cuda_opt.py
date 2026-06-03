@@ -26,6 +26,7 @@ from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 FLAGS = (
+    "MCORE_GDN_SPLIT_IN_PROJ",
     "MCORE_GDN_USE_OPT_WRAPPER",
     "MCORE_GDN_OPT_BACKEND",
     "MCORE_GDN_OPT_WARN_FALLBACK",
@@ -203,8 +204,13 @@ def scenario_label(index, name):
     return f"gdn_only/{index:02d}_{safe_name}"
 
 
-def make_model(dtype):
+def make_model(dtype, split_in_proj=False):
     from megatron.core.ssm.gated_delta_net import GatedDeltaNet
+
+    if split_in_proj:
+        os.environ["MCORE_GDN_SPLIT_IN_PROJ"] = "1"
+    else:
+        os.environ.pop("MCORE_GDN_SPLIT_IN_PROJ", None)
 
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=1
@@ -397,6 +403,7 @@ def parse_args():
     parser.add_argument("--rtol", type=float, default=5e-3)
     parser.add_argument("--fail-on-accuracy", action="store_true")
     parser.add_argument("--no-nvtx", dest="use_nvtx", action="store_false", default=True)
+    parser.add_argument("--split-in-proj", action="store_true")
     return parser.parse_args()
 
 
@@ -416,10 +423,10 @@ def main():
     set_env({})
     print(
         f"DEVICE {torch.cuda.get_device_name(0)} SHAPE B=2 T=8192 H=64 D=128 "
-        f"dtype={args.dtype} loss={args.loss}"
+        f"dtype={args.dtype} loss={args.loss} split_in_proj={args.split_in_proj}"
     )
     try:
-        model = make_model(dtype).eval()
+        model = make_model(dtype, split_in_proj=args.split_in_proj).eval()
         x = torch.randn(8192, 2, 128, device="cuda", dtype=dtype)
         accuracy_rows = check_accuracy(
             model, x, scenario_items, args.loss, args.atol, args.rtol, args.use_nvtx

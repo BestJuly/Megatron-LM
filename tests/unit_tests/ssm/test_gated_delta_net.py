@@ -348,6 +348,76 @@ class TestGDNCuSeqlensResolve:
             mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q")
 
 
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.internal
+def test_gated_delta_net_split_in_proj_builds_expected_projections(monkeypatch):
+    monkeypatch.setenv("MCORE_GDN_SPLIT_IN_PROJ", "1")
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=1,
+    )
+    try:
+        model_parallel_cuda_manual_seed(123)
+        pg_collection = ProcessGroupCollection(
+            tp=parallel_state.get_tensor_model_parallel_group(),
+            cp=parallel_state.get_context_parallel_group(),
+        )
+        transformer_config = TransformerConfig(
+            hidden_size=256,
+            linear_conv_kernel_dim=2,
+            linear_key_head_dim=64,
+            linear_value_head_dim=64,
+            linear_num_key_heads=4,
+            linear_num_value_heads=8,
+            num_layers=1,
+            normalization="RMSNorm",
+            use_cpu_initialization=True,
+            layernorm_zero_centered_gamma=True,
+            num_attention_heads=8,
+            activation_func=F.silu,
+            bf16=True,
+            experimental_attention_variant="gated_delta_net",
+            linear_attention_freq=[1],
+            transformer_impl="transformer_engine",
+        )
+        gdn_submodules = get_experimental_attention_variant_module_spec(
+            config=transformer_config
+        ).submodules
+        gdn = (
+            GatedDeltaNet(
+                transformer_config,
+                submodules=gdn_submodules,
+                layer_number=1,
+                bias=False,
+                conv_bias=False,
+                conv_init=1.0,
+                use_qk_l2norm=True,
+                A_init_range=(1, 16),
+                pg_collection=pg_collection,
+            )
+            .cuda()
+            .bfloat16()
+        )
+
+        assert gdn.split_in_proj
+        assert not hasattr(gdn, "in_proj")
+        assert gdn.qkv_proj.weight.shape[0] == gdn.conv_dim_local_tp
+        assert gdn.gba_proj.weight.shape[0] == gdn.gba_dim_local_tp
+
+        hidden_states = torch.randn(
+            16, 2, gdn.config.hidden_size, device=torch.cuda.current_device(), dtype=torch.bfloat16
+        )
+        output, _ = gdn(hidden_states, attention_mask=None)
+        output.float().square().mean().backward()
+
+        assert output.shape == hidden_states.shape
+        assert gdn.qkv_proj.weight.grad is not None
+        assert gdn.gba_proj.weight.grad is not None
+    finally:
+        Utils.destroy_model_parallel()
+
+
 @pytest.mark.parametrize("sequence_packing", [False, True])
 @pytest.mark.parametrize(
     ("tp", "sp", "cp"),

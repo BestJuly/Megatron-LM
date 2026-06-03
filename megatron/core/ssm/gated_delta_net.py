@@ -148,29 +148,62 @@ class GatedDeltaNet(MegatronModule):
         # Input projection (hidden_states -> q, k, v, gate, beta, alpha)
         # TODO: for now, output gate is forced for GDN.
         # We may remove this restriction in the future.
-        self.in_proj_dim = self.qk_dim * 2 + self.v_dim * 2 + self.num_value_heads * 2
+        self.conv_dim = self.qk_dim * 2 + self.v_dim
+        self.gba_dim = self.v_dim + self.num_value_heads * 2
+        self.gba_dim_local_tp = self.gba_dim // self.tp_size
+        self.in_proj_dim = self.conv_dim + self.gba_dim
+        self.split_in_proj = os.environ.get("MCORE_GDN_SPLIT_IN_PROJ", "0") == "1"
         if self.config.fp8:
             fp8_align_size = get_fp8_align_size(self.config.fp8_recipe)
-            assert self.in_proj_dim % fp8_align_size == 0, (
-                "For FP8, the innermost dimension of the GDN layer "
-                "input projection output tensor must be a multiple of 16."
+            fp8_dims = [self.conv_dim, self.gba_dim] if self.split_in_proj else [self.in_proj_dim]
+            for fp8_dim in fp8_dims:
+                assert fp8_dim % fp8_align_size == 0, (
+                    "For FP8, the innermost dimension of each GDN layer "
+                    "input projection output tensor must be a multiple of 16."
+                )
+        if self.split_in_proj:
+            self.qkv_proj = build_module(
+                submodules.in_proj,
+                self.hidden_size,
+                self.conv_dim,
+                config=self.config,
+                init_method=self.config.init_method,
+                gather_output=False,
+                bias=bias,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name="fc1_qkv",
+                tp_group=self.pg_collection.tp,
             )
-        self.in_proj = build_module(
-            submodules.in_proj,
-            self.hidden_size,
-            self.in_proj_dim,
-            config=self.config,
-            init_method=self.config.init_method,
-            gather_output=False,
-            bias=bias,
-            skip_bias_add=False,
-            is_expert=False,
-            tp_comm_buffer_name="fc1",
-            tp_group=self.pg_collection.tp,
-        )
+            self.gba_proj = build_module(
+                submodules.in_proj,
+                self.hidden_size,
+                self.gba_dim,
+                config=self.config,
+                init_method=self.config.init_method,
+                gather_output=False,
+                bias=bias,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name="fc1_gba",
+                tp_group=self.pg_collection.tp,
+            )
+        else:
+            self.in_proj = build_module(
+                submodules.in_proj,
+                self.hidden_size,
+                self.in_proj_dim,
+                config=self.config,
+                init_method=self.config.init_method,
+                gather_output=False,
+                bias=bias,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name="fc1",
+                tp_group=self.pg_collection.tp,
+            )
 
         # Conv1d for QKV
-        self.conv_dim = self.qk_dim * 2 + self.v_dim
         self.conv_dim_local_tp = self.conv_dim // self.tp_size
 
         # weight shape: [conv_dim, 1, d_conv]
@@ -339,63 +372,125 @@ class GatedDeltaNet(MegatronModule):
             cu_seqlens_q = None
             cu_seqlens_kv = None
 
-        # Input projection
-        nvtx_range_push(suffix="in_proj")
-        qkvzba, _ = self.in_proj(hidden_states)
-        nvtx_range_pop(suffix="in_proj")
+        qkv_channels_split_sections = [
+            self.qk_dim_local_tp,
+            self.qk_dim_local_tp,
+            self.v_dim_local_tp,
+        ]
+        gba_split_sections = [
+            self.v_dim_local_tp,
+            self.num_value_heads // self.tp_size,
+            self.num_value_heads // self.tp_size,
+        ]
+        if self.split_in_proj:
+            # Input projection
+            nvtx_range_push(suffix="qkv_proj")
+            qkv, _ = self.qkv_proj(hidden_states)
+            nvtx_range_pop(suffix="qkv_proj")
+            nvtx_range_push(suffix="gba_proj")
+            gba, _ = self.gba_proj(hidden_states)
+            nvtx_range_pop(suffix="gba_proj")
 
-        # CP All to All: CP to HP
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            unpacked_qkvzba = _unpack_sequence(qkvzba, cu_seqlens_q // self.cp_size, dim=0)
-            outputs = []
-            for qkvzba_i in unpacked_qkvzba:
-                qkvzba_i = tensor_a2a_cp2hp(
-                    qkvzba_i,
+            # CP All to All: CP to HP
+            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+                unpacked_qkv = _unpack_sequence(qkv, cu_seqlens_q // self.cp_size, dim=0)
+                unpacked_gba = _unpack_sequence(gba, cu_seqlens_q // self.cp_size, dim=0)
+                qkv_outputs = []
+                gba_outputs = []
+                for qkv_i, gba_i in zip(unpacked_qkv, unpacked_gba):
+                    qkv_outputs.append(
+                        tensor_a2a_cp2hp(
+                            qkv_i,
+                            seq_dim=0,
+                            head_dim=-1,
+                            cp_group=self.pg_collection.cp,
+                            split_sections=qkv_channels_split_sections,
+                        )
+                    )
+                    gba_outputs.append(
+                        tensor_a2a_cp2hp(
+                            gba_i,
+                            seq_dim=0,
+                            head_dim=-1,
+                            cp_group=self.pg_collection.cp,
+                            split_sections=gba_split_sections,
+                        )
+                    )
+                qkv = torch.cat(qkv_outputs, dim=0)
+                gba = torch.cat(gba_outputs, dim=0)
+            else:
+                qkv = tensor_a2a_cp2hp(
+                    qkv,
                     seq_dim=0,
                     head_dim=-1,
                     cp_group=self.pg_collection.cp,
-                    split_sections=[
-                        self.qk_dim_local_tp,
-                        self.qk_dim_local_tp,
-                        self.v_dim_local_tp,
-                        self.v_dim_local_tp,
-                        self.num_value_heads // self.tp_size,
-                        self.num_value_heads // self.tp_size,
-                    ],
+                    split_sections=qkv_channels_split_sections,
                 )
-                outputs.append(qkvzba_i)
-            qkvzba = torch.cat(outputs, dim=0)
-        else:
-            qkvzba = tensor_a2a_cp2hp(
-                qkvzba,
-                seq_dim=0,
-                head_dim=-1,
-                cp_group=self.pg_collection.cp,
-                split_sections=[
-                    self.qk_dim_local_tp,
-                    self.qk_dim_local_tp,
-                    self.v_dim_local_tp,
-                    self.v_dim_local_tp,
-                    self.num_value_heads // self.tp_size,
-                    self.num_value_heads // self.tp_size,
+                gba = tensor_a2a_cp2hp(
+                    gba,
+                    seq_dim=0,
+                    head_dim=-1,
+                    cp_group=self.pg_collection.cp,
+                    split_sections=gba_split_sections,
+                )
+
+            # Transpose: s b x --> b s x
+            # From sbhd to bshd format
+            qkv = qkv.transpose(0, 1)
+            gba = gba.transpose(0, 1)
+            gate, beta, alpha = torch.split(
+                gba,
+                [
+                    self.v_dim_local_tp // self.cp_size,
+                    self.num_value_heads // self.tp_size // self.cp_size,
+                    self.num_value_heads // self.tp_size // self.cp_size,
                 ],
+                dim=-1,
             )
+        else:
+            # Input projection
+            nvtx_range_push(suffix="in_proj")
+            qkvzba, _ = self.in_proj(hidden_states)
+            nvtx_range_pop(suffix="in_proj")
 
-        # Transpose: s b x --> b s x
-        # From sbhd to bshd format
-        qkvzba = qkvzba.transpose(0, 1)
+            # CP All to All: CP to HP
+            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+                unpacked_qkvzba = _unpack_sequence(qkvzba, cu_seqlens_q // self.cp_size, dim=0)
+                outputs = []
+                for qkvzba_i in unpacked_qkvzba:
+                    qkvzba_i = tensor_a2a_cp2hp(
+                        qkvzba_i,
+                        seq_dim=0,
+                        head_dim=-1,
+                        cp_group=self.pg_collection.cp,
+                        split_sections=qkv_channels_split_sections + gba_split_sections,
+                    )
+                    outputs.append(qkvzba_i)
+                qkvzba = torch.cat(outputs, dim=0)
+            else:
+                qkvzba = tensor_a2a_cp2hp(
+                    qkvzba,
+                    seq_dim=0,
+                    head_dim=-1,
+                    cp_group=self.pg_collection.cp,
+                    split_sections=qkv_channels_split_sections + gba_split_sections,
+                )
 
-        # Split, reorder, and reshape the tensor into q, k, v, gate, beta, alpha
-        qkv, gate, beta, alpha = torch.split(
-            qkvzba,
-            [
-                (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // self.cp_size,
-                self.v_dim_local_tp // self.cp_size,
-                self.num_value_heads // self.tp_size // self.cp_size,
-                self.num_value_heads // self.tp_size // self.cp_size,
-            ],
-            dim=-1,
-        )
+            # Transpose: s b x --> b s x
+            # From sbhd to bshd format
+            qkvzba = qkvzba.transpose(0, 1)
+
+            # Split, reorder, and reshape the tensor into q, k, v, gate, beta, alpha
+            qkv, gate, beta, alpha = torch.split(
+                qkvzba,
+                [
+                    self.conv_dim_local_tp // self.cp_size,
+                    self.v_dim_local_tp // self.cp_size,
+                    self.num_value_heads // self.tp_size // self.cp_size,
+                    self.num_value_heads // self.tp_size // self.cp_size,
+                ],
+                dim=-1,
+            )
         gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
         beta = beta.reshape(batch, seq_len, -1)
         alpha = alpha.reshape(batch, seq_len, -1)
@@ -403,11 +498,6 @@ class GatedDeltaNet(MegatronModule):
         # Convolution on qkv
         nvtx_range_push(suffix="conv1d")
         seq_len = qkv.shape[1]
-        qkv_channels_split_sections = [
-            self.qk_dim_local_tp,
-            self.qk_dim_local_tp,
-            self.v_dim_local_tp,
-        ]
         conv1d_weight = get_parameter_local_cp(
             self.conv1d.weight,
             dim=0,
@@ -637,25 +727,54 @@ class GatedDeltaNet(MegatronModule):
 
         # At this point the TP sharding is correctly defined for each tensor, but some of the
         # tensors must be additionally split into separate parts
-        in_proj_dim_local_tp = self.in_proj_dim // self.tp_size
-        assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim_local_tp, (
-            in_proj_dim_local_tp,
-            sharded_state_dict[f"{prefix}in_proj.weight"],
-        )
+        if self.split_in_proj:
+            assert (
+                sharded_state_dict[f"{prefix}qkv_proj.weight"].data.size(0)
+                == self.conv_dim_local_tp
+            ), (self.conv_dim_local_tp, sharded_state_dict[f"{prefix}qkv_proj.weight"])
+            assert (
+                sharded_state_dict[f"{prefix}gba_proj.weight"].data.size(0)
+                == self.gba_dim_local_tp
+            ), (self.gba_dim_local_tp, sharded_state_dict[f"{prefix}gba_proj.weight"])
 
-        sharded_state_dict[f"{prefix}in_proj.weight"] = _split_tensor_factory(
-            sharded_state_dict[f"{prefix}in_proj.weight"],
-            [
-                self.qk_dim_local_tp,
-                self.qk_dim_local_tp,
-                self.v_dim_local_tp,
-                self.v_dim_local_tp,
-                self.num_value_heads // self.tp_size,
-                self.num_value_heads // self.tp_size,
-            ],
-            ["query", "key", "value", "z", "beta", "alpha"],
-            0,
-        )
+            sharded_state_dict[f"{prefix}qkv_proj.weight"] = _split_tensor_factory(
+                sharded_state_dict[f"{prefix}qkv_proj.weight"],
+                [self.qk_dim_local_tp, self.qk_dim_local_tp, self.v_dim_local_tp],
+                ["query", "key", "value"],
+                0,
+            )
+            sharded_state_dict[f"{prefix}gba_proj.weight"] = _split_tensor_factory(
+                sharded_state_dict[f"{prefix}gba_proj.weight"],
+                [
+                    self.v_dim_local_tp,
+                    self.num_value_heads // self.tp_size,
+                    self.num_value_heads // self.tp_size,
+                ],
+                ["z", "beta", "alpha"],
+                0,
+            )
+        else:
+            in_proj_dim_local_tp = self.in_proj_dim // self.tp_size
+            assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(
+                0
+            ) == in_proj_dim_local_tp, (
+                in_proj_dim_local_tp,
+                sharded_state_dict[f"{prefix}in_proj.weight"],
+            )
+
+            sharded_state_dict[f"{prefix}in_proj.weight"] = _split_tensor_factory(
+                sharded_state_dict[f"{prefix}in_proj.weight"],
+                [
+                    self.qk_dim_local_tp,
+                    self.qk_dim_local_tp,
+                    self.v_dim_local_tp,
+                    self.v_dim_local_tp,
+                    self.num_value_heads // self.tp_size,
+                    self.num_value_heads // self.tp_size,
+                ],
+                ["query", "key", "value", "z", "beta", "alpha"],
+                0,
+            )
 
         conv_layer_name_list = ["conv1d.weight"]
         assert (
@@ -678,12 +797,20 @@ class GatedDeltaNet(MegatronModule):
 
     def backward_dw(self):
         """Execute weight gradient computation for all linear layers."""
-        self._backward_in_proj()
+        if self.split_in_proj:
+            self._backward_split_in_proj()
+        else:
+            self._backward_in_proj()
         self._backward_out_proj()
 
     def _backward_in_proj(self):
         """Computes weight gradients of input projection layer."""
         self.in_proj.backward_dw()
+
+    def _backward_split_in_proj(self):
+        """Computes weight gradients of split input projection layers."""
+        self.qkv_proj.backward_dw()
+        self.gba_proj.backward_dw()
 
     def _backward_out_proj(self):
         """Computes weight gradients of output projection layer."""
