@@ -64,6 +64,351 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+_FLASHINFER_PREFILL_BACKEND_ENV = "MCORE_GDN_PREFILL_BACKEND"
+_FLASHINFER_PREFILL_ENABLE_VALUES = {"1", "true", "yes", "flashinfer", "mcore", "mcore_cute"}
+_FLASHINFER_FIXED_CU_SEQLENS_CACHE = {}
+
+
+def _is_flashinfer_gdn_prefill_enabled():
+    return (
+        os.environ.get(_FLASHINFER_PREFILL_BACKEND_ENV, "triton").strip().lower()
+        in _FLASHINFER_PREFILL_ENABLE_VALUES
+    )
+
+
+def _get_flashinfer_gdn_prefill_kernel():
+    try:
+        from mcore_gdn_opt.gated_delta_rule.forward import (
+            chunk_gated_delta_rule_prefill_cute as mcore_gdn_prefill,
+        )
+    except ImportError as exc:
+        raise ImportError(
+            "MCore GDN prefill requested via "
+            f"{_FLASHINFER_PREFILL_BACKEND_ENV}=flashinfer/mcore_cute, but "
+            "mcore_gdn_opt.gated_delta_rule.forward.chunk_gated_delta_rule_prefill_cute "
+            "is not importable. Build/install mcore_gdn_opt on SM100."
+        ) from exc
+    return mcore_gdn_prefill
+
+
+def _flashinfer_validate_chunk_aligned(cu_seqlens, seq_len):
+    """The FlashInfer A side-output store writes complete 64x64 chunks."""
+    if cu_seqlens is None:
+        if seq_len % 64 != 0:
+            raise ValueError(
+                "FlashInfer GDN prefill fwd+bwd currently requires sequence length "
+                f"to be a multiple of 64, got {seq_len}."
+            )
+        return
+    lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+    if not bool((lengths % 64 == 0).all().item()):
+        raise ValueError(
+            "FlashInfer GDN prefill fwd+bwd currently requires every packed "
+            "sequence length to be a multiple of 64."
+        )
+
+
+def _flashinfer_fixed_cu_seqlens(batch, seq_len, device):
+    device = torch.device(device)
+    key = (device.type, device.index, batch, seq_len)
+    cached = _FLASHINFER_FIXED_CU_SEQLENS_CACHE.get(key)
+    if cached is not None and cached.device == device:
+        return cached
+    cu_seqlens = torch.arange(
+        0,
+        batch * seq_len + 1,
+        seq_len,
+        device=device,
+        dtype=torch.int32,
+    )
+    _FLASHINFER_FIXED_CU_SEQLENS_CACHE[key] = cu_seqlens
+    return cu_seqlens
+
+
+def _flashinfer_prepare_flat_inputs(query, key, value, g, beta, cu_seqlens):
+    batch, seq_len, _, _ = query.shape
+    total_tokens = batch * seq_len
+    if cu_seqlens is None:
+        flashinfer_cu_seqlens = _flashinfer_fixed_cu_seqlens(batch, seq_len, query.device)
+        assume_valid_cu_seqlens = True
+    else:
+        flashinfer_cu_seqlens = cu_seqlens.to(device=query.device, dtype=torch.int64)
+        assume_valid_cu_seqlens = False
+
+    query_flat = query.reshape(total_tokens, query.shape[-2], query.shape[-1]).contiguous()
+    key_flat = key.reshape(total_tokens, key.shape[-2], key.shape[-1]).contiguous()
+    value_flat = value.reshape(total_tokens, value.shape[-2], value.shape[-1]).contiguous()
+    g_decay = torch.exp(g.float()).reshape(total_tokens, g.shape[-1]).contiguous()
+    beta_flat = beta.float().reshape(total_tokens, beta.shape[-1]).contiguous()
+    return (
+        query_flat,
+        key_flat,
+        value_flat,
+        g_decay,
+        beta_flat,
+        flashinfer_cu_seqlens,
+        assume_valid_cu_seqlens,
+    )
+
+
+def _flashinfer_run_prefill_kernel(
+    query,
+    key,
+    value,
+    g,
+    beta,
+    cu_seqlens,
+    *,
+    kernel,
+    scale,
+    output_A=None,
+    assume_valid_cu_seqlens=False,
+):
+    if kernel is None:
+        kernel = _get_flashinfer_gdn_prefill_kernel()
+    output = kernel(
+        q=query.detach(),
+        k=key.detach(),
+        v=value.detach(),
+        g=g.detach(),
+        beta=beta.detach(),
+        scale=scale,
+        initial_state=None,
+        output_final_state=False,
+        cu_seqlens=cu_seqlens,
+        assume_valid_cu_seqlens=assume_valid_cu_seqlens,
+        use_qk_l2norm_in_kernel=False,
+        output_A=output_A.detach() if output_A is not None else None,
+    )
+    if isinstance(output, tuple):
+        output = output[0]
+    return output
+
+
+def _flashinfer_chunk_local_cumsum_for_backward(g, cu_seqlens, chunk_indices):
+    if g.is_cuda:
+        from fla.ops.utils import chunk_local_cumsum
+        from fla.ops.utils.constant import RCP_LN2
+
+        return chunk_local_cumsum(
+            g,
+            chunk_size=64,
+            scale=RCP_LN2,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
+
+    # CPU-only unit tests use fake FlashInfer kernels. Keep this path simple and
+    # equivalent for dense fixed-length inputs; real execution uses the CUDA path.
+    return g.float().cumsum(dim=1) / torch.log(torch.tensor(2.0, device=g.device))
+
+
+def _flashinfer_prepare_backward_context(query, key, value, g, beta, cu_seqlens):
+    batch, seq_len, _, _ = query.shape
+    num_heads = beta.shape[-1]
+    total_tokens = batch * seq_len
+    if cu_seqlens is None:
+        chunk_indices = None
+        bwd_cu_seqlens = None
+        q_bwd, k_bwd, v_bwd = query, key, value
+        g_bwd, beta_bwd = g, beta
+        output_A = torch.empty(
+            batch,
+            seq_len,
+            num_heads,
+            64,
+            dtype=query.dtype,
+            device=query.device,
+        )
+    else:
+        bwd_cu_seqlens = cu_seqlens.to(device=query.device, dtype=torch.int64)
+        if int(bwd_cu_seqlens[-1].item()) != total_tokens:
+            raise ValueError(
+                "FlashInfer GDN prefill received cu_seqlens whose final value does not "
+                f"match flattened tokens: {int(bwd_cu_seqlens[-1].item())} != {total_tokens}."
+            )
+        from fla.ops.utils.index import prepare_chunk_indices
+
+        chunk_indices = prepare_chunk_indices(bwd_cu_seqlens, 64)
+        q_bwd = query.reshape(1, total_tokens, query.shape[-2], query.shape[-1]).contiguous()
+        k_bwd = key.reshape(1, total_tokens, key.shape[-2], key.shape[-1]).contiguous()
+        v_bwd = value.reshape(1, total_tokens, value.shape[-2], value.shape[-1]).contiguous()
+        g_bwd = g.reshape(1, total_tokens, g.shape[-1]).contiguous()
+        beta_bwd = beta.reshape(1, total_tokens, beta.shape[-1]).contiguous()
+        output_A = torch.empty(
+            1,
+            total_tokens,
+            num_heads,
+            64,
+            dtype=query.dtype,
+            device=query.device,
+        )
+
+    g_cumsum = _flashinfer_chunk_local_cumsum_for_backward(g_bwd, bwd_cu_seqlens, chunk_indices)
+    return q_bwd, k_bwd, v_bwd, g_cumsum, beta_bwd, output_A, bwd_cu_seqlens, chunk_indices
+
+
+def _flashinfer_gdn_prefill_backward_impl():
+    try:
+        from mcore_gdn_opt.gated_delta_rule.chunk import (
+            _chunk_gated_delta_rule_bwd_fla,
+            _chunk_gated_delta_rule_bwd_opt,
+        )
+        from mcore_gdn_opt.gated_delta_rule.dispatch import get_policy
+
+        return _chunk_gated_delta_rule_bwd_fla if get_policy().backend == "fla" else _chunk_gated_delta_rule_bwd_opt
+    except ImportError:
+        from fla.ops.gated_delta_rule.chunk import chunk_gated_delta_rule_bwd
+
+        return chunk_gated_delta_rule_bwd
+
+
+class _FlashInferGdnPrefillFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, query, key, value, g, beta, cu_seqlens, scale, kernel):
+        if query.dim() != 4 or key.dim() != 4 or value.dim() != 4:
+            raise ValueError(
+                "FlashInfer GDN prefill expects Megatron BSHD query/key/value tensors, "
+                f"got query={tuple(query.shape)}, key={tuple(key.shape)}, value={tuple(value.shape)}"
+            )
+        batch, seq_len, _, _ = query.shape
+        _flashinfer_validate_chunk_aligned(cu_seqlens, seq_len)
+        scale_value = scale if scale is not None and scale != 0.0 else query.shape[-1] ** -0.5
+        (
+            q_bwd,
+            k_bwd,
+            v_bwd,
+            g_bwd,
+            beta_bwd,
+            output_A,
+            bwd_cu_seqlens,
+            chunk_indices,
+        ) = _flashinfer_prepare_backward_context(query, key, value, g, beta, cu_seqlens)
+        (
+            query_flat,
+            key_flat,
+            value_flat,
+            g_decay,
+            beta_flat,
+            flashinfer_cu_seqlens,
+            assume_valid_cu_seqlens,
+        ) = _flashinfer_prepare_flat_inputs(query, key, value, g, beta, cu_seqlens)
+        output_A_flat = output_A.reshape(query_flat.shape[0], output_A.shape[-2], 64)
+        output = _flashinfer_run_prefill_kernel(
+            query_flat,
+            key_flat,
+            value_flat,
+            g_decay,
+            beta_flat,
+            flashinfer_cu_seqlens,
+            kernel=kernel,
+            scale=scale_value,
+            output_A=output_A_flat,
+            assume_valid_cu_seqlens=assume_valid_cu_seqlens,
+        )
+        ctx.save_for_backward(
+            q_bwd,
+            k_bwd,
+            v_bwd,
+            g_bwd,
+            beta_bwd,
+            output_A,
+            bwd_cu_seqlens,
+            chunk_indices,
+        )
+        ctx.query_shape = tuple(query.shape)
+        ctx.key_shape = tuple(key.shape)
+        ctx.value_shape = tuple(value.shape)
+        ctx.g_shape = tuple(g.shape)
+        ctx.beta_shape = tuple(beta.shape)
+        ctx.scale = scale_value
+        ctx.varlen = cu_seqlens is not None
+        return output.reshape(batch, seq_len, output.shape[-2], output.shape[-1]).contiguous()
+
+    @staticmethod
+    def backward(ctx, do):
+        q, k, v, g, beta, A, cu_seqlens, chunk_indices = ctx.saved_tensors
+        do_bwd = do.reshape_as(v) if ctx.varlen else do.contiguous()
+        bwd_impl = _flashinfer_gdn_prefill_backward_impl()
+        dq, dk, dv, db, dg, _ = bwd_impl(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A=A,
+            scale=ctx.scale,
+            initial_state=None,
+            do=do_bwd,
+            dht=None,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            use_exp2=True,
+        )
+        return (
+            dq.reshape(ctx.query_shape).to(q),
+            dk.reshape(ctx.key_shape).to(k),
+            dv.reshape(ctx.value_shape).to(v),
+            dg.reshape(ctx.g_shape).to(g),
+            db.reshape(ctx.beta_shape).to(beta),
+            None,
+            None,
+            None,
+        )
+
+
+def _flashinfer_gdn_prefill_forward(
+    query,
+    key,
+    value,
+    g,
+    beta,
+    cu_seqlens,
+    *,
+    kernel=None,
+    scale=None,
+):
+    """Run FlashInfer GDN prefill on Megatron BSHD tensors.
+
+    Megatron/FLA use BSHD tensors and log-space decay ``g``. FlashInfer prefill
+    uses packed THD tensors and decay alpha, so this helper owns both conversions.
+    When autograd is active, FlashInfer provides the forward output and saved
+    ``A`` while the existing FLA/MCore implementation computes the backward pass.
+    """
+    if query.dim() != 4 or key.dim() != 4 or value.dim() != 4:
+        raise ValueError(
+            "FlashInfer GDN prefill expects Megatron BSHD query/key/value tensors, "
+            f"got query={tuple(query.shape)}, key={tuple(key.shape)}, value={tuple(value.shape)}"
+        )
+    if torch.is_grad_enabled() and any(
+        tensor.requires_grad for tensor in (query, key, value, g, beta) if tensor is not None
+    ):
+        return _FlashInferGdnPrefillFunction.apply(query, key, value, g, beta, cu_seqlens, scale, kernel)
+
+    batch, seq_len, _, _ = query.shape
+    (
+        query_flat,
+        key_flat,
+        value_flat,
+        g_decay,
+        beta_flat,
+        flashinfer_cu_seqlens,
+        assume_valid_cu_seqlens,
+    ) = _flashinfer_prepare_flat_inputs(query, key, value, g, beta, cu_seqlens)
+    output = _flashinfer_run_prefill_kernel(
+        query_flat,
+        key_flat,
+        value_flat,
+        g_decay,
+        beta_flat,
+        flashinfer_cu_seqlens,
+        kernel=kernel,
+        scale=scale,
+        assume_valid_cu_seqlens=assume_valid_cu_seqlens,
+    )
+    return output.reshape(batch, seq_len, output.shape[-2], output.shape[-1]).contiguous()
+
+
 @dataclass
 class GatedDeltaNetSubmodules:
     """
@@ -467,17 +812,30 @@ class GatedDeltaNet(MegatronModule):
         nvtx_range_pop(suffix="g_and_beta")
 
         nvtx_range_push(suffix="gated_delta_rule")
-        core_attn_out, last_recurrent_state = self.gated_delta_rule(
-            query,
-            key,
-            value,
-            g=g,
-            beta=beta,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=False,
-            cu_seqlens=cu_seqlens_q,
-        )
+        if _is_flashinfer_gdn_prefill_enabled():
+            if self.config.deterministic_mode:
+                raise RuntimeError("FlashInfer GDN prefill is not supported in deterministic mode.")
+            core_attn_out = _flashinfer_gdn_prefill_forward(
+                query,
+                key,
+                value,
+                g,
+                beta,
+                cu_seqlens_q,
+            )
+            last_recurrent_state = None
+        else:
+            core_attn_out, last_recurrent_state = self.gated_delta_rule(
+                query,
+                key,
+                value,
+                g=g,
+                beta=beta,
+                initial_state=None,
+                output_final_state=False,
+                use_qk_l2norm_in_kernel=False,
+                cu_seqlens=cu_seqlens_q,
+            )
         nvtx_range_pop(suffix="gated_delta_rule")
 
         # RMSNorm
