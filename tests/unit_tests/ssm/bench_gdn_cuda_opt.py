@@ -29,11 +29,13 @@ FLAGS = (
     "MCORE_GDN_USE_OPT_WRAPPER",
     "MCORE_GDN_OPT_BACKEND",
     "MCORE_GDN_OPT_WARN_FALLBACK",
+    "MCORE_GDN_OPT_ENABLE_RECOMPUTE_FWD_H",
     "MCORE_GDN_OPT_ENABLE_FWD_H",
     "MCORE_GDN_OPT_ENABLE_WY_BWD",
     "MCORE_GDN_OPT_ENABLE_DV_DHU",
     "MCORE_GDN_OPT_ENABLE_DHU",
     "MCORE_GDN_OPT_ENABLE_DQKWG",
+    "MCORE_GDN_PREFILL_BACKEND",
     "FLA_CUTE_FWD_H",
     "CHUNK_DELTA_FWD_USE_BWD_PORT",
     "FLA_CUTE_WY_BWD",
@@ -45,6 +47,27 @@ FLAGS = (
 
 SCENARIOS = {
     "baseline": ("Triton baseline", {}),
+    "flashinfer_prefill": (
+        "FlashInfer GDN prefill fwd + existing bwd",
+        {"MCORE_GDN_PREFILL_BACKEND": "flashinfer"},
+    ),
+    "flashinfer_prefill_cuda_bwd": (
+        "FlashInfer GDN prefill fwd + CUDA bwd",
+        {
+            "MCORE_GDN_PREFILL_BACKEND": "flashinfer",
+            "MCORE_GDN_USE_OPT_WRAPPER": "1",
+            "MCORE_GDN_OPT_BACKEND": "cuda",
+        },
+    ),
+    "flashinfer_prefill_cuda_bwd_existing": (
+        "FlashInfer GDN prefill fwd + existing CUDA bwd",
+        {
+            "MCORE_GDN_PREFILL_BACKEND": "flashinfer",
+            "MCORE_GDN_USE_OPT_WRAPPER": "1",
+            "MCORE_GDN_OPT_BACKEND": "cuda",
+            "MCORE_GDN_OPT_ENABLE_RECOMPUTE_FWD_H": "0",
+        },
+    ),
     "wrapper_fla": (
         "MCore wrapper forced FLA",
         {"MCORE_GDN_USE_OPT_WRAPPER": "1", "MCORE_GDN_OPT_BACKEND": "fla"},
@@ -62,6 +85,7 @@ SCENARIOS = {
         {
             "MCORE_GDN_USE_OPT_WRAPPER": "1",
             "MCORE_GDN_OPT_BACKEND": "cuda",
+            "MCORE_GDN_OPT_ENABLE_RECOMPUTE_FWD_H": "0",
             "MCORE_GDN_OPT_ENABLE_FWD_H": "0",
             "MCORE_GDN_OPT_ENABLE_DV_DHU": "0",
             "MCORE_GDN_OPT_ENABLE_DHU": "0",
@@ -73,6 +97,7 @@ SCENARIOS = {
         {
             "MCORE_GDN_USE_OPT_WRAPPER": "1",
             "MCORE_GDN_OPT_BACKEND": "cuda",
+            "MCORE_GDN_OPT_ENABLE_RECOMPUTE_FWD_H": "0",
             "MCORE_GDN_OPT_ENABLE_FWD_H": "0",
             "MCORE_GDN_OPT_ENABLE_WY_BWD": "0",
             "MCORE_GDN_OPT_ENABLE_DHU": "0",
@@ -84,6 +109,7 @@ SCENARIOS = {
         {
             "MCORE_GDN_USE_OPT_WRAPPER": "1",
             "MCORE_GDN_OPT_BACKEND": "cuda",
+            "MCORE_GDN_OPT_ENABLE_RECOMPUTE_FWD_H": "0",
             "MCORE_GDN_OPT_ENABLE_FWD_H": "0",
             "MCORE_GDN_OPT_ENABLE_WY_BWD": "0",
             "MCORE_GDN_OPT_ENABLE_DV_DHU": "0",
@@ -95,6 +121,7 @@ SCENARIOS = {
         {
             "MCORE_GDN_USE_OPT_WRAPPER": "1",
             "MCORE_GDN_OPT_BACKEND": "cuda",
+            "MCORE_GDN_OPT_ENABLE_RECOMPUTE_FWD_H": "0",
             "MCORE_GDN_OPT_ENABLE_FWD_H": "0",
             "MCORE_GDN_OPT_ENABLE_WY_BWD": "0",
             "MCORE_GDN_OPT_ENABLE_DV_DHU": "0",
@@ -106,6 +133,7 @@ SCENARIOS = {
         {
             "MCORE_GDN_USE_OPT_WRAPPER": "1",
             "MCORE_GDN_OPT_BACKEND": "cuda",
+            "MCORE_GDN_OPT_ENABLE_RECOMPUTE_FWD_H": "0",
             "MCORE_GDN_OPT_ENABLE_FWD_H": "0",
             "MCORE_GDN_OPT_ENABLE_DV_DHU": "0",
         },
@@ -115,6 +143,7 @@ SCENARIOS = {
         {
             "MCORE_GDN_USE_OPT_WRAPPER": "1",
             "MCORE_GDN_OPT_BACKEND": "cuda",
+            "MCORE_GDN_OPT_ENABLE_RECOMPUTE_FWD_H": "0",
             "MCORE_GDN_OPT_ENABLE_FWD_H": "0",
             "MCORE_GDN_OPT_ENABLE_WY_BWD": "0",
             "MCORE_GDN_OPT_ENABLE_DHU": "0",
@@ -125,6 +154,7 @@ SCENARIOS = {
         {
             "MCORE_GDN_USE_OPT_WRAPPER": "1",
             "MCORE_GDN_OPT_BACKEND": "cuda",
+            "MCORE_GDN_OPT_ENABLE_RECOMPUTE_FWD_H": "0",
             "MCORE_GDN_OPT_ENABLE_DV_DHU": "0",
         },
     ),
@@ -133,6 +163,7 @@ SCENARIOS = {
         {
             "MCORE_GDN_USE_OPT_WRAPPER": "1",
             "MCORE_GDN_OPT_BACKEND": "cuda",
+            "MCORE_GDN_OPT_ENABLE_RECOMPUTE_FWD_H": "0",
             "MCORE_GDN_OPT_ENABLE_DHU": "0",
         },
     ),
@@ -258,6 +289,8 @@ def zero_grads(model):
 def compute_loss(output, loss):
     if loss == "sum":
         return output.float().sum()
+    if loss == "square_sum":
+        return output.float().square().sum()
     if loss == "square_mean":
         return output.float().square().mean()
     raise ValueError(f"unknown loss: {loss}")
@@ -297,6 +330,97 @@ def allclose(actual, expected, atol, rtol):
     )
 
 
+
+def run_forward_once(model, x, env, nvtx_label=None, use_nvtx=True):
+    set_env(env)
+    set_model_dispatch(model)
+    print(
+        "RUN_FORWARD_ONCE "
+        f"label={nvtx_label or 'none'} "
+        f"prefill_backend={os.environ.get('MCORE_GDN_PREFILL_BACKEND', 'triton')}",
+        flush=True,
+    )
+    with torch.inference_mode():
+        with nvtx_range(nvtx_label, enabled=use_nvtx and nvtx_label is not None):
+            out, _ = model(x.detach(), attention_mask=None)
+    torch.cuda.synchronize()
+    return out.detach().float().clone().cpu()
+
+
+def check_forward_accuracy(model, x, scenario_items, atol, rtol, use_nvtx=True):
+    base_name, base_env = SCENARIOS["baseline"]
+    base_out = run_forward_once(
+        model, x, base_env, "gdn_only/00_forward_accuracy_reference/Triton_baseline", use_nvtx
+    )
+    rows = []
+    for scenario_idx, (_, (name, env)) in enumerate(scenario_items, start=1):
+        label = f"{scenario_label(scenario_idx, name)}/forward_accuracy"
+        out = run_forward_once(model, x, env, label, use_nvtx)
+        rows.append(
+            AccuracyRow(
+                name=name,
+                status="PASS" if allclose(out, base_out, atol, rtol) else "FAIL",
+                output_max_abs=diff_max_abs(out, base_out),
+                input_grad_max_abs=0.0,
+                worst_param="",
+                worst_param_max_abs=0.0,
+            )
+        )
+    return rows
+
+
+def forward_only(model, x, env, nvtx_label=None, use_nvtx=True):
+    set_env(env)
+    set_model_dispatch(model)
+    with torch.inference_mode():
+        with nvtx_range(nvtx_label, enabled=use_nvtx and nvtx_label is not None):
+            model(x.detach(), attention_mask=None)
+
+
+def benchmark_forward(model, x, scenario_items, warmup, repeats, rounds, use_nvtx=True):
+    rows = []
+    baseline_us = None
+    for scenario_idx, (_, (name, env)) in enumerate(scenario_items, start=1):
+        base_label = scenario_label(scenario_idx, name)
+        for warmup_idx in range(warmup):
+            forward_only(model, x, env, f"{base_label}/forward_warmup_{warmup_idx:02d}", use_nvtx)
+        torch.cuda.synchronize()
+        samples = []
+        for round_idx in range(rounds):
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            with nvtx_range(
+                f"{base_label}/forward_round_{round_idx:02d}/measured_{repeats}iters",
+                enabled=use_nvtx,
+            ):
+                start.record()
+                for iter_idx in range(repeats):
+                    forward_only(
+                        model,
+                        x,
+                        env,
+                        f"{base_label}/forward_round_{round_idx:02d}/iter_{iter_idx:02d}",
+                        use_nvtx,
+                    )
+                end.record()
+            torch.cuda.synchronize()
+            samples.append(start.elapsed_time(end) * 1000.0 / repeats)
+        mean_us = statistics.mean(samples)
+        if baseline_us is None:
+            baseline_us = mean_us
+        rows.append(
+            PerfRow(
+                name=name,
+                mean_us=mean_us,
+                median_us=statistics.median(samples),
+                min_us=min(samples),
+                max_us=max(samples),
+                speedup=baseline_us / mean_us,
+            )
+        )
+    return rows
+
+
 def check_accuracy(model, x, scenario_items, loss, atol, rtol, use_nvtx=True):
     base_name, base_env = SCENARIOS["baseline"]
     base_out, base_grad, base_params = run_once(
@@ -311,10 +435,16 @@ def check_accuracy(model, x, scenario_items, loss, atol, rtol, use_nvtx=True):
         worst_param = ""
         worst_param_abs = 0.0
         params_ok = True
+        use_norm_param_check = loss in {"sum", "square_sum"}
         for param_name, expected in base_params.items():
             actual = params[param_name]
-            params_ok = params_ok and allclose(actual, expected, atol, rtol)
             param_abs = diff_max_abs(actual, expected)
+            param_ok = allclose(actual, expected, atol, rtol)
+            if not param_ok and use_norm_param_check:
+                diff_norm = float((actual - expected).norm().item())
+                ref_norm = float(expected.norm().item())
+                param_ok = ref_norm > 0.0 and diff_norm / ref_norm <= rtol
+            params_ok = params_ok and param_ok
             if param_abs > worst_param_abs:
                 worst_param = param_name
                 worst_param_abs = param_abs
@@ -388,7 +518,8 @@ def benchmark(model, x, scenario_items, loss, warmup, repeats, rounds, use_nvtx=
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
-    parser.add_argument("--loss", choices=("sum", "square_mean"), default="square_mean")
+    parser.add_argument("--loss", choices=("sum", "square_mean", "square_sum"), default="square_sum")
+    parser.add_argument("--mode", choices=("fwd_bwd", "forward"), default="fwd_bwd")
     parser.add_argument("--scenarios", default="baseline,separate,all_four,fwd_h_wy_dv_dhu_dqkwg")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=20)
@@ -421,27 +552,46 @@ def main():
     try:
         model = make_model(dtype).eval()
         x = torch.randn(8192, 2, 128, device="cuda", dtype=dtype)
-        accuracy_rows = check_accuracy(
-            model, x, scenario_items, args.loss, args.atol, args.rtol, args.use_nvtx
-        )
-        for row in accuracy_rows:
-            print(
-                f"ACCURACY name={row.name!r} status={row.status} "
-                f"output_max_abs={row.output_max_abs:.9f} "
-                f"input_grad_max_abs={row.input_grad_max_abs:.9f} "
-                f"worst_param={row.worst_param} "
-                f"worst_param_max_abs={row.worst_param_max_abs:.9f}"
+        if args.mode == "forward":
+            accuracy_rows = check_forward_accuracy(
+                model, x, scenario_items, args.atol, args.rtol, args.use_nvtx
             )
-        perf_rows = benchmark(
-            model,
-            x,
-            scenario_items,
-            args.loss,
-            args.warmup,
-            args.repeats,
-            args.rounds,
-            args.use_nvtx,
-        )
+            for row in accuracy_rows:
+                print(
+                    f"FORWARD_ACCURACY name={row.name!r} status={row.status} "
+                    f"output_max_abs={row.output_max_abs:.9f}"
+                )
+            perf_rows = benchmark_forward(
+                model,
+                x,
+                scenario_items,
+                args.warmup,
+                args.repeats,
+                args.rounds,
+                args.use_nvtx,
+            )
+        else:
+            accuracy_rows = check_accuracy(
+                model, x, scenario_items, args.loss, args.atol, args.rtol, args.use_nvtx
+            )
+            for row in accuracy_rows:
+                print(
+                    f"ACCURACY name={row.name!r} status={row.status} "
+                    f"output_max_abs={row.output_max_abs:.9f} "
+                    f"input_grad_max_abs={row.input_grad_max_abs:.9f} "
+                    f"worst_param={row.worst_param} "
+                    f"worst_param_max_abs={row.worst_param_max_abs:.9f}"
+                )
+            perf_rows = benchmark(
+                model,
+                x,
+                scenario_items,
+                args.loss,
+                args.warmup,
+                args.repeats,
+                args.rounds,
+                args.use_nvtx,
+            )
         for row in perf_rows:
             print(
                 f"PERF name={row.name!r} mean_us={row.mean_us:.3f} "

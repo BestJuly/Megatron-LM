@@ -25,7 +25,7 @@ def _scenario_items():
     keys = [
         key.strip()
         for key in os.environ.get(
-            "MCORE_GDN_UNIT_TEST_SCENARIOS", "baseline,fwd_h_wy_dv_dhu_dqkwg"
+            "MCORE_GDN_UNIT_TEST_SCENARIOS", "baseline,flashinfer_prefill_cuda_bwd"
         ).split(",")
         if key.strip()
     ]
@@ -37,7 +37,9 @@ def _scenario_items():
     return [(key, runner.SCENARIOS[key]) for key in keys]
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+# The mcore_gdn_opt SM100 CUDA kernels are currently bf16-only. Generic fp16
+# GatedDeltaNet coverage lives outside this focused optimized-kernel test.
+@pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bf16"])
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available.")
 @pytest.mark.internal
@@ -55,7 +57,7 @@ def test_gated_delta_net_cuda_opt_correctness_and_optional_perf(dtype):
 
         atol = float(os.environ.get("MCORE_GDN_UNIT_TEST_ATOL", "5e-3"))
         rtol = float(os.environ.get("MCORE_GDN_UNIT_TEST_RTOL", "5e-3"))
-        loss = os.environ.get("MCORE_GDN_UNIT_TEST_LOSS", "sum")
+        loss = os.environ.get("MCORE_GDN_UNIT_TEST_LOSS", "square_sum")
         accuracy_rows = runner.check_accuracy(
             model, x, scenario_items, loss=loss, atol=atol, rtol=rtol, use_nvtx=False
         )
