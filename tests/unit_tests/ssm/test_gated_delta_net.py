@@ -403,3 +403,120 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, sequence_packi
         micro_batch_size=4,
         sequence_packing=sequence_packing,
     )
+
+
+def test_flashinfer_prefill_helper_flattens_batch_and_converts_log_g_to_decay():
+    from megatron.core.ssm import gated_delta_net as gdn_module
+
+    query = torch.arange(12, dtype=torch.float32).reshape(2, 3, 1, 2)
+    key = (query + 100).contiguous()
+    value = (query + 200).contiguous()
+    g = torch.tensor([[[0.0], [-1.0], [-2.0]], [[-3.0], [-4.0], [-5.0]]])
+    beta = torch.linspace(0.1, 0.6, 6, dtype=torch.float32).reshape(2, 3, 1)
+    captured = {}
+
+    def fake_flashinfer_kernel(**kwargs):
+        captured.update(kwargs)
+        return kwargs["q"] + kwargs["v"]
+
+    output = gdn_module._flashinfer_gdn_prefill_forward(
+        query, key, value, g, beta, cu_seqlens=None, kernel=fake_flashinfer_kernel
+    )
+
+    assert output.shape == query.shape
+    assert captured["q"].shape == (6, 1, 2)
+    assert captured["k"].shape == (6, 1, 2)
+    assert captured["v"].shape == (6, 1, 2)
+    assert captured["cu_seqlens"].tolist() == [0, 3, 6]
+    torch.testing.assert_close(captured["g"], torch.exp(g.float()).reshape(6, 1))
+    torch.testing.assert_close(captured["beta"], beta.float().reshape(6, 1))
+    torch.testing.assert_close(output.reshape(6, 1, 2), captured["q"] + captured["v"])
+
+
+def test_flashinfer_prefill_kernel_omits_gate_log_cumsum_kwarg_by_default():
+    from megatron.core.ssm import gated_delta_net as gdn_module
+
+    q = torch.zeros(2, 1, 2)
+    k = torch.zeros_like(q)
+    v = torch.ones_like(q)
+    g = torch.ones(2, 1)
+    beta = torch.ones(2, 1)
+    cu_seqlens = torch.tensor([0, 2], dtype=torch.int32)
+    captured = {}
+
+    def fake_flashinfer_kernel(**kwargs):
+        captured.update(kwargs)
+        return kwargs["v"]
+
+    out = gdn_module._flashinfer_run_prefill_kernel(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        cu_seqlens,
+        kernel=fake_flashinfer_kernel,
+        scale=0.5,
+        gate_is_log_cumsum=False,
+    )
+
+    assert "gate_is_log_cumsum" not in captured
+    torch.testing.assert_close(out, v)
+
+
+def test_flashinfer_prefill_helper_allocates_forward_context_for_autograd_inputs():
+    from megatron.core.ssm import gated_delta_net as gdn_module
+
+    query = torch.ones(1, 64, 1, 2, requires_grad=True)
+    key = torch.ones_like(query, requires_grad=True)
+    value = torch.ones_like(query, requires_grad=True)
+    g = torch.zeros(1, 64, 1, requires_grad=True)
+    beta = torch.ones(1, 64, 1, requires_grad=True)
+    captured = {}
+
+    def fake_flashinfer_kernel(**kwargs):
+        captured.update(kwargs)
+        kwargs["output_A"].fill_(1)
+        return kwargs["q"] + kwargs["v"]
+
+    output = gdn_module._flashinfer_gdn_prefill_forward(
+        query, key, value, g, beta, cu_seqlens=None, kernel=fake_flashinfer_kernel
+    )
+
+    assert output.requires_grad
+    assert not captured["q"].requires_grad
+    assert not captured["k"].requires_grad
+    assert not captured["v"].requires_grad
+    assert not captured["g"].requires_grad
+    assert not captured["beta"].requires_grad
+    assert not captured["output_A"].requires_grad
+    assert captured["output_A"].shape == (64, 1, 64)
+    assert captured["output_A"].dtype == query.dtype
+
+
+def test_flashinfer_prefill_default_kernel_uses_mcore_owned_source(monkeypatch):
+    import sys
+    import types
+
+    from megatron.core.ssm import gated_delta_net as gdn_module
+
+    fake_kernel = object()
+    pkg = types.ModuleType("mcore_gdn_opt")
+    subpkg = types.ModuleType("mcore_gdn_opt.gated_delta_rule")
+    forward = types.ModuleType("mcore_gdn_opt.gated_delta_rule.forward")
+    forward.chunk_gated_delta_rule_prefill_cute = fake_kernel
+    subpkg.forward = forward
+    pkg.gated_delta_rule = subpkg
+    monkeypatch.setitem(sys.modules, "mcore_gdn_opt", pkg)
+    monkeypatch.setitem(sys.modules, "mcore_gdn_opt.gated_delta_rule", subpkg)
+    monkeypatch.setitem(sys.modules, "mcore_gdn_opt.gated_delta_rule.forward", forward)
+
+    assert gdn_module._get_flashinfer_gdn_prefill_kernel() is fake_kernel
+
+
+def test_flashinfer_prefill_is_enabled_by_default(monkeypatch):
+    from megatron.core.ssm import gated_delta_net as gdn_module
+
+    monkeypatch.delenv("MCORE_GDN_PREFILL_BACKEND", raising=False)
+
+    assert gdn_module._is_flashinfer_gdn_prefill_enabled()

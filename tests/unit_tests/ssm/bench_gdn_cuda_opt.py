@@ -46,7 +46,7 @@ FLAGS = (
 
 
 SCENARIOS = {
-    "baseline": ("Triton baseline", {}),
+    "baseline": ("Triton baseline", {"MCORE_GDN_PREFILL_BACKEND": "triton"}),
     "flashinfer_prefill": (
         "FlashInfer GDN prefill fwd + existing bwd",
         {"MCORE_GDN_PREFILL_BACKEND": "flashinfer"},
@@ -337,7 +337,7 @@ def run_forward_once(model, x, env, nvtx_label=None, use_nvtx=True):
     print(
         "RUN_FORWARD_ONCE "
         f"label={nvtx_label or 'none'} "
-        f"prefill_backend={os.environ.get('MCORE_GDN_PREFILL_BACKEND', 'triton')}",
+        f"prefill_backend={os.environ.get('MCORE_GDN_PREFILL_BACKEND', 'flashinfer')}",
         flush=True,
     )
     with torch.inference_mode():
