@@ -65,15 +65,25 @@ logger = logging.getLogger(__name__)
 
 
 _FLASHINFER_PREFILL_BACKEND_ENV = "MCORE_GDN_PREFILL_BACKEND"
+_FLASHINFER_PREFILL_GATE_LOG_CUMSUM_ENV = "MCORE_GDN_PREFILL_USE_PRECOMPUTED_G_CUMSUM"
 _FLASHINFER_PREFILL_ENABLE_VALUES = {"1", "true", "yes", "flashinfer", "mcore", "mcore_cute"}
 _FLASHINFER_FIXED_CU_SEQLENS_CACHE = {}
 
 
 def _is_flashinfer_gdn_prefill_enabled():
     return (
-        os.environ.get(_FLASHINFER_PREFILL_BACKEND_ENV, "triton").strip().lower()
+        os.environ.get(_FLASHINFER_PREFILL_BACKEND_ENV, "flashinfer").strip().lower()
         in _FLASHINFER_PREFILL_ENABLE_VALUES
     )
+
+
+def _is_flashinfer_prefill_gate_log_cumsum_enabled():
+    return os.environ.get(_FLASHINFER_PREFILL_GATE_LOG_CUMSUM_ENV, "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _get_flashinfer_gdn_prefill_kernel():
@@ -125,7 +135,7 @@ def _flashinfer_fixed_cu_seqlens(batch, seq_len, device):
     return cu_seqlens
 
 
-def _flashinfer_prepare_flat_inputs(query, key, value, g, beta, cu_seqlens):
+def _flashinfer_prepare_flat_inputs(query, key, value, g, beta, cu_seqlens, gate_log_cumsum=None):
     batch, seq_len, _, _ = query.shape
     total_tokens = batch * seq_len
     if cu_seqlens is None:
@@ -138,13 +148,16 @@ def _flashinfer_prepare_flat_inputs(query, key, value, g, beta, cu_seqlens):
     query_flat = query.reshape(total_tokens, query.shape[-2], query.shape[-1]).contiguous()
     key_flat = key.reshape(total_tokens, key.shape[-2], key.shape[-1]).contiguous()
     value_flat = value.reshape(total_tokens, value.shape[-2], value.shape[-1]).contiguous()
-    g_decay = torch.exp(g.float()).reshape(total_tokens, g.shape[-1]).contiguous()
+    if gate_log_cumsum is None:
+        g_for_prefill = torch.exp(g.float()).reshape(total_tokens, g.shape[-1]).contiguous()
+    else:
+        g_for_prefill = gate_log_cumsum.reshape(total_tokens, g.shape[-1]).float().contiguous()
     beta_flat = beta.float().reshape(total_tokens, beta.shape[-1]).contiguous()
     return (
         query_flat,
         key_flat,
         value_flat,
-        g_decay,
+        g_for_prefill,
         beta_flat,
         flashinfer_cu_seqlens,
         assume_valid_cu_seqlens,
@@ -163,23 +176,27 @@ def _flashinfer_run_prefill_kernel(
     scale,
     output_A=None,
     assume_valid_cu_seqlens=False,
+    gate_is_log_cumsum=False,
 ):
     if kernel is None:
         kernel = _get_flashinfer_gdn_prefill_kernel()
-    output = kernel(
-        q=query.detach(),
-        k=key.detach(),
-        v=value.detach(),
-        g=g.detach(),
-        beta=beta.detach(),
-        scale=scale,
-        initial_state=None,
-        output_final_state=False,
-        cu_seqlens=cu_seqlens,
-        assume_valid_cu_seqlens=assume_valid_cu_seqlens,
-        use_qk_l2norm_in_kernel=False,
-        output_A=output_A.detach() if output_A is not None else None,
-    )
+    kwargs = {
+        "q": query.detach(),
+        "k": key.detach(),
+        "v": value.detach(),
+        "g": g.detach(),
+        "beta": beta.detach(),
+        "scale": scale,
+        "initial_state": None,
+        "output_final_state": False,
+        "cu_seqlens": cu_seqlens,
+        "assume_valid_cu_seqlens": assume_valid_cu_seqlens,
+        "use_qk_l2norm_in_kernel": False,
+        "output_A": output_A.detach() if output_A is not None else None,
+    }
+    if gate_is_log_cumsum:
+        kwargs["gate_is_log_cumsum"] = True
+    output = kernel(**kwargs)
     if isinstance(output, tuple):
         output = output[0]
     return output
@@ -284,6 +301,8 @@ class _FlashInferGdnPrefillFunction(torch.autograd.Function):
             bwd_cu_seqlens,
             chunk_indices,
         ) = _flashinfer_prepare_backward_context(query, key, value, g, beta, cu_seqlens)
+        use_gate_log_cumsum = _is_flashinfer_prefill_gate_log_cumsum_enabled()
+        gate_log_cumsum = g_bwd if use_gate_log_cumsum else None
         (
             query_flat,
             key_flat,
@@ -292,7 +311,9 @@ class _FlashInferGdnPrefillFunction(torch.autograd.Function):
             beta_flat,
             flashinfer_cu_seqlens,
             assume_valid_cu_seqlens,
-        ) = _flashinfer_prepare_flat_inputs(query, key, value, g, beta, cu_seqlens)
+        ) = _flashinfer_prepare_flat_inputs(
+            query, key, value, g, beta, cu_seqlens, gate_log_cumsum=gate_log_cumsum
+        )
         output_A_flat = output_A.reshape(query_flat.shape[0], output_A.shape[-2], 64)
         output = _flashinfer_run_prefill_kernel(
             query_flat,
@@ -305,6 +326,7 @@ class _FlashInferGdnPrefillFunction(torch.autograd.Function):
             scale=scale_value,
             output_A=output_A_flat,
             assume_valid_cu_seqlens=assume_valid_cu_seqlens,
+            gate_is_log_cumsum=use_gate_log_cumsum,
         )
         ctx.save_for_backward(
             q_bwd,
