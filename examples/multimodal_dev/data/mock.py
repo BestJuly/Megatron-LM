@@ -504,6 +504,26 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     from megatron.training import get_args
 
     args = get_args()
+    mdp_multimodal_enabled = (
+        bool(getattr(args, "mdp_encoder_mode", True))
+        and not bool(getattr(args, "text_only", False))
+        and getattr(args, "model_arch", "")
+        in {"qwen3vl", "qwen35_vl"}
+    )
+    distributed_mdp_scope = (
+        int(getattr(args, "context_parallel_size", 1)) > 1
+        or (
+            getattr(args, "mdp_inner_dp_scope", "cp") == "pp_cp"
+            and int(getattr(args, "pipeline_model_parallel_size", 1)) > 1
+        )
+    )
+    if mdp_multimodal_enabled and distributed_mdp_scope:
+        from examples.multimodal_dev.data.mock_mdp import (
+            train_valid_test_datasets_provider as mock_mdp_provider,
+        )
+
+        return mock_mdp_provider(train_val_test_num_samples)
+
     kwargs = {
         "seq_length": getattr(args, "total_seq_length", 1024),
         # Image-token counts are derived from each patch grid.
@@ -522,8 +542,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         "layout": getattr(args, "mock_layout", "single"),
         "pack_num_docs": getattr(args, "mock_pack_num_docs", 1),
         "text_only": getattr(args, "text_only", False),
-        # PR2 has no MDP model path. Keep ordinary mock training fully
-        # materialized; focused tests can opt into descriptor-only samples.
+        # Distributed MDP routes through mock_mdp above. Keep the ordinary
+        # fixed-shape path fully materialized.
         "metadata_only_batch": False,
     }
 

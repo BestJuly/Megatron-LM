@@ -35,13 +35,21 @@ def test_registry_adds_qwen3_paths_without_replacing_existing_models():
 
     assert set(MODEL_REGISTRY) == {"kimi_k25", "qwen3", "qwen35_vl", "qwen3vl"}
     assert set(MODEL_REGISTRY["qwen35_vl"]["dataset_providers"]) == {
+        "blend",
         "cord_v2",
         "energon",
         "mock",
+        "mock_mdp",
     }
     assert set(MODEL_REGISTRY["kimi_k25"]["dataset_providers"]) == {"mock"}
-    assert set(MODEL_REGISTRY["qwen3vl"]["dataset_providers"]) == {"energon", "mock"}
+    assert set(MODEL_REGISTRY["qwen3vl"]["dataset_providers"]) == {
+        "blend",
+        "energon",
+        "mock",
+        "mock_mdp",
+    }
     assert MODEL_REGISTRY["qwen3"]["text_only"] is True
+    assert set(MODEL_REGISTRY["qwen3"]["dataset_providers"]) == {"mock"}
 
 
 def test_model_provider_marks_qwen3_text_only_and_forwards_stage_flags(monkeypatch):
@@ -228,6 +236,46 @@ def test_qwen3vl_factory_preserves_b436_model_shape_and_qwen35_wrapper():
     assert captured["rotary_percent"] == 0.5
     assert captured["vocab_size"] == 248320
     assert captured["max_sequence_length"] == 40960
+
+
+def test_qwen3vl_factory_builds_vision_on_downstream_pp_cp_stage():
+    from examples.multimodal_dev.models.qwen3vl import factory
+
+    language_config = SimpleNamespace(num_layers=48, linear_attention_freq=None)
+    vision_config = SimpleNamespace(num_layers=27, hidden_size=1152)
+    args = SimpleNamespace(
+        image_token_id=248056,
+        max_position_embeddings=40960,
+        mtp_num_layers=None,
+        padded_vocab_size=248320,
+        rotary_percent=0.5,
+        transformer_impl="transformer_engine",
+        mdp_encoder_mode=True,
+        mdp_inner_dp_scope="pp_cp",
+        pipeline_model_parallel_size=2,
+        text_only=False,
+    )
+    captured = {}
+
+    with (
+        mock.patch.object(factory, "get_qwen3_language_spec", return_value=object()),
+        mock.patch.object(
+            factory,
+            "Qwen35VLModel",
+            side_effect=lambda **kwargs: captured.update(kwargs) or kwargs,
+        ),
+    ):
+        factory.build_model(
+            args,
+            language_config,
+            vision_config,
+            pre_process=False,
+            post_process=True,
+        )
+
+    assert captured["pre_process"] is False
+    assert captured["post_process"] is True
+    assert captured["build_vision_model"] is True
 
 
 def test_qwen35_wrapper_keeps_default_rotary_and_accepts_qwen3vl_override():

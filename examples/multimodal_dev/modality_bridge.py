@@ -408,6 +408,7 @@ def gather_to_inner_dp_zero(
     encoder_dp_group,
     global_per_image_row_counts=None,
     local_zero_dep=None,
+    return_zero_dependency_only: bool = False,
 ):
     """All-gather per-image embeddings across an InnerDP process group.
 
@@ -436,8 +437,13 @@ def gather_to_inner_dp_zero(
         local_zero_dep: optional scalar zero dependency attached to padding
             rows so empty local shards can still keep trainable local modules
             in the autograd graph.
+        return_zero_dependency_only: when True, return a scalar zero
+            dependency on the gathered tensor immediately after the
+            collective. Non-consuming PP stages need the collective autograd
+            edge, but not canonical gathered rows.
     Returns:
-        Tensor ``[total_image_tokens, hidden]`` on every CP group member.
+        Tensor ``[total_image_tokens, hidden]`` on every group member, or a
+        scalar zero dependency when ``return_zero_dependency_only`` is True.
     """
     world_size = dist.get_world_size(group=encoder_dp_group)
     device = local_embeddings.device
@@ -495,6 +501,11 @@ def gather_to_inner_dp_zero(
         # e.g., text-only batch); return an empty [0, hidden] tensor on
         # every rank.
         empty = torch.empty((0, hidden), dtype=dtype, device=device)
+        if return_zero_dependency_only:
+            zero = local_embeddings.reshape(-1)[:0].sum() * 0.0
+            if local_zero_dep is not None:
+                zero = zero + local_zero_dep.to(dtype=dtype) * 0.0
+            return zero
         if local_zero_dep is not None:
             empty = empty + local_zero_dep.to(dtype=dtype) * 0.0
         return empty
@@ -515,6 +526,8 @@ def gather_to_inner_dp_zero(
     # Step 4 - all_gather the equal-shape padded tensor with explicit
     # autograd support.
     padded_cat = _gather_padded_sequence_parallel_region(padded_local, encoder_dp_group)
+    if return_zero_dependency_only:
+        return padded_cat.reshape(-1)[:1].sum() * 0.0
 
     padded_out = [padded_cat.narrow(0, r * max_count, max_count) for r in range(world_size)]
 

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from examples.multimodal_dev.mdp_parallel_groups import get_pp_cp_local_rank
 from examples.multimodal_dev.models.qwen35_vl.configuration import (
     QWEN35_VL_IMAGE_TOKEN_ID,
     QWEN35_VL_VIDEO_TOKEN_ID,
@@ -82,15 +83,26 @@ def _task_encoder(args, tokenizer) -> Qwen35EnergonTaskEncoder:
         cp_rank = 0
         pp_size = int(getattr(args, "pipeline_model_parallel_size", 1))
 
-    partition_vision = bool(getattr(args, "mdp_encoder_mode", False)) and cp_size > 1
     inner_scope = str(getattr(args, "mdp_inner_dp_scope", "cp"))
-    if partition_vision and inner_scope != "cp":
+    mdp_requested = bool(getattr(args, "mdp_encoder_mode", True))
+    if mdp_requested and inner_scope not in ("cp", "pp_cp"):
         raise ValueError(
-            "PR #4 supports --mdp-inner-dp-scope cp only; the following "
-            "sidecar PR adds pp_cp"
+            "--mdp-inner-dp-scope must be either cp or pp_cp; "
+            f"got {inner_scope!r}"
         )
-    if partition_vision and pp_size != 1:
+    partition_vision = mdp_requested and (
+        cp_size > 1 or (inner_scope == "pp_cp" and pp_size > 1)
+    )
+    if partition_vision and inner_scope == "cp" and pp_size != 1:
         raise ValueError("CP-local --mdp-encoder-mode requires PP=1")
+    if mdp_requested and inner_scope == "pp_cp" and pp_size <= 1:
+        raise ValueError("pp_cp --mdp-encoder-mode requires PP>1")
+
+    prepartition_rank = int(cp_rank) if partition_vision else 0
+    prepartition_world = int(cp_size) if partition_vision else 1
+    if partition_vision and inner_scope == "pp_cp":
+        prepartition_rank = get_pp_cp_local_rank(args, pp_size, cp_size)
+        prepartition_world = int(pp_size) * int(cp_size)
 
     return Qwen35EnergonTaskEncoder(
         tokenizer=tokenizer,
@@ -110,8 +122,8 @@ def _task_encoder(args, tokenizer) -> Qwen35EnergonTaskEncoder:
         image_max_pixels=int(getattr(args, "image_max_pixels", 0)),
         cp_size=int(cp_size),
         mdp_loader_prepartition=partition_vision,
-        mdp_loader_prepartition_rank=int(cp_rank) if partition_vision else 0,
-        mdp_loader_prepartition_world=int(cp_size) if partition_vision else 1,
+        mdp_loader_prepartition_rank=prepartition_rank,
+        mdp_loader_prepartition_world=prepartition_world,
         mdp_loader_prepartition_encoder_stage=True,
         mdp_loader_prepartition_materialize=True,
         mdp_lpt_hidden_size=int(getattr(args, "vision_hidden_size", 1152)),

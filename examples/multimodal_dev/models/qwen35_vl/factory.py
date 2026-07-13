@@ -38,6 +38,15 @@ def set_vision_flops_metadata(args, language_config, vision_config):
     args.vision_out_hidden_size = language_config.hidden_size
 
 
+def _pp_cp_replicated_vision_requested(args) -> bool:
+    return (
+        bool(getattr(args, "mdp_encoder_mode", False))
+        and int(getattr(args, "pipeline_model_parallel_size", 1)) > 1
+        and getattr(args, "mdp_inner_dp_scope", "cp") == "pp_cp"
+        and not bool(getattr(args, "text_only", False))
+    )
+
+
 def build_model(args, language_config, vision_config, **kwargs):
     """Build a complete Qwen3.5-VL model instance.
 
@@ -87,6 +96,14 @@ def build_model(args, language_config, vision_config, **kwargs):
     share_embeddings = not getattr(
         args, "untie_embeddings_and_output_weights", False
     )
+    pre_process = kwargs.get("pre_process", True)
+    post_process = kwargs.get("post_process", True)
+    vp_stage = kwargs.get("vp_stage", None)
+    replicate_vision = _pp_cp_replicated_vision_requested(args)
+    if replicate_vision and vp_stage is not None:
+        raise ValueError(
+            "PP x CP replicated vision supports only non-interleaved pipeline stages"
+        )
 
     return Qwen35VLModel(
         language_config=language_config,
@@ -98,4 +115,8 @@ def build_model(args, language_config, vision_config, **kwargs):
         mtp_block_spec=mtp_block_spec,
         parallel_output=True,
         share_embeddings_and_output_weights=share_embeddings,
+        pre_process=pre_process,
+        post_process=post_process,
+        vp_stage=vp_stage,
+        build_vision_model=pre_process or replicate_vision,
     )

@@ -26,6 +26,9 @@ from examples.multimodal_dev.models.qwen35_vl.factory import (
     set_vision_flops_metadata as _qwen35_vl_set_vision_flops_metadata,
 )
 from examples.multimodal_dev.models.qwen35_vl.model import Qwen35VLModel
+from examples.multimodal_dev.mdp_pipeline_sidecar import (
+    pp_cp_replicated_vision_requested,
+)
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
 
 # qwen35-VL uses rotary_percent=0.25 with
@@ -90,6 +93,15 @@ def build_model(args, language_config, vision_config, **kwargs):
             pp_rank=None,
         )
 
+    pre_process = kwargs.get("pre_process", True)
+    post_process = kwargs.get("post_process", True)
+    vp_stage = kwargs.get("vp_stage", None)
+    replicate_vision = pp_cp_replicated_vision_requested(args)
+    if replicate_vision and vp_stage is not None:
+        raise ValueError(
+            "PP x CP replicated vision supports only non-interleaved pipeline stages"
+        )
+
     return Qwen35VLModel(
         language_config=language_config,
         language_spec=language_spec,
@@ -100,4 +112,8 @@ def build_model(args, language_config, vision_config, **kwargs):
         mtp_block_spec=mtp_block_spec,
         parallel_output=kwargs.get("parallel_output", True),
         rotary_percent=getattr(args, "rotary_percent", QWEN3VL_ROTARY_PERCENT),
+        pre_process=pre_process,
+        post_process=post_process,
+        vp_stage=vp_stage,
+        build_vision_model=pre_process or replicate_vision,
     )

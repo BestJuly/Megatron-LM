@@ -1,17 +1,17 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-"""Base multimodal model for FSDP + EP training.
+"""Base multimodal model for Megatron VLM training.
 
-Composes a vision encoder and a ``GPTModel`` language decoder.  Designed
-for FSDP + EP: always builds the **full** model on every rank (no PP
-flags).  PP support is only available through the MIMO ``MimoModel``
-assembly path.
+Composes a vision encoder and a ``GPTModel`` language decoder. Pipeline
+stages split language preprocessing and postprocessing; PP x CP MDP can
+replicate the vision encoder on every stage.
 
 Subclasses override ``compute_position_ids()`` for model-specific
 position encoding (e.g. MRoPE for Qwen3.5-VL).
 """
 
 import contextlib
+from collections import deque
 from typing import Optional
 
 import torch
@@ -30,6 +30,7 @@ from megatron.core.models.gpt import GPTModel
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.training import get_args
 from megatron.training.utils import get_nvtx_range
 
@@ -115,6 +116,22 @@ def _zero_dep_on_trainable_params(module):
     return zero
 
 
+def _replace_pp_replica_id(replica_id, pp_rank: int):
+    """Replace only the pipeline coordinate of checkpoint replica metadata."""
+    if isinstance(replica_id, int):
+        return int(pp_rank)
+    if not replica_id:
+        return replica_id
+    return (int(pp_rank), *tuple(replica_id)[1:])
+
+
+def _mark_replicated_pp_vision_shards(sharded_state_dict, pp_rank: int) -> None:
+    """Make PP0 the main checkpoint replica without changing TP/DP identity."""
+    for shard in sharded_state_dict.values():
+        if hasattr(shard, "replica_id"):
+            shard.replica_id = _replace_pp_replica_id(shard.replica_id, pp_rank)
+
+
 def _zero_dep_on_tensor(tensor):
     if tensor.numel() == 0:
         return tensor.sum() * 0.0
@@ -156,8 +173,7 @@ class MultimodalModel(MegatronModule):
     """Base class for multimodal vision-language models.
 
     Composes a pre-constructed vision encoder and a ``GPTModel`` language
-    decoder.  Designed for FSDP + EP; always builds the full model on
-    every rank.
+    decoder with Megatron pipeline stage ownership.
 
     Args:
         language_config: ``TransformerConfig`` for the language decoder.
@@ -179,7 +195,7 @@ class MultimodalModel(MegatronModule):
         self,
         language_config: TransformerConfig,
         language_spec: ModuleSpec,
-        vision_encoder: MegatronModule,
+        vision_encoder: Optional[MegatronModule],
         vocab_size: int,
         max_sequence_length: int,
         image_token_id: int,
@@ -190,10 +206,16 @@ class MultimodalModel(MegatronModule):
         mtp_block_spec: ModuleSpec = None,
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
+        pre_process: bool = True,
+        post_process: bool = True,
+        vp_stage: Optional[int] = None,
     ):
         super().__init__(config=language_config)
 
         self.image_token_id = image_token_id
+        self.pre_process = pre_process
+        self.post_process = post_process
+        self.vp_stage = vp_stage
 
         self.vision_model = vision_encoder
         self.language_model = GPTModel(
@@ -201,8 +223,8 @@ class MultimodalModel(MegatronModule):
             transformer_layer_spec=language_spec,
             vocab_size=vocab_size,
             max_sequence_length=max_sequence_length,
-            pre_process=True,
-            post_process=True,
+            pre_process=pre_process,
+            post_process=post_process,
             parallel_output=parallel_output,
             share_embeddings_and_output_weights=(
                 share_embeddings_and_output_weights
@@ -211,10 +233,143 @@ class MultimodalModel(MegatronModule):
             rotary_percent=rotary_percent,
             rotary_base=rotary_base,
             mtp_block_spec=mtp_block_spec,
+            vp_stage=vp_stage,
+        )
+        self.share_embeddings_and_output_weights = (
+            self.language_model.share_embeddings_and_output_weights
         )
 
+    @property
+    def embedding_activation_buffer(self):
+        return self.language_model.embedding_activation_buffer
+
+    @property
+    def grad_output_buffer(self):
+        return self.language_model.grad_output_buffer
+
+    @property
+    def output_layer(self):
+        return self.language_model.output_layer
+
+    def shared_embedding_or_output_weight(self):
+        return self.language_model.shared_embedding_or_output_weight()
+
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        """Build checkpoint state with PP-replicated vision saved once."""
+        sharded_state = {}
+        if self.vision_model is not None:
+            vision_state = sharded_state_dict_default(
+                self.vision_model,
+                f'{prefix}vision_model.',
+                sharded_offsets,
+                metadata,
+            )
+            if bool(getattr(self, '_mdp_pp_cp_inner', False)):
+                _mark_replicated_pp_vision_shards(
+                    vision_state,
+                    parallel_state.get_pipeline_model_parallel_rank(),
+                )
+            sharded_state.update(vision_state)
+        sharded_state.update(
+            sharded_state_dict_default(
+                self.language_model,
+                f'{prefix}language_model.',
+                sharded_offsets,
+                metadata,
+            )
+        )
+        return sharded_state
+
+    def mdp_pp_cp_sidecar_compute_vision(
+        self,
+        *,
+        pixel_values: Optional[Tensor],
+        image_grid_thw: Optional[Tensor],
+        mdp_cp_local_plan=None,
+    ):
+        """Run the CP-local bridge supplied by the preceding MDP layer."""
+        del mdp_cp_local_plan
+        if not bool(getattr(self, '_mdp_pp_cp_inner', False)):
+            raise RuntimeError("PP x CP vision sidecar requires replicated MDP mode")
+        return self._run_mdp_vision_bridge(
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+        )
+
+    def pipeline_sidecar_pre_forward(
+        self,
+        *,
+        data_iterator=None,
+        current_microbatch=None,
+        num_microbatches=None,
+        forward_only=False,
+    ) -> None:
+        """Precompute one PP x CP vision microbatch before pipeline P2P."""
+        del current_microbatch, num_microbatches
+        if not bool(getattr(self, '_pipeline_sidecar_enabled', False)):
+            return
+        from examples.multimodal_dev.forward_step import (
+            build_mdp_pp_cp_sidecar_cache,
+        )
+
+        cache = build_mdp_pp_cp_sidecar_cache(
+            data_iterator=data_iterator,
+            model=self,
+            vp_stage=self.vp_stage,
+            forward_only=forward_only,
+        )
+        queue = getattr(self, '_mdp_pp_cp_sidecar_cache', None)
+        if queue is None:
+            queue = deque()
+            object.__setattr__(self, '_mdp_pp_cp_sidecar_cache', queue)
+        queue.append(cache)
+
+    def mdp_pp_cp_sidecar_pop_cache(self):
+        queue = getattr(self, '_mdp_pp_cp_sidecar_cache', None)
+        if not queue:
+            return None
+        return queue.popleft()
+
+    def mdp_pp_cp_sidecar_activate_cache(self, cache) -> None:
+        vision_embeddings = None if cache is None else cache.get('vision_embeddings')
+        object.__setattr__(
+            self,
+            '_mdp_pp_cp_active_vision_embeddings',
+            vision_embeddings,
+        )
+        if (
+            torch.is_grad_enabled()
+            and not bool(cache.get('forward_only', False))
+            and not self.pre_process
+            and torch.is_tensor(vision_embeddings)
+        ):
+            queue = getattr(self, '_mdp_pp_cp_sidecar_backward_cache', None)
+            if queue is None:
+                queue = deque()
+                object.__setattr__(
+                    self,
+                    '_mdp_pp_cp_sidecar_backward_cache',
+                    queue,
+                )
+            queue.append(_zero_dep_on_tensor(vision_embeddings))
+
+    def pipeline_sidecar_post_backward(self) -> None:
+        """Backpropagate the matching non-consuming PP vision dependency."""
+        if not bool(getattr(self, '_pipeline_sidecar_enabled', False)):
+            return
+        if bool(getattr(self, '_pp_cp_batch_sidecar', False)):
+            return
+        if self.pre_process:
+            return
+        queue = getattr(self, '_mdp_pp_cp_sidecar_backward_cache', None)
+        if not queue:
+            raise RuntimeError("PP x CP vision sidecar backward cache is empty")
+        dependency = queue.popleft()
+        if dependency.requires_grad:
+            dependency.backward()
+
     def set_input_tensor(self, input_tensor):
-        """Route input tensors (simplified, no PP routing)."""
+        """Route pipeline input tensors to the language decoder."""
         if not isinstance(input_tensor, list):
             input_tensor = [input_tensor]
         assert len(input_tensor) == 1
@@ -247,6 +402,14 @@ class MultimodalModel(MegatronModule):
         if has_local_imgs:
             with get_nvtx_range()("MultimodalModel/vision_encoder"):
                 local_embeddings = self.vision_model(pixel_values, image_grid_thw)
+            if (
+                bool(getattr(self, "_mdp_pp_cp_inner", False))
+                and torch.is_grad_enabled()
+                and not local_embeddings.requires_grad
+            ):
+                # Frozen vision replicas still need the bridge autograd node
+                # so every PP x CP rank enters the gather backward collective.
+                local_embeddings = local_embeddings.detach().requires_grad_(True)
         else:
             lm_param = next(self.language_model.parameters())
             hidden_size = int(getattr(self.config, "hidden_size", 0))
@@ -277,7 +440,15 @@ class MultimodalModel(MegatronModule):
             encoder_dp_group=gather_group,
             global_per_image_row_counts=global_row_counts,
             local_zero_dep=zero_dep if not has_local_imgs else None,
+            return_zero_dependency_only=(
+                not self.pre_process
+                and bool(getattr(self, "_mdp_pp_cp_inner", False))
+            ),
         )
+        if not self.pre_process and bool(
+            getattr(self, "_mdp_pp_cp_inner", False)
+        ):
+            return vision_embeddings
         if global_row_counts is not None:
             local_per_image_row_counts = None
         elif image_grid_thw is not None and image_grid_thw.numel() > 0:
@@ -613,7 +784,7 @@ class MultimodalModel(MegatronModule):
         Returns:
             Loss tensor (post_process=True) or hidden states.
         """
-        if position_ids is None:
+        if position_ids is None and input_ids is not None:
             position_ids = self.compute_position_ids(
                 input_ids=input_ids,
                 image_grid_thw=image_grid_thw,
@@ -623,14 +794,32 @@ class MultimodalModel(MegatronModule):
         object.__setattr__(self, "_decoder_input_already_cp_partitioned", False)
 
         mdp_enabled = bool(getattr(self, "_mdp_enabled", False))
+        cp_local_mdp = (
+            mdp_enabled and parallel_state.get_context_parallel_world_size() > 1
+        )
+        pp_cp_sidecar = bool(getattr(self, "_mdp_pp_cp_inner", False))
         vision_embeddings = None
-        if mdp_enabled:
+        if pp_cp_sidecar:
+            active_vision_embeddings = getattr(
+                self, "_mdp_pp_cp_active_vision_embeddings", None
+            )
+            if active_vision_embeddings is None:
+                raise RuntimeError(
+                    "PP x CP vision sidecar cache was not activated before model forward"
+                )
+            object.__setattr__(
+                self, "_mdp_pp_cp_active_vision_embeddings", None
+            )
+            if self.pre_process:
+                vision_embeddings = active_vision_embeddings
+        elif mdp_enabled:
             vision_embeddings = self._run_mdp_vision_bridge(
                 pixel_values=pixel_values,
                 image_grid_thw=image_grid_thw,
             )
         elif (
-            self.vision_model is not None
+            self.pre_process
+            and self.vision_model is not None
             and pixel_values is not None
             and pixel_values.numel() > 0
         ):
@@ -639,10 +828,10 @@ class MultimodalModel(MegatronModule):
             )
 
         decoder_input_already_cp_partitioned = False
-        if decoder_input is None and self.language_model is not None:
+        if decoder_input is None and self.language_model is not None and self.pre_process:
             input_ids_for_embedding = (
                 self._partition_cp_local_input_ids(input_ids, packed_seq_params)
-                if mdp_enabled
+                if cp_local_mdp
                 else input_ids
             )
             text_embeddings = self.language_model.embedding(
@@ -650,7 +839,7 @@ class MultimodalModel(MegatronModule):
             )
 
             if vision_embeddings is not None:
-                if mdp_enabled:
+                if cp_local_mdp:
                     decoder_input = self._cp_local_merge_decoder_input(
                         input_ids=input_ids_for_embedding,
                         text_embeddings=text_embeddings,

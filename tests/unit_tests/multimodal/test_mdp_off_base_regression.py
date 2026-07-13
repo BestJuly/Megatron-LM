@@ -26,6 +26,7 @@ class _MdpOffHarness:
 
     def __init__(self, text_embeddings, vision_embeddings):
         self.config = SimpleNamespace(sequence_parallel=False)
+        self.pre_process = True
         self.image_token_id = 99
         self.language_model = _LanguageModel(text_embeddings)
         self.vision_model = lambda _pixels, _grid: vision_embeddings

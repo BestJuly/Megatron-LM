@@ -102,6 +102,117 @@ def test_mdp_off_energon_marks_packed_and_disables_overlap_before_ddp_setup():
     assert model._mdp_enabled is False
 
 
+@pytest.mark.parametrize("dataset_provider", ["blend", "energon", "mock", "mock_mdp"])
+def test_descriptor_backed_mdp_providers_are_allowed_and_marked_packed(
+    monkeypatch, dataset_provider
+):
+    group = object()
+    model = SimpleNamespace(vision_model=torch.nn.Linear(2, 2))
+    args = _args(
+        context_parallel_size=2,
+        dataset_provider=dataset_provider,
+        micro_batch_size=1,
+        use_packed_sequence=False,
+    )
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda _group: [0, 1])
+    monkeypatch.setattr(mdp_model_setup.ps, "get_context_parallel_group", lambda: group)
+
+    result = mdp_model_setup.configure_mdp_model(model, args)
+
+    assert result is model
+    assert args.use_packed_sequence is True
+    assert args.overlap_grad_reduce is False
+    assert args.overlap_param_gather is False
+    assert args.overlap_param_gather_with_optimizer_step is False
+    assert model._mdp_enabled is True
+
+
+def test_direct_blend_packing_is_marked_before_ddp_when_mdp_is_off():
+    model = SimpleNamespace(vision_model=torch.nn.Linear(2, 2))
+    args = _args(
+        mdp_encoder_mode=False,
+        dataset_provider="blend",
+        pack_samples_per_item=2,
+        use_packed_sequence=False,
+    )
+
+    mdp_model_setup.configure_mdp_model(model, args)
+
+    assert args.use_packed_sequence is True
+    assert args.overlap_grad_reduce is False
+    assert args.overlap_param_gather is False
+    assert args.overlap_param_gather_with_optimizer_step is False
+
+
+@pytest.mark.parametrize("mdp_requested", [False, True])
+def test_mdp_off_packed_pipeline_enables_generic_batch_sidecar_without_vision(mdp_requested):
+    model = SimpleNamespace(vision_model=None)
+    args = _args(
+        mdp_encoder_mode=mdp_requested,
+        context_parallel_size=1,
+        pipeline_model_parallel_size=4,
+        dataset_provider="mock",
+        micro_batch_size=1,
+        overlap_grad_reduce=False,
+        overlap_param_gather=False,
+    )
+
+    result = mdp_model_setup.configure_mdp_model(model, args)
+
+    assert result is model
+    assert args.mdp_encoder_mode is False
+    assert model._mdp_enabled is False
+    assert model._pp_cp_batch_sidecar is True
+    assert model._pipeline_sidecar_enabled is True
+
+
+def test_qwen3_text_only_pipeline_never_enables_generic_sidecar():
+    model = SimpleNamespace(vision_model=None)
+    args = _args(
+        model_arch="qwen3",
+        context_parallel_size=1,
+        pipeline_model_parallel_size=2,
+        dataset_provider="mock",
+        micro_batch_size=1,
+    )
+
+    result = mdp_model_setup.configure_mdp_model(model, args)
+
+    assert result is model
+    assert args.text_only is True
+    assert args.mdp_encoder_mode is False
+    assert model._mdp_enabled is False
+    assert model._pp_cp_batch_sidecar is False
+    assert model._pipeline_sidecar_enabled is False
+    assert args.overlap_grad_reduce is True
+    assert args.overlap_param_gather is True
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"use_packed_sequence": False}, "requires --use-packed-sequence"),
+        ({"micro_batch_size": 2}, "requires micro_batch_size=1"),
+    ],
+)
+def test_mdp_off_pp_rejects_unsupported_thd_contract(override, message):
+    model = SimpleNamespace(vision_model=torch.nn.Linear(2, 2))
+    args = _args(
+        mdp_encoder_mode=False,
+        context_parallel_size=1,
+        pipeline_model_parallel_size=2,
+        dataset_provider="mock",
+        overlap_grad_reduce=False,
+        overlap_param_gather=False,
+        **override,
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        mdp_model_setup.configure_mdp_model(model, args)
+
+
 def test_cp_scope_wires_megatron_context_group(monkeypatch):
     group = object()
     model = SimpleNamespace(vision_model=torch.nn.Linear(2, 2))
@@ -117,16 +228,39 @@ def test_cp_scope_wires_megatron_context_group(monkeypatch):
     assert model._mdp_inner_dp_group is group
 
 
-def test_pp_cp_scope_is_reserved_for_following_sidecar_pr():
+def test_pp_cp_scope_delegates_to_replicated_sidecar(monkeypatch):
+    from examples.multimodal_dev import mdp_pipeline_sidecar
+
+    group = object()
     model = SimpleNamespace(vision_model=torch.nn.Linear(2, 2))
     args = _args(
         context_parallel_size=2,
+        pipeline_model_parallel_size=2,
         mdp_inner_dp_scope="pp_cp",
-        overlap_grad_reduce=False,
-        overlap_param_gather=False,
+        dataset_provider="energon",
+        micro_batch_size=1,
     )
-    with pytest.raises(RuntimeError, match="requires --mdp-inner-dp-scope cp"):
-        mdp_model_setup.configure_mdp_model(model, args)
+
+    def configure_sidecar(inner_model, _args):
+        inner_model._mdp_inner_dp_group = group
+        inner_model._mdp_enabled = True
+        inner_model._mdp_pp_cp_inner = True
+        inner_model._pipeline_sidecar_enabled = True
+        return True
+
+    monkeypatch.setattr(
+        mdp_pipeline_sidecar, "configure_pp_cp_replicated_vision", configure_sidecar
+    )
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 4)
+
+    result = mdp_model_setup.configure_mdp_model(model, args)
+
+    assert result is model
+    assert model._mdp_pp_cp_inner is True
+    assert model._pipeline_sidecar_enabled is True
+    assert args.overlap_grad_reduce is False
+    assert args.overlap_param_gather is False
+    assert args.overlap_param_gather_with_optimizer_step is False
 
 
 def test_pipeline_parallelism_is_reserved_for_following_sidecar_pr():
@@ -141,11 +275,24 @@ def test_pipeline_parallelism_is_reserved_for_following_sidecar_pr():
         mdp_model_setup.configure_mdp_model(model, args)
 
 
+def test_pp_cp_scope_requires_pipeline_parallelism():
+    model = SimpleNamespace(vision_model=torch.nn.Linear(2, 2))
+    args = _args(
+        context_parallel_size=2,
+        pipeline_model_parallel_size=1,
+        mdp_inner_dp_scope="pp_cp",
+        dataset_provider="energon",
+        micro_batch_size=1,
+    )
+    with pytest.raises(RuntimeError, match="pipeline_model_parallel_size > 1"):
+        mdp_model_setup.configure_mdp_model(model, args)
+
+
 @pytest.mark.parametrize(
     ("override", "message"),
     [
         ({"micro_batch_size": 2}, "micro_batch_size=1"),
-        ({"dataset_provider": "mock"}, "dataset-provider energon"),
+        ({"dataset_provider": "cord_v2"}, "descriptor-backed"),
         ({"dynamic_context_parallel": True}, "static context parallelism"),
         ({"use_megatron_fsdp": True}, "does not support FSDP"),
     ],

@@ -129,6 +129,58 @@ def _allreduce_conditional_embedding_grads(
                     grad.copy_(grads[0])
 
 
+def _has_mdp_pp_cp_inner(model: List[torch.nn.Module]) -> bool:
+    """Return whether this model owns PP-replicated MDP vision parameters."""
+    for model_chunk in model:
+        try:
+            if bool(get_attr_wrapped_model(model_chunk, '_mdp_pp_cp_inner')):
+                return True
+        except RuntimeError:
+            continue
+    return False
+
+
+def _allreduce_mdp_pp_cp_vision_grads(
+    model: List[torch.nn.Module], pp_group: Optional[torch.distributed.ProcessGroup] = None
+):
+    """Sum disjoint vision-shard gradients across replicated PP stages."""
+    if pp_group is None:
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+    if get_pg_size(pp_group) <= 1 or not _has_mdp_pp_cp_inner(model):
+        return
+
+    params = []
+    grads = []
+    for model_chunk in model:
+        try:
+            vision_model = get_attr_wrapped_model(model_chunk, 'vision_model')
+        except RuntimeError:
+            continue
+        if vision_model is None:
+            continue
+        for param in vision_model.parameters():
+            if not param.requires_grad:
+                continue
+            grad_attr = _get_main_grad_attr(param)
+            original_grad = getattr(param, grad_attr, None)
+            grad = torch.zeros_like(param.data) if original_grad is None else original_grad.data
+            params.append((param, grad_attr, original_grad))
+            grads.append(grad)
+
+    if not grads:
+        return
+
+    coalesced = _flatten_dense_tensors(grads)
+    torch.distributed.all_reduce(coalesced, group=pp_group)
+    for (param, grad_attr, original_grad), grad, synced in zip(
+        params, grads, _unflatten_dense_tensors(coalesced, grads)
+    ):
+        if original_grad is None:
+            setattr(param, grad_attr, synced.clone())
+        else:
+            grad.copy_(synced)
+
+
 def _get_shared_word_embedding_weight(
     model_module: torch.nn.Module, config: TransformerConfig
 ) -> Optional[torch.nn.Parameter]:
@@ -439,6 +491,17 @@ def finalize_model_grads(
         embd_group = parallel_state.get_embedding_group(check_initialized=False)
         pos_emb_group = parallel_state.get_position_embedding_group(check_initialized=False)
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+
+    if _has_mdp_pp_cp_inner(model):
+        # DistOpt reduce-scatter can leave each PP stage with a different local
+        # shard. Sum the full replicated vision gradients before that happens.
+        if config.timers is not None:
+            config.timers('mdp-vision-pp-grads-all-reduce', log_level=1).start(
+                barrier=config.barrier_with_L1_time
+            )
+        _allreduce_mdp_pp_cp_vision_grads(model, pp_group)
+        if config.timers is not None:
+            config.timers('mdp-vision-pp-grads-all-reduce').stop()
 
     # All-reduce / reduce-scatter across DP replicas.
     if config.timers is not None:

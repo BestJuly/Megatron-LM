@@ -46,6 +46,32 @@ from .combined_1f1b import (
 Shape = Union[List[int], torch.Size]
 
 
+def _get_pipeline_sidecar_hooks(model):
+    """Return optional pre-forward and post-backward hooks from a wrapped model."""
+    while model is not None and not hasattr(model, "_pipeline_sidecar_enabled"):
+        model = getattr(model, "module", None)
+    if model is None or not bool(model._pipeline_sidecar_enabled):
+        return None, None
+
+    pre_forward = getattr(model, "pipeline_sidecar_pre_forward", None)
+    if pre_forward is None:
+        raise RuntimeError("_pipeline_sidecar_enabled requires pipeline_sidecar_pre_forward")
+    return pre_forward, getattr(model, "pipeline_sidecar_post_backward", None)
+
+
+def _prefetch_pipeline_sidecar(pre_forward, *, data_iterator, num_microbatches, forward_only):
+    """Prepare every sidecar microbatch before pipeline communication starts."""
+    if pre_forward is None:
+        return
+    for microbatch_id in range(int(num_microbatches)):
+        pre_forward(
+            data_iterator=data_iterator,
+            current_microbatch=microbatch_id,
+            num_microbatches=num_microbatches,
+            forward_only=forward_only,
+        )
+
+
 def get_forward_backward_func(pp_size: Optional[int] = None, vp_size: Optional[int] = None):
     """Retrieves the appropriate forward_backward function given the
     configuration of parallel_state.
@@ -650,6 +676,23 @@ def forward_backward_no_pipelining(
     forward_data_store = []
     input_tensor, output_tensor_grad = None, None
     total_num_tokens = torch.zeros([], dtype=torch.int, device="cuda")
+    sidecar_pre_forward, sidecar_post_backward = _get_pipeline_sidecar_hooks(model)
+
+    if (
+        sidecar_post_backward is not None
+        and config.overlap_moe_expert_parallel_comm
+        and not forward_only
+    ):
+        raise RuntimeError(
+            "Pipeline sidecars are not supported by the combined no-pipeline "
+            "forward/backward schedule. Disable overlap_moe_expert_parallel_comm."
+        )
+    _prefetch_pipeline_sidecar(
+        sidecar_pre_forward,
+        data_iterator=data_iterator,
+        num_microbatches=num_microbatches,
+        forward_only=forward_only,
+    )
 
     if config.overlap_moe_expert_parallel_comm and not forward_only:
         forward_data_store, total_num_tokens = combined_1f1b_schedule_for_no_pipelining(
@@ -687,6 +730,8 @@ def forward_backward_no_pipelining(
                 total_num_tokens += num_tokens
                 if not forward_only:
                     backward_step(input_tensor, output_tensor, output_tensor_grad, config)
+                    if sidecar_post_backward is not None:
+                        sidecar_post_backward()
         # Run computation for last microbatch out of context handler (want to
         # synchronize gradients).
         output_tensor, num_tokens = forward_step(
@@ -709,6 +754,8 @@ def forward_backward_no_pipelining(
 
         if not forward_only:
             backward_step(input_tensor, output_tensor, output_tensor_grad, config)
+            if sidecar_post_backward is not None:
+                sidecar_post_backward()
 
     if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
@@ -2366,6 +2413,13 @@ def forward_backward_pipelining_without_interleaving(
         input_tensors = []
         output_tensors = []
     forward_data_store = []
+    sidecar_pre_forward, sidecar_post_backward = _get_pipeline_sidecar_hooks(model)
+    _prefetch_pipeline_sidecar(
+        sidecar_pre_forward,
+        data_iterator=data_iterator,
+        num_microbatches=num_microbatches,
+        forward_only=forward_only,
+    )
 
     # Run warmup forward passes.
     for i in range(num_warmup_microbatches):
@@ -2483,6 +2537,8 @@ def forward_backward_pipelining_without_interleaving(
                 input_tensor = p2p_communicator.send_backward_recv_forward(
                     input_tensor_grad, recv_tensor_shapes, p2p_communicator.is_pp_first_stage
                 )
+            if sidecar_post_backward is not None:
+                sidecar_post_backward()
 
     # Run cooldown backward passes.
     if not forward_only:
@@ -2509,6 +2565,8 @@ def forward_backward_pipelining_without_interleaving(
             )
 
             p2p_communicator.send_backward(input_tensor_grad, p2p_communicator.is_pp_first_stage)
+            if sidecar_post_backward is not None:
+                sidecar_post_backward()
 
         # Launch any remaining grad reductions.
         if no_sync_context is not None:

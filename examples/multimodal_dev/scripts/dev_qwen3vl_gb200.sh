@@ -77,6 +77,9 @@ Usage:
                  seq_len, image_size, image_size_w, image_sizes_h,
                  image_sizes_w, num_images, mock_layout,
                  mock_pack_num_docs, text_only, vision_num_layers,
+                 dataset_provider, dataset_backend, dataset_subsets,
+                 dataset_root, dataset_split, pack_samples_per_item,
+                 pack_scan_multiplier, image_size_max,
                  dispatcher_backend, a2a_overlap, use_fsdp, cuda_graph_scope,
                  recompute, mtp, fp8, fp8_recipe).
 
@@ -138,6 +141,7 @@ run_benchmark() {
     local mbs=1 gbs=512
     local seq_len=4096
     local image_size=224
+    local image_size_max=""
     local image_size_w=""
     local image_sizes_h=""
     local image_sizes_w=""
@@ -162,6 +166,12 @@ run_benchmark() {
     local fp8=""
     local fp8_recipe=""
     local dataset_provider="mock"
+    local dataset_backend=""
+    local dataset_subsets=""
+    local dataset_root=""
+    local dataset_split="train"
+    local pack_samples_per_item=1
+    local pack_scan_multiplier=1
     local extra_args=""
     local num_nodes_override=""
     local gpus_override=""
@@ -180,6 +190,7 @@ run_benchmark() {
             mbs) mbs="$val" ;; gbs) gbs="$val" ;;
             seq_len) seq_len="$val" ;;
             image_size) image_size="$val" ;;
+            image_size_max) image_size_max="$val" ;;
             image_size_w) image_size_w="$val" ;;
             image_sizes_h) image_sizes_h="$val" ;;
             image_sizes_w) image_sizes_w="$val" ;;
@@ -204,6 +215,12 @@ run_benchmark() {
             fp8) fp8="$val" ;;
             fp8_recipe) fp8_recipe="$val" ;;
             dataset_provider) dataset_provider="$val" ;;
+            dataset_backend) dataset_backend="$val" ;;
+            dataset_subsets) dataset_subsets="$val" ;;
+            dataset_root) dataset_root="$val" ;;
+            dataset_split) dataset_split="$val" ;;
+            pack_samples_per_item) pack_samples_per_item="$val" ;;
+            pack_scan_multiplier) pack_scan_multiplier="$val" ;;
             extra_args) extra_args="$val" ;;
             num_nodes) num_nodes_override="$val" ;;
             gpus) gpus_override="$val" ;;
@@ -214,11 +231,6 @@ run_benchmark() {
             *) echo "ERROR: unknown override '$key'" >&2; return 2 ;;
         esac
     done
-
-    if [ "$pp" -ne 1 ]; then
-        echo "ERROR: this Qwen3VL baseline PR supports pp=1 only; pipeline support is added by the PP x CP sidecar PR." >&2
-        return 2
-    fi
 
     local run_nodes="${num_nodes_override:-$NUM_NODES}"
     local run_gpus_per_node="${gpus_override:-$GPUS_PER_NODE}"
@@ -377,6 +389,9 @@ run_benchmark() {
     local multimodal_args=(
         --model-arch qwen3vl
         --dataset-provider "$dataset_provider"
+        --dataset-split "$dataset_split"
+        --pack-samples-per-item "$pack_samples_per_item"
+        --pack-scan-multiplier "$pack_scan_multiplier"
         --image-token-id 248056
         --image-size "$image_size"
         --total-seq-length "$seq_len"
@@ -385,6 +400,10 @@ run_benchmark() {
         --mock-layout "$mock_layout"
         --mock-pack-num-docs "$mock_pack_num_docs"
     )
+    [ -n "$dataset_backend" ] && multimodal_args+=( --dataset-backend "$dataset_backend" )
+    [ -n "$dataset_subsets" ] && multimodal_args+=( --dataset-subsets "$dataset_subsets" )
+    [ -n "$dataset_root" ] && multimodal_args+=( --dataset-root "$dataset_root" )
+    [ -n "$image_size_max" ] && multimodal_args+=( --image-size-max "$image_size_max" )
     [ -n "$image_size_w" ] && multimodal_args+=( --image-size-w "$image_size_w" )
     [ -n "$image_sizes_h" ] && multimodal_args+=( --image-sizes-h "$image_sizes_h" )
     [ -n "$image_sizes_w" ] && multimodal_args+=( --image-sizes-w "$image_sizes_w" )

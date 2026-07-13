@@ -77,6 +77,14 @@ MODEL_REGISTRY = {
                 "examples.multimodal_dev.data.vlm_dataset"
                 ".train_valid_test_datasets_provider"
             ),
+            "mock_mdp": (
+                "examples.multimodal_dev.data.mock_mdp"
+                ".train_valid_test_datasets_provider"
+            ),
+            "blend": (
+                "examples.multimodal_dev.data.blend_dataset"
+                ".train_valid_test_datasets_provider"
+            ),
             "energon": (
                 "examples.multimodal_dev.data.qwen35_energon.provider"
                 ".train_valid_test_datasets_provider"
@@ -118,6 +126,14 @@ MODEL_REGISTRY = {
         "dataset_providers": {
             "mock": (
                 "examples.multimodal_dev.data.mock"
+                ".train_valid_test_datasets_provider"
+            ),
+            "mock_mdp": (
+                "examples.multimodal_dev.data.mock_mdp"
+                ".train_valid_test_datasets_provider"
+            ),
+            "blend": (
+                "examples.multimodal_dev.data.blend_dataset"
                 ".train_valid_test_datasets_provider"
             ),
             "energon": (

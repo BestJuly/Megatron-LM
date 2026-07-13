@@ -227,6 +227,62 @@ def test_provider_plumbs_fixed_axes_and_keeps_regular_mock_materialized(monkeypa
     assert "_mdp_image_descriptors_json" not in sample
 
 
+@pytest.mark.parametrize(
+    "topology",
+    [
+        {"context_parallel_size": 2, "pipeline_model_parallel_size": 1, "mdp_inner_dp_scope": "cp"},
+        {
+            "context_parallel_size": 1,
+            "pipeline_model_parallel_size": 2,
+            "mdp_inner_dp_scope": "pp_cp",
+        },
+    ],
+)
+def test_mock_provider_routes_distributed_mdp_to_direct_blend(monkeypatch, topology):
+    args = SimpleNamespace(mdp_encoder_mode=True, text_only=False, model_arch="qwen3vl", **topology)
+    expected = (object(), object(), object())
+    captured = []
+
+    def mock_mdp_provider(counts):
+        captured.append(counts)
+        return expected
+
+    monkeypatch.setattr("megatron.training.get_args", lambda: args)
+    monkeypatch.setattr(
+        "examples.multimodal_dev.data.mock_mdp.train_valid_test_datasets_provider",
+        mock_mdp_provider,
+    )
+
+    result = train_valid_test_datasets_provider([3, 2, 1])
+
+    assert result is expected
+    assert captured == [[3, 2, 1]]
+
+
+def test_mock_provider_keeps_fixed_path_for_text_only_mdp_request(monkeypatch):
+    args = SimpleNamespace(
+        mdp_encoder_mode=True,
+        text_only=True,
+        model_arch="qwen3vl",
+        context_parallel_size=2,
+        pipeline_model_parallel_size=1,
+        mdp_inner_dp_scope="cp",
+        total_seq_length=32,
+        padded_vocab_size=128,
+        image_token_id=1,
+    )
+    monkeypatch.setattr("megatron.training.get_args", lambda: args)
+    monkeypatch.setattr(
+        "examples.multimodal_dev.data.mock_mdp.train_valid_test_datasets_provider",
+        lambda _counts: pytest.fail("text-only mock must not route to mock_mdp"),
+    )
+
+    train, _, _ = train_valid_test_datasets_provider([1, 0, 0])
+
+    assert train.text_only is True
+    assert train[0]["image_grid_thw"].shape == torch.Size([0, 3])
+
+
 def test_qwen3vl_launcher_forwards_fixed_mock_overrides(tmp_path):
     repository_root = Path(__file__).parents[3]
     script = repository_root / "examples" / "multimodal_dev" / "scripts" / "dev_qwen3vl_gb200.sh"
@@ -272,3 +328,86 @@ def test_qwen3vl_launcher_forwards_fixed_mock_overrides(tmp_path):
         assert option in command
     assert "--pack-sequences" not in command
     assert "--use-packed-sequence" not in command
+
+
+def test_qwen3vl_launcher_forwards_direct_blend_overrides(tmp_path):
+    repository_root = Path(__file__).parents[3]
+    script = repository_root / "examples" / "multimodal_dev" / "scripts" / "dev_qwen3vl_gb200.sh"
+    result = subprocess.run(
+        [
+            "bash",
+            str(script),
+            "--dry-run",
+            "--gpus",
+            "1",
+            "--nnodes",
+            "1",
+            "--results-dir",
+            str(tmp_path),
+            "direct-blend",
+            "ep=1",
+            "dispatcher_backend=alltoall",
+            "dataset_provider=blend",
+            "dataset_backend=mock",
+            "dataset_split=train",
+            "pack_samples_per_item=4",
+            "pack_scan_multiplier=2",
+            "image_size_max=896",
+            "extra_args=--dataloader-sequence-packing",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    command = next(line for line in result.stdout.splitlines() if line.startswith("CMD: "))
+    for option in (
+        "--dataset-provider blend",
+        "--dataset-backend mock",
+        "--dataset-split train",
+        "--pack-samples-per-item 4",
+        "--pack-scan-multiplier 2",
+        "--image-size-max 896",
+        "--dataloader-sequence-packing",
+    ):
+        assert option in command
+
+
+def test_qwen3vl_real_blend_accepts_huggingface_tokenizer_override(tmp_path):
+    repository_root = Path(__file__).parents[3]
+    script = repository_root / "examples" / "multimodal_dev" / "scripts" / "dev_qwen3vl_gb200.sh"
+    result = subprocess.run(
+        [
+            "bash",
+            str(script),
+            "--dry-run",
+            "--gpus",
+            "1",
+            "--nnodes",
+            "1",
+            "--results-dir",
+            str(tmp_path),
+            "real-blend",
+            "ep=1",
+            "dispatcher_backend=alltoall",
+            "dataset_provider=blend",
+            "dataset_backend=mantis-instruct",
+            "dataset_subsets=multi_vqa,nlvr2",
+            "dataset_root=/mnt/mantis",
+            (
+                "extra_args=--tokenizer-type HuggingFaceTokenizer "
+                "--tokenizer-model /mnt/Qwen3.5-35B-A3B --trust-remote-code"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    command = next(line for line in result.stdout.splitlines() if line.startswith("CMD: "))
+    assert "--dataset-backend mantis-instruct" in command
+    assert "--dataset-subsets multi_vqa,nlvr2" in command
+    assert "--dataset-root /mnt/mantis" in command
+    assert "--tokenizer-type HuggingFaceTokenizer" in command
+    assert "--tokenizer-model /mnt/Qwen3.5-35B-A3B" in command
+    assert command.rfind("HuggingFaceTokenizer") > command.rfind("NullMultimodalTokenizer")

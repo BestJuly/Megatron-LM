@@ -22,6 +22,9 @@ def _provider_args(**overrides):
         "vision_hidden_size": 8,
         "context_parallel_size": 2,
         "pipeline_model_parallel_size": 1,
+        "tensor_model_parallel_size": 1,
+        "world_size": 2,
+        "rank": 0,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -57,12 +60,33 @@ def test_provider_keeps_pr2_full_materialization_when_mdp_is_off(monkeypatch):
     assert encoder.mdp_loader_prepartition_world == 1
 
 
-def test_provider_rejects_pipeline_scope_before_sidecar_pr(monkeypatch):
+def test_provider_rejects_pipeline_parallelism_for_cp_local_scope(monkeypatch):
     from examples.multimodal_dev.data.qwen35_energon import provider
 
     monkeypatch.setattr(provider.parallel_state, "model_parallel_is_initialized", lambda: False)
     with pytest.raises(ValueError, match="requires PP=1"):
         provider._task_encoder(_provider_args(pipeline_model_parallel_size=2), tokenizer=object())
+
+
+def test_provider_uses_pp_cp_inner_rank_for_loader_owner(monkeypatch):
+    from examples.multimodal_dev.data.qwen35_energon import provider
+
+    monkeypatch.setattr(provider.parallel_state, "model_parallel_is_initialized", lambda: False)
+    encoder = provider._task_encoder(
+        _provider_args(
+            mdp_inner_dp_scope="pp_cp",
+            pipeline_model_parallel_size=2,
+            context_parallel_size=2,
+            world_size=4,
+            rank=3,
+        ),
+        tokenizer=object(),
+    )
+
+    assert encoder.mdp_loader_prepartition is True
+    assert encoder.mdp_loader_prepartition_rank == 3
+    assert encoder.mdp_loader_prepartition_world == 4
+    assert encoder.mdp_loader_prepartition_encoder_stage is True
 
 
 def test_json_lazy_descriptors_materialize_only_on_the_cp_owner(monkeypatch):

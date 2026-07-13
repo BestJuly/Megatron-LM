@@ -234,9 +234,9 @@ def _strip_loader_prepartition_python_metadata(data):
 
 
 def _loader_prepartition_enabled() -> bool:
-    if not _bool_arg("mdp_encoder_mode", False):
+    if not _bool_arg("mdp_encoder_mode", True):
         return False
-    return _arg("mdp_inner_dp_scope", "cp") == "cp"
+    return _arg("mdp_inner_dp_scope", "cp") in ("cp", "pp_cp")
 
 
 def _numel_from_shape(shape):
@@ -407,9 +407,9 @@ def apply_mdp_prepartition(
         _set_mdp_rank_assignment((inner_model, model), None, None)
         return pixel_values, image_grid_thw
 
-    # Loader-prepartitioned batches already carry the canonical CP ownership
-    # assignment (normalized in ``fetch_and_broadcast``) and per-image row
-    # counts.
+    # The loader assignment is already expressed in the active InnerDP
+    # group's local-rank coordinates (CP-only or PP x CP) and normalized in
+    # ``fetch_and_broadcast``.
     if prepartitioned_assignment is not None:
         assignment = prepartitioned_assignment
         row_counts = (
@@ -435,7 +435,7 @@ def fetch_and_broadcast(data_iterator: Iterator[Dict[str, Any]]):
     tp_world_size = (
         int(get_tensor_model_parallel_world_size()) if model_parallel_is_initialized() else 1
     )
-    mdp_encoder_enabled = _bool_arg("mdp_encoder_mode", False)
+    mdp_encoder_enabled = _bool_arg("mdp_encoder_mode", True)
 
     balancedata_grid_rows = None
     cp_local_plan = None

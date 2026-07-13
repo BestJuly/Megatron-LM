@@ -14,13 +14,13 @@ def test_cp_scope_enables_loader_prepartition(monkeypatch):
     assert mdp_batch._loader_prepartition_enabled() is True
 
 
-def test_pp_cp_scope_is_not_enabled_before_sidecar_pr(monkeypatch):
+def test_pp_cp_scope_enables_loader_prepartition_with_sidecar(monkeypatch):
     monkeypatch.setattr(
         mdp_batch,
         "get_args",
         lambda: SimpleNamespace(mdp_encoder_mode=True, mdp_inner_dp_scope="pp_cp"),
     )
-    assert mdp_batch._loader_prepartition_enabled() is False
+    assert mdp_batch._loader_prepartition_enabled() is True
 
 
 def test_fetch_normalizes_assignment_after_tp_metadata_broadcast(monkeypatch):

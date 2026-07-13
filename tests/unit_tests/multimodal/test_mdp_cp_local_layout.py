@@ -8,7 +8,8 @@ Pure-python login-node tests that exercise:
    (typically 2), per-image LPT distributes images BETWEEN the two
    CP-pair members balancing FLOPs.
 2. The reorder-to-canonical contract under CP-pair gather order.
-3. Login-node-safe CLI parsing for the public MDP flags.
+3. PP x CP InnerDP rank layout.
+4. Login-node-safe CLI parsing for the public MDP flags.
 
 The pure-python helpers are loaded via importlib.util.spec_from_file_location
 to bypass the torch-poisoned ``tests/unit_tests/__init__.py``.
@@ -22,6 +23,9 @@ import os
 import unittest
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+_PARALLEL_GROUPS_PATH = os.path.join(
+    _REPO_ROOT, "examples", "multimodal_dev", "mdp_parallel_groups.py"
+)
 _BAL_PATH = os.path.join(_REPO_ROOT, "examples", "multimodal_dev", "balance_data.py")
 _MB_PATH = os.path.join(_REPO_ROOT, "examples", "multimodal_dev", "modality_bridge.py")
 _ARGS_PATH = os.path.join(_REPO_ROOT, "examples", "multimodal_dev", "arguments.py")
@@ -34,6 +38,7 @@ def _load(name, path):
     return mod
 
 
+_groups = _load("mdp_cp_local_layout_groups", _PARALLEL_GROUPS_PATH)
 _bal = _load("mdp_cp_local_layout_bal", _BAL_PATH)
 _args_mod = _load("mdp_cp_local_layout_args", _ARGS_PATH)
 try:
@@ -42,7 +47,15 @@ except ModuleNotFoundError as exc:
     if exc.name != "torch":
         raise
     _mb = None
+try:
+    _torch = __import__("torch")
+except ModuleNotFoundError as exc:
+    if exc.name != "torch":
+        raise
+    _torch = None
 
+compute_pp_cp_inner_dp_layout = _groups.compute_pp_cp_inner_dp_layout
+find_pp_cp_inner_dp_group_for_rank = _groups.find_pp_cp_inner_dp_group_for_rank
 balance_per_image_lpt = _bal.balance_per_image_lpt
 compute_image_flops = _bal.compute_image_flops
 build_global_ordering = _mb.build_global_ordering if _mb is not None else None
@@ -64,6 +77,57 @@ class TestMdpArgs(unittest.TestCase):
     def test_no_auxiliary_vision_parallel_arg(self):
         args = self._parse([])
         self.assertFalse(hasattr(args, "mdp_vision_parallel_mode"))
+
+
+class TestPpCpInnerDpLayout(unittest.TestCase):
+    """PP-replicated MDP fixes TP and outer DP while spanning PP x CP."""
+
+    def test_tp1_pp2_cp2(self):
+        groups = compute_pp_cp_inner_dp_layout(world_size=8, tp_size=1, cp_size=2, pp_size=2)
+        self.assertEqual(groups, [[0, 1, 4, 5], [2, 3, 6, 7]])
+        group, local_rank = find_pp_cp_inner_dp_group_for_rank(5, groups)
+        self.assertEqual(group, [0, 1, 4, 5])
+        self.assertEqual(local_rank, 3)
+
+    def test_tp2_pp2_cp2_keeps_tp_fixed(self):
+        groups = compute_pp_cp_inner_dp_layout(world_size=16, tp_size=2, cp_size=2, pp_size=2)
+        self.assertEqual(groups, [[0, 2, 8, 10], [1, 3, 9, 11], [4, 6, 12, 14], [5, 7, 13, 15]])
+        self.assertEqual(sorted(rank for group in groups for rank in group), list(range(16)))
+
+    def test_pp_first_mapping_and_cp1(self):
+        pp_first = compute_pp_cp_inner_dp_layout(
+            world_size=16, tp_size=1, cp_size=2, pp_size=2, order="tp-cp-ep-pp-dp"
+        )
+        self.assertEqual(pp_first, [[0, 1, 2, 3], [4, 5, 6, 7], [8, 9, 10, 11], [12, 13, 14, 15]])
+        cp1 = compute_pp_cp_inner_dp_layout(world_size=16, tp_size=1, cp_size=1, pp_size=4)
+        self.assertEqual(cp1, [[0, 4, 8, 12], [1, 5, 9, 13], [2, 6, 10, 14], [3, 7, 11, 15]])
+
+    def test_rejects_invalid_world(self):
+        with self.assertRaises(ValueError):
+            compute_pp_cp_inner_dp_layout(world_size=10, tp_size=1, cp_size=2, pp_size=4)
+
+    @unittest.skipIf(_torch is None, "torch is unavailable")
+    def test_matches_megatron_rank_generator(self):
+        from megatron.core.parallel_state import RankGenerator
+
+        cases = (
+            (64, 1, 2, 2, "tp-cp-ep-dp-pp"),
+            (64, 2, 2, 2, "tp-cp-ep-dp-pp"),
+            (64, 1, 4, 2, "tp-cp-ep-dp-pp"),
+            (64, 1, 2, 4, "tp-cp-ep-dp-pp"),
+            (64, 1, 2, 2, "tp-cp-ep-pp-dp"),
+        )
+        for world, tp, pp, cp, order in cases:
+            with self.subTest(world=world, tp=tp, pp=pp, cp=cp, order=order):
+                expected = RankGenerator(
+                    tp=tp, ep=1, dp=world // (tp * pp * cp), pp=pp, cp=cp, order=order
+                ).get_ranks("pp-cp")
+                self.assertEqual(
+                    compute_pp_cp_inner_dp_layout(
+                        world_size=world, tp_size=tp, cp_size=cp, pp_size=pp, order=order
+                    ),
+                    expected,
+                )
 
 
 class TestCpPairLPTSplit(unittest.TestCase):

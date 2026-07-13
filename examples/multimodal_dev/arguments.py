@@ -20,18 +20,21 @@ def add_multimodal_args(parser):
     group.add_argument(
         "--mdp-encoder-mode",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help=(
-            "Enable the opt-in MDP CP-local encoder path. The ordinary "
-            "Megatron multimodal path remains the default."
+            "Enable the default MDP encoder path. Use --no-mdp-encoder-mode "
+            "for the baseline Megatron multimodal path."
         ),
     )
     group.add_argument(
         "--mdp-inner-dp-scope",
         type=str,
-        choices=["cp"],
+        choices=["cp", "pp_cp"],
         default="cp",
-        help="MDP vision encoder inner data-parallel scope (CP-local in this change).",
+        help=(
+            "MDP vision encoder inner data-parallel scope. 'cp' uses the "
+            "Megatron CP group; 'pp_cp' uses the PP x CP group when PP > 1."
+        ),
     )
     group.add_argument(
         "--model-variant",
@@ -46,10 +49,34 @@ def add_multimodal_args(parser):
         help="Dataset provider registered for the selected model architecture",
     )
     group.add_argument(
+        "--dataset-backend",
+        type=str,
+        default="mantis-instruct",
+        help=(
+            "Blend backend identifier, or a comma-separated list of "
+            "backend identifiers"
+        ),
+    )
+    group.add_argument(
+        "--dataset-subsets",
+        type=str,
+        default=None,
+        help="Optional comma-separated subset list for direct blend data",
+    )
+    group.add_argument(
+        "--dataset-root",
+        type=str,
+        default=None,
+        help=(
+            "Dataset directory for one direct blend backend, or the common "
+            "parent directory for a multi-backend blend"
+        ),
+    )
+    group.add_argument(
         "--dataset-split",
         type=str,
         default="train",
-        help="Dataset split used by the Energon provider",
+        help="Dataset split used by the Energon or direct blend provider",
     )
     group.add_argument(
         "--energon-path",
@@ -82,6 +109,21 @@ def add_multimodal_args(parser):
         help="Energon worker prefetch factor",
     )
     group.add_argument(
+        "--pack-samples-per-item",
+        type=int,
+        default=1,
+        help=(
+            "Blend dataset only. Pack up to this many source records into "
+            "one fixed-length THD item."
+        ),
+    )
+    group.add_argument(
+        "--pack-scan-multiplier",
+        type=int,
+        default=1,
+        help="Blend dataset only. Multiplier for the packed-item scan window.",
+    )
+    group.add_argument(
         "--dataloader-sequence-packing",
         action="store_true",
         help=(
@@ -101,6 +143,15 @@ def add_multimodal_args(parser):
         type=int,
         default=224,
         help="Image size (height and width) for mock data",
+    )
+    group.add_argument(
+        "--image-size-max",
+        type=int,
+        default=0,
+        help=(
+            "Direct dataset image resize ceiling per side; zero preserves "
+            "native resolution subject to patch-grid alignment"
+        ),
     )
     group.add_argument(
         "--image-size-w",

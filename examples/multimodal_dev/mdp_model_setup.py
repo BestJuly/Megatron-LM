@@ -1,6 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
-"""Build-time CP-local MDP wiring for multimodal training."""
+"""Build-time CP-local and PP x CP MDP wiring for multimodal training."""
 
 import torch
 
@@ -53,22 +53,38 @@ def _disable_unsafe_packed_vision_overlap(args, vision_model, *, mdp_enabled: bo
     )
 
 
+def _validate_mdp_off_pp_batch_sidecar(args, *, mdp_enabled: bool) -> None:
+    """Validate the fixed-shape packed contract used by the no-MDP PP sidecar."""
+    if (
+        mdp_enabled
+        or bool(getattr(args, "text_only", False))
+        or int(getattr(args, "pipeline_model_parallel_size", 1)) <= 1
+    ):
+        return
+    if not bool(getattr(args, "use_packed_sequence", False)):
+        raise RuntimeError(
+            "MDP-off multimodal pipeline training requires --use-packed-sequence "
+            "so every pipeline stage uses fixed THD communication shapes"
+        )
+    if int(getattr(args, "micro_batch_size", 1)) != 1:
+        raise RuntimeError(
+            "MDP-off multimodal pipeline packed THD currently requires "
+            "micro_batch_size=1"
+        )
+
+
 def configure_mdp_model(model, args):
-    """Attach the b436 CP-local MDP process-group contract to ``model``."""
+    """Attach the b436 MDP process-group contract to ``model``."""
     if getattr(args, "model_arch", None) == "qwen3":
         args.text_only = True
-    mdp_enabled = bool(getattr(args, "mdp_encoder_mode", False))
+    mdp_enabled = bool(getattr(args, "mdp_encoder_mode", True))
     cp_size = int(getattr(args, "context_parallel_size", 1))
     pp_size = int(getattr(args, "pipeline_model_parallel_size", 1))
     inner_dp_scope = getattr(args, "mdp_inner_dp_scope", "cp")
+    dataset_provider = getattr(args, "dataset_provider", "energon")
     vision_model = getattr(model, "vision_model", None)
-    if getattr(args, "dataset_provider", None) == "energon":
-        # Energon emits THD-packed batches. Establish that contract before
-        # model/DDP construction; the dataset provider is created later and
-        # cannot safely toggle overlap flags retroactively.
-        args.use_packed_sequence = True
 
-    if vision_model is None or bool(getattr(args, "text_only", False)):
+    if bool(getattr(args, "text_only", False)):
         # Text-only models such as qwen3 share this training entrypoint but
         # have no image ownership or loader-prepartition contract.
         args.mdp_encoder_mode = False
@@ -76,47 +92,116 @@ def configure_mdp_model(model, args):
             model,
             _mdp_enabled=False,
             _mdp_inner_dp_group=None,
+            _mdp_pp_cp_inner=False,
+            _pp_cp_batch_sidecar=False,
+            _pipeline_sidecar_enabled=False,
             _mdp_rank_assignment=None,
             _mdp_rank_assignment_row_counts=None,
         )
         return model
 
-    if mdp_enabled and inner_dp_scope != "cp":
+    if mdp_enabled and inner_dp_scope not in ("cp", "pp_cp"):
         raise RuntimeError(
-            "CP-local MDP requires --mdp-inner-dp-scope cp."
+            "--mdp-inner-dp-scope must be either cp or pp_cp; "
+            f"got {inner_dp_scope!r}"
         )
 
-    if mdp_enabled and cp_size <= 1:
+    if mdp_enabled and inner_dp_scope == "cp" and cp_size <= 1:
         # A one-rank CP scope has no distributed owner set. Keep the loader
         # and model on their ordinary full-vision path together.
         args.mdp_encoder_mode = False
         mdp_enabled = False
 
-    if mdp_enabled and pp_size != 1:
-        raise RuntimeError(
-            "CP-local MDP requires pipeline_model_parallel_size=1."
-        )
-    if mdp_enabled and int(getattr(args, "micro_batch_size", 1)) != 1:
-        raise RuntimeError("MDP CP-local Energon packing requires micro_batch_size=1")
-    if mdp_enabled and getattr(args, "dataset_provider", "energon") != "energon":
-        raise RuntimeError("MDP CP-local mode requires --dataset-provider energon")
-    if mdp_enabled and bool(getattr(args, "dynamic_context_parallel", False)):
-        raise RuntimeError("MDP CP-local mode requires static context parallelism")
-    if mdp_enabled and (
-        bool(getattr(args, "use_megatron_fsdp", False))
-        or bool(getattr(args, "use_torch_fsdp2", False))
+    direct_packing_requested = (
+        bool(getattr(args, "dataloader_sequence_packing", False))
+        or int(getattr(args, "pack_samples_per_item", 1) or 1) > 1
+        or int(getattr(args, "mock_pack_num_docs", 1) or 1) > 1
+    )
+    if dataset_provider == "energon" or (
+        dataset_provider in {"blend", "mock", "mock_mdp"}
+        and (mdp_enabled or direct_packing_requested)
     ):
-        raise RuntimeError("MDP CP-local mode does not support FSDP")
+        # Descriptor-backed providers emit fixed THD batches. Establish the
+        # contract before model/DDP construction; providers are built later
+        # and cannot safely toggle overlap or sidecar state retroactively.
+        args.use_packed_sequence = True
 
-    _disable_unsafe_packed_vision_overlap(args, vision_model, mdp_enabled=mdp_enabled)
-
-    if not mdp_enabled:
+    if vision_model is None and mdp_enabled:
+        # Preserve the ordinary non-vision fallback for model variants that do
+        # not construct a vision tower. A genuinely disabled MDP pipeline is
+        # handled below so downstream PP stages can still receive batch data.
+        args.mdp_encoder_mode = False
         _set_model_attrs(
             model,
             _mdp_enabled=False,
             _mdp_inner_dp_group=None,
+            _mdp_pp_cp_inner=False,
+            _pp_cp_batch_sidecar=False,
+            _pipeline_sidecar_enabled=False,
             _mdp_rank_assignment=None,
             _mdp_rank_assignment_row_counts=None,
+        )
+        return model
+
+    if mdp_enabled and inner_dp_scope == "cp" and pp_size != 1:
+        raise RuntimeError(
+            "CP-local MDP requires pipeline_model_parallel_size=1; "
+            "use --mdp-inner-dp-scope pp_cp for replicated pipeline vision"
+        )
+    if mdp_enabled and inner_dp_scope == "pp_cp" and pp_size <= 1:
+        raise RuntimeError(
+            "PP x CP replicated vision requires pipeline_model_parallel_size > 1"
+        )
+    if mdp_enabled and int(getattr(args, "micro_batch_size", 1)) != 1:
+        raise RuntimeError("MDP packed multimodal data requires micro_batch_size=1")
+    mdp_dataset_providers = {"blend", "energon", "mock", "mock_mdp"}
+    if mdp_enabled and dataset_provider not in mdp_dataset_providers:
+        raise RuntimeError(
+            "MDP mode requires a descriptor-backed --dataset-provider in "
+            f"{sorted(mdp_dataset_providers)}; got {dataset_provider!r}"
+        )
+    if mdp_enabled and bool(getattr(args, "dynamic_context_parallel", False)):
+        raise RuntimeError("MDP mode requires static context parallelism")
+    if mdp_enabled and (
+        bool(getattr(args, "use_megatron_fsdp", False))
+        or bool(getattr(args, "use_torch_fsdp2", False))
+    ):
+        raise RuntimeError("MDP mode does not support FSDP")
+
+    _validate_mdp_off_pp_batch_sidecar(args, mdp_enabled=mdp_enabled)
+
+    _disable_unsafe_packed_vision_overlap(args, vision_model, mdp_enabled=mdp_enabled)
+
+    if not mdp_enabled:
+        pp_batch_sidecar = (
+            pp_size > 1 and bool(getattr(args, "use_packed_sequence", False))
+        )
+        _set_model_attrs(
+            model,
+            _mdp_enabled=False,
+            _mdp_inner_dp_group=None,
+            _mdp_pp_cp_inner=False,
+            _pp_cp_batch_sidecar=pp_batch_sidecar,
+            _pipeline_sidecar_enabled=pp_batch_sidecar,
+            _mdp_rank_assignment=None,
+            _mdp_rank_assignment_row_counts=None,
+        )
+        return model
+
+    if inner_dp_scope == "pp_cp":
+        from examples.multimodal_dev.mdp_pipeline_sidecar import (
+            configure_pp_cp_replicated_vision,
+        )
+
+        if not configure_pp_cp_replicated_vision(model, args):
+            raise RuntimeError(
+                "PP x CP replicated vision was selected but sidecar setup was not activated"
+            )
+        print_rank_0(
+            "> MDP PPxCP multimodal path enabled: "
+            f"PP={pp_size}, CP={cp_size}, "
+            f"InnerDP={torch.distributed.get_world_size(group=model._mdp_inner_dp_group)}, "
+            "packed THD input, vision encoder replicated on every pipeline stage."
         )
         return model
 
@@ -141,6 +226,9 @@ def configure_mdp_model(model, args):
         model,
         _mdp_enabled=True,
         _mdp_inner_dp_group=cp_group,
+        _mdp_pp_cp_inner=False,
+        _pp_cp_batch_sidecar=False,
+        _pipeline_sidecar_enabled=False,
         _mdp_rank_assignment=None,
         _mdp_rank_assignment_row_counts=None,
     )
