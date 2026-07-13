@@ -18,6 +18,11 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 import torch
 from PIL import Image
 
+from examples.multimodal_dev.data.energon_vision_balance import (
+    assign_images_lpt,
+    image_costs_from_grid,
+    vision_rows_from_grid,
+)
 from examples.multimodal_dev.mdp_image_materialize import (
     encode_image_descriptors,
     materialize_descriptor,
@@ -68,6 +73,12 @@ class Qwen35EnergonTaskEncoder(TaskEncoder):
         image_max_pixels: int = 1280 * 32 * 32,
         image_min_pixels: int = 256 * 32 * 32,
         cp_size: int = 1,
+        mdp_loader_prepartition: bool = False,
+        mdp_loader_prepartition_rank: int = 0,
+        mdp_loader_prepartition_world: int = 1,
+        mdp_loader_prepartition_encoder_stage: bool = True,
+        mdp_loader_prepartition_materialize: bool = True,
+        mdp_lpt_hidden_size: int = 1152,
     ):
         super().__init__()
         self.tokenizer = tokenizer
@@ -83,6 +94,18 @@ class Qwen35EnergonTaskEncoder(TaskEncoder):
         self.image_min_pixels = int(image_min_pixels)
         self.cp_size = int(cp_size)
         self.align = max(2 * self.cp_size, _MIMO_PACK_PAD_MULTIPLE)
+        self.mdp_loader_prepartition = bool(mdp_loader_prepartition)
+        self.mdp_loader_prepartition_rank = int(mdp_loader_prepartition_rank)
+        self.mdp_loader_prepartition_world = max(
+            1, int(mdp_loader_prepartition_world)
+        )
+        self.mdp_loader_prepartition_encoder_stage = bool(
+            mdp_loader_prepartition_encoder_stage
+        )
+        self.mdp_loader_prepartition_materialize = bool(
+            mdp_loader_prepartition_materialize
+        )
+        self.mdp_lpt_hidden_size = int(mdp_lpt_hidden_size)
         self._pixel_dim = 3 * self.temporal_patch_size * self.patch_size * self.patch_size
 
     @staticmethod
@@ -739,7 +762,149 @@ class Qwen35EnergonTaskEncoder(TaskEncoder):
                 used = 0
         if current:
             groups.append(current)
+        self._attach_window_assignments(groups)
         return groups
+
+    def _attach_window_assignments(self, groups):
+        """Attach one deterministic CP owner to each selected image."""
+        if not self.mdp_loader_prepartition or not self.mdp_loader_prepartition_materialize:
+            return
+        image_refs = []
+        costs_by_item = []
+        for group in groups:
+            refs = []
+            costs = []
+            for doc_idx, doc in enumerate(group):
+                for image_idx, cost in enumerate(self._image_balance_costs(doc)):
+                    refs.append((doc_idx, image_idx))
+                    costs.append(cost)
+            image_refs.append(refs)
+            costs_by_item.append(costs)
+
+        assignment = assign_images_lpt(
+            costs_by_item,
+            self.mdp_loader_prepartition_world,
+            across_items=False,
+        )
+        for group in groups:
+            for doc in group:
+                doc["_mdp_image_owner_ranks"] = [-1] * int(doc["num_images"])
+        for rank, items in assignment.items():
+            for item_idx, image_idx in items:
+                doc_idx, local_image_idx = image_refs[int(item_idx)][int(image_idx)]
+                groups[int(item_idx)][doc_idx]["_mdp_image_owner_ranks"][
+                    local_image_idx
+                ] = int(rank)
+
+    def _assignment_from_doc_owners(self, docs: Sequence[dict]):
+        assignment = {
+            rank: [] for rank in range(self.mdp_loader_prepartition_world)
+        }
+        for doc_idx, doc in enumerate(docs):
+            owners = doc.get("_mdp_image_owner_ranks")
+            if owners is None:
+                single_assignment = assign_images_lpt(
+                    [self._image_balance_costs(doc)],
+                    self.mdp_loader_prepartition_world,
+                    across_items=False,
+                )
+                owners = [-1] * int(doc["num_images"])
+                for rank, items in single_assignment.items():
+                    for _item_idx, image_idx in items:
+                        owners[int(image_idx)] = int(rank)
+            for image_idx, owner in enumerate(owners):
+                if int(owner) >= 0:
+                    assignment[int(owner)].append((int(doc_idx), int(image_idx)))
+        return assignment
+
+    def _image_balance_costs(self, doc: dict):
+        grid = doc.get("image_grid_thw")
+        if not torch.is_tensor(grid) or grid.numel() == 0:
+            return []
+        return image_costs_from_grid(
+            grid.detach().cpu().tolist(),
+            hidden_size=self.mdp_lpt_hidden_size,
+        )
+
+    def _prepartition_assignment_tensor(self, assignment, doc_offsets):
+        rows = []
+        for rank in sorted(assignment):
+            for doc_idx, image_idx in assignment[rank]:
+                rows.append(
+                    [
+                        int(rank),
+                        int(doc_idx),
+                        int(doc_offsets[int(doc_idx)] + int(image_idx)),
+                    ]
+                )
+        if not rows:
+            return torch.zeros(0, 3, dtype=torch.int32)
+        return torch.tensor(rows, dtype=torch.int32)
+
+    def _attach_prepartition(self, out: dict, docs: Sequence[dict]) -> dict:
+        """Materialize only this CP rank's LPT-owned image descriptors."""
+        if not self.mdp_loader_prepartition:
+            return out
+        world = self.mdp_loader_prepartition_world
+        rank = self.mdp_loader_prepartition_rank
+        if rank < 0 or rank >= world:
+            raise RuntimeError(
+                "loader prepartition rank is outside its CP world: "
+                f"rank={rank} world={world}"
+            )
+
+        assignment = self._assignment_from_doc_owners(docs)
+        doc_offsets = []
+        offset = 0
+        for doc in docs:
+            doc_offsets.append(offset)
+            offset += int(doc["num_images"])
+
+        local_pixels = []
+        local_grids = []
+        if self.mdp_loader_prepartition_encoder_stage and self.mdp_loader_prepartition_materialize:
+            for doc_idx, image_idx in assignment.get(rank, []):
+                doc = docs[int(doc_idx)]
+                grid = [
+                    int(value)
+                    for value in doc["image_grid_thw"][int(image_idx)]
+                    .detach()
+                    .cpu()
+                    .tolist()
+                ]
+                descriptor = doc["_mdp_image_descriptors"][int(image_idx)]
+                patches = materialize_descriptor(
+                    descriptor,
+                    grid,
+                    pixel_dim=int(self._pixel_dim),
+                    patch_size=int(self.patch_size),
+                )
+                local_pixels.append(patches.to(torch.bfloat16))
+                local_grids.append(torch.tensor(grid, dtype=torch.long))
+
+        if local_pixels:
+            out["pixel_values"] = torch.cat(local_pixels, dim=0)
+            local_grid = torch.stack(local_grids, dim=0)
+        else:
+            out["pixel_values"] = torch.zeros(
+                0, self._pixel_dim, dtype=torch.bfloat16
+            )
+            local_grid = torch.zeros(0, 3, dtype=torch.long)
+
+        global_rows = []
+        for doc in docs:
+            for row in doc["image_grid_thw"].detach().cpu().tolist():
+                global_rows.append(
+                    vision_rows_from_grid(row, self.spatial_merge_size)
+                )
+        out["_mdp_prepartitioned_image_grid_thw"] = local_grid
+        out["_mdp_prepartitioned_assignment"] = (
+            self._prepartition_assignment_tensor(assignment, doc_offsets)
+        )
+        out["_mdp_prepartitioned_row_counts"] = torch.tensor(
+            global_rows, dtype=torch.int32
+        )
+        return out
 
     def _materialize_all_images(self, descriptors, image_grid_thw) -> torch.Tensor:
         local_pixels = []
@@ -826,7 +991,9 @@ class Qwen35EnergonTaskEncoder(TaskEncoder):
         for doc in docs:
             descriptors.extend(doc.get("_mdp_image_descriptors", []))
 
-        pixel_values = self._materialize_all_images(descriptors, image_grid_thw)
+        pixel_values = torch.zeros(0, self._pixel_dim, dtype=torch.float32)
+        if not self.mdp_loader_prepartition:
+            pixel_values = self._materialize_all_images(descriptors, image_grid_thw)
 
         out = {
             "input_ids": input_ids,
@@ -839,6 +1006,11 @@ class Qwen35EnergonTaskEncoder(TaskEncoder):
             "num_images": int(sum(int(doc["num_images"]) for doc in docs)),
             "_mdp_image_descriptors_json": encode_image_descriptors(descriptors),
         }
+        if self.mdp_loader_prepartition and not self.mdp_loader_prepartition_materialize:
+            out["_mdp_image_descriptors"] = descriptors
+        if self.mdp_loader_prepartition_materialize:
+            out = self._attach_prepartition(out, docs)
+
         cu = [0]
         for doc_len in real_lens:
             cu.append(cu[-1] + doc_len)

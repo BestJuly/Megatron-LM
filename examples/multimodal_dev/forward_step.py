@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterator
 import torch
 import torch.nn.functional as F
 
+from examples.multimodal_dev.mdp_batch import apply_mdp_prepartition, fetch_and_broadcast
 from megatron.core import mpu
 from megatron.core.extensions.transformer_engine import get_thd_partitioned_indices
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -240,6 +241,32 @@ def _prepare_prepacked_batch(batch: Dict[str, Any]) -> Dict[str, Any]:
     return batch
 
 
+def _mdp_prepartition_kwargs(batch):
+    """Collect loader-side LPT metadata for ``apply_mdp_prepartition``."""
+    return {
+        "prepartitioned_assignment": batch.get("_mdp_prepartitioned_assignment"),
+        "prepartitioned_row_counts": batch.get("_mdp_prepartitioned_row_counts"),
+        "prepartitioned_image_grid_thw": batch.get(
+            "_mdp_prepartitioned_image_grid_thw"
+        ),
+    }
+
+
+def _get_mdp_prepartitioned_batch(data_iterator):
+    """Fetch the b436 loader-prepartitioned THD batch for CP-local MDP."""
+    batch = fetch_and_broadcast(data_iterator)
+    if batch is None:
+        return None
+    if "input_ids" not in batch and batch.get("tokens") is not None:
+        batch["input_ids"] = batch["tokens"]
+    batch.pop("local_cp_size", None)
+
+    # Keep one THD normalization owner. PR #2's helper preserves logical q/kv
+    # boundaries while using physical padded boundaries for residual-stream
+    # shape; the MDP path must not reconstruct either view independently.
+    return _prepare_prepacked_batch(batch)
+
+
 def pack_or_pad_batch(batch: list[Dict[str, Any]], use_packed_sequence: bool=False, seq_length: int=None, device = "cuda") -> list[Dict[str, Any]]:
     """Pack or pad a ``[B, S]`` batch into ``[1, T]`` THD format."""
     tp_size = mpu.get_tensor_model_parallel_world_size()
@@ -394,6 +421,12 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
     device = "cuda"
     args = get_args()
 
+    if (
+        bool(getattr(args, "mdp_encoder_mode", False))
+        and get_context_parallel_world_size() > 1
+    ):
+        return _get_mdp_prepartitioned_batch(data_iterator)
+
     if get_tensor_model_parallel_rank() == 0:
         try:
             data = next(data_iterator)
@@ -494,18 +527,29 @@ def loss_func(loss_mask, output_tensor):
 
 def forward_step(data_iterator, model, return_schedule_plan=False):
     """Forward step for multimodal_dev training."""
+    args = get_args()
     batch = get_batch(data_iterator)
 
     if batch is None:
         return None, None
 
     pixel_values = batch.get("pixel_values", None)
+    image_grid_thw = batch.get("image_grid_thw", None)
     if (
         pixel_values is not None
         and pixel_values.is_floating_point()
         and pixel_values.dtype == torch.float32
     ):
         pixel_values = pixel_values.bfloat16()
+
+    if bool(getattr(args, "mdp_encoder_mode", False)):
+        pixel_values, image_grid_thw = apply_mdp_prepartition(
+            model=model,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            image_grid_thw_rows=batch.get("_balancedata_image_grid_thw_rows"),
+            **_mdp_prepartition_kwargs(batch),
+        )
 
     model_kwargs = dict(
         input_ids=batch["input_ids"],
@@ -514,8 +558,9 @@ def forward_step(data_iterator, model, return_schedule_plan=False):
         labels=batch.get("labels", None),
         loss_mask=batch.get("loss_mask", None),
         pixel_values=pixel_values,
-        image_grid_thw=batch.get("image_grid_thw", None),
+        image_grid_thw=image_grid_thw,
         packed_seq_params=batch.get("packed_seq_params", None),
+        mdp_cp_local_plan=batch.get("_mdp_cp_local_plan"),
     )
     if return_schedule_plan:
         args = get_args()

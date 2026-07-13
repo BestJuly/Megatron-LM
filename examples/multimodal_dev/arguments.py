@@ -2,6 +2,8 @@
 
 """Extra CLI arguments for multimodal_dev standalone training."""
 
+import argparse
+
 
 def add_multimodal_args(parser):
     """Add multimodal-specific arguments to the Megatron argument parser."""
@@ -14,6 +16,22 @@ def add_multimodal_args(parser):
         type=str,
         default="qwen35_vl",
         help="Model architecture registered in MODEL_REGISTRY.",
+    )
+    group.add_argument(
+        "--mdp-encoder-mode",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable the opt-in MDP CP-local encoder path. The ordinary "
+            "Megatron multimodal path remains the default."
+        ),
+    )
+    group.add_argument(
+        "--mdp-inner-dp-scope",
+        type=str,
+        choices=["cp"],
+        default="cp",
+        help="MDP vision encoder inner data-parallel scope (CP-local in this change).",
     )
     group.add_argument(
         "--model-variant",

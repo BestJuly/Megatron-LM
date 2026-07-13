@@ -39,7 +39,7 @@ _PARQUET_ROW_GROUP_STARTS_CACHE: Dict[int, Sequence[int]] = {}
 
 
 def metadata_only_batch_enabled() -> bool:
-    return bool(getattr(get_args(), "mdp_encoder_mode", True))
+    return bool(getattr(get_args(), "mdp_encoder_mode", False))
 
 
 def append_image_or_descriptor(

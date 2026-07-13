@@ -32,12 +32,26 @@ sys.path.insert(
     os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")),
 )
 
-from megatron.core.enums import ModelType
-from megatron.training import get_args, pretrain
-from megatron.training.arguments import core_transformer_config_from_args
-
 from examples.multimodal_dev.arguments import add_multimodal_args
 from examples.multimodal_dev.forward_step import forward_step
+from examples.multimodal_dev.mdp_model_setup import configure_mdp_model
+from megatron.core.enums import ModelType
+from megatron.training import get_args, pretrain, print_rank_0
+from megatron.training.arguments import core_transformer_config_from_args
+
+
+def _enforce_cp_token_loss_normalization(args, config=None) -> bool:
+    """Use a global valid-token denominator whenever CP is active."""
+    if int(getattr(args, "context_parallel_size", 1) or 1) <= 1:
+        return False
+    changed = not bool(getattr(args, "calculate_per_token_loss", False))
+    args.calculate_per_token_loss = True
+    if config is not None:
+        changed = changed or not bool(
+            getattr(config, "calculate_per_token_loss", False)
+        )
+        config.calculate_per_token_loss = True
+    return changed
 
 
 def model_provider(
@@ -53,6 +67,10 @@ def model_provider(
     registry factory functions.
     """
     args = get_args()
+    if _enforce_cp_token_loss_normalization(args):
+        print_rank_0(
+            "> Enabling global per-token loss normalization for context parallelism."
+        )
     model_arch = getattr(args, "model_arch", "qwen35_vl")
 
     from examples.multimodal_dev.models import MODEL_REGISTRY
@@ -103,7 +121,7 @@ def model_provider(
         **kwargs,
     )
 
-    return model
+    return configure_mdp_model(model, args)
 
 
 def _resolve_provider_fn(provider_fn):

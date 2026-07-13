@@ -324,6 +324,64 @@ def test_task_encoder_accepts_llava_decoded_dict_shape():
     assert descriptors[0]["kind"] == "image_bytes"
 
 
+def test_task_encoder_prepartitions_vqa_sample_shape():
+    from examples.multimodal_dev.data.qwen35_energon.task_encoder import Qwen35EnergonTaskEncoder
+
+    class FakeVQASample:
+        context = "What is shown?"
+        answers = "A square."
+        image = Image.new("RGB", (64, 64), color="white")
+
+    encoder = Qwen35EnergonTaskEncoder(
+        tokenizer=_FakeTokenizer(),
+        seq_length=128,
+        patch_size=16,
+        spatial_merge_size=2,
+        image_max_pixels=0,
+        image_min_pixels=0,
+        mdp_loader_prepartition=True,
+        mdp_loader_prepartition_materialize=False,
+    )
+
+    encoded = encoder.preencode_sample(FakeVQASample())
+    batch = encoder.pack_selected_samples([encoded])
+
+    assert batch["pixel_values"].shape == (0, encoder._pixel_dim)
+    assert batch["image_grid_thw"].tolist() == [[1, 4, 4]]
+    assert len(batch["_mdp_image_descriptors"]) == 1
+    assert batch["_mdp_image_descriptors"][0]["kind"] == "image_bytes"
+
+
+def test_task_encoder_prepartitions_llava_decoded_dict_shape():
+    from examples.multimodal_dev.data.qwen35_energon.task_encoder import Qwen35EnergonTaskEncoder
+
+    encoder = Qwen35EnergonTaskEncoder(
+        tokenizer=_FakeTokenizer(),
+        seq_length=128,
+        patch_size=16,
+        spatial_merge_size=2,
+        image_max_pixels=0,
+        image_min_pixels=0,
+        mdp_loader_prepartition=True,
+        mdp_loader_prepartition_materialize=False,
+    )
+    sample = {
+        "jpg": Image.new("RGB", (64, 64), color="white"),
+        "json": [
+            {"from": "human", "value": "<image>\nWhat is shown?"},
+            {"from": "gpt", "value": "A square."},
+        ],
+    }
+
+    encoded = encoder.preencode_sample(sample)
+    batch = encoder.pack_selected_samples([encoded])
+
+    assert batch["pixel_values"].shape == (0, encoder._pixel_dim)
+    assert batch["image_grid_thw"].tolist() == [[1, 4, 4]]
+    assert len(batch["_mdp_image_descriptors"]) == 1
+    assert batch["_mdp_image_descriptors"][0]["kind"] == "image_bytes"
+
+
 def test_qwen3vl_launcher_accepts_energon_provider(tmp_path):
     from examples.multimodal_dev.arguments import add_multimodal_args
     from examples.multimodal_dev.models import MODEL_REGISTRY

@@ -27,10 +27,24 @@ class Qwen3TextOnlyGPTModel(GPTModel):
     ``--overlap-moe-expert-parallel-comm`` is set) is patched the same way.
     """
 
-    def forward(self, *args, pixel_values=None, image_grid_thw=None, **kwargs):
+    def forward(
+        self,
+        *args,
+        pixel_values=None,
+        image_grid_thw=None,
+        mdp_cp_local_plan=None,
+        **kwargs,
+    ):
         return super().forward(*args, **kwargs)
 
-    def build_schedule_plan(self, *args, pixel_values=None, image_grid_thw=None, **kwargs):
+    def build_schedule_plan(
+        self,
+        *args,
+        pixel_values=None,
+        image_grid_thw=None,
+        mdp_cp_local_plan=None,
+        **kwargs,
+    ):
         return super().build_schedule_plan(*args, **kwargs)
 
 

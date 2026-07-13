@@ -73,11 +73,25 @@ def _tokenizer(args):
 
 
 def _task_encoder(args, tokenizer) -> Qwen35EnergonTaskEncoder:
-    cp_size = (
-        parallel_state.get_context_parallel_world_size()
-        if parallel_state.model_parallel_is_initialized()
-        else int(getattr(args, "context_parallel_size", 1))
-    )
+    if parallel_state.model_parallel_is_initialized():
+        cp_size = int(parallel_state.get_context_parallel_world_size())
+        cp_rank = int(parallel_state.get_context_parallel_rank())
+        pp_size = int(parallel_state.get_pipeline_model_parallel_world_size())
+    else:
+        cp_size = int(getattr(args, "context_parallel_size", 1))
+        cp_rank = 0
+        pp_size = int(getattr(args, "pipeline_model_parallel_size", 1))
+
+    partition_vision = bool(getattr(args, "mdp_encoder_mode", False)) and cp_size > 1
+    inner_scope = str(getattr(args, "mdp_inner_dp_scope", "cp"))
+    if partition_vision and inner_scope != "cp":
+        raise ValueError(
+            "PR #4 supports --mdp-inner-dp-scope cp only; the following "
+            "sidecar PR adds pp_cp"
+        )
+    if partition_vision and pp_size != 1:
+        raise ValueError("CP-local --mdp-encoder-mode requires PP=1")
+
     return Qwen35EnergonTaskEncoder(
         tokenizer=tokenizer,
         seq_length=int(getattr(args, "total_seq_length", args.seq_length)),
@@ -95,6 +109,12 @@ def _task_encoder(args, tokenizer) -> Qwen35EnergonTaskEncoder:
         image_min_pixels=int(getattr(args, "image_min_pixels", 0)),
         image_max_pixels=int(getattr(args, "image_max_pixels", 0)),
         cp_size=int(cp_size),
+        mdp_loader_prepartition=partition_vision,
+        mdp_loader_prepartition_rank=int(cp_rank) if partition_vision else 0,
+        mdp_loader_prepartition_world=int(cp_size) if partition_vision else 1,
+        mdp_loader_prepartition_encoder_stage=True,
+        mdp_loader_prepartition_materialize=True,
+        mdp_lpt_hidden_size=int(getattr(args, "vision_hidden_size", 1152)),
     )
 
 
