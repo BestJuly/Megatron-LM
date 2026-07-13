@@ -64,6 +64,10 @@ def model_provider(
         )
 
     registry = MODEL_REGISTRY[model_arch]
+    args.text_only = bool(
+        getattr(args, "text_only", False)
+        or registry.get("text_only", False)
+    )
 
     # --- language config (generic + model-specific post-processing) ---
     language_config = core_transformer_config_from_args(args)
@@ -94,6 +98,8 @@ def model_provider(
         args=args,
         language_config=language_config,
         vision_config=vision_config,
+        pre_process=pre_process,
+        post_process=post_process,
         **kwargs,
     )
 

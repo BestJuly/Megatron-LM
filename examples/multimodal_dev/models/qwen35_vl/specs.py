@@ -43,17 +43,38 @@ def _apply_rope_fp32(t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=Non
             mscale=mscale,
         )
     else:
-        if cp_group is None:
-            cp_group = parallel_state.get_context_parallel_group()
-        out = _apply_rotary_pos_emb_thd(
-            t_fp32,
-            cu_seqlens,
-            freqs,
-            rotary_interleaved=config.rotary_interleaved,
-            multi_latent_attention=getattr(config, 'multi_latent_attention', False),
-            mscale=mscale,
-            cp_group=cp_group,
-        )
+        if (
+            t_fp32.dim() == 3
+            and freqs.dim() >= 1
+            and freqs.size(0) == t_fp32.size(0)
+        ):
+            # The vision encoder builds frequencies in exact packed-token
+            # order. Treating that tensor as BSHD avoids the generic THD
+            # helper's cu_seqlens host synchronization while preserving the
+            # same elementwise rotary calculation used by b436.
+            out = _apply_rotary_pos_emb_bshd(
+                t_fp32.unsqueeze(1),
+                freqs,
+                rotary_interleaved=config.rotary_interleaved,
+                multi_latent_attention=getattr(
+                    config, 'multi_latent_attention', False
+                ),
+                mscale=mscale,
+            ).squeeze(1)
+        else:
+            if cp_group is None:
+                cp_group = parallel_state.get_context_parallel_group()
+            out = _apply_rotary_pos_emb_thd(
+                t_fp32,
+                cu_seqlens,
+                freqs,
+                rotary_interleaved=config.rotary_interleaved,
+                multi_latent_attention=getattr(
+                    config, 'multi_latent_attention', False
+                ),
+                mscale=mscale,
+                cp_group=cp_group,
+            )
     return out.to(orig_dtype)
 
 

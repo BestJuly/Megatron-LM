@@ -5,10 +5,10 @@
 Architecture (matches HF ``Qwen3VLVisionModel`` exactly):
 
   PatchEmbed (Conv3d)
-    → learned position embedding (bilinear interpolation)
-    → 2D Vision RoPE
-    → TransformerBlock × N  (with PackedSeqParams / THD attention)
-    → PatchMerger  (per-token LN → spatial merge → MLP)
+    -> learned position embedding (bilinear interpolation)
+    -> 2D Vision RoPE
+    -> TransformerBlock x N  (with PackedSeqParams / THD attention)
+    -> PatchMerger  (per-token LN -> spatial merge -> MLP)
 
 Key design choices:
   * ``Conv3d`` patch embedding is replicated across TP ranks (no MCore
@@ -20,29 +20,35 @@ Key design choices:
     processor) so the merger's simple reshape is correct.
 """
 
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from megatron.core.models.common.vision_module.vision_module import (
-    VisionModule,
-)
-from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.tensor_parallel.layers import (
-    ColumnParallelLinear,
-    RowParallelLinear,
-)
+from examples.multimodal_dev.models.qwen35_vl.specs import get_qwen35_vl_vision_spec
 from megatron.core.extensions.transformer_engine import TENorm
+from megatron.core.models.common.vision_module.vision_module import VisionModule
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training import get_args
+from megatron.training.utils import get_nvtx_range
 
-# -------------------------------------------------------------------
-# PatchEmbed — Conv3d (replicated, no TP sharding)
-# -------------------------------------------------------------------
+
+def _has_partial_storage(tensor: Tensor) -> bool:
+    try:
+        return tensor.untyped_storage().nbytes() < tensor.numel() * tensor.element_size()
+    except RuntimeError:
+        return False
+
+
+def _using_megatron_fsdp() -> bool:
+    return bool(getattr(get_args(), "use_megatron_fsdp", False))
+
 
 class Qwen35VLPatchEmbed(MegatronModule):
     """3D convolution patch embedding matching HF ``Qwen3VLVisionPatchEmbed``.
@@ -93,20 +99,29 @@ class Qwen35VLPatchEmbed(MegatronModule):
             Patch embeddings ``[total_patches, hidden_size]``.
         """
         target_dtype = self.proj.weight.dtype
-        pixel_values = pixel_values.view(
-            -1,
-            self.in_channels,
-            self.temporal_patch_size,
-            self.patch_size,
-            self.patch_size,
-        )
-        return self.proj(pixel_values.to(dtype=target_dtype)).view(
-            -1, self.hidden_size
+        if _using_megatron_fsdp() or _has_partial_storage(self.proj.weight):
+            pixel_values = pixel_values.to(dtype=target_dtype).view(
+                -1,
+                self.in_channels,
+                self.temporal_patch_size,
+                self.patch_size,
+                self.patch_size,
+            )
+            return self.proj(pixel_values).flatten(1)
+
+        # The dataloader already materializes non-overlapping flattened
+        # patches. The Conv3d kernel therefore degenerates to one linear
+        # projection per patch; keeping the Conv3d module preserves checkpoint
+        # compatibility while avoiding cuDNN convolution overhead here.
+        return F.linear(
+            pixel_values.to(dtype=target_dtype),
+            self.proj.weight.flatten(1),
+            self.proj.bias,
         )
 
 
 # -------------------------------------------------------------------
-# VisionRotaryEmbedding — 1D frequency table
+# VisionRotaryEmbedding - 1D frequency table
 # -------------------------------------------------------------------
 
 class Qwen35VLVisionRotaryEmbedding(MegatronModule):
@@ -183,17 +198,17 @@ class Qwen35VLVisionRotaryEmbedding(MegatronModule):
 
 
 # -------------------------------------------------------------------
-# PatchMerger — per-token LN, spatial merge, TP-sharded MLP
+# PatchMerger - per-token LN, spatial merge, TP-sharded MLP
 # -------------------------------------------------------------------
 
 class Qwen35VLPatchMerger(MegatronModule):
     """Spatial patch merger matching HF ``Qwen3VLVisionPatchMerger``.
 
-    Per-token ``LayerNorm`` on ``hidden_size`` → reshape to merge
-    ``spatial_merge_size ** 2`` adjacent patches → two-layer MLP
-    (``ColumnParallelLinear`` → GELU → ``RowParallelLinear``).
+    Per-token ``LayerNorm`` on ``hidden_size`` -> reshape to merge
+    ``spatial_merge_size ** 2`` adjacent patches -> two-layer MLP
+    (``ColumnParallelLinear`` -> GELU -> ``RowParallelLinear``).
 
-    MLP dimensions: ``merge_dim → merge_dim → out_hidden_size``
+    MLP dimensions: ``merge_dim -> merge_dim -> out_hidden_size``
     where ``merge_dim = hidden_size * spatial_merge_size ** 2``.
 
     Args:
@@ -246,17 +261,21 @@ class Qwen35VLPatchMerger(MegatronModule):
         Returns:
             ``[total_merged_patches, out_hidden_size]``.
         """
-        hidden_states = self.patch_norm(hidden_states)
+        with get_nvtx_range()("PatchMerger/patch_norm"):
+            hidden_states = self.patch_norm(hidden_states)
         merged = hidden_states.view(-1, self.merge_dim)
-        merged, _ = self.linear_fc1(merged)
-        # NOTE: Official HuggingFace uses default approximate='none' in Qwen3VLVisionPatchMerger.
-        merged = torch.nn.functional.gelu(merged, approximate="tanh")
-        merged, _ = self.linear_fc2(merged)
+        with get_nvtx_range()("PatchMerger/linear_fc1"):
+            merged, _ = self.linear_fc1(merged)
+        with get_nvtx_range()("PatchMerger/gelu"):
+            # NOTE: Official HuggingFace uses default approximate='none' in Qwen3VLVisionPatchMerger.
+            merged = torch.nn.functional.gelu(merged, approximate="tanh")
+        with get_nvtx_range()("PatchMerger/linear_fc2"):
+            merged, _ = self.linear_fc2(merged)
         return merged
 
 
 # -------------------------------------------------------------------
-# Qwen35VLVisionEncoder — top-level encoder module
+# Qwen35VLVisionEncoder - top-level encoder module
 # -------------------------------------------------------------------
 
 class Qwen35VLVisionEncoder(VisionModule):
@@ -267,7 +286,7 @@ class Qwen35VLVisionEncoder(VisionModule):
     1. ``Qwen35VLPatchEmbed``  (Conv3d)
     2. Learned ``nn.Embedding`` position table with bilinear interpolation
     3. 2D Vision RoPE from ``(row, col)`` patch positions
-    4. ``TransformerBlock`` × N  with ``PackedSeqParams`` (THD attention)
+    4. ``TransformerBlock`` x N  with ``PackedSeqParams`` (THD attention)
     5. ``Qwen35VLPatchMerger``
 
     Output dimension matches the language model ``hidden_size``.
@@ -298,6 +317,10 @@ class Qwen35VLVisionEncoder(VisionModule):
 
         self.hidden_size = config.hidden_size
         self.spatial_merge_size = spatial_merge_size
+        # Cached so mRoPE position construction does not need to materialize
+        # GPU grid metadata on the host for multi-image batches.
+        self._patch_size = patch_size
+        self._temporal_patch_size = temporal_patch_size
 
         # --- Patch embedding (Conv3d) ---
         self.patch_embed = Qwen35VLPatchEmbed(
@@ -319,12 +342,25 @@ class Qwen35VLVisionEncoder(VisionModule):
         self.rot_pos_emb = Qwen35VLVisionRotaryEmbedding(
             head_dim // 2, config=config,
         )
+        self._pos_embed_grid_cache: Dict[
+            Tuple[int, int, int, str, torch.dtype],
+            Tuple[Tensor, Tensor],
+        ] = {}
+        self._rotary_pos_id_cache: Dict[
+            Tuple[int, int, int, str],
+            Tensor,
+        ] = {}
+        self._rotary_freq_grid_cache: Dict[
+            Tuple[int, int, int, str],
+            Tensor,
+        ] = {}
+        self._packed_seq_params_grid_cache: Dict[
+            Tuple[int, int, int, int, str],
+            Tuple[Tensor, Tensor],
+        ] = {}
 
         # --- Transformer blocks ---
         if transformer_layer_spec is None:
-            from examples.multimodal_dev.models.qwen35_vl.specs import (
-                get_qwen35_vl_vision_spec,
-            )
             transformer_layer_spec = get_qwen35_vl_vision_spec()
 
         self.decoder = TransformerBlock(
@@ -343,16 +379,132 @@ class Qwen35VLVisionEncoder(VisionModule):
             spatial_merge_size=spatial_merge_size,
         )
 
+    def _uniform_grid_spec(
+        self,
+        grid_thw: Tensor,
+    ) -> Optional[Tuple[int, int, int, int]]:
+        """Return ``(num_images, t, h, w)`` when all grids are identical."""
+        num_images = int(grid_thw.shape[0])
+        if num_images == 1:
+            result = (
+                1,
+                int(grid_thw[0, 0].item()),
+                int(grid_thw[0, 1].item()),
+                int(grid_thw[0, 2].item()),
+            )
+            return result
+        all_equal = bool(torch.all(grid_thw == grid_thw[0]).item())
+        if all_equal:
+            result = (
+                num_images,
+                int(grid_thw[0, 0].item()),
+                int(grid_thw[0, 1].item()),
+                int(grid_thw[0, 2].item()),
+            )
+            return result
+        return None
+
     # ---------------------------------------------------------------
     # Learned position embedding with bilinear interpolation
     # ---------------------------------------------------------------
 
+    def _cached_pos_embed_indices_and_weights(
+        self,
+        t: int,
+        h: int,
+        w: int,
+    ) -> Tuple[Tensor, Tensor]:
+        device = self.pos_embed.weight.device
+        dtype = self.pos_embed.weight.dtype
+        key = (int(t), int(h), int(w), str(device), dtype)
+        cached = self._pos_embed_grid_cache.get(key)
+        if cached is not None:
+            return cached
+
+        n = self.num_grid_per_side
+        merge = int(self.spatial_merge_size)
+        h_idxs = torch.linspace(0, n - 1, int(h))
+        w_idxs = torch.linspace(0, n - 1, int(w))
+
+        h_floor = h_idxs.int()
+        w_floor = w_idxs.int()
+        h_ceil = (h_floor + 1).clip(max=n - 1)
+        w_ceil = (w_floor + 1).clip(max=n - 1)
+
+        dh = h_idxs - h_floor
+        dw = w_idxs - w_floor
+
+        base_h = h_floor * n
+        base_h_ceil = h_ceil * n
+        indices = [
+            base_h[:, None] + w_floor[None, :],
+            base_h[:, None] + w_ceil[None, :],
+            base_h_ceil[:, None] + w_floor[None, :],
+            base_h_ceil[:, None] + w_ceil[None, :],
+        ]
+        weights = [
+            (1 - dh)[:, None] * (1 - dw)[None, :],
+            (1 - dh)[:, None] * dw[None, :],
+            dh[:, None] * (1 - dw)[None, :],
+            dh[:, None] * dw[None, :],
+        ]
+
+        idx_parts = []
+        weight_parts = []
+        for idx, weight in zip(indices, weights):
+            idx = (
+                idx.view(1, h, w)
+                .expand(t, h, w)
+                .view(t, h // merge, merge, w // merge, merge)
+                .permute(0, 1, 3, 2, 4)
+                .reshape(-1)
+            )
+            weight = (
+                weight.view(1, h, w)
+                .expand(t, h, w)
+                .view(t, h // merge, merge, w // merge, merge)
+                .permute(0, 1, 3, 2, 4)
+                .reshape(-1)
+            )
+            idx_parts.append(idx)
+            weight_parts.append(weight)
+
+        idx_tensor = torch.stack(idx_parts, dim=0).to(
+            dtype=torch.long,
+            device=device,
+        )
+        weight_tensor = torch.stack(weight_parts, dim=0).to(
+            dtype=dtype,
+            device=device,
+        )
+        cached = (idx_tensor, weight_tensor)
+        if len(self._pos_embed_grid_cache) >= 64:
+            self._pos_embed_grid_cache.clear()
+        self._pos_embed_grid_cache[key] = cached
+        return cached
+
+    def _single_pos_embed_interpolate(self, t: int, h: int, w: int) -> Tensor:
+        idx_tensor, weight_tensor = self._cached_pos_embed_indices_and_weights(
+            t, h, w,
+        )
+        pos_embeds = self.pos_embed(idx_tensor) * weight_tensor[:, :, None]
+        return pos_embeds.sum(dim=0)
+
     def _fast_pos_embed_interpolate(
-        self, grid_thw: Tensor,
+        self,
+        grid_thw: Tensor,
+        uniform_grid: Optional[Tuple[int, int, int, int]] = None,
     ) -> Tensor:
         """Bilinear interpolation of the learned 2D position table.
 
         Matches HF ``Qwen3VLVisionModel.fast_pos_embed_interpolate``.
+        Adopted from megatron-bridge ``Qwen3VLVisionModel.fast_pos_embed_interpolate``
+        which avoids the upfront ``grid_thw.tolist()`` GPU->CPU memcpy that
+        deadlocks for some multi-image configs.
+        Each per-image (h, w) iteration is via ``zip(grid_hs, grid_ws)`` -
+        which yields 0-d GPU tensors that PyTorch implicitly converts to
+        Python ints via small per-element syncs (working under multi-image
+        whereas a single batch ``.tolist()`` deadlocked).
 
         Args:
             grid_thw: ``[num_images, 3]`` (T, H, W) in patch-grid units.
@@ -361,18 +513,27 @@ class Qwen35VLVisionEncoder(VisionModule):
             ``[total_patches, hidden_size]`` position embeddings in
             block-merge order.
         """
-        grid_thw_list = grid_thw.tolist()
-        grid_ts = [int(row[0]) for row in grid_thw_list]
-        grid_hs = [int(row[1]) for row in grid_thw_list]
-        grid_ws = [int(row[2]) for row in grid_thw_list]
-        device = self.pos_embed.weight.device
-        n = self.num_grid_per_side
+        if uniform_grid is None:
+            uniform_grid = self._uniform_grid_spec(grid_thw)
+
+        if uniform_grid is not None:
+            num_images, t, h, w = uniform_grid
+            single_image_embeds = self._single_pos_embed_interpolate(t, h, w)
+            if int(num_images) == 1:
+                return single_image_embeds
+            result = single_image_embeds.repeat(int(num_images), 1)
+            return result
+
+        grid_ts, grid_hs, grid_ws = grid_thw[:, 0], grid_thw[:, 1], grid_thw[:, 2]
 
         idx_list: List[List[int]] = [[] for _ in range(4)]
         weight_list: List[List[float]] = [[] for _ in range(4)]
 
-        for t, h, w in grid_thw_list:
-            t, h, w = int(t), int(h), int(w)
+        n = self.num_grid_per_side
+
+        for t, h, w in zip(grid_ts, grid_hs, grid_ws):
+            # h, w are 0-d GPU tensors. torch.linspace accepts them as the
+            # `steps` argument (PyTorch converts via small per-element sync).
             h_idxs = torch.linspace(0, n - 1, h)
             w_idxs = torch.linspace(0, n - 1, w)
 
@@ -381,8 +542,8 @@ class Qwen35VLVisionEncoder(VisionModule):
             h_ceil = (h_floor + 1).clip(max=n - 1)
             w_ceil = (w_floor + 1).clip(max=n - 1)
 
-            dh = h_idxs - h_floor.float()
-            dw = w_idxs - w_floor.float()
+            dh = h_idxs - h_floor
+            dw = w_idxs - w_floor
 
             base_h = h_floor * n
             base_h_ceil = h_ceil * n
@@ -401,85 +562,151 @@ class Qwen35VLVisionEncoder(VisionModule):
             ]
 
             for i in range(4):
+                # indices[i] / weights[i] are CPU tensors (torch.linspace
+                # default device = cpu); .tolist() here is CPU-only.
                 idx_list[i].extend(indices[i].tolist())
                 weight_list[i].extend(weights[i].tolist())
 
         idx_tensor = torch.tensor(
-            idx_list, dtype=torch.long, device=device,
+            idx_list, dtype=torch.long, device=self.pos_embed.weight.device,
         )
         weight_tensor = torch.tensor(
             weight_list,
             dtype=self.pos_embed.weight.dtype,
-            device=device,
+            device=self.pos_embed.weight.device,
         )
-        pos_embeds = (
-            self.pos_embed(idx_tensor).to(device)
-            * weight_tensor[:, :, None]
-        )
-        patch_pos_embeds = (
-            pos_embeds[0] + pos_embeds[1]
-            + pos_embeds[2] + pos_embeds[3]
-        )
+        pos_embeds = self.pos_embed(idx_tensor) * weight_tensor[:, :, None]
+        patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
 
-        patch_pos_embeds = patch_pos_embeds.split(
-            [h * w for h, w in zip(grid_hs, grid_ws)]
-        )
+        # split sizes - each (h*w) is a small product of 0-d tensors -> int via small implicit sync.
+        split_sizes = [h * w for h, w in zip(grid_hs, grid_ws)]
+        patch_pos_embeds = patch_pos_embeds.split(split_sizes)
 
         merge = self.spatial_merge_size
         result = []
-        for pe, t, h, w in zip(
-            patch_pos_embeds, grid_ts, grid_hs, grid_ws,
-        ):
+        for pe, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws):
             pe = pe.repeat(t, 1)
             pe = (
-                pe.view(
-                    t, h // merge, merge, w // merge, merge, -1,
-                )
+                pe.view(t, h // merge, merge, w // merge, merge, -1)
                 .permute(0, 1, 3, 2, 4, 5)
                 .flatten(0, 4)
             )
             result.append(pe)
-
-        return torch.cat(result)
+        result = torch.cat(result)
+        return result
 
     # ---------------------------------------------------------------
     # 2D Vision RoPE
     # ---------------------------------------------------------------
 
-    def _compute_rotary_pos_emb(self, grid_thw: Tensor) -> Tensor:
+    def _cached_rotary_pos_ids(self, t: int, h: int, w: int, device) -> Tensor:
+        key = (int(t), int(h), int(w), str(device))
+        cached = self._rotary_pos_id_cache.get(key)
+        if cached is not None:
+            return cached
+
+        merge = int(self.spatial_merge_size)
+        merged_h, merged_w = int(h) // merge, int(w) // merge
+        block_rows = torch.arange(merged_h, device=device)
+        block_cols = torch.arange(merged_w, device=device)
+        intra_row = torch.arange(merge, device=device)
+        intra_col = torch.arange(merge, device=device)
+
+        row_idx = (
+            block_rows[:, None, None, None] * merge
+            + intra_row[None, None, :, None]
+        )
+        col_idx = (
+            block_cols[None, :, None, None] * merge
+            + intra_col[None, None, None, :]
+        )
+        row_idx = row_idx.expand(merged_h, merged_w, merge, merge).reshape(-1)
+        col_idx = col_idx.expand(merged_h, merged_w, merge, merge).reshape(-1)
+        pos_ids = torch.stack((row_idx, col_idx), dim=-1)
+        if int(t) > 1:
+            pos_ids = pos_ids.repeat(int(t), 1)
+        if len(self._rotary_pos_id_cache) >= 64:
+            self._rotary_pos_id_cache.clear()
+        self._rotary_pos_id_cache[key] = pos_ids
+        return pos_ids
+
+    def _cached_rotary_freqs_for_grid(
+        self,
+        t: int,
+        h: int,
+        w: int,
+        device,
+    ) -> Tensor:
+        key = (int(t), int(h), int(w), str(device))
+        cached = self._rotary_freq_grid_cache.get(key)
+        if cached is not None:
+            return cached
+
+        max_hw = max(int(h), int(w))
+        freq_table = self.rot_pos_emb(max_hw, device=device)
+        pos_ids = self._cached_rotary_pos_ids(t, h, w, device)
+        freqs = freq_table[pos_ids].flatten(1)
+        if len(self._rotary_freq_grid_cache) >= 64:
+            self._rotary_freq_grid_cache.clear()
+        self._rotary_freq_grid_cache[key] = freqs
+        return freqs
+
+    def _compute_rotary_pos_emb(
+        self,
+        grid_thw: Tensor,
+        uniform_grid: Optional[Tuple[int, int, int, int]] = None,
+    ) -> Tensor:
         """Compute 2D Vision RoPE for all patches in block-merge order.
 
         Matches HF ``Qwen3VLVisionModel.rot_pos_emb``.
+        Adopted from megatron-bridge ``Qwen3VLVisionModel.rot_pos_emb`` -
+        avoids the upfront ``grid_thw.tolist()`` GPU->CPU memcpy that
+        deadlocks for multi-image configs. Uses GPU-vectorized ``.max()``
+        / ``torch.prod`` then a single small ``.item()`` (sync on a
+        small derived tensor, NOT on the original grid_thw).
 
         Args:
-            grid_thw: ``[num_images, 3]`` (T, H, W) per image.
+            grid_thw: ``[num_images, 3]`` (T, H, W) per image, on GPU.
 
         Returns:
-            ``[total_patches, head_dim // 2]`` raw RoPE frequencies.
+            ``[total_patches, head_dim // 2]`` raw RoPE frequencies on GPU.
         """
+        device = self.rot_pos_emb.inv_freq.device
+        if device.type == "meta":
+            device = torch.device("cuda", torch.cuda.current_device())
+
+        if uniform_grid is None:
+            uniform_grid = self._uniform_grid_spec(grid_thw)
+        if uniform_grid is not None:
+            num_images, t, h, w = uniform_grid
+            single_image_freqs = self._cached_rotary_freqs_for_grid(t, h, w, device)
+            if int(num_images) == 1:
+                return single_image_freqs
+            result = single_image_freqs.repeat(int(num_images), 1)
+            return result
+
         merge = self.spatial_merge_size
-        grid_thw_list = grid_thw.tolist()
 
-        max_hw = max(max(int(h), int(w)) for _, h, w in grid_thw_list)
-        freq_table = self.rot_pos_emb(
-            max_hw, device=grid_thw.device,
-        )
-        device = freq_table.device
+        # GPU-vectorized derivations: result is a small (0-d) tensor; the
+        # only sync is the final .item() - single-shot sync on a fresh
+        # small derived tensor (works under multi-image; .tolist() of the
+        # original grid_thw deadlocks on multi-element copy).
+        max_hw = int(grid_thw[:, 1:].max().item())
+        freq_table = self.rot_pos_emb(max_hw, device=device)
 
-        total_tokens = sum(
-            int(t) * int(h) * int(w) for t, h, w in grid_thw_list
-        )
+        total_tokens = int(torch.prod(grid_thw, dim=1).sum().item())
         pos_ids = torch.empty(
             (total_tokens, 2), dtype=torch.long, device=device,
         )
 
         offset = 0
-        for num_frames, height, width in grid_thw_list:
-            num_frames = int(num_frames)
-            height = int(height)
-            width = int(width)
-            merged_h = height // merge
-            merged_w = width // merge
+        # Iterate over GPU rows directly. Each `num_frames`/`height`/`width`
+        # is a 0-d GPU tensor; `height // merge` is a GPU tensor op; the
+        # arange / expand / reshape ops below all stay on GPU. The only
+        # sync per row is via `coords.shape[0]` (Python int from .shape -
+        # CPU-side metadata, no sync).
+        for num_frames, height, width in grid_thw:
+            merged_h, merged_w = height // merge, width // merge
 
             block_rows = torch.arange(merged_h, device=device)
             block_cols = torch.arange(merged_w, device=device)
@@ -520,32 +747,91 @@ class Qwen35VLVisionEncoder(VisionModule):
 
     @staticmethod
     def _build_packed_seq_params(grid_thw: Tensor) -> PackedSeqParams:
-        """Build ``PackedSeqParams`` from grid dimensions.
+        """Build ``PackedSeqParams`` from grid dimensions - pure GPU path.
 
-        Each temporal frame of each image forms a separate sub-sequence
-        in the packed THD layout, matching HF's ``cu_seqlens`` computation.
+        Adopted from megatron-bridge ``Qwen3VLVisionModel.build_packed_seq_params``.
+        All ops are GPU tensor ops (``repeat_interleave``, ``cumsum``,
+        ``F.pad``, ``.max()``) - NO ``.tolist()`` / ``.item()`` on the
+        per-element data; ``max_seqlen_q`` is passed as a 0-d GPU tensor
+        (TE / Megatron PackedSeqParams accepts both int and 0-d tensor).
+
+        This avoids the GPU->CPU memcpy deadlock observed under specific
+        multi-image (image_size, N) configs.
 
         Args:
-            grid_thw: ``[num_images, 3]``.
+            grid_thw: ``[num_images, 3]`` (T, H, W) on GPU.
 
         Returns:
-            ``PackedSeqParams`` for ``TransformerBlock``.
+            ``PackedSeqParams`` with cu_seqlens / max_seqlen on GPU.
         """
-        cu_seqlens = torch.repeat_interleave(
+        seqlens = torch.repeat_interleave(
             grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0],
-        ).cumsum(dim=0, dtype=torch.int32)
-        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0)
-        max_seqlen = int(
-            (grid_thw[:, 1] * grid_thw[:, 2]).max().item()
         )
+        cu_seqlens = seqlens.cumsum(dim=0)
+        cu_seqlens = F.pad(cu_seqlens, (1, 0), value=0).int()
+
+        max_seqlen_q = int((grid_thw[:, 1] * grid_thw[:, 2]).max().item())
 
         return PackedSeqParams(
             qkv_format="thd",
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_seqlens,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_kv=max_seqlen,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_q,
         )
+
+    def _cached_packed_seq_params_for_uniform_grid(
+        self,
+        num_images: int,
+        t: int,
+        h: int,
+        w: int,
+        device,
+    ) -> PackedSeqParams:
+        key = (int(num_images), int(t), int(h), int(w), str(device))
+        cached = self._packed_seq_params_grid_cache.get(key)
+        if cached is None:
+            num_seqs = int(num_images) * int(t)
+            seqlen = int(h) * int(w)
+            cu_seqlens = (
+                torch.arange(num_seqs + 1, device=device, dtype=torch.int32)
+                * seqlen
+            )
+            max_seqlen_q = seqlen
+            cached = (cu_seqlens, max_seqlen_q)
+            if len(self._packed_seq_params_grid_cache) >= 64:
+                self._packed_seq_params_grid_cache.clear()
+            self._packed_seq_params_grid_cache[key] = cached
+
+        cu_seqlens, max_seqlen_q = cached
+        return PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_q,
+        )
+
+    def _build_or_get_packed_seq_params(
+        self,
+        grid_thw: Tensor,
+        uniform_grid: Optional[Tuple[int, int, int, int]] = None,
+    ) -> PackedSeqParams:
+        if uniform_grid is None:
+            uniform_grid = self._uniform_grid_spec(grid_thw)
+        if uniform_grid is not None:
+            num_images, t, h, w = uniform_grid
+            result = self._cached_packed_seq_params_for_uniform_grid(
+                int(num_images),
+                int(t),
+                int(h),
+                int(w),
+                grid_thw.device,
+            )
+            return result
+
+        result = self._build_packed_seq_params(grid_thw)
+        return result
 
     # ---------------------------------------------------------------
     # Forward
@@ -566,20 +852,33 @@ class Qwen35VLVisionEncoder(VisionModule):
         Returns:
             ``[total_merged_patches, out_hidden_size]`` visual embeddings.
         """
+
+
         # 1. Patch embedding (Conv3d)
-        hidden_states = self.patch_embed(pixel_values)
+        with get_nvtx_range()("VisionEncoder/patch_embed"):
+            hidden_states = self.patch_embed(pixel_values)
+
+        uniform_grid = self._uniform_grid_spec(grid_thw)
 
         # 2. Learned position embedding (bilinear interpolation)
-        pos_embeds = self._fast_pos_embed_interpolate(grid_thw)
-        hidden_states = hidden_states + pos_embeds
+        with get_nvtx_range()("VisionEncoder/pos_embed_interpolate"):
+            pos_embeds = self._fast_pos_embed_interpolate(
+                grid_thw, uniform_grid=uniform_grid,
+            )
+            hidden_states = hidden_states + pos_embeds
 
         # 3. 2D Vision RoPE
-        rot_freqs = self._compute_rotary_pos_emb(grid_thw)
-        emb = torch.cat((rot_freqs, rot_freqs), dim=-1)
-        rot_freqs_expanded = emb.unsqueeze(1).unsqueeze(1)
+        with get_nvtx_range()("VisionEncoder/vision_rope"):
+            rot_freqs = self._compute_rotary_pos_emb(
+                grid_thw, uniform_grid=uniform_grid,
+            )
+            emb = torch.cat((rot_freqs, rot_freqs), dim=-1)
+            rot_freqs_expanded = emb.unsqueeze(1).unsqueeze(1)
 
         # 4. Transformer blocks with PackedSeqParams
-        packed_seq_params = self._build_packed_seq_params(grid_thw)
+        packed_seq_params = self._build_or_get_packed_seq_params(
+            grid_thw, uniform_grid=uniform_grid,
+        )
         hidden_states = hidden_states.unsqueeze(1)
         hidden_states = self.decoder(
             hidden_states=hidden_states,
@@ -590,4 +889,6 @@ class Qwen35VLVisionEncoder(VisionModule):
         hidden_states = hidden_states.squeeze(1)
 
         # 5. Patch merger
-        return self.merger(hidden_states)
+        with get_nvtx_range()("VisionEncoder/patch_merger"):
+            hidden_states = self.merger(hidden_states)
+        return hidden_states

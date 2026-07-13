@@ -390,3 +390,78 @@ class MultimodalModel(MegatronModule):
                 loss_mask=loss_mask,
                 packed_seq_params=packed_seq_params,
             )
+
+    def build_schedule_plan(
+        self,
+        input_ids: Tensor,
+        position_ids: Tensor,
+        attention_mask: Tensor = None,
+        labels: Tensor = None,
+        loss_mask: Tensor = None,
+        pixel_values: Tensor = None,
+        image_grid_thw: Tensor = None,
+        decoder_input: Tensor = None,
+        packed_seq_params=None,
+        **kwargs,
+    ):
+        """Build the inner GPT schedule plan after multimodal preprocessing."""
+        del kwargs
+        if position_ids is None:
+            position_ids = self.compute_position_ids(
+                input_ids=input_ids,
+                image_grid_thw=image_grid_thw,
+                packed_seq_params=packed_seq_params,
+            )
+
+        pre_process = getattr(
+            self,
+            "pre_process",
+            getattr(self.language_model, "pre_process", True),
+        )
+        vision_embeddings = None
+        if (
+            pre_process
+            and self.vision_model is not None
+            and pixel_values is not None
+        ):
+            vision_embeddings = self.vision_model(
+                pixel_values, image_grid_thw,
+            )
+
+        if (
+            pre_process
+            and decoder_input is None
+            and self.language_model is not None
+        ):
+            text_embeddings = self.language_model.embedding(
+                input_ids=input_ids, position_ids=None,
+            )
+            if vision_embeddings is not None:
+                decoder_input = self._scatter_vision_embeddings(
+                    input_ids, text_embeddings, vision_embeddings,
+                )
+            else:
+                decoder_input = text_embeddings
+
+        (
+            decoder_input, input_ids, labels, loss_mask,
+            attention_mask, position_ids,
+        ) = self._cp_split_for_forward(
+            decoder_input=decoder_input,
+            input_ids=input_ids,
+            labels=labels,
+            loss_mask=loss_mask,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            packed_seq_params=packed_seq_params,
+        )
+
+        return self.language_model.build_schedule_plan(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            decoder_input=decoder_input,
+            labels=labels,
+            loss_mask=loss_mask,
+            packed_seq_params=packed_seq_params,
+        )

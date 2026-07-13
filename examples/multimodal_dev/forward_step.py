@@ -11,13 +11,16 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core import mpu
+from megatron.core.extensions.transformer_engine import get_thd_partitioned_indices
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
+    get_context_parallel_rank,
     get_context_parallel_world_size,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_src_rank,
 )
+from megatron.core.utils import get_thd_batch_on_this_cp_rank
 from megatron.training import get_args
 
 # -------------------------------------------------------------------
@@ -284,6 +287,58 @@ def pack_or_pad_batch(batch: list[Dict[str, Any]], use_packed_sequence: bool=Fal
         return padded_batch
 
 
+def _shard_qwen3_packed_batch_for_cp(batch, cp_size, cp_rank):
+    """Apply MCore's canonical data-side THD shard for plain Qwen3 GPT.
+
+    Vision tensors are not sequence-aligned and must not be passed to
+    ``get_thd_batch_on_this_cp_rank``.  Position IDs use the same THD
+    partition indices but may have an extra MRoPE channel dimension, so
+    they are indexed separately along their last dimension.
+    """
+    packed_seq_params = batch["packed_seq_params"]
+    cu_seqlens = packed_seq_params.cu_seqlens_q
+    cu_seqlens_padded = packed_seq_params.cu_seqlens_q_padded
+    max_seqlen = torch.tensor(
+        [packed_seq_params.max_seqlen_q],
+        dtype=torch.int32,
+        device=cu_seqlens.device,
+    )
+
+    sequence_batch = {"tokens": batch["input_ids"]}
+    for key in ("labels", "loss_mask", "attention_mask"):
+        if batch.get(key) is not None:
+            sequence_batch[key] = batch[key]
+
+    sequence_batch, packed_seq_params = get_thd_batch_on_this_cp_rank(
+        sequence_batch,
+        cu_seqlens,
+        cu_seqlens_padded,
+        max_seqlen,
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+    )
+
+    sharded_batch = dict(batch)
+    sharded_batch["input_ids"] = sequence_batch.pop("tokens")
+    sharded_batch.update(sequence_batch)
+    sharded_batch["packed_seq_params"] = packed_seq_params
+
+    position_ids = batch.get("position_ids")
+    if position_ids is not None:
+        indices = get_thd_partitioned_indices(
+            cu_seqlens_padded,
+            int(cu_seqlens_padded[-1].item()),
+            cp_size,
+            cp_rank,
+        ).long()
+        sharded_batch["position_ids"] = position_ids.index_select(-1, indices)
+
+    # ``forward_step`` uses this marker to avoid sharding the loss mask a
+    # second time after the plain GPT model returns its already-local output.
+    sharded_batch["_data_side_cp_sharded"] = True
+    return sharded_batch
+
+
 # -------------------------------------------------------------------
 # get_batch
 # -------------------------------------------------------------------
@@ -338,6 +393,18 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
         if g.dim() == 3:
             batch["image_grid_thw"] = g.squeeze(1)
 
+    cp_size = get_context_parallel_world_size()
+    if (
+        getattr(args, "model_arch", None) == "qwen3"
+        and batch.get("packed_seq_params") is not None
+        and cp_size > 1
+    ):
+        batch = _shard_qwen3_packed_batch_for_cp(
+            batch,
+            cp_size=cp_size,
+            cp_rank=get_context_parallel_rank(),
+        )
+
     return batch
 
 
@@ -363,7 +430,7 @@ def loss_func(loss_mask, output_tensor):
 # Forward step
 # -------------------------------------------------------------------
 
-def forward_step(data_iterator, model):
+def forward_step(data_iterator, model, return_schedule_plan=False):
     """Forward step for multimodal_dev training."""
     batch = get_batch(data_iterator)
 
@@ -378,8 +445,7 @@ def forward_step(data_iterator, model):
     ):
         pixel_values = pixel_values.bfloat16()
 
-    # We don't provide position_ids, now. Let model handle it itself.
-    output_tensor = model(
+    model_kwargs = dict(
         input_ids=batch["input_ids"],
         position_ids=batch.get("position_ids"),
         attention_mask=batch.get("attention_mask", None),
@@ -389,6 +455,27 @@ def forward_step(data_iterator, model):
         image_grid_thw=batch.get("image_grid_thw", None),
         packed_seq_params=batch.get("packed_seq_params", None),
     )
+    if return_schedule_plan:
+        args = get_args()
+        if not args.overlap_moe_expert_parallel_comm:
+            raise RuntimeError(
+                "overlap_moe_expert_parallel_comm must be enabled "
+                "to return the schedule plan"
+            )
+        if (
+            getattr(args, "model_arch", None) in {"qwen35_vl", "qwen3vl"}
+            and model_kwargs["packed_seq_params"] is not None
+            and get_context_parallel_world_size() > 1
+        ):
+            raise RuntimeError(
+                "Qwen VL packed THD with context parallelism does not "
+                "support overlap_moe_expert_parallel_comm: deferred MRoPE "
+                "execution cannot use the regular forward CP override"
+            )
+        output_tensor = model.build_schedule_plan(**model_kwargs)
+    else:
+        # We don't provide position_ids, now. Let model handle it itself.
+        output_tensor = model(**model_kwargs)
 
     loss_mask = batch.get("loss_mask", None)
     if loss_mask is None:
@@ -401,9 +488,7 @@ def forward_step(data_iterator, model):
     # THD: use the same TE-based per-sample partition index as the model.
     # BSHD: use the matching zigzag split.
     cp_size = get_context_parallel_world_size()
-    if cp_size > 1:
-        from megatron.core.parallel_state import get_context_parallel_rank
-
+    if cp_size > 1 and not batch.get("_data_side_cp_sharded", False):
         from examples.multimodal_dev.models.base import (
             _cp_split_tensor,
             _thd_cp_partition_index,

@@ -13,7 +13,7 @@ def add_multimodal_args(parser):
         "--model-arch",
         type=str,
         default="qwen35_vl",
-        help="Model architecture. Available: qwen35_vl",
+        help="Model architecture registered in MODEL_REGISTRY.",
     )
     group.add_argument(
         "--model-variant",
@@ -50,6 +50,15 @@ def add_multimodal_args(parser):
         type=int,
         default=256,
         help="Number of image tokens in mock data",
+    )
+    group.add_argument(
+        "--text-only",
+        action="store_true",
+        default=False,
+        help=(
+            "Mock dataset: emit plain text positions and empty vision "
+            "tensors. Implied by --model-arch qwen3."
+        ),
     )
     group.add_argument(
         "--vision-num-layers",

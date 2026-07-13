@@ -29,6 +29,7 @@ class MegatronTokenizerVision(MegatronTokenizerBase):
 
         super().__init__(path, config, **kwargs)
         self._tokenizer = self._restore_model(**kwargs)
+        self.additional_args = kwargs
         self.path = path
 
     def _restore_model(self, **kwargs):
@@ -125,6 +126,16 @@ class MegatronTokenizerVision(MegatronTokenizerBase):
     def vocab(self):
         """Tokenizer vocab."""
         return self._tokenizer.vocab
+
+    @property
+    def unique_identifiers(self) -> OrderedDict:
+        """Returns a dictionary of unique identifiers."""
+        unique_identifiers = OrderedDict()
+        unique_identifiers["class"] = f"{type(self).__module__}.{type(self).__qualname__}"
+        unique_identifiers["tokenizer_path"] = self.path
+        for arg in self.additional_args:
+            unique_identifiers[arg] = str(self.additional_args[arg])
+        return unique_identifiers
 
     @property
     def vocab_size(self) -> int:

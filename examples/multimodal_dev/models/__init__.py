@@ -31,6 +31,9 @@ Registry entry fields
     Maps ``--dataset-provider`` names to callables (or dotted import paths
     resolved lazily) with signature
     ``(train_val_test_num_samples) -> (train_ds, val_ds, test_ds)``.
+
+``text_only``  *(optional, default False)*
+    Marks architectures that must bypass multimodal-only runtime wiring.
 """
 
 from examples.multimodal_dev.models.qwen35_vl.configuration import (
@@ -40,6 +43,18 @@ from examples.multimodal_dev.models.qwen35_vl.factory import (
     build_model as _build_qwen35_vl_model,
     post_language_config as _qwen35_vl_post_language_config,
     set_vision_flops_metadata as _qwen35_vl_vision_flops,
+)
+from examples.multimodal_dev.models.qwen3.factory import (
+    build_model as _build_qwen3_model,
+    get_qwen3_vision_config as _qwen3_vision_config,
+    post_language_config as _qwen3_post_language_config,
+    set_vision_flops_metadata as _qwen3_vision_flops,
+)
+from examples.multimodal_dev.models.qwen3vl.factory import (
+    build_model as _build_qwen3vl_model,
+    get_qwen3vl_vision_config as _qwen3vl_vision_config,
+    post_language_config as _qwen3vl_post_language_config,
+    set_vision_flops_metadata as _qwen3vl_vision_flops,
 )
 from examples.multimodal_dev.models.kimi_k25.factory import (
     build_model as _build_kimi_k25_model,
@@ -71,6 +86,34 @@ MODEL_REGISTRY = {
         "dataset_providers": {
             "mock": (
                 "examples.multimodal_dev.data.kimi_k25_vlm_mock"
+                ".train_valid_test_datasets_provider"
+            ),
+        },
+    },
+    "qwen3": {
+        # Text-only Qwen3-30B-A3B-style MoE architecture with plain 1D RoPE.
+        "model_factory_fn": _build_qwen3_model,
+        "vision_config_fn": _qwen3_vision_config,
+        "post_language_config_fn": _qwen3_post_language_config,
+        "vision_flops_fn": _qwen3_vision_flops,
+        "text_only": True,
+        "dataset_providers": {
+            "mock": (
+                "examples.multimodal_dev.data.mock"
+                ".train_valid_test_datasets_provider"
+            ),
+        },
+    },
+    "qwen3vl": {
+        # Qwen3.5-VL vision/MRoPE with the Qwen3 decoder used by the
+        # b436aba59 workload (48 decoder layers are set by the launcher).
+        "model_factory_fn": _build_qwen3vl_model,
+        "vision_config_fn": _qwen3vl_vision_config,
+        "post_language_config_fn": _qwen3vl_post_language_config,
+        "vision_flops_fn": _qwen3vl_vision_flops,
+        "dataset_providers": {
+            "mock": (
+                "examples.multimodal_dev.data.mock"
                 ".train_valid_test_datasets_provider"
             ),
         },

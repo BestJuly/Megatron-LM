@@ -2,9 +2,8 @@
 
 """Mock dataset for multimodal_dev end-to-end testing.
 
-Generates synthetic image + text data.  Each sample has random text
-tokens with image-token placeholders, random pixel values sized for the
-vision encoder, 3D MRoPE position IDs, and shifted labels.
+Generates synthetic image + text data by default. Text-only samples use
+plain 1D position IDs and empty vision tensors.
 """
 
 import torch
@@ -33,6 +32,8 @@ class MockQwen35VLDataset(Dataset):
         patch_size: Spatial patch size.
         temporal_patch_size: Temporal patch size.
         spatial_merge_size: Spatial merge factor.
+        text_only: Emit plain text tokens and positions with empty vision
+            tensors. Intended for text-only model architectures.
     """
 
     def __init__(
@@ -48,6 +49,7 @@ class MockQwen35VLDataset(Dataset):
         patch_size: int = 16,
         temporal_patch_size: int = 2,
         spatial_merge_size: int = 2,
+        text_only: bool = False,
     ):
         self.num_samples = num_samples
         self.seq_length = seq_length
@@ -59,6 +61,7 @@ class MockQwen35VLDataset(Dataset):
         self.patch_size = patch_size
         self.temporal_patch_size = temporal_patch_size
         self.spatial_merge_size = spatial_merge_size
+        self.text_only = bool(text_only)
 
         h_patches = image_size // patch_size
         w_patches = image_size // patch_size
@@ -79,6 +82,59 @@ class MockQwen35VLDataset(Dataset):
         return self.num_samples
 
     def __getitem__(self, idx):
+        if self.text_only:
+            special_ids = {
+                self.image_token_id,
+                self.video_token_id,
+                self.vision_start_token_id,
+            }
+            fallback_id = next(
+                (
+                    token_id
+                    for token_id in range(1, self.vocab_size)
+                    if token_id not in special_ids
+                ),
+                None,
+            )
+            if fallback_id is None:
+                raise ValueError("vocab_size has no non-vision token ID")
+            input_ids = torch.randint(
+                1, self.vocab_size, (self.seq_length,), dtype=torch.long,
+            )
+            for special_id in special_ids:
+                input_ids[input_ids == special_id] = fallback_id
+
+            labels = input_ids.clone()
+            labels[:-1] = input_ids[1:]
+            labels[-1] = 0
+            loss_mask = torch.ones_like(input_ids, dtype=torch.float)
+            loss_mask[-1] = 0
+            pixel_dim = (
+                3
+                * self.temporal_patch_size
+                * self.patch_size
+                * self.patch_size
+            )
+            cu_seqlens = torch.tensor(
+                [0, self.seq_length], dtype=torch.int32,
+            )
+            return {
+                "input_ids": input_ids,
+                "tokens": input_ids,
+                "labels": labels,
+                "loss_mask": loss_mask,
+                "cu_seqlens": cu_seqlens,
+                "cu_seqlens_padded": cu_seqlens.clone(),
+                "max_seqlen": torch.tensor(
+                    self.seq_length, dtype=torch.int32,
+                ),
+                "position_ids": torch.arange(
+                    self.seq_length, dtype=torch.long,
+                ),
+                "pixel_values": torch.empty(0, pixel_dim),
+                "image_grid_thw": torch.empty(0, 3, dtype=torch.long),
+            }
+
         # Reserve 1 slot for the vision_start sentinel before image tokens.
         text_length = self.seq_length - self.image_seq_length - 1
         text_tokens = torch.randint(
@@ -177,6 +233,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         vocab_size=getattr(args, "padded_vocab_size", 248320),
         image_token_id=getattr(args, "image_token_id", 248056),
         image_size=getattr(args, "image_size", 224),
+        text_only=getattr(args, "text_only", False),
     )
 
     train_ds = MockQwen35VLDataset(

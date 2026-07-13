@@ -74,6 +74,10 @@ def build_tokenizer(args, **kwargs):
         metadata = {'library': tokenizer_library}
         if args.vocab_size:
             kwargs['vocab_size'] = args.vocab_size
+        if args.tokenizer_type == 'NullMultimodalTokenizer':
+            image_token_id = getattr(args, 'image_token_id', None)
+            if image_token_id is not None:
+                kwargs['image_token_id'] = image_token_id
         tokenizer = MegatronTokenizer.from_pretrained(metadata_path=metadata, **kwargs)
 
         # Add vocab size (if not already set from a checkpoint).
