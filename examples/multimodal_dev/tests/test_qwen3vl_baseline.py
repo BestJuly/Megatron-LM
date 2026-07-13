@@ -34,9 +34,13 @@ def test_registry_adds_qwen3_paths_without_replacing_existing_models():
     from examples.multimodal_dev.models import MODEL_REGISTRY
 
     assert set(MODEL_REGISTRY) == {"kimi_k25", "qwen3", "qwen35_vl", "qwen3vl"}
-    assert set(MODEL_REGISTRY["qwen35_vl"]["dataset_providers"]) == {"cord_v2", "mock"}
+    assert set(MODEL_REGISTRY["qwen35_vl"]["dataset_providers"]) == {
+        "cord_v2",
+        "energon",
+        "mock",
+    }
     assert set(MODEL_REGISTRY["kimi_k25"]["dataset_providers"]) == {"mock"}
-    assert set(MODEL_REGISTRY["qwen3vl"]["dataset_providers"]) == {"mock"}
+    assert set(MODEL_REGISTRY["qwen3vl"]["dataset_providers"]) == {"energon", "mock"}
     assert MODEL_REGISTRY["qwen3"]["text_only"] is True
 
 

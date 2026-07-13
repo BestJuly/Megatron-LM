@@ -52,15 +52,16 @@ def _id_to_dtype(id_val):
 
 def _broadcast_tensor(tensor, src, group, device):
     """Broadcast a single tensor from *src* to all ranks in *group*."""
-    ndim = torch.tensor(
-        [len(tensor.shape) if tensor is not None else 0],
+    encoded_ndim = torch.tensor(
+        [tensor.dim() + 1 if tensor is not None else 0],
         dtype=torch.long,
         device=device,
     )
-    torch.distributed.broadcast(ndim, src, group=group)
+    torch.distributed.broadcast(encoded_ndim, src, group=group)
 
-    if ndim.item() == 0:
+    if encoded_ndim.item() == 0:
         return None
+    ndim = int(encoded_ndim.item()) - 1
 
     if tensor is not None:
         shape_tensor = torch.tensor(
@@ -73,7 +74,7 @@ def _broadcast_tensor(tensor, src, group, device):
         )
     else:
         shape_tensor = torch.zeros(
-            ndim.item(), dtype=torch.long, device=device,
+            ndim, dtype=torch.long, device=device,
         )
         dtype_id = torch.zeros(1, dtype=torch.long, device=device)
 
@@ -192,6 +193,51 @@ def _build_packed_seq_params_from_cu_seqlens(
     )
 
 
+def _prepare_prepacked_batch(batch: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize an Energon-packed dict and restore ``PackedSeqParams``."""
+    cu_seqlens = batch.pop("cu_seqlens")
+    cu_seqlens_padded = batch.pop("cu_seqlens_padded")
+    max_seqlen = batch.pop("max_seqlen")
+    if cu_seqlens.dim() == 2:
+        if cu_seqlens.shape[0] != 1:
+            raise ValueError("packed Energon batches require micro-batch-size 1")
+        cu_seqlens = cu_seqlens[0]
+    if cu_seqlens_padded.dim() == 2:
+        if cu_seqlens_padded.shape[0] != 1:
+            raise ValueError("packed Energon batches require micro-batch-size 1")
+        cu_seqlens_padded = cu_seqlens_padded[0]
+    if cu_seqlens.dim() != 1 or cu_seqlens_padded.dim() != 1:
+        raise ValueError("packed sequence boundaries must be one-dimensional")
+
+    for key in ("input_ids", "labels", "loss_mask"):
+        tensor = batch.get(key)
+        if tensor is not None and tensor.dim() == 1:
+            batch[key] = tensor.unsqueeze(0)
+    position_ids = batch.get("position_ids")
+    if position_ids is not None and position_ids.dim() == 2:
+        batch["position_ids"] = position_ids.unsqueeze(1)
+
+    sequence_length = int(batch["input_ids"].shape[-1])
+    if int(cu_seqlens_padded[-1].item()) != sequence_length:
+        raise ValueError(
+            "packed sequence boundary does not match input length: "
+            f"boundary={int(cu_seqlens_padded[-1].item())}, "
+            f"input={sequence_length}"
+        )
+    max_seqlen_value = int(max_seqlen.reshape(-1)[0].item())
+    logical_cu_seqlens = cu_seqlens.to(dtype=torch.int32)
+    physical_cu_seqlens = cu_seqlens_padded.to(dtype=torch.int32)
+    batch["packed_seq_params"] = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=logical_cu_seqlens,
+        cu_seqlens_kv=logical_cu_seqlens,
+        cu_seqlens_q_padded=physical_cu_seqlens,
+        cu_seqlens_kv_padded=physical_cu_seqlens,
+        max_seqlen_q=max_seqlen_value,
+        max_seqlen_kv=max_seqlen_value,
+        total_tokens=sequence_length,
+    )
+    return batch
 
 
 def pack_or_pad_batch(batch: list[Dict[str, Any]], use_packed_sequence: bool=False, seq_length: int=None, device = "cuda") -> list[Dict[str, Any]]:
@@ -370,8 +416,24 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]]):
     if has_data.item() == 0:
         return None
 
-    # Because broadcast will not broadcast packed_seq_params, we move it into pack_or_pad_batch
-    batch = pack_or_pad_batch(data, args.use_packed_sequence, args.seq_length, device=device)
+    if get_tensor_model_parallel_rank() == 0:
+        prepacked = torch.tensor(
+            [int(isinstance(data, dict) and "cu_seqlens" in data)],
+            dtype=torch.uint8,
+            device=device,
+        )
+    else:
+        prepacked = torch.empty(1, dtype=torch.uint8, device=device)
+    torch.distributed.broadcast(prepacked, src, group=group)
+
+    if prepacked.item():
+        batch = _prepare_prepacked_batch(
+            broadcast_data_batch(data, device=device)
+        )
+    else:
+        batch = pack_or_pad_batch(
+            data, args.use_packed_sequence, args.seq_length, device=device
+        )
 
     # Fix shapes produced by default_collate.
     if "position_ids" in batch and batch["position_ids"] is not None:

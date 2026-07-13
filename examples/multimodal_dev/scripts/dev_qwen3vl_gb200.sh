@@ -74,7 +74,9 @@ Usage:
 
   bench_name     Run label.
   key=value      run_benchmark overrides (tp, ep, pp, cp, etp, mbs, gbs,
-                 seq_len, image_size, vision_num_layers,
+                 seq_len, image_size, image_size_w, image_sizes_h,
+                 image_sizes_w, num_images, mock_layout,
+                 mock_pack_num_docs, text_only, vision_num_layers,
                  dispatcher_backend, a2a_overlap, use_fsdp, cuda_graph_scope,
                  recompute, mtp, fp8, fp8_recipe).
 
@@ -136,6 +138,13 @@ run_benchmark() {
     local mbs=1 gbs=512
     local seq_len=4096
     local image_size=224
+    local image_size_w=""
+    local image_sizes_h=""
+    local image_sizes_w=""
+    local num_images=1
+    local mock_layout="single"
+    local mock_pack_num_docs=1
+    local text_only=0
     local vision_num_layers=27
     local dispatcher="alltoall"
     local dispatcher_backend="hybridep"
@@ -152,6 +161,7 @@ run_benchmark() {
     local calculate_per_token_loss=0
     local fp8=""
     local fp8_recipe=""
+    local dataset_provider="mock"
     local extra_args=""
     local num_nodes_override=""
     local gpus_override=""
@@ -170,6 +180,13 @@ run_benchmark() {
             mbs) mbs="$val" ;; gbs) gbs="$val" ;;
             seq_len) seq_len="$val" ;;
             image_size) image_size="$val" ;;
+            image_size_w) image_size_w="$val" ;;
+            image_sizes_h) image_sizes_h="$val" ;;
+            image_sizes_w) image_sizes_w="$val" ;;
+            num_images) num_images="$val" ;;
+            mock_layout) mock_layout="$val" ;;
+            mock_pack_num_docs) mock_pack_num_docs="$val" ;;
+            text_only) text_only="$val" ;;
             vision_num_layers) vision_num_layers="$val" ;;
             dispatcher) dispatcher="$val" ;;
             dispatcher_backend) dispatcher_backend="$val" ;;
@@ -186,6 +203,7 @@ run_benchmark() {
             calculate_per_token_loss) calculate_per_token_loss="$val" ;;
             fp8) fp8="$val" ;;
             fp8_recipe) fp8_recipe="$val" ;;
+            dataset_provider) dataset_provider="$val" ;;
             extra_args) extra_args="$val" ;;
             num_nodes) num_nodes_override="$val" ;;
             gpus) gpus_override="$val" ;;
@@ -221,7 +239,7 @@ run_benchmark() {
     echo "   GPUs:     ${run_total_gpus} (${run_nodes}N x ${run_gpus_per_node}G)"
     echo "   Parallel: TP=${tp} EP=${ep} PP=${pp} CP=${cp} ETP=${etp}"
     echo "   Batch:    MBS=${mbs} GBS=${gbs}"
-    echo "   Seq:      ${seq_len}"
+    echo "   Seq:      ${seq_len}  Images: ${num_images} (${mock_layout})  Pack: ${mock_pack_num_docs}"
     echo "   Precision:${precision_label}  Dispatcher: ${dispatcher_backend}"
     echo "   A2A overlap: ${a2a_overlap}  CUDA Graph: ${cuda_graph_scope:-none}"
     echo "   Recompute: ${recompute} (modules=${recompute_modules:-full-uniform})  vision_recompute=${recompute_vision}"
@@ -358,16 +376,23 @@ run_benchmark() {
     # Override to 0 to test the sbhd path.
     local multimodal_args=(
         --model-arch qwen3vl
-        --dataset-provider mock
+        --dataset-provider "$dataset_provider"
         --image-token-id 248056
         --image-size "$image_size"
         --total-seq-length "$seq_len"
         --vision-num-layers "$vision_num_layers"
+        --num-images "$num_images"
+        --mock-layout "$mock_layout"
+        --mock-pack-num-docs "$mock_pack_num_docs"
     )
+    [ -n "$image_size_w" ] && multimodal_args+=( --image-size-w "$image_size_w" )
+    [ -n "$image_sizes_h" ] && multimodal_args+=( --image-sizes-h "$image_sizes_h" )
+    [ -n "$image_sizes_w" ] && multimodal_args+=( --image-sizes-w "$image_sizes_w" )
     if [ "$cp" -gt 1 ] || [ "$calculate_per_token_loss" = "1" ]; then
         multimodal_args+=( --calculate-per-token-loss )
     fi
     [ "$use_packed_sequence" -eq 1 ] && multimodal_args+=( --use-packed-sequence )
+    [ "$text_only" -eq 1 ] && multimodal_args+=( --text-only )
 
     # --- Tokenizer (qwen35-VL vocab to retain image_token_id) ---
     local tokenizer_args=(

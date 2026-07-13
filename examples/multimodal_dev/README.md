@@ -49,6 +49,56 @@ The `forward_step` is also model-agnostic — it uses the model's
 `compute_position_ids()` method polymorphically and passes a standard
 batch dict.
 
+## Qwen3.5-VL Energon Data
+
+The `energon` provider packs source documents into fixed-length THD
+sequences after inspecting image metadata. The standalone provider materializes
+every selected image before returning the packed batch; later distributed
+vision changes may partition that materialization without changing the data
+contract.
+
+Each CrudeWebDataset sample contains a `.json` member with `text`,
+`conversation`, `conversations`, or `messages`. Its
+`image_descriptors` follow image-token order and provide either `grid_thw`
+or `width` and `height`. Two image storage forms are supported:
+
+- JSON-only lazy descriptors name a `materializer` module and identify an
+  image in a zip or parquet source. Mantis-Instruct, M4-Instruct, and PixMo
+  descriptor materializers are included.
+- A prepared `.jpgs` member contains a pickled list of raw image byte strings
+  in descriptor order. Its restricted decoder rejects pickle globals and
+  non-byte values.
+
+Select the Qwen cooker in a metadataset entry:
+
+```yaml
+datasets:
+  - path: /path/to/prepared-shards
+    weight: 1.0
+    subflavors:
+      crude_type: qwen35
+```
+
+Launch with an external dataloader and micro-batch size one:
+
+```bash
+torchrun --nproc_per_node=8 examples/multimodal_dev/pretrain_multimodal.py \
+    --model-arch qwen35_vl \
+    --dataset-provider energon \
+    --energon-path /path/to/energon-dataset \
+    --dataloader-type external \
+    --micro-batch-size 1 \
+    --tokenizer-type HuggingFaceTokenizer \
+    --tokenizer-model /path/to/Qwen3.5-VL \
+    ...
+```
+
+`--image-min-pixels` and `--image-max-pixels` control aspect-preserving
+resize by area; zero disables that bound. Packing is controlled by
+`--energon-packing-buffer-size`,
+`--energon-max-samples-per-sequence`, and the fixed
+`--total-seq-length` container size.
+
 ## Adding a New Model Architecture
 
 Adding a new model (e.g. `llava_next`) requires **no changes** to

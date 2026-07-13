@@ -77,6 +77,10 @@ MODEL_REGISTRY = {
                 "examples.multimodal_dev.data.vlm_dataset"
                 ".train_valid_test_datasets_provider"
             ),
+            "energon": (
+                "examples.multimodal_dev.data.qwen35_energon.provider"
+                ".train_valid_test_datasets_provider"
+            ),
         },
     },
     "kimi_k25": {
@@ -114,6 +118,10 @@ MODEL_REGISTRY = {
         "dataset_providers": {
             "mock": (
                 "examples.multimodal_dev.data.mock"
+                ".train_valid_test_datasets_provider"
+            ),
+            "energon": (
+                "examples.multimodal_dev.data.qwen35_energon.provider"
                 ".train_valid_test_datasets_provider"
             ),
         },

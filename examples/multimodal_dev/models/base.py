@@ -350,6 +350,7 @@ class MultimodalModel(MegatronModule):
         if (
             self.vision_model is not None
             and pixel_values is not None
+            and pixel_values.numel() > 0
         ):
             vision_embeddings = self.vision_model(
                 pixel_values, image_grid_thw,
