@@ -787,6 +787,61 @@ def build_mdp_pp_cp_sidecar_cache(
     }
 
 
+def build_mdp_pp_cp_sidecar_cache_window(
+    *,
+    data_iterator,
+    model,
+    vp_stage=None,
+    count: int,
+    max_sequence_length: int,
+    forward_only=False,
+):
+    """Consume an ordered loader-planned window and build fused vision caches."""
+    if bool(_wrapped_model_attr(model, "_pp_cp_batch_sidecar", False)):
+        return [
+            _build_pp_batch_sidecar_cache(
+                data_iterator=data_iterator,
+                model=model,
+                vp_stage=vp_stage,
+                forward_only=forward_only,
+            )
+            for _ in range(int(count))
+        ]
+
+    del vp_stage
+    from examples.multimodal_dev.fused_vision_window import (
+        build_fused_vision_caches,
+    )
+
+    batches = []
+    for _ in range(int(count)):
+        batch = get_batch(data_iterator)
+        if batch is None:
+            raise RuntimeError(
+                "MDP fused vision sidecar received no batch before pipeline forward"
+            )
+        if (
+            batch.get("_mdp_image_descriptors") is not None
+            or batch.get("_mdp_image_descriptors_json") is not None
+        ):
+            raise RuntimeError(
+                "MDP fused vision requires loader-side owner planning and "
+                "descriptor materialization before the schedule sidecar"
+            )
+        batches.append(batch)
+
+    args = get_args()
+    return build_fused_vision_caches(
+        model,
+        batches,
+        max_sequence_length=int(max_sequence_length),
+        backward_mode=str(
+            getattr(args, "mdp_fused_vision_backward", "recompute")
+        ),
+        forward_only=bool(forward_only),
+    )
+
+
 def _pop_mdp_pp_cp_sidecar_cache(model):
     pop_cache = _wrapped_model_method(model, "mdp_pp_cp_sidecar_pop_cache")
     if pop_cache is None:

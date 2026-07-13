@@ -92,7 +92,10 @@ def configure_mdp_model(model, args):
             model,
             _mdp_enabled=False,
             _mdp_inner_dp_group=None,
+            _mdp_tp_source_group=None,
+            _mdp_tp_source_group_device=None,
             _mdp_pp_cp_inner=False,
+            _mdp_cp_fused_sidecar=False,
             _pp_cp_batch_sidecar=False,
             _pipeline_sidecar_enabled=False,
             _mdp_rank_assignment=None,
@@ -135,7 +138,10 @@ def configure_mdp_model(model, args):
             model,
             _mdp_enabled=False,
             _mdp_inner_dp_group=None,
+            _mdp_tp_source_group=None,
+            _mdp_tp_source_group_device=None,
             _mdp_pp_cp_inner=False,
+            _mdp_cp_fused_sidecar=False,
             _pp_cp_batch_sidecar=False,
             _pipeline_sidecar_enabled=False,
             _mdp_rank_assignment=None,
@@ -148,9 +154,15 @@ def configure_mdp_model(model, args):
             "CP-local MDP requires pipeline_model_parallel_size=1; "
             "use --mdp-inner-dp-scope pp_cp for replicated pipeline vision"
         )
-    if mdp_enabled and inner_dp_scope == "pp_cp" and pp_size <= 1:
+    from examples.multimodal_dev.mdp_pipeline_sidecar import cp_fused_vision_requested
+
+    pp1_cp_fused = (
+        pp_size == 1
+        and cp_fused_vision_requested(args)
+    )
+    if mdp_enabled and inner_dp_scope == "pp_cp" and pp_size <= 1 and not pp1_cp_fused:
         raise RuntimeError(
-            "PP x CP replicated vision requires pipeline_model_parallel_size > 1"
+            "PP=1 pp_cp MDP requires CP>1 fused vision prefetch"
         )
     if mdp_enabled and int(getattr(args, "micro_batch_size", 1)) != 1:
         raise RuntimeError("MDP packed multimodal data requires micro_batch_size=1")
@@ -180,7 +192,10 @@ def configure_mdp_model(model, args):
             model,
             _mdp_enabled=False,
             _mdp_inner_dp_group=None,
+            _mdp_tp_source_group=None,
+            _mdp_tp_source_group_device=None,
             _mdp_pp_cp_inner=False,
+            _mdp_cp_fused_sidecar=False,
             _pp_cp_batch_sidecar=pp_batch_sidecar,
             _pipeline_sidecar_enabled=pp_batch_sidecar,
             _mdp_rank_assignment=None,
@@ -188,7 +203,7 @@ def configure_mdp_model(model, args):
         )
         return model
 
-    if inner_dp_scope == "pp_cp":
+    if inner_dp_scope == "pp_cp" and pp_size > 1:
         from examples.multimodal_dev.mdp_pipeline_sidecar import (
             configure_pp_cp_replicated_vision,
         )
@@ -226,7 +241,10 @@ def configure_mdp_model(model, args):
         model,
         _mdp_enabled=True,
         _mdp_inner_dp_group=cp_group,
+        _mdp_tp_source_group=None,
+        _mdp_tp_source_group_device=None,
         _mdp_pp_cp_inner=False,
+        _mdp_cp_fused_sidecar=False,
         _pp_cp_batch_sidecar=False,
         _pipeline_sidecar_enabled=False,
         _mdp_rank_assignment=None,

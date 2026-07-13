@@ -284,8 +284,42 @@ def test_pp_cp_scope_requires_pipeline_parallelism():
         dataset_provider="energon",
         micro_batch_size=1,
     )
-    with pytest.raises(RuntimeError, match="pipeline_model_parallel_size > 1"):
+    with pytest.raises(RuntimeError, match="requires CP>1 fused vision prefetch"):
         mdp_model_setup.configure_mdp_model(model, args)
+
+
+@pytest.mark.parametrize("inner_scope", ["cp", "pp_cp"])
+def test_pp1_fused_window_uses_cp_group_and_sidecar(monkeypatch, inner_scope):
+    from examples.multimodal_dev.mdp_pipeline_sidecar import configure_mdp_pipeline_sidecar
+
+    group = object()
+    model = SimpleNamespace(vision_model=torch.nn.Linear(2, 2))
+    args = _args(
+        context_parallel_size=2,
+        pipeline_model_parallel_size=1,
+        mdp_inner_dp_scope=inner_scope,
+        dataset_provider="energon",
+        micro_batch_size=1,
+        mdp_fused_vision_window=True,
+        mdp_vision_encoder_max_sequence_length=262_144,
+        overlap_grad_reduce=False,
+        overlap_param_gather=False,
+    )
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda _group: [0, 1])
+    monkeypatch.setattr(mdp_model_setup.ps, "get_context_parallel_group", lambda: group)
+
+    result = mdp_model_setup.configure_mdp_model(model, args)
+
+    assert result is model
+    assert model._mdp_enabled is True
+    assert model._mdp_inner_dp_group is group
+    assert model._mdp_pp_cp_inner is False
+    assert model._mdp_cp_fused_sidecar is False
+    assert configure_mdp_pipeline_sidecar(model, args) is True
+    assert model._mdp_cp_fused_sidecar is True
+    assert model._pipeline_sidecar_enabled is True
 
 
 @pytest.mark.parametrize(

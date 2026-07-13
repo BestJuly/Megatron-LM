@@ -643,7 +643,7 @@ def test_generic_sidecar_window_builds_n_caches_without_vision(monkeypatch):
         base,
         "get_args",
         lambda: SimpleNamespace(
-            mdp_vision_prefetch_microbatches=1,
+            mdp_fused_vision_window=False,
             mdp_vision_encoder_max_sequence_length=0,
         ),
     )
@@ -703,6 +703,52 @@ def test_generic_sidecar_window_builds_n_caches_without_vision(monkeypatch):
         )
 
     caches = list(model._mdp_pp_cp_sidecar_cache)
+    assert len(caches) == 3
+    assert all(cache["vision_embeddings"] is None for cache in caches)
+    assert calls == ["batch", "batch", "batch"]
+
+
+def test_generic_sidecar_maxseq_window_bypasses_fused_vision(monkeypatch):
+    batches = [_generic_sidecar_batch() for _ in range(3)]
+    calls = []
+    monkeypatch.setattr(
+        forward_step_module.mpu,
+        "is_pipeline_first_stage",
+        lambda **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        forward_step_module.mpu,
+        "is_pipeline_last_stage",
+        lambda **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        forward_step_module.mpu,
+        "get_pipeline_model_parallel_group",
+        lambda: object(),
+    )
+    monkeypatch.setattr(
+        forward_step_module.mpu,
+        "get_pipeline_model_parallel_first_rank",
+        lambda: 0,
+    )
+    monkeypatch.setattr(
+        forward_step_module,
+        "get_batch",
+        lambda _iterator: (calls.append("batch"), batches.pop(0))[1],
+    )
+    monkeypatch.setattr(
+        forward_step_module,
+        "broadcast_data_batch_from_rank",
+        lambda batch, **_kwargs: batch,
+    )
+
+    caches = forward_step_module.build_mdp_pp_cp_sidecar_cache_window(
+        data_iterator=object(),
+        model=SimpleNamespace(_pp_cp_batch_sidecar=True),
+        count=3,
+        max_sequence_length=262_144,
+    )
+
     assert len(caches) == 3
     assert all(cache["vision_embeddings"] is None for cache in caches)
     assert calls == ["batch", "batch", "batch"]

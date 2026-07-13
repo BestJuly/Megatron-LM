@@ -39,6 +39,7 @@ def test_provider_assigns_cp_rank_as_loader_prepartition_owner(monkeypatch):
     monkeypatch.setattr(
         provider.parallel_state, "get_pipeline_model_parallel_world_size", lambda: 1
     )
+    monkeypatch.setattr(provider.parallel_state, "get_pipeline_model_parallel_rank", lambda: 0)
 
     encoder = provider._task_encoder(_provider_args(), tokenizer=object())
 
@@ -87,6 +88,166 @@ def test_provider_uses_pp_cp_inner_rank_for_loader_owner(monkeypatch):
     assert encoder.mdp_loader_prepartition_rank == 3
     assert encoder.mdp_loader_prepartition_world == 4
     assert encoder.mdp_loader_prepartition_encoder_stage is True
+
+
+@pytest.mark.parametrize("inner_scope", ["cp", "pp_cp"])
+def test_fused_pp1_cp_window_uses_lazy_train_materialization_only(monkeypatch, inner_scope):
+    from examples.multimodal_dev.data.qwen35_energon import provider
+
+    args = _provider_args(
+        mdp_inner_dp_scope=inner_scope,
+        rank=1,
+        mdp_fused_vision_window=True,
+        mdp_vision_encoder_max_sequence_length=262_144,
+        mdp_loader_prepartition_prefetch_windows=2,
+        global_batch_size=512,
+        data_parallel_size=32,
+        micro_batch_size=1,
+        energon_path="unused",
+        dataloader_type="external",
+        energon_packing_buffer_size=4,
+        energon_max_samples_per_sequence=4,
+        energon_prefetch_factor=2,
+        energon_shuffle_buffer_size=4,
+        dataset_split="train",
+        num_workers=2,
+        eval_iters=2,
+    )
+    encoders = []
+    wrappers = []
+
+    class FakeEncoder:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+            encoders.append(self)
+
+    def wrap_train(source, **kwargs):
+        wrappers.append((source, kwargs))
+        return ("planned", source)
+
+    monkeypatch.setattr(provider, "get_args", lambda: args)
+    monkeypatch.setattr(provider.parallel_state, "model_parallel_is_initialized", lambda: False)
+    monkeypatch.setattr(provider, "_parallel_layout", lambda _args: (2, 1, 1, 0))
+    monkeypatch.setattr(provider, "_worker_config", lambda _args: object())
+    monkeypatch.setattr(provider, "_tokenizer", lambda _args: object())
+    monkeypatch.setattr(provider, "Qwen35EnergonTaskEncoder", FakeEncoder)
+    monkeypatch.setattr(provider, "get_train_dataset", lambda *_args, **_kwargs: "train-ds")
+    monkeypatch.setattr(provider, "get_savable_loader", lambda *_args, **_kwargs: "train-loader")
+    monkeypatch.setattr(provider, "CyclicDataIterator", lambda source: ("cyclic", source))
+    monkeypatch.setattr(provider, "PPxCPBalancingMaterializingIterator", wrap_train)
+    monkeypatch.setattr(
+        provider, "get_val_datasets", lambda *_args, **_kwargs: [("validation-ds", 1.0)]
+    )
+    monkeypatch.setattr(provider, "get_loader", lambda *_args, **_kwargs: ["validation"])
+
+    train, validation, test = provider.train_valid_test_datasets_provider(None)
+
+    assert encoders[0].mdp_loader_prepartition_materialize is False
+    assert encoders[1].mdp_loader_prepartition_materialize is True
+    assert encoders[0].mdp_loader_prepartition_rank == 1
+    assert encoders[0].mdp_loader_prepartition_world == 2
+    assert len(wrappers) == 1
+    assert wrappers[0][1]["lookahead_microbatches"] == 16
+    assert wrappers[0][1]["prefetch_windows"] == 2
+    assert wrappers[0][1]["balance_across_microbatches"] is True
+    assert train[0] == "planned"
+    assert list(validation) == ["validation"]
+    assert test is None
+
+
+@pytest.mark.parametrize("inner_scope", ["cp", "pp_cp"])
+def test_pp1_cp_scopes_share_fused_planning_contract(inner_scope):
+    from examples.multimodal_dev.data.qwen35_energon import provider
+
+    layout = provider._resolve_mdp_layout(
+        _provider_args(
+            mdp_inner_dp_scope=inner_scope,
+            rank=1,
+            mdp_fused_vision_window=True,
+            mdp_vision_encoder_max_sequence_length=262_144,
+            global_batch_size=512,
+            data_parallel_size=32,
+            micro_batch_size=1,
+        ),
+        cp_size=2,
+        cp_rank=1,
+        pp_size=1,
+        pp_rank=0,
+    )
+
+    assert layout.prepartition_rank == 1
+    assert layout.prepartition_world == 2
+    assert layout.prepartition_encoder_stage is True
+    assert layout.planning_microbatches == 16
+    assert layout.use_planning_prefetch is True
+    assert layout.balance_across_microbatches is True
+
+
+def test_pp1_cp_scope_window_off_keeps_fused_planning_off():
+    from examples.multimodal_dev.data.qwen35_energon import provider
+
+    layout = provider._resolve_mdp_layout(
+        _provider_args(
+            mdp_inner_dp_scope="cp",
+            mdp_fused_vision_window=False,
+            mdp_vision_encoder_max_sequence_length=262_144,
+        ),
+        cp_size=2,
+        cp_rank=1,
+        pp_size=1,
+        pp_rank=0,
+    )
+
+    assert layout.planning_microbatches == 1
+    assert layout.use_planning_prefetch is False
+    assert layout.balance_across_microbatches is False
+
+
+def test_pp2_cp2_pp_cp_fused_layout_is_unchanged():
+    from examples.multimodal_dev.data.qwen35_energon import provider
+
+    layout = provider._resolve_mdp_layout(
+        _provider_args(
+            mdp_inner_dp_scope="pp_cp",
+            pipeline_model_parallel_size=2,
+            context_parallel_size=2,
+            world_size=4,
+            rank=3,
+            mdp_fused_vision_window=True,
+            mdp_vision_encoder_max_sequence_length=262_144,
+            global_batch_size=512,
+            data_parallel_size=32,
+            micro_batch_size=1,
+        ),
+        cp_size=2,
+        cp_rank=1,
+        pp_size=2,
+        pp_rank=1,
+    )
+
+    assert layout.prepartition_rank == 3
+    assert layout.prepartition_world == 4
+    assert layout.prepartition_encoder_stage is True
+    assert layout.planning_microbatches == 16
+    assert layout.use_planning_prefetch is True
+    assert layout.balance_across_microbatches is True
+
+
+def test_pp1_pp_cp_requires_a_fused_window():
+    from examples.multimodal_dev.data.qwen35_energon import provider
+
+    with pytest.raises(ValueError, match="requires CP>1 fused vision prefetch"):
+        provider._resolve_mdp_layout(
+            _provider_args(
+                mdp_inner_dp_scope="pp_cp",
+                mdp_fused_vision_window=False,
+                mdp_vision_encoder_max_sequence_length=262_144,
+            ),
+            cp_size=2,
+            cp_rank=0,
+            pp_size=1,
+            pp_rank=0,
+        )
 
 
 def test_json_lazy_descriptors_materialize_only_on_the_cp_owner(monkeypatch):

@@ -289,8 +289,11 @@ class MultimodalModel(MegatronModule):
     ):
         """Run the CP-local bridge supplied by the preceding MDP layer."""
         del mdp_cp_local_plan
-        if not bool(getattr(self, '_mdp_pp_cp_inner', False)):
-            raise RuntimeError("PP x CP vision sidecar requires replicated MDP mode")
+        if not (
+            bool(getattr(self, '_mdp_pp_cp_inner', False))
+            or bool(getattr(self, '_mdp_cp_fused_sidecar', False))
+        ):
+            raise RuntimeError("vision sidecar requires PP x CP or CP-fused MDP mode")
         return self._run_mdp_vision_bridge(
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
@@ -304,25 +307,60 @@ class MultimodalModel(MegatronModule):
         num_microbatches=None,
         forward_only=False,
     ) -> None:
-        """Precompute one PP x CP vision microbatch before pipeline P2P."""
-        del current_microbatch, num_microbatches
+        """Precompute one ordered MDP vision window before pipeline P2P."""
         if not bool(getattr(self, '_pipeline_sidecar_enabled', False)):
             return
         from examples.multimodal_dev.forward_step import (
             build_mdp_pp_cp_sidecar_cache,
+            build_mdp_pp_cp_sidecar_cache_window,
+        )
+        from examples.multimodal_dev.sidecar_prefetch import (
+            sidecar_prefetch_window_count,
+            validate_fused_vision_window,
         )
 
-        cache = build_mdp_pp_cp_sidecar_cache(
-            data_iterator=data_iterator,
-            model=self,
-            vp_stage=self.vp_stage,
-            forward_only=forward_only,
+        args = get_args()
+        max_sequence_length = int(
+            getattr(args, "mdp_vision_encoder_max_sequence_length", 0) or 0
+        )
+        fused_window = validate_fused_vision_window(
+            getattr(args, "mdp_fused_vision_window", False), max_sequence_length
         )
         queue = getattr(self, '_mdp_pp_cp_sidecar_cache', None)
         if queue is None:
             queue = deque()
             object.__setattr__(self, '_mdp_pp_cp_sidecar_cache', queue)
-        queue.append(cache)
+
+        count = sidecar_prefetch_window_count(
+            fused_window,
+            current_microbatch=current_microbatch,
+            num_microbatches=num_microbatches,
+        )
+        if count <= 0:
+            return
+
+        if fused_window and count > 1:
+            queue.extend(
+                build_mdp_pp_cp_sidecar_cache_window(
+                    data_iterator=data_iterator,
+                    model=self,
+                    vp_stage=self.vp_stage,
+                    count=count,
+                    max_sequence_length=max_sequence_length,
+                    forward_only=forward_only,
+                )
+            )
+            return
+
+        for _ in range(count):
+            queue.append(
+                build_mdp_pp_cp_sidecar_cache(
+                    data_iterator=data_iterator,
+                    model=self,
+                    vp_stage=self.vp_stage,
+                    forward_only=forward_only,
+                )
+            )
 
     def mdp_pp_cp_sidecar_pop_cache(self):
         queue = getattr(self, '_mdp_pp_cp_sidecar_cache', None)
@@ -338,9 +376,24 @@ class MultimodalModel(MegatronModule):
             vision_embeddings,
         )
         if (
-            torch.is_grad_enabled()
-            and not bool(cache.get('forward_only', False))
-            and not self.pre_process
+            not torch.is_grad_enabled()
+            or bool(cache.get('forward_only', False))
+        ):
+            return
+        fused_entries = cache.get('fused_backward_entries')
+        if fused_entries is not None:
+            queue = getattr(self, '_mdp_pp_cp_sidecar_backward_cache', None)
+            if queue is None:
+                queue = deque()
+                object.__setattr__(
+                    self,
+                    '_mdp_pp_cp_sidecar_backward_cache',
+                    queue,
+                )
+            queue.append({"kind": "fused_backward", "entries": fused_entries})
+            return
+        if (
+            not self.pre_process
             and torch.is_tensor(vision_embeddings)
         ):
             queue = getattr(self, '_mdp_pp_cp_sidecar_backward_cache', None)
@@ -354,17 +407,29 @@ class MultimodalModel(MegatronModule):
             queue.append(_zero_dep_on_tensor(vision_embeddings))
 
     def pipeline_sidecar_post_backward(self) -> None:
-        """Backpropagate the matching non-consuming PP vision dependency."""
+        """Backpropagate the matching generic or fused vision dependency."""
         if not bool(getattr(self, '_pipeline_sidecar_enabled', False)):
             return
         if bool(getattr(self, '_pp_cp_batch_sidecar', False)):
             return
-        if self.pre_process:
-            return
         queue = getattr(self, '_mdp_pp_cp_sidecar_backward_cache', None)
         if not queue:
+            if self.pre_process:
+                return
             raise RuntimeError("PP x CP vision sidecar backward cache is empty")
         dependency = queue.popleft()
+        if (
+            isinstance(dependency, dict)
+            and dependency.get("kind") == "fused_backward"
+        ):
+            from examples.multimodal_dev.fused_vision_window import (
+                fused_vision_post_backward,
+            )
+
+            fused_vision_post_backward(self, dependency.get("entries") or [])
+            return
+        if self.pre_process:
+            return
         if dependency.requires_grad:
             dependency.backward()
 
@@ -797,15 +862,18 @@ class MultimodalModel(MegatronModule):
         cp_local_mdp = (
             mdp_enabled and parallel_state.get_context_parallel_world_size() > 1
         )
-        pp_cp_sidecar = bool(getattr(self, "_mdp_pp_cp_inner", False))
+        sidecar_active = (
+            bool(getattr(self, "_mdp_pp_cp_inner", False))
+            or bool(getattr(self, "_mdp_cp_fused_sidecar", False))
+        )
         vision_embeddings = None
-        if pp_cp_sidecar:
+        if sidecar_active:
             active_vision_embeddings = getattr(
                 self, "_mdp_pp_cp_active_vision_embeddings", None
             )
             if active_vision_embeddings is None:
                 raise RuntimeError(
-                    "PP x CP vision sidecar cache was not activated before model forward"
+                    "MDP vision sidecar cache was not activated before model forward"
                 )
             object.__setattr__(
                 self, "_mdp_pp_cp_active_vision_embeddings", None

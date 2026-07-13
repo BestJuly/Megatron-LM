@@ -37,6 +37,46 @@ def add_multimodal_args(parser):
         ),
     )
     group.add_argument(
+        "--mdp-loader-prepartition-prefetch-windows",
+        type=int,
+        default=1,
+        help="Number of loader-prepartition planning windows to keep queued.",
+    )
+    group.add_argument(
+        "--mdp-fused-vision-window",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Fuse the full optimization step's MDP vision work into ordered "
+            "packed windows precomputed before pipeline forward. Off keeps "
+            "one vision call per microbatch. Requires a non-zero "
+            "--mdp-vision-encoder-max-sequence-length."
+        ),
+    )
+    group.add_argument(
+        "--mdp-vision-encoder-max-sequence-length",
+        type=int,
+        default=0,
+        help=(
+            "Maximum raw patch-token sequence length per fused MDP vision "
+            "encoder call when --mdp-fused-vision-window is on. A negative "
+            "value fuses the full window into one unbounded pack. The fused "
+            "path uses the all-gather bridge."
+        ),
+    )
+    group.add_argument(
+        "--mdp-fused-vision-backward",
+        type=str,
+        choices=["recompute", "retain"],
+        default="recompute",
+        help=(
+            "Backward strategy for fused multi-microbatch vision packs. "
+            "'recompute' discards the forward graph and reruns vision at "
+            "backward time. 'retain' keeps the original graph until all "
+            "microbatch gradients for the pack are available."
+        ),
+    )
+    group.add_argument(
         "--model-variant",
         type=str,
         default="proxy",

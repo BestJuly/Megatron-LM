@@ -4,6 +4,7 @@
 
 import torch
 
+from examples.multimodal_dev.sidecar_prefetch import validate_fused_vision_window
 from megatron.core import parallel_state as ps
 
 
@@ -14,6 +15,25 @@ def pp_cp_replicated_vision_requested(args) -> bool:
         and int(getattr(args, "pipeline_model_parallel_size", 1)) > 1
         and getattr(args, "mdp_inner_dp_scope", "cp") == "pp_cp"
         and not bool(getattr(args, "text_only", False))
+    )
+
+
+def cp_fused_vision_requested(args) -> bool:
+    """Return whether PP=1 should precompute fused CP vision windows."""
+    return (
+        bool(getattr(args, "mdp_encoder_mode", False))
+        and int(getattr(args, "pipeline_model_parallel_size", 1)) == 1
+        and int(getattr(args, "context_parallel_size", 1)) > 1
+        and getattr(args, "mdp_inner_dp_scope", "cp") in ("cp", "pp_cp")
+        and not bool(getattr(args, "text_only", False))
+        and bool(getattr(args, "use_packed_sequence", False))
+        and validate_fused_vision_window(
+            getattr(args, "mdp_fused_vision_window", False),
+            int(
+                getattr(args, "mdp_vision_encoder_max_sequence_length", 0)
+                or 0
+            ),
+        )
     )
 
 
@@ -143,6 +163,7 @@ def configure_pp_cp_replicated_vision(model, args) -> bool:
             "cpu" if tp_source_group is not None else None
         ),
         "_mdp_pp_cp_inner": True,
+        "_mdp_cp_fused_sidecar": False,
         "_pp_cp_batch_sidecar": False,
         "_pipeline_sidecar_enabled": True,
         "_mdp_rank_assignment": None,
@@ -150,4 +171,19 @@ def configure_pp_cp_replicated_vision(model, args) -> bool:
     }
     for name, value in attrs.items():
         setattr(model, name, value)
+    return True
+
+
+def configure_mdp_pipeline_sidecar(model, args) -> bool:
+    """Configure either replicated PP x CP or fused CP-only sidecars."""
+    if bool(getattr(model, "_mdp_pp_cp_inner", False)):
+        return True
+    if configure_pp_cp_replicated_vision(model, args):
+        return True
+    if not cp_fused_vision_requested(args):
+        return False
+    if not bool(getattr(model, "_mdp_enabled", False)):
+        raise RuntimeError("CP-fused vision sidecar requires MDP encoder mode")
+    setattr(model, "_mdp_cp_fused_sidecar", True)
+    setattr(model, "_pipeline_sidecar_enabled", True)
     return True

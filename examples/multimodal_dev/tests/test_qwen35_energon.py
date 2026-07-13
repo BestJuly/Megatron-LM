@@ -295,6 +295,47 @@ def test_task_encoder_accepts_vqa_sample_shape():
     assert descriptors[0]["kind"] == "image_bytes"
 
 
+@pytest.mark.parametrize(("eval_iters", "val_built"), [(0, False), (2, True)])
+def test_energon_provider_builds_val_only_when_eval_iters_positive(monkeypatch, eval_iters, val_built):
+    from types import SimpleNamespace
+
+    from examples.multimodal_dev.data.qwen35_energon import provider
+
+    calls = {"val": 0}
+
+    def fake_get_val_datasets(*_args, **_kwargs):
+        calls["val"] += 1
+        return [(object(), None)]
+
+    args = SimpleNamespace(
+        energon_path="unused",
+        dataloader_type="external",
+        micro_batch_size=1,
+        energon_packing_buffer_size=1,
+        energon_max_samples_per_sequence=1,
+        energon_prefetch_factor=1,
+        energon_shuffle_buffer_size=1,
+        dataset_split="train",
+        num_workers=1,
+        mdp_encoder_mode=False,
+        eval_iters=eval_iters,
+    )
+    monkeypatch.setattr(provider, "get_args", lambda: args)
+    monkeypatch.setattr(provider.parallel_state, "model_parallel_is_initialized", lambda: False)
+    monkeypatch.setattr(provider.parallel_state, "is_initialized", lambda: False)
+    monkeypatch.setattr(provider, "_tokenizer", lambda _args: object())
+    monkeypatch.setattr(provider, "_task_encoder", lambda *a, **k: object())
+    monkeypatch.setattr(provider, "get_train_dataset", lambda *a, **k: object())
+    monkeypatch.setattr(provider, "get_savable_loader", lambda *a, **k: [])
+    monkeypatch.setattr(provider, "get_val_datasets", fake_get_val_datasets)
+    monkeypatch.setattr(provider, "get_loader", lambda *a, **k: [])
+
+    _train, val_loader, _test = provider.train_valid_test_datasets_provider([1, 0, 0])
+
+    assert calls["val"] == (1 if val_built else 0)
+    assert (val_loader is not None) == val_built
+
+
 def test_task_encoder_accepts_llava_decoded_dict_shape():
     from examples.multimodal_dev.data.qwen35_energon.task_encoder import Qwen35EnergonTaskEncoder
 
@@ -382,7 +423,7 @@ def test_task_encoder_prepartitions_llava_decoded_dict_shape():
     assert batch["_mdp_image_descriptors"][0]["kind"] == "image_bytes"
 
 
-def test_qwen3vl_launcher_accepts_energon_provider(tmp_path):
+def test_qwen3vl_launcher_matches_job241536_contract(tmp_path):
     from examples.multimodal_dev.arguments import add_multimodal_args
     from examples.multimodal_dev.models import MODEL_REGISTRY
 
@@ -394,11 +435,27 @@ def test_qwen3vl_launcher_accepts_energon_provider(tmp_path):
             "--energon-path",
             "/workspace/reference/blend3.yaml",
             "--dataloader-sequence-packing",
+            "--mdp-encoder-mode",
+            "--mdp-inner-dp-scope",
+            "pp_cp",
+            "--mdp-loader-prepartition-prefetch-windows",
+            "1",
+            "--mdp-fused-vision-window",
+            "--mdp-vision-encoder-max-sequence-length",
+            "262144",
+            "--mdp-fused-vision-backward",
+            "retain",
         ]
     )
     assert parsed.dataset_provider == "energon"
     assert parsed.energon_path == "/workspace/reference/blend3.yaml"
     assert parsed.dataloader_sequence_packing is True
+    assert parsed.mdp_encoder_mode is True
+    assert parsed.mdp_inner_dp_scope == "pp_cp"
+    assert parsed.mdp_loader_prepartition_prefetch_windows == 1
+    assert parsed.mdp_fused_vision_window is True
+    assert parsed.mdp_vision_encoder_max_sequence_length == 262144
+    assert parsed.mdp_fused_vision_backward == "retain"
 
     script = Path(__file__).parents[1] / "scripts" / "dev_qwen3vl_gb200.sh"
     result = subprocess.run(
@@ -407,31 +464,47 @@ def test_qwen3vl_launcher_accepts_energon_provider(tmp_path):
             str(script),
             "--dry-run",
             "--gpus",
-            "1",
+            "4",
             "--nnodes",
-            "1",
+            "32",
+            "--train-iters",
+            "45",
+            "--warmup-iters",
+            "5",
             "--results-dir",
             str(tmp_path),
-            "energon_loader",
+            "job241536",
             "tp=1",
             "ep=8",
-            "pp=1",
-            "cp=1",
+            "pp=2",
+            "cp=2",
             "etp=1",
             "vpp=0",
             "mbs=1",
-            "gbs=8",
-            "seq_len=4096",
+            "gbs=512",
+            "seq_len=8192",
+            "image_size=448",
+            "dispatcher_backend=hybridep",
+            "a2a_overlap=0",
+            "recompute=0",
+            "recompute_vision=0",
+            "mtp=0",
             "use_packed_sequence=1",
             "dataset_provider=energon",
             (
                 "extra_args=--dataloader-type external "
                 "--energon-path /workspace/reference/blend3.yaml "
+                "--image-min-pixels 0 --image-max-pixels 327680 "
                 "--energon-packing-buffer-size 128 "
                 "--energon-shuffle-buffer-size 128 "
                 "--energon-max-samples-per-sequence 16 "
                 "--energon-prefetch-factor 1 --num-workers 1 "
-                "--dataloader-sequence-packing --eval-iters 0"
+                "--dataloader-sequence-packing --mdp-encoder-mode "
+                "--mdp-inner-dp-scope pp_cp "
+                "--mdp-loader-prepartition-prefetch-windows 1 "
+                "--mdp-fused-vision-window "
+                "--mdp-vision-encoder-max-sequence-length 262144 "
+                "--mdp-fused-vision-backward retain --eval-iters 0"
             ),
         ],
         check=True,
@@ -450,25 +523,35 @@ def test_qwen3vl_launcher_accepts_energon_provider(tmp_path):
     expected = {
         "--model-arch": "qwen3vl",
         "--tensor-model-parallel-size": "1",
-        "--pipeline-model-parallel-size": "1",
-        "--context-parallel-size": "1",
+        "--pipeline-model-parallel-size": "2",
+        "--context-parallel-size": "2",
         "--expert-model-parallel-size": "8",
         "--expert-tensor-parallel-size": "1",
         "--micro-batch-size": "1",
-        "--global-batch-size": "8",
-        "--seq-length": "4096",
+        "--global-batch-size": "512",
+        "--train-iters": "50",
+        "--seq-length": "8192",
         "--dataset-provider": "energon",
         "--energon-path": "/workspace/reference/blend3.yaml",
+        "--image-max-pixels": "327680",
         "--energon-packing-buffer-size": "128",
         "--energon-shuffle-buffer-size": "128",
         "--energon-max-samples-per-sequence": "16",
         "--energon-prefetch-factor": "1",
+        "--mdp-inner-dp-scope": "pp_cp",
+        "--mdp-loader-prepartition-prefetch-windows": "1",
+        "--mdp-vision-encoder-max-sequence-length": "262144",
+        "--mdp-fused-vision-backward": "retain",
+        "--moe-flex-dispatcher-backend": "hybridep",
         "--eval-iters": "0",
     }
     for flag, value in expected.items():
         assert last_value(flag) == value
     for flag in (
+        "--calculate-per-token-loss",
         "--dataloader-sequence-packing",
+        "--mdp-encoder-mode",
+        "--mdp-fused-vision-window",
         "--use-distributed-optimizer",
         "--use-packed-sequence",
     ):
@@ -478,7 +561,5 @@ def test_qwen3vl_launcher_accepts_energon_provider(tmp_path):
         "--overlap-moe-expert-parallel-comm",
         "--recompute-vision",
         "--use-megatron-fsdp",
-        "--mdp-encoder-mode",
-        "--mdp-vision-prefetch-microbatches",
     ):
         assert flag not in argv
