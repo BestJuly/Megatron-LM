@@ -296,7 +296,9 @@ def test_task_encoder_accepts_vqa_sample_shape():
 
 
 @pytest.mark.parametrize(("eval_iters", "val_built"), [(0, False), (2, True)])
-def test_energon_provider_builds_val_only_when_eval_iters_positive(monkeypatch, eval_iters, val_built):
+def test_energon_provider_builds_val_only_when_eval_iters_positive(
+    monkeypatch, eval_iters, val_built
+):
     from types import SimpleNamespace
 
     from examples.multimodal_dev.data.qwen35_energon import provider
@@ -428,6 +430,7 @@ def test_qwen3vl_launcher_matches_job241536_contract(tmp_path):
     from examples.multimodal_dev.models import MODEL_REGISTRY
 
     assert "energon" in MODEL_REGISTRY["qwen3vl"]["dataset_providers"]
+    # Keep fused packs within the GB200 blend3 cap validated at world 64.
     parsed = add_multimodal_args(ArgumentParser()).parse_args(
         [
             "--dataset-provider",
@@ -442,7 +445,7 @@ def test_qwen3vl_launcher_matches_job241536_contract(tmp_path):
             "1",
             "--mdp-fused-vision-window",
             "--mdp-vision-encoder-max-sequence-length",
-            "262144",
+            "131072",
             "--mdp-fused-vision-backward",
             "retain",
         ]
@@ -454,7 +457,7 @@ def test_qwen3vl_launcher_matches_job241536_contract(tmp_path):
     assert parsed.mdp_inner_dp_scope == "pp_cp"
     assert parsed.mdp_loader_prepartition_prefetch_windows == 1
     assert parsed.mdp_fused_vision_window is True
-    assert parsed.mdp_vision_encoder_max_sequence_length == 262144
+    assert parsed.mdp_vision_encoder_max_sequence_length == 131072
     assert parsed.mdp_fused_vision_backward == "retain"
 
     script = Path(__file__).parents[1] / "scripts" / "dev_qwen3vl_gb200.sh"
@@ -503,7 +506,7 @@ def test_qwen3vl_launcher_matches_job241536_contract(tmp_path):
                 "--mdp-inner-dp-scope pp_cp "
                 "--mdp-loader-prepartition-prefetch-windows 1 "
                 "--mdp-fused-vision-window "
-                "--mdp-vision-encoder-max-sequence-length 262144 "
+                "--mdp-vision-encoder-max-sequence-length 131072 "
                 "--mdp-fused-vision-backward retain --eval-iters 0"
             ),
         ],
@@ -540,7 +543,7 @@ def test_qwen3vl_launcher_matches_job241536_contract(tmp_path):
         "--energon-prefetch-factor": "1",
         "--mdp-inner-dp-scope": "pp_cp",
         "--mdp-loader-prepartition-prefetch-windows": "1",
-        "--mdp-vision-encoder-max-sequence-length": "262144",
+        "--mdp-vision-encoder-max-sequence-length": "131072",
         "--mdp-fused-vision-backward": "retain",
         "--moe-flex-dispatcher-backend": "hybridep",
         "--eval-iters": "0",

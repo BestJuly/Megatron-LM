@@ -7,8 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from examples.multimodal_dev.data.energon_mdp import (
-    CyclicDataIterator,
-    PPxCPBalancingMaterializingIterator,
+    MDPWindowMaterializingIterator,
     loader_prepartition_window_size,
 )
 from examples.multimodal_dev.mdp_parallel_groups import get_pp_cp_local_rank
@@ -35,14 +34,35 @@ from .task_encoder import Qwen35EnergonTaskEncoder
 @dataclass(frozen=True)
 class _MDPLayout:
     loader_prepartition: bool
-    inner_scope: str
     prepartition_rank: int
     prepartition_world: int
     prepartition_encoder_stage: bool
     planning_microbatches: int
     prefetch_windows: int
     use_planning_prefetch: bool
-    balance_across_microbatches: bool
+
+
+class _CyclicDataIterator:
+    """Expose an Energon loader as the cyclic iterator Megatron expects."""
+
+    def __init__(self, dataloader):
+        self._dataloader = dataloader
+        self._iterator = self._cycle()
+
+    def _cycle(self):
+        while True:
+            yielded = False
+            for batch in self._dataloader:
+                yielded = True
+                yield batch
+            if not yielded:
+                raise RuntimeError("Energon training loader produced no batches")
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._iterator)
 
 
 def _worker_config(args) -> WorkerConfig:
@@ -83,30 +103,20 @@ def _resolve_mdp_layout(
     mdp_requested = bool(getattr(args, "mdp_encoder_mode", True))
     if mdp_requested and inner_scope not in ("cp", "pp_cp"):
         raise ValueError(
-            "--mdp-inner-dp-scope must be either cp or pp_cp; "
-            f"got {inner_scope!r}"
+            f"--mdp-inner-dp-scope must be either cp or pp_cp; got {inner_scope!r}"
         )
-    max_sequence_length = int(
-        getattr(args, "mdp_vision_encoder_max_sequence_length", 0) or 0
-    )
+    max_sequence_length = int(getattr(args, "mdp_vision_encoder_max_sequence_length", 0) or 0)
     fused_window = validate_fused_vision_window(
         getattr(args, "mdp_fused_vision_window", False), max_sequence_length
     )
-    pp1_cp_fused = (
-        mdp_requested
-        and int(pp_size) == 1
-        and int(cp_size) > 1
-        and fused_window
-    )
+    pp1_cp_fused = mdp_requested and int(pp_size) == 1 and int(cp_size) > 1 and fused_window
     partition_vision = mdp_requested and (
         int(cp_size) > 1 or (inner_scope == "pp_cp" and int(pp_size) > 1)
     )
     if partition_vision and inner_scope == "cp" and pp_size != 1:
         raise ValueError("CP-local --mdp-encoder-mode requires PP=1")
     if mdp_requested and inner_scope == "pp_cp" and pp_size <= 1 and not pp1_cp_fused:
-        raise ValueError(
-            "PP=1 pp_cp --mdp-encoder-mode requires CP>1 fused vision prefetch"
-        )
+        raise ValueError("PP=1 pp_cp --mdp-encoder-mode requires CP>1 fused vision prefetch")
 
     prepartition_rank = int(cp_rank) if partition_vision else 0
     prepartition_world = int(cp_size) if partition_vision else 1
@@ -120,9 +130,7 @@ def _resolve_mdp_layout(
     if prefetch_windows < 1:
         raise ValueError("--mdp-loader-prepartition-prefetch-windows must be positive")
     planning_microbatches = loader_prepartition_window_size(
-        args,
-        loader_prepartition=partition_vision,
-        inner_scope=inner_scope,
+        args, loader_prepartition=partition_vision, inner_scope=inner_scope
     )
     use_planning_prefetch = (
         partition_vision
@@ -132,14 +140,12 @@ def _resolve_mdp_layout(
     )
     return _MDPLayout(
         loader_prepartition=partition_vision,
-        inner_scope=inner_scope,
         prepartition_rank=prepartition_rank,
         prepartition_world=prepartition_world,
         prepartition_encoder_stage=prepartition_encoder_stage,
         planning_microbatches=planning_microbatches,
         prefetch_windows=prefetch_windows,
         use_planning_prefetch=use_planning_prefetch,
-        balance_across_microbatches=use_planning_prefetch,
     )
 
 
@@ -160,20 +166,12 @@ def _parallel_layout(args):
 
 
 def _task_encoder(
-    args,
-    tokenizer,
-    *,
-    layout: _MDPLayout | None = None,
-    materialize: bool = True,
+    args, tokenizer, *, layout: _MDPLayout | None = None, materialize: bool = True
 ) -> Qwen35EnergonTaskEncoder:
     cp_size, cp_rank, pp_size, pp_rank = _parallel_layout(args)
     if layout is None:
         layout = _resolve_mdp_layout(
-            args,
-            cp_size=cp_size,
-            cp_rank=cp_rank,
-            pp_size=pp_size,
-            pp_rank=pp_rank,
+            args, cp_size=cp_size, cp_rank=cp_rank, pp_size=pp_size, pp_rank=pp_rank
         )
 
     return Qwen35EnergonTaskEncoder(
@@ -229,11 +227,7 @@ def train_valid_test_datasets_provider(_train_val_test_num_samples):
     tokenizer = _tokenizer(args)
     cp_size, cp_rank, pp_size, pp_rank = _parallel_layout(args)
     layout = _resolve_mdp_layout(
-        args,
-        cp_size=cp_size,
-        cp_rank=cp_rank,
-        pp_size=pp_size,
-        pp_rank=pp_rank,
+        args, cp_size=cp_size, cp_rank=cp_rank, pp_size=pp_size, pp_rank=pp_rank
     )
     common = {
         "batch_size": 1,
@@ -244,16 +238,13 @@ def train_valid_test_datasets_provider(_train_val_test_num_samples):
     train_dataset = get_train_dataset(
         data_path,
         task_encoder=_task_encoder(
-            args,
-            tokenizer,
-            layout=layout,
-            materialize=not layout.use_planning_prefetch,
+            args, tokenizer, layout=layout, materialize=not layout.use_planning_prefetch
         ),
         split_part=args.dataset_split,
         shuffle_buffer_size=int(args.energon_shuffle_buffer_size),
         **common,
     )
-    train_loader = CyclicDataIterator(
+    train_loader = _CyclicDataIterator(
         get_savable_loader(train_dataset, prefetch_factor=int(args.energon_prefetch_factor))
     )
     if layout.use_planning_prefetch:
@@ -263,7 +254,7 @@ def train_valid_test_datasets_provider(_train_val_test_num_samples):
             * int(getattr(args, "patch_size", 16))
             * int(getattr(args, "patch_size", 16))
         )
-        train_loader = PPxCPBalancingMaterializingIterator(
+        train_loader = MDPWindowMaterializingIterator(
             train_loader,
             lookahead_microbatches=layout.planning_microbatches,
             prefetch_windows=layout.prefetch_windows,
@@ -273,7 +264,7 @@ def train_valid_test_datasets_provider(_train_val_test_num_samples):
             patch_size=int(getattr(args, "patch_size", 16)),
             spatial_merge_size=int(getattr(args, "spatial_merge_size", 2)),
             lpt_hidden_size=int(getattr(args, "vision_hidden_size", 1152)),
-            balance_across_microbatches=layout.balance_across_microbatches,
+            balance_across_microbatches=True,
             materialize_workers=int(getattr(args, "num_workers", 2)),
         )
 

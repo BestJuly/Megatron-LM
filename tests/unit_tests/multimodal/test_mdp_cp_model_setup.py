@@ -290,8 +290,6 @@ def test_pp_cp_scope_requires_pipeline_parallelism():
 
 @pytest.mark.parametrize("inner_scope", ["cp", "pp_cp"])
 def test_pp1_fused_window_uses_cp_group_and_sidecar(monkeypatch, inner_scope):
-    from examples.multimodal_dev.mdp_pipeline_sidecar import configure_mdp_pipeline_sidecar
-
     group = object()
     model = SimpleNamespace(vision_model=torch.nn.Linear(2, 2))
     args = _args(
@@ -316,8 +314,6 @@ def test_pp1_fused_window_uses_cp_group_and_sidecar(monkeypatch, inner_scope):
     assert model._mdp_enabled is True
     assert model._mdp_inner_dp_group is group
     assert model._mdp_pp_cp_inner is False
-    assert model._mdp_cp_fused_sidecar is False
-    assert configure_mdp_pipeline_sidecar(model, args) is True
     assert model._mdp_cp_fused_sidecar is True
     assert model._pipeline_sidecar_enabled is True
 

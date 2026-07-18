@@ -35,9 +35,6 @@ sys.path.insert(
 from examples.multimodal_dev.arguments import add_multimodal_args
 from examples.multimodal_dev.forward_step import forward_step
 from examples.multimodal_dev.mdp_model_setup import configure_mdp_model
-from examples.multimodal_dev.mdp_pipeline_sidecar import (
-    configure_mdp_pipeline_sidecar,
-)
 from megatron.core.enums import ModelType
 from megatron.training import get_args, pretrain, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
@@ -124,9 +121,7 @@ def model_provider(
         **kwargs,
     )
 
-    model = configure_mdp_model(model, args)
-    configure_mdp_pipeline_sidecar(model, args)
-    return model
+    return configure_mdp_model(model, args)
 
 
 def _resolve_provider_fn(provider_fn):

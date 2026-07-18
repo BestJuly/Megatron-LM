@@ -99,6 +99,30 @@ resize by area; zero disables that bound. Packing is controlled by
 `--energon-max-samples-per-sequence`, and the fixed
 `--total-seq-length` container size.
 
+### MDP vision prepartitioning
+
+For pipeline-parallel packed training, select the PP x CP ownership group and
+optionally fuse one optimization step's vision work into bounded packs:
+
+```bash
+--mdp-encoder-mode \
+--mdp-inner-dp-scope pp_cp \
+--mdp-fused-vision-window \
+--mdp-vision-encoder-max-sequence-length 131072 \
+--mdp-fused-vision-backward recompute
+```
+
+The maximum sequence length is a raw-patch pack limit, not an automatic GPU
+memory limit. `131072` completed 50 iterations with 16 GB200 nodes, PP2 x CP2,
+and the Mantis + M4 + PixMo blend; `262144` exceeded fused-attention backward
+workspace memory on the same workload. Revalidate the cap for other hardware,
+topologies, or data distributions.
+
+`recompute` rebuilds each vision pack during backward and uses less memory.
+`retain` keeps the forward graph until its dependent text microbatches finish;
+it can use substantially more memory. Repeated world-64 measurements did not
+establish a consistent throughput winner between the two modes.
+
 ## Adding a New Model Architecture
 
 Adding a new model (e.g. `llava_next`) requires **no changes** to

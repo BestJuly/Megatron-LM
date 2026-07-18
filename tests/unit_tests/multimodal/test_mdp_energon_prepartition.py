@@ -30,6 +30,15 @@ def _provider_args(**overrides):
     return SimpleNamespace(**values)
 
 
+def test_cyclic_loader_rejects_an_empty_epoch():
+    from examples.multimodal_dev.data.qwen35_energon import provider
+
+    iterator = provider._CyclicDataIterator([])
+
+    with pytest.raises(RuntimeError, match="produced no batches"):
+        next(iterator)
+
+
 def test_provider_assigns_cp_rank_as_loader_prepartition_owner(monkeypatch):
     from examples.multimodal_dev.data.qwen35_energon import provider
 
@@ -133,8 +142,8 @@ def test_fused_pp1_cp_window_uses_lazy_train_materialization_only(monkeypatch, i
     monkeypatch.setattr(provider, "Qwen35EnergonTaskEncoder", FakeEncoder)
     monkeypatch.setattr(provider, "get_train_dataset", lambda *_args, **_kwargs: "train-ds")
     monkeypatch.setattr(provider, "get_savable_loader", lambda *_args, **_kwargs: "train-loader")
-    monkeypatch.setattr(provider, "CyclicDataIterator", lambda source: ("cyclic", source))
-    monkeypatch.setattr(provider, "PPxCPBalancingMaterializingIterator", wrap_train)
+    monkeypatch.setattr(provider, "_CyclicDataIterator", lambda source: ("cyclic", source))
+    monkeypatch.setattr(provider, "MDPWindowMaterializingIterator", wrap_train)
     monkeypatch.setattr(
         provider, "get_val_datasets", lambda *_args, **_kwargs: [("validation-ds", 1.0)]
     )
@@ -180,7 +189,6 @@ def test_pp1_cp_scopes_share_fused_planning_contract(inner_scope):
     assert layout.prepartition_encoder_stage is True
     assert layout.planning_microbatches == 16
     assert layout.use_planning_prefetch is True
-    assert layout.balance_across_microbatches is True
 
 
 def test_pp1_cp_scope_window_off_keeps_fused_planning_off():
@@ -200,7 +208,6 @@ def test_pp1_cp_scope_window_off_keeps_fused_planning_off():
 
     assert layout.planning_microbatches == 1
     assert layout.use_planning_prefetch is False
-    assert layout.balance_across_microbatches is False
 
 
 def test_pp2_cp2_pp_cp_fused_layout_is_unchanged():
@@ -230,7 +237,6 @@ def test_pp2_cp2_pp_cp_fused_layout_is_unchanged():
     assert layout.prepartition_encoder_stage is True
     assert layout.planning_microbatches == 16
     assert layout.use_planning_prefetch is True
-    assert layout.balance_across_microbatches is True
 
 
 def test_pp1_pp_cp_requires_a_fused_window():

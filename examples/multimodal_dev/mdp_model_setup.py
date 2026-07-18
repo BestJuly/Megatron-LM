@@ -244,9 +244,9 @@ def configure_mdp_model(model, args):
         _mdp_tp_source_group=None,
         _mdp_tp_source_group_device=None,
         _mdp_pp_cp_inner=False,
-        _mdp_cp_fused_sidecar=False,
+        _mdp_cp_fused_sidecar=pp1_cp_fused,
         _pp_cp_batch_sidecar=False,
-        _pipeline_sidecar_enabled=False,
+        _pipeline_sidecar_enabled=pp1_cp_fused,
         _mdp_rank_assignment=None,
         _mdp_rank_assignment_row_counts=None,
     )

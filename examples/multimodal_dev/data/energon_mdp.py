@@ -11,8 +11,8 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from collections import deque
+from collections.abc import Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Deque, Iterable, List, Sequence
 
 import torch
 
@@ -28,31 +28,11 @@ from examples.multimodal_dev.mdp_image_materialize import (
 from examples.multimodal_dev.sidecar_prefetch import validate_fused_vision_window
 
 
-class CyclicDataIterator:
-    """Expose an Energon loader as the cyclic iterator Megatron expects."""
-
-    def __init__(self, dataloader):
-        self._dataloader = dataloader
-        self._iterator = self._cycle()
-
-    def _cycle(self):
-        while True:
-            yield from self._dataloader
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        return next(self._iterator)
-
-
 def loader_prepartition_window_size(args, *, loader_prepartition: bool, inner_scope: str) -> int:
     """Resolve the deterministic MDP planning-window size."""
     if not loader_prepartition or inner_scope not in ("cp", "pp_cp"):
         return 1
-    max_sequence_length = int(
-        getattr(args, "mdp_vision_encoder_max_sequence_length", 0) or 0
-    )
+    max_sequence_length = int(getattr(args, "mdp_vision_encoder_max_sequence_length", 0) or 0)
     if not validate_fused_vision_window(
         getattr(args, "mdp_fused_vision_window", False), max_sequence_length
     ):
@@ -63,7 +43,7 @@ def loader_prepartition_window_size(args, *, loader_prepartition: bool, inner_sc
     return max(1, global_batch_size // (micro_batch_size * dp_size))
 
 
-def grid_rows_from_batch(batch: dict) -> List[List[int]]:
+def grid_rows_from_batch(batch: dict) -> list[list[int]]:
     """Return ``image_grid_thw`` as ``[[t, h, w], ...]`` rows from a batch."""
     grid = batch.get("image_grid_thw")
     if not torch.is_tensor(grid) or grid.numel() == 0:
@@ -71,20 +51,18 @@ def grid_rows_from_batch(batch: dict) -> List[List[int]]:
     if grid.dim() == 3:
         grid = grid.flatten(0, 1)
     if grid.dim() != 2 or grid.shape[1] != 3:
-        raise RuntimeError(
-            f"MDP expects image_grid_thw as [N,3], got {tuple(grid.shape)}"
-        )
+        raise RuntimeError(f"MDP expects image_grid_thw as [N,3], got {tuple(grid.shape)}")
     return [[int(x) for x in row] for row in grid.detach().cpu().tolist()]
 
 
-def _descriptors(batch: dict) -> List[dict]:
+def _descriptors(batch: dict) -> list[dict]:
     raw = batch.get("_mdp_image_descriptors")
     if raw is None:
         raw = decode_image_descriptors(batch.get("_mdp_image_descriptors_json"))
     return [dict(desc) for desc in (raw or [])]
 
 
-def _image_cu(batch: dict) -> List[int]:
+def _image_cu(batch: dict) -> list[int]:
     image_cu = batch.get("image_cu_seqlens")
     if torch.is_tensor(image_cu):
         return [int(x) for x in image_cu.detach().cpu().reshape(-1).tolist()]
@@ -110,7 +88,7 @@ def _assignment_tensor_for_batch(assignment, item_idx: int, batch: dict) -> torc
     return torch.tensor(rows, dtype=torch.int32)
 
 
-class PPxCPBalancingMaterializingIterator:
+class MDPWindowMaterializingIterator:
     """Prefetch ordered windows and materialize only this rank's images.
 
     The wrapped iterator yields descriptor-bearing Energon batches. This
@@ -155,11 +133,15 @@ class PPxCPBalancingMaterializingIterator:
         self._lpt_hidden_size = int(lpt_hidden_size)
         self._balance_across_microbatches = bool(balance_across_microbatches)
         self._executor = ThreadPoolExecutor(max_workers=max(1, int(materialize_workers)))
-        self._pending_windows: Deque[List[Future]] = deque()
-        self._ready_slots: Deque[dict] = deque()
+        self._pending_windows: deque[list[Future]] = deque()
+        self._ready_slots: deque[dict] = deque()
         self._source_exhausted = False
         self._closed = False
-        self._fill_pending()
+        try:
+            self._fill_pending()
+        except Exception:
+            self.close()
+            raise
 
     def __iter__(self):
         return self
@@ -169,7 +151,10 @@ class PPxCPBalancingMaterializingIterator:
             raise StopIteration
         while not self._ready_slots:
             self._activate_next_window()
-        return self._ready_slots.popleft()
+        batch = self._ready_slots.popleft()
+        if self._source_exhausted and not self._pending_windows and not self._ready_slots:
+            self.close()
+        return batch
 
     def close(self) -> None:
         if self._closed:
@@ -185,8 +170,8 @@ class PPxCPBalancingMaterializingIterator:
                 break
             self._pending_windows.append(self._schedule_window(window))
 
-    def _fetch_window(self) -> List[dict]:
-        window: List[dict] = []
+    def _fetch_window(self) -> list[dict]:
+        window: list[dict] = []
         for _ in range(self._lookahead):
             try:
                 window.append(next(self._source))
@@ -202,17 +187,20 @@ class PPxCPBalancingMaterializingIterator:
             raise StopIteration
         futures = self._pending_windows.popleft()
         self._fill_pending()
-        self._ready_slots.extend(future.result() for future in futures)
+        try:
+            self._ready_slots.extend(future.result() for future in futures)
+        except Exception:
+            self.close()
+            raise
 
-    def _schedule_window(self, window: Sequence[dict]) -> List[Future]:
+    def _schedule_window(self, window: Sequence[dict]) -> list[Future]:
         grids_by_item = [grid_rows_from_batch(batch) for batch in window]
         row_counts_by_item = [
             [int(vision_rows_from_grid(row, self._spatial_merge_size)) for row in rows]
             for rows in grids_by_item
         ]
         costs_by_item = [
-            image_costs_from_grid(rows, hidden_size=self._lpt_hidden_size)
-            for rows in grids_by_item
+            image_costs_from_grid(rows, hidden_size=self._lpt_hidden_size) for rows in grids_by_item
         ]
         assignment = assign_images_lpt(
             costs_by_item, self._world, across_items=self._balance_across_microbatches
@@ -273,9 +261,7 @@ class PPxCPBalancingMaterializingIterator:
             else torch.zeros(0, self._pixel_dim, dtype=torch.bfloat16)
         )
         batch["_mdp_prepartitioned_image_grid_thw"] = (
-            torch.stack(local_grids, dim=0)
-            if local_grids
-            else torch.zeros(0, 3, dtype=torch.long)
+            torch.stack(local_grids, dim=0) if local_grids else torch.zeros(0, 3, dtype=torch.long)
         )
         batch["_mdp_prepartitioned_assignment"] = _assignment_tensor_for_batch(
             assignment, int(item_idx), batch

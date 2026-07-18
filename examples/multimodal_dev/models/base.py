@@ -339,7 +339,7 @@ class MultimodalModel(MegatronModule):
         if count <= 0:
             return
 
-        if fused_window and count > 1:
+        if fused_window:
             queue.extend(
                 build_mdp_pp_cp_sidecar_cache_window(
                     data_iterator=data_iterator,

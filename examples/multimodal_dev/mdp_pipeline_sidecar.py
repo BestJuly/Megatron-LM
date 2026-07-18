@@ -172,18 +172,3 @@ def configure_pp_cp_replicated_vision(model, args) -> bool:
     for name, value in attrs.items():
         setattr(model, name, value)
     return True
-
-
-def configure_mdp_pipeline_sidecar(model, args) -> bool:
-    """Configure either replicated PP x CP or fused CP-only sidecars."""
-    if bool(getattr(model, "_mdp_pp_cp_inner", False)):
-        return True
-    if configure_pp_cp_replicated_vision(model, args):
-        return True
-    if not cp_fused_vision_requested(args):
-        return False
-    if not bool(getattr(model, "_mdp_enabled", False)):
-        raise RuntimeError("CP-fused vision sidecar requires MDP encoder mode")
-    setattr(model, "_mdp_cp_fused_sidecar", True)
-    setattr(model, "_pipeline_sidecar_enabled", True)
-    return True

@@ -54,15 +54,11 @@ def vision_length_pack_plan(lengths: list[int], max_rows: int) -> list[list[int]
     return packs
 
 
-def flatten_microbatch_lengths(lengths_by_microbatch: list[list[int]]) -> list[int]:
-    """Flatten per-microbatch image lengths while preserving window order."""
-    return [int(length) for lengths in lengths_by_microbatch for length in lengths]
-
-
 def image_vision_pack_plan(
     lengths_by_microbatch: list[list[int]], max_sequence_length: int
 ) -> list[list[int]]:
     """Pack flattened window images by vision sequence length."""
     return vision_length_pack_plan(
-        flatten_microbatch_lengths(lengths_by_microbatch), int(max_sequence_length)
+        [int(length) for lengths in lengths_by_microbatch for length in lengths],
+        int(max_sequence_length),
     )
