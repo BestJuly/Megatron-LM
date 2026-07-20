@@ -319,6 +319,48 @@ def test_qwen3_launcher_enforces_text_only_mock_contract(tmp_path):
     assert "--num-virtual-stages-per-pipeline-rank" not in command
 
 
+def test_qwen35_launcher_allows_offline_smoke_overrides(tmp_path, monkeypatch):
+    script = Path(__file__).parents[1] / "scripts" / "run_qwen35_vl.sh"
+    overrides = {
+        "DRY_RUN": "1",
+        "MODEL_VARIANT": "0.8b",
+        "GPUS_PER_NODE": "4",
+        "NNODES": "1",
+        "TP": "1",
+        "EP": "1",
+        "PP": "1",
+        "CP": "1",
+        "MBS": "1",
+        "GBS": "4",
+        "SEQ_LEN": "512",
+        "TRAIN_ITERS": "1",
+        "EVAL_ITERS": "1",
+        "USE_FSDP": "0",
+        "DATASET_PROVIDER": "mock",
+        "TOKENIZER_MODEL": "/data/tokenizer/Qwen3.5-35B-A3B",
+        "HF_PROCESSOR_PATH": "/data/tokenizer/Qwen3.5-35B-A3B",
+        "ROOT_DIR": f"{tmp_path}/checkpoints/",
+        "TENSORBOARD_LOGS_PATH": str(tmp_path / "tensorboard"),
+    }
+    for name, value in overrides.items():
+        monkeypatch.setenv(name, value)
+
+    result = subprocess.run(
+        ["bash", str(script)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    command = next(
+        line for line in result.stdout.splitlines() if line.startswith("torchrun ")
+    )
+    assert "--model-arch qwen35_vl" in command
+    assert "--dataset-provider mock" in command
+    assert "--hf-processor-path /data/tokenizer/Qwen3.5-35B-A3B" in command
+    assert "--eval-iters 1" in command
+
+
 def test_qwen35_patch_projection_fast_path_matches_conv3d():
     from examples.multimodal_dev.models.qwen35_vl import vision_encoder
     from megatron.core.transformer.transformer_config import TransformerConfig

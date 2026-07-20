@@ -12,6 +12,9 @@
 #   TP, EP, PP: parallelism sizes
 #   MBS, GBS: micro/global batch sizes
 #   NUM_LAYERS, NUM_EXPERTS: override for proxy testing
+#   DATASET_PROVIDER: dataset provider (default: cord_v2)
+#   HF_PROCESSOR_PATH: local path or Hugging Face processor ID
+#   EVAL_ITERS: validation/test iterations (default: 10)
 #   LAUNCHER: torchrun (default) or python
 #   PROFILE: set to 1 to enable Nsight Systems profiling (default: 0)
 #   PROFILE_STEP_START/PROFILE_STEP_END: profiled iteration window (default: 4-5)
@@ -43,6 +46,9 @@ LAUNCHER=${LAUNCHER:-torchrun}
 
 MODEL_VARIANT=${MODEL_VARIANT:-proxy}
 VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-}
+DATASET_PROVIDER=${DATASET_PROVIDER:-cord_v2}
+HF_PROCESSOR_PATH=${HF_PROCESSOR_PATH:-Qwen/Qwen3.5-397B-A17B}
+EVAL_ITERS=${EVAL_ITERS:-10}
 
 # Batch sizes
 MBS=${MBS:-2}
@@ -282,7 +288,7 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval "$SAVE_INTERVAL"
     --eval-interval 500
     --save "$CHECKPOINT_STORE_PATH"
-    --eval-iters 10
+    --eval-iters "$EVAL_ITERS"
     --tensorboard-dir "$TENSORBOARD_LOGS_PATH"
     --wandb-project "$WANDB_PROJECT"
     --wandb-exp-name "$EXP_NAME"
@@ -301,8 +307,8 @@ TOKENIZER_ARGS=(
 MULTIMODAL_ARGS=(
     --model-arch qwen35_vl
     --model-variant "$MODEL_VARIANT"
-    --dataset-provider cord_v2
-    --hf-processor-path Qwen/Qwen3.5-397B-A17B
+    --dataset-provider "$DATASET_PROVIDER"
+    --hf-processor-path "$HF_PROCESSOR_PATH"
     --use-vanilla-collate-fn
     --image-token-id 248056
     --image-size 224
