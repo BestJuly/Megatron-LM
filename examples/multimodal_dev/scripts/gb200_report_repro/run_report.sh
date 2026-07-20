@@ -5,12 +5,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../.." && pwd)"
 
-PR1_SHA="0f5d69d91647c20751de17a8ed64dbb90c590ae5"
-PR2_SHA="c1d9395d3e0d168193e08cf3511686b57e3bb89e"
-PR4_SHA="4ca60a037b3be0b8859e0e990f31bc47be7f42d3"
-PR5_SHA="6d09727edc349fccef5ba4518a4d052ee74e7f93"
+PR1_SHA="1c99e8d550e530c7d04564b4ae2061f23b7cdcee"
+PR2_SHA="d7b3bb7f2df4e48a8ea0bf3c78f0791a415db54c"
+PR4_SHA="7696cc537cbd946a075c5595dc2b2d25269d1553"
+PR5_SHA="e755e9f47b342ab73538ff7f637a0b817e7ff634"
 # This is the PR6 code tip before this documentation-only reproduction commit.
-PR6_CODE_SHA="4403202effaeafcdcf4190f6fa4c45b2845dcb68"
+PR6_CODE_SHA="e0450f1b948ed53932a9059a3cefc09d0a0a2371"
 
 usage() {
     cat <<'EOF'
@@ -27,7 +27,6 @@ Options:
   --cells CSV                 Run only the listed cell labels.
   --dry-run                   Build every launcher command without srun/torch.
   --prepare-only              Prepare checkouts and metadata, then stop.
-  --include-unsafe-262144     Add PR6's expected-OOM cap-262144 diagnostics.
   -h, --help                  Show this help.
 
 The PR-specific reproduce_pr*.sh wrappers supply the first argument.
@@ -48,7 +47,6 @@ checkout_root="${MDP_REPRO_CHECKOUT_ROOT:-${HOME}/.cache/megatron-mdp-report/che
 selected_cells=""
 dry_run=0
 prepare_only=0
-include_unsafe=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -59,7 +57,6 @@ while [[ $# -gt 0 ]]; do
         --cells) selected_cells="${2:?missing value for --cells}"; shift 2 ;;
         --dry-run) dry_run=1; shift ;;
         --prepare-only) prepare_only=1; shift ;;
-        --include-unsafe-262144) include_unsafe=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -94,7 +91,6 @@ modes=()
 backward_modes=()
 caps=()
 measure_from=()
-expected_outcomes=()
 reference_stats=()
 reference_steps_ms=()
 reference_tflops=()
@@ -111,70 +107,61 @@ add_cell() {
     backward_modes+=("$6")
     caps+=("$7")
     measure_from+=("$8")
-    expected_outcomes+=("$9")
-    reference_stats+=("${10}")
-    reference_steps_ms+=("${11}")
-    reference_tflops+=("${12}")
-    reference_padded_tps+=("${13}")
-    reference_peaks+=("${14}")
-    reference_notes+=("${15}")
+    reference_stats+=("$9")
+    reference_steps_ms+=("${10}")
+    reference_tflops+=("${11}")
+    reference_padded_tps+=("${12}")
+    reference_peaks+=("${13}")
+    reference_notes+=("${14}")
 }
 
 case "${report}" in
     pr1)
         # PR1's body explicitly reports the PR1+PR2 boundary because real
         # Energon data support first exists in PR2.
-        add_cell pr1_pr2_baseline "${PR2_SHA}" pr2 1 ordinary none 0 10 pass \
+        add_cell pr1_pr2_baseline "${PR2_SHA}" pr2 1 ordinary none 0 10 \
             median 20619.3 45.9244 101708.21 reserved=101.0977_GiB \
             "PR1+PR2 prior-chain report; PR1 has no standalone real-data result"
         ;;
     pr2)
-        add_cell pr2_baseline "${PR2_SHA}" pr2 1 ordinary none 0 10 pass \
+        add_cell pr2_baseline "${PR2_SHA}" pr2 1 ordinary none 0 10 \
             median 20619.3 45.9244 101708.21 reserved=101.0977_GiB \
             "PR2 prior-chain ordinary-loader report"
         ;;
     pr4)
-        add_cell pr2_baseline "${PR2_SHA}" pr2 1 ordinary none 0 10 pass \
+        add_cell pr2_baseline "${PR2_SHA}" pr2 1 ordinary none 0 10 \
             median 20619.3 45.9244 101708.21 reserved=101.0977_GiB \
             "PR2 comparison boundary"
-        add_cell pr4_mdp_off "${PR4_SHA}" pr4 1 mdp_off none 0 10 pass \
+        add_cell pr4_mdp_off "${PR4_SHA}" pr4 1 mdp_off none 0 10 \
             median 19745.3 NA 106210.19 reserved=101.0566_GiB \
             "PR4 default path with MDP disabled"
-        add_cell pr4_mdp_on "${PR4_SHA}" pr4 1 mdp_on none 0 10 pass \
+        add_cell pr4_mdp_on "${PR4_SHA}" pr4 1 mdp_on none 0 10 \
             median 18910.4 NA 110899.40 reserved=76.6074_GiB \
             "PR4 CP-local MDP"
         ;;
     pr5)
-        add_cell pr5_mdp_off "${PR5_SHA}" pr5 2 mdp_off none 0 10 pass \
+        add_cell pr5_mdp_off "${PR5_SHA}" pr5 2 mdp_off none 0 10 \
             median 37782.3 NA 55506.20 reserved=111.7617_GiB \
             "PR5 generic PP sidecar, MDP disabled"
-        add_cell pr5_mdp_on "${PR5_SHA}" pr5 2 mdp_on none 0 10 pass \
+        add_cell pr5_mdp_on "${PR5_SHA}" pr5 2 mdp_on none 0 10 \
             median 29419.9 NA 71283.45 reserved=138.6836_GiB \
             "PR5 replicated PPxCP vision"
         ;;
     pr6)
         # The default set is the safe world64 report. The reference numbers
         # were measured at cf12; 4403202 adds the validated PR6 quality fix.
-        add_cell pr6_mdp_off "${PR6_CODE_SHA}" pr6 2 mdp_off recompute 0 6 pass \
+        add_cell pr6_mdp_off "${PR6_CODE_SHA}" pr6 2 mdp_off recompute 0 6 \
             mean 30481.0 31.26 68801.94 allocated=96974.57_MB \
             "cf12 exact-tip world64 rerun reference"
-        add_cell pr6_mdp_on "${PR6_CODE_SHA}" pr6 2 mdp_on recompute 0 6 pass \
+        add_cell pr6_mdp_on "${PR6_CODE_SHA}" pr6 2 mdp_on recompute 0 6 \
             mean 24086.0 39.71 87069.33 allocated=127735.80_MB \
             "cf12 exact-tip world64 rerun reference"
-        add_cell pr6_fused_retain_131072 "${PR6_CODE_SHA}" pr6 2 mdp_fused retain 131072 6 pass \
+        add_cell pr6_fused_retain_131072 "${PR6_CODE_SHA}" pr6 2 mdp_fused retain 131072 6 \
             mean 13030.0 74.25 160947.97 allocated=128383.62_MB \
             "safe-cap exact-tip world64 rerun reference"
-        add_cell pr6_fused_recompute_131072 "${PR6_CODE_SHA}" pr6 2 mdp_fused recompute 131072 6 pass \
+        add_cell pr6_fused_recompute_131072 "${PR6_CODE_SHA}" pr6 2 mdp_fused recompute 131072 6 \
             mean 12775.0 74.79 164160.63 allocated=92029.23_MB \
             "safe-cap exact-tip world64 rerun reference"
-        if [[ "${include_unsafe}" == "1" ]]; then
-            add_cell pr6_fused_retain_262144 "${PR6_CODE_SHA}" pr6 2 mdp_fused retain 262144 6 oom \
-                NA NA NA NA expected=OOM_at_iteration_15 \
-                "unsafe diagnostic; fused_attn_bwd workspace OOM was reported"
-            add_cell pr6_fused_recompute_262144 "${PR6_CODE_SHA}" pr6 2 mdp_fused recompute 262144 6 oom \
-                NA NA NA NA expected=OOM_at_iteration_15 \
-                "unsafe diagnostic; fused_attn_bwd workspace OOM was reported"
-        fi
         ;;
 esac
 
@@ -220,7 +207,7 @@ prepare_checkout() {
 }
 
 manifest="${result_root}/manifest.tsv"
-printf 'cell\tsha\tstack_level\tpp\tmode\tbackward\tcap\tmeasure_from\texpected_outcome\treference_stat\treference_step_ms\treference_tflops\treference_padded_tps\treference_peak\treference_note\n' > "${manifest}"
+printf 'cell\tsha\tstack_level\tpp\tmode\tbackward\tcap\tmeasure_from\treference_stat\treference_step_ms\treference_tflops\treference_padded_tps\treference_peak\treference_note\n' > "${manifest}"
 
 selected_count=0
 declare -a checkouts=()
@@ -233,11 +220,10 @@ for index in "${!labels[@]}"; do
     checkout="$(prepare_checkout "${shas[$index]}")"
     checkouts+=("${checkout}")
     selected_count=$((selected_count + 1))
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "${label}" "${shas[$index]}" "${levels[$index]}" "${pps[$index]}" \
         "${modes[$index]}" "${backward_modes[$index]}" "${caps[$index]}" \
-        "${measure_from[$index]}" "${expected_outcomes[$index]}" \
-        "${reference_stats[$index]}" "${reference_steps_ms[$index]}" \
+        "${measure_from[$index]}" "${reference_stats[$index]}" "${reference_steps_ms[$index]}" \
         "${reference_tflops[$index]}" "${reference_padded_tps[$index]}" \
         "${reference_peaks[$index]}" "${reference_notes[$index]}" >> "${manifest}"
 done
@@ -292,7 +278,7 @@ for index in "${!labels[@]}"; do
     checkout="${checkouts[$index]}"
     cell_host="${result_root}/${label}"
     mkdir -p "${cell_host}"
-    rm -f "${cell_host}/SUCCESS" "${cell_host}/FAILED" "${cell_host}/EXPECTED_OOM" "${cell_host}/UNEXPECTED_PASS"
+    rm -f "${cell_host}/SUCCESS" "${cell_host}/FAILED"
     port=$(( ${MASTER_PORT_BASE:-29600} + cell_number ))
     cell_number=$((cell_number + 1))
 
@@ -335,12 +321,6 @@ for index in "${!labels[@]}"; do
 
     if [[ "${cell_rc}" -eq 0 ]]; then
         touch "${cell_host}/SUCCESS"
-        if [[ "${expected_outcomes[$index]}" == "oom" ]]; then
-            touch "${cell_host}/UNEXPECTED_PASS"
-        fi
-    elif [[ "${expected_outcomes[$index]}" == "oom" ]] && \
-        grep -RqsE 'CUDA out of memory|OutOfMemoryError' "${cell_host}"; then
-        touch "${cell_host}/EXPECTED_OOM"
     else
         touch "${cell_host}/FAILED"
         overall_rc=1

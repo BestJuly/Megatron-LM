@@ -79,12 +79,8 @@ def format_number(value: float | None, digits: int = 2) -> str:
 
 
 def marker_status(cell_dir: Path) -> str:
-    if (cell_dir / "EXPECTED_OOM").exists():
-        return "EXPECTED_OOM"
     if (cell_dir / "FAILED").exists():
         return "FAILED"
-    if (cell_dir / "UNEXPECTED_PASS").exists():
-        return "UNEXPECTED_PASS"
     if (cell_dir / "SUCCESS").exists():
         return "PASS"
     return "UNKNOWN"
@@ -131,7 +127,7 @@ def summarize_cell(root: Path, row: dict[str, str]) -> dict[str, str]:
     skipped = max((item.skipped for item in best_iterations.values()), default=0)
     nan = max((item.nan for item in best_iterations.values()), default=0)
     status = marker_status(cell_dir)
-    if row["expected_outcome"] == "pass" and status == "PASS":
+    if status == "PASS":
         complete = bool(total) and completed == total and len(best_iterations) == total
         if not complete or skipped or nan:
             status = "INVALID_RESULT"

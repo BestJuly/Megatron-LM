@@ -114,8 +114,7 @@ optionally fuse one optimization step's vision work into bounded packs:
 
 The maximum sequence length is a raw-patch pack limit, not an automatic GPU
 memory limit. `131072` completed 50 iterations with 16 GB200 nodes, PP2 x CP2,
-and the Mantis + M4 + PixMo blend; `262144` exceeded fused-attention backward
-workspace memory on the same workload. Revalidate the cap for other hardware,
+and the Mantis + M4 + PixMo blend. Revalidate the cap for other hardware,
 topologies, or data distributions.
 
 `recompute` rebuilds each vision pack during backward and uses less memory.
@@ -189,7 +188,7 @@ number; `summary.md` calculates the descriptive delta.
 
 The PR1-PR5 reference numbers predate the final restack, while the scripts use
 the final functional SHAs listed in those PRs. PR6's long-run references were
-measured at `cf12b34e2`; its wrapper uses `4403202e`, which adds the validated
+measured at `cf12b34e2`; its wrapper uses `e0450f1b`, which adds the validated
 quality fix and completed a world-64 real-data smoke. The first complete run of
 these scripts is therefore also the canonical long-run refresh for the final
 code boundaries.
@@ -208,12 +207,8 @@ The bundled reference contract is:
 | PR6 fused retain, cap 131072 | mean | 13,030.0 ms | 160,947.97 | 128,383.62 MB allocated |
 | PR6 fused recompute, cap 131072 | mean | 12,775.0 ms | 164,160.63 | 92,029.23 MB allocated |
 
-PR6 defaults to cap `131072`, the only cap that completed the documented
-GB200/world64/blend3/50-iteration safety run. The historical cap `262144`
-diagnostic is excluded because both backward modes can fail in
-`fused_attn_bwd`. It can be requested explicitly with
-`--include-unsafe-262144`; those two cells are expected-OOM diagnostics, not
-recommended benchmarks.
+PR6 uses cap `131072`, the value validated by the documented
+GB200/world64/blend3/50-iteration safety run.
 
 The PR reports are single-run diagnostics. They did not pin external payload
 bytes or sample identity and have no repeat variance estimate. These scripts
