@@ -137,6 +137,11 @@ PyTorch 26.02 container, and the prepared Mantis + M4 + PixMo Energon blend.
 | PR5 | `reproduce_pr5.sh` | PP sidecar MDP off/on | PP2 x CP2 |
 | PR6 | `reproduce_pr6.sh` | MDP off/on, fused retain/recompute at cap 131072 | PP2 x CP2 |
 
+Each listed file is intentionally standalone. It contains its own pinned
+commits, cell matrix, allocation validation, container-side runner, and result
+summarizer; none of the PR scripts sources or invokes a shared reproduction
+helper. Invoke only the `reproduce_pr*.sh` file for the report being measured.
+
 PR1 does not contain the real Energon provider, so its PR body intentionally
 reports the combined PR1 + PR2 boundary. `reproduce_pr1.sh` therefore runs the
 PR2 feature SHA and labels the result `pr1_pr2_baseline`; it does not claim an
@@ -155,9 +160,9 @@ examples/multimodal_dev/scripts/gb200_report_repro/reproduce_pr4.sh \
   --job-id "${SLURM_JOB_ID}"
 ```
 
-Each wrapper prepares clean detached worktrees for the required PR
-boundaries, runs one `srun` task per node, and lets the existing GB200 launcher
-start four local workers. All report cells use world size 64, BF16 HybridEP,
+Each standalone script prepares clean detached worktrees for its required PR
+boundaries, runs one `srun` task per node, and lets the checked-out GB200
+training launcher start four local workers. All report cells use world size 64, BF16 HybridEP,
 `seq=8192`, `MBS=1`, `GBS=256`, `TP=1`, `CP=2`, `EP=8`, and `ETP=1`.
 They execute five warmup plus 45 measured iterations. Historical PR1-PR5
 references use the PR-body window (iterations 10-50); the PR6 safety report
@@ -188,8 +193,8 @@ number; `summary.md` calculates the descriptive delta.
 
 The PR1-PR5 reference numbers predate the final restack, while the scripts use
 the final functional SHAs listed in those PRs. PR6's long-run references were
-measured at `cf12b34e2`; its wrapper uses `e0450f1b`, which adds the validated
-quality fix and completed a world-64 real-data smoke. The first complete run of
+measured at `cf12b34e2`; its standalone script uses `e0450f1b`, which adds the
+validated quality fix and completed a world-64 real-data smoke. The first complete run of
 these scripts is therefore also the canonical long-run refresh for the final
 code boundaries.
 
