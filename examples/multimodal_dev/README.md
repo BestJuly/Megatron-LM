@@ -123,6 +123,104 @@ topologies, or data distributions.
 it can use substantially more memory. Repeated world-64 measurements did not
 establish a consistent throughput winner between the two modes.
 
+### GB200 world-64 performance reproduction
+
+The scripts in `scripts/gb200_report_repro/` recreate the launch contract used
+by the performance sections of stacked PRs #1, #2, #4, #5, and #6. They run on
+this cluster's 16-node allocation with four GB200 GPUs per node, the ARM64
+PyTorch 26.02 container, and the prepared Mantis + M4 + PixMo Energon blend.
+
+| Report | Script | Cells | Topology |
+|---|---|---|---|
+| PR1 | `reproduce_pr1.sh` | PR1 + PR2 ordinary-loader baseline | PP1 x CP2 |
+| PR2 | `reproduce_pr2.sh` | ordinary-loader baseline | PP1 x CP2 |
+| PR4 | `reproduce_pr4.sh` | PR2 baseline, PR4 MDP off/on | PP1 x CP2 |
+| PR5 | `reproduce_pr5.sh` | PP sidecar MDP off/on | PP2 x CP2 |
+| PR6 | `reproduce_pr6.sh` | MDP off/on, fused retain/recompute at cap 131072 | PP2 x CP2 |
+
+PR1 does not contain the real Energon provider, so its PR body intentionally
+reports the combined PR1 + PR2 boundary. `reproduce_pr1.sh` therefore runs the
+PR2 feature SHA and labels the result `pr1_pr2_baseline`; it does not claim an
+isolated PR1 data-path result.
+
+Allocate from the login node. Do not enter a node with `srun --pty` before
+starting the multi-node step.
+
+```bash
+salloc -A coreai_devtech_all \
+  -J 'coreai_devtech_all-megatron:vlm' \
+  -N 16 -p batch --qos=normal --gres=gpu:4 \
+  --time=04:00:00 bash
+
+examples/multimodal_dev/scripts/gb200_report_repro/reproduce_pr4.sh \
+  --job-id "${SLURM_JOB_ID}"
+```
+
+Each wrapper prepares clean detached worktrees for the required PR
+boundaries, runs one `srun` task per node, and lets the existing GB200 launcher
+start four local workers. All report cells use world size 64, BF16 HybridEP,
+`seq=8192`, `MBS=1`, `GBS=256`, `TP=1`, `CP=2`, `EP=8`, and `ETP=1`.
+They execute five warmup plus 45 measured iterations. Historical PR1-PR5
+references use the PR-body window (iterations 10-50); the PR6 safety report
+uses iterations 6-50.
+
+The default cluster paths are:
+
+```text
+container: /lustre/fsw/portfolios/coreai/users/dongjael/containers/mcore-moe-pytorch26.02-hybridep7febc6e-arm64.sqsh
+energon:   /lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/dongjael/Megatron-Energon-7.3.2
+data:      /lustre/fsw/portfolios/coreai/users/dongjael/datasets/qwen35-mdp-data
+blend:     /data/energon/blends/blend3.yaml
+tokenizer: /data/tokenizer/Qwen3.5-35B-A3B
+```
+
+Override them with `CONTAINER_IMAGE`, `ENERGON_HOST`, `DATA_HOST`,
+`RAW_DATA_HOST`, or `VENV_HOST`. Use `--dry-run` without an allocation to
+prepare every exact checkout and validate the generated launcher commands:
+
+```bash
+examples/multimodal_dev/scripts/gb200_report_repro/reproduce_pr6.sh --dry-run
+```
+
+Every real run writes code revisions, the container and blend identity,
+per-task logs, `manifest.tsv`, `summary.tsv`, and `summary.md` under its result
+root. The manifest includes the number reported by the PR next to the observed
+number; `summary.md` calculates the descriptive delta.
+
+The PR1-PR5 reference numbers predate the final restack, while the scripts use
+the final functional SHAs listed in those PRs. PR6's long-run references were
+measured at `cf12b34e2`; its wrapper uses `4403202e`, which adds the validated
+quality fix and completed a world-64 real-data smoke. The first complete run of
+these scripts is therefore also the canonical long-run refresh for the final
+code boundaries.
+
+The bundled reference contract is:
+
+| Cell | Statistic | Step | Padded tok/s | Peak |
+|---|---|---:|---:|---:|
+| PR1/PR2 ordinary loader | median | 20,619.3 ms | 101,708.21 | 101.0977 GiB reserved |
+| PR4 MDP off | median | 19,745.3 ms | 106,210.19 | 101.0566 GiB reserved |
+| PR4 MDP on | median | 18,910.4 ms | 110,899.40 | 76.6074 GiB reserved |
+| PR5 MDP off | median | 37,782.3 ms | 55,506.20 | 111.7617 GiB reserved |
+| PR5 MDP on | median | 29,419.9 ms | 71,283.45 | 138.6836 GiB reserved |
+| PR6 MDP off | mean | 30,481.0 ms | 68,801.94 | 96,974.57 MB allocated |
+| PR6 MDP on | mean | 24,086.0 ms | 87,069.33 | 127,735.80 MB allocated |
+| PR6 fused retain, cap 131072 | mean | 13,030.0 ms | 160,947.97 | 128,383.62 MB allocated |
+| PR6 fused recompute, cap 131072 | mean | 12,775.0 ms | 164,160.63 | 92,029.23 MB allocated |
+
+PR6 defaults to cap `131072`, the only cap that completed the documented
+GB200/world64/blend3/50-iteration safety run. The historical cap `262144`
+diagnostic is excluded because both backward modes can fail in
+`fused_attn_bwd`. It can be requested explicitly with
+`--include-unsafe-262144`; those two cells are expected-OOM diagnostics, not
+recommended benchmarks.
+
+The PR reports are single-run diagnostics. They did not pin external payload
+bytes or sample identity and have no repeat variance estimate. These scripts
+pin the code boundary, topology, launcher arguments, measurement window,
+container path, and current blend-file hash, but exact timing equality is not
+guaranteed if node placement, payloads, or runtime state differ.
+
 ## Adding a New Model Architecture
 
 Adding a new model (e.g. `llava_next`) requires **no changes** to
