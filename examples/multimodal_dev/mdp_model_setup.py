@@ -114,9 +114,13 @@ def configure_mdp_model(model, args):
             _mdp_rank_assignment_row_counts=None,
         )
         return model
-    # is_vpp_sidecar_owner: only PP0+VP0 rank (pre_process=True) owns the sidecar.
-    # PP1+VP0 ranks still participate in group creation below (collective safety)
-    # but their _pipeline_sidecar_enabled will be set to False afterward.
+    # For VP0 chunks, ALL PP ranks (PP0 and PP1) must call configure_pp_cp_replicated_vision
+    # to participate in the group-creation collectives AND to participate in the
+    # all-gather inside _run_mdp_vision_bridge.  The existing code already handles
+    # PP1 correctly: _run_mdp_vision_bridge sets return_zero_dependency_only=True
+    # when pre_process=False, so PP1 participates in the all-gather but discards
+    # the result.  We must NOT disable the sidecar for PP1+VP0 — doing so would
+    # prevent PP1 from calling the all-gather, causing an NCCL deadlock.
 
     if bool(getattr(args, "text_only", False)):
         # Text-only models such as qwen3 share this training entrypoint but
@@ -242,25 +246,20 @@ def configure_mdp_model(model, args):
             configure_pp_cp_replicated_vision,
         )
 
-        # For VPP chunk 0, PP1 ranks (pre_process=False) must still call
-        # configure_pp_cp_replicated_vision to participate in the NCCL
-        # new_group() collectives — but they should not own the sidecar.
-        is_sidecar_owner = (not is_vpp) or model_pre_process
         if not configure_pp_cp_replicated_vision(model, args):
             raise RuntimeError(
                 "PP x CP replicated vision was selected but sidecar setup was not activated"
             )
-        if not is_sidecar_owner:
-            # Participate in group creation (done above) but disable sidecar
-            # for non-PP0 VPP chunk 0 ranks.
-            model._pipeline_sidecar_enabled = False
-            model._mdp_enabled = False
-            model._mdp_inner_dp_group = None
-        else:
-            print_rank_0(
-                "> MDP PPxCP multimodal path enabled: "
-                f"PP={pp_size}, CP={cp_size}, "
-                "packed THD input, vision encoder replicated on every pipeline stage."
+        # Do NOT disable _pipeline_sidecar_enabled for PP1+VP0 ranks.
+        # All VP0 ranks (PP0 and PP1) need to call the sidecar's gather to
+        # participate in the NCCL all-gather inside _run_mdp_vision_bridge.
+        # The existing return_zero_dependency_only path in _run_mdp_vision_bridge
+        # handles non-pre_process ranks: they join the collective but discard the
+        # gathered embeddings.
+        print_rank_0(
+            "> MDP PPxCP multimodal path enabled: "
+            f"PP={pp_size}, CP={cp_size}, "
+            "packed THD input, vision encoder replicated on every pipeline stage."
             )
         return model
 
