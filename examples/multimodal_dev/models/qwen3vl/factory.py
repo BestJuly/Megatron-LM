@@ -97,10 +97,8 @@ def build_model(args, language_config, vision_config, **kwargs):
     post_process = kwargs.get("post_process", True)
     vp_stage = kwargs.get("vp_stage", None)
     replicate_vision = pp_cp_replicated_vision_requested(args)
-    if replicate_vision and vp_stage is not None:
-        raise ValueError(
-            "PP x CP replicated vision supports only non-interleaved pipeline stages"
-        )
+    # VPP is now supported: non-sidecar chunks are filtered by pre_process in
+    # mdp_model_setup.configure_mdp_model before this factory is called.
 
     return Qwen35VLModel(
         language_config=language_config,
