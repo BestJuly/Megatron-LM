@@ -477,7 +477,8 @@ class DistributedDataParallel(_BaseDataParallel):
 
             if param in self.param_to_bucket_group:
                 assert param.requires_grad
-                if self.ddp_config.overlap_grad_reduce:
+                bucket_group = self.param_to_bucket_group[param]
+                if bucket_group.ddp_config.overlap_grad_reduce:
                     assert (
                         param.grad is not None
                     ), 'param.grad being None is not safe when overlap_grad_reduce is True'
@@ -487,10 +488,8 @@ class DistributedDataParallel(_BaseDataParallel):
                     param.main_grad.add_(param.grad.data)
                 param.grad = None
 
-                if self.ddp_config.overlap_grad_reduce:
-                    self.param_to_bucket_group[param].register_grad_ready(
-                        param, self.force_all_reduce
-                    )
+                if bucket_group.ddp_config.overlap_grad_reduce:
+                    bucket_group.register_grad_ready(param, self.force_all_reduce)
 
         return hook
 

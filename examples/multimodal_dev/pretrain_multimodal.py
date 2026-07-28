@@ -134,11 +134,15 @@ def _resolve_provider_fn(provider_fn):
     return provider_fn
 
 
-def datasets_provider(train_val_test_num_samples):
+def datasets_provider(train_val_test_num_samples, vp_stage=None):
     """Dataset provider dispatcher.
 
     Routes to the dataset factory registered for the current
     ``(--model-arch, --dataset-provider)`` combination.
+
+    The ``vp_stage`` kwarg is required by Megatron's training loop when VPP
+    is enabled.  Data providers are model-agnostic, so this argument is
+    accepted but not used.
     """
     args = get_args()
     model_arch = getattr(args, "model_arch", "qwen35_vl")
