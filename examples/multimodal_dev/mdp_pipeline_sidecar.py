@@ -123,13 +123,15 @@ def _build_pp_cp_groups(args):
 
 
 def configure_pp_cp_replicated_vision(model, args) -> bool:
-    """Attach PP x CP InnerDP, replica, checkpoint, and schedule metadata."""
+    """Attach PP x CP InnerDP, replica, checkpoint, and schedule metadata.
+
+    For VPP, this is called once per model chunk.  The VPP sidecar detection
+    in mdp_model_setup.configure_mdp_model returns early for non-sidecar
+    chunks (pre_process=False), so this function only runs for the owning
+    chunk.  No VPP restriction is needed here.
+    """
     if not pp_cp_replicated_vision_requested(args):
         return False
-    if getattr(args, "virtual_pipeline_model_parallel_size", None) is not None:
-        raise RuntimeError(
-            "PP x CP replicated vision supports only non-interleaved pipeline schedules"
-        )
     if not bool(getattr(args, "use_packed_sequence", False)):
         raise RuntimeError(
             "PP x CP replicated vision requires packed THD input"
