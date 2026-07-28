@@ -155,7 +155,13 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
     """
     # Handle packed sequences cases
     if packed_seq_params is not None:
-        return _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group)
+        normalized_dim = dims if dims >= 0 else tensor.dim() + dims
+        if normalized_dim == tensor.dim() - 1:
+            return _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group)
+        # Non-last dim: move the target dim to last, roll, then restore.
+        moved = tensor.movedim(normalized_dim, -1)
+        rolled, rolled_sum = _roll_tensor_packed_seq(moved, shifts, -1, packed_seq_params, cp_group)
+        return rolled.movedim(-1, normalized_dim), rolled_sum
 
     # Standard rolling behavior when CP is not enabled (cp_group is None or size=1)
     if cp_group is None or cp_group.size() == 1:
@@ -873,48 +879,152 @@ class MultiTokenPredictionLayer(MegatronModule):
 
     def _get_embeddings(
         self,
-        input_ids: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
         position_ids: torch.Tensor,
         embedding: Callable,
         hidden_states: torch.Tensor,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        decoder_input: Optional[torch.Tensor] = None,
     ):
-        """
-        Preprocesses input data for the Multi-Token Prediction (MTP) layers.
+        """Prepare inputs for an MTP prediction head.
 
-        This function computes the decoder input and sends updated input_ids and position_ids to
-        the next layer.
+        When ``decoder_input`` is provided (e.g. for multimodal models where
+        vision tokens have already been scattered into the embedding), the
+        precomputed tensor is shifted across TP/CP shards instead of
+        re-embedding ``input_ids``.  Otherwise the standard roll-and-embed
+        path is used.
 
         Args:
-            input_ids (torch.Tensor): The input token IDs.
-            position_ids (torch.Tensor): The position IDs corresponding to the input tokens.
-            embedding (Callable): The embedding module
-                from gpt model to compute the decoder input.
-            hidden_states (torch.Tensor): hidden states tensor of shape [s, b, h] where s is the
-                sequence length, b is the batch size, and h is the hidden size.
-            packed_seq_params (PackedSeqParams): Parameters for packed sequence processing.
+            input_ids: Token IDs. Required when ``decoder_input`` is None.
+            position_ids: Position IDs for the embedding lookup.
+            embedding: Embedding callable from the GPT model.
+            hidden_states: Hidden states ``[s, b, h]`` from the main trunk.
+            packed_seq_params: THD packing metadata for CP-aware rolling.
+            decoder_input: Pre-computed embedding tensor to shift instead of
+                re-embedding ``input_ids``.
         """
-        # Calc logits for the current Multi-Token Prediction (MTP) layers.
-        input_ids, _ = roll_tensor(
-            input_ids,
-            shifts=-1,
-            dims=-1,
-            cp_group=self.cp_group,
-            packed_seq_params=packed_seq_params,
-        )
-        position_ids, _ = roll_tensor(
-            position_ids,
-            shifts=-1,
-            dims=-1,
-            cp_group=self.cp_group,
-            packed_seq_params=packed_seq_params,
-        )
-        # embedding
-        decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
+        if decoder_input is None:
+            if input_ids is None:
+                raise RuntimeError(
+                    "MTP _get_embeddings requires input_ids when decoder_input is not provided."
+                )
+            input_ids, _ = roll_tensor(
+                input_ids,
+                shifts=-1,
+                dims=-1,
+                cp_group=self.cp_group,
+                packed_seq_params=packed_seq_params,
+            )
+            position_ids, _ = roll_tensor(
+                position_ids,
+                shifts=-1,
+                dims=-1,
+                cp_group=self.cp_group,
+                packed_seq_params=packed_seq_params,
+            )
+            decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
+        else:
+            decoder_input = self._roll_precomputed_decoder_input(
+                decoder_input=decoder_input,
+                packed_seq_params=packed_seq_params,
+            )
 
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
-
         return input_ids, position_ids, decoder_input, hidden_states
+
+    def _roll_precomputed_decoder_input(
+        self,
+        decoder_input: Tensor,
+        packed_seq_params: Optional[PackedSeqParams],
+    ) -> Tensor:
+        """Shift a pre-computed embedding tensor by one position across TP/CP shards.
+
+        Used by multimodal models that scatter vision tokens into the embedding
+        before calling MTP, so MTP receives the correct next-token targets.
+        """
+        from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
+
+        tp_size = self.tp_group.size() if self.tp_group is not None else 1
+        if self.sequence_parallel and tp_size > 1:
+            decoder_input = gather_from_sequence_parallel_region(
+                decoder_input,
+                tensor_parallel_output_grad=False,
+                group=self.tp_group,
+            )
+
+        cp_size = self.cp_group.size() if self.cp_group is not None else 1
+        if cp_size == 1:
+            decoder_input, _ = roll_tensor(
+                decoder_input,
+                shifts=-1,
+                dims=0,
+                cp_group=None,
+                packed_seq_params=packed_seq_params,
+            )
+        else:
+            if (
+                packed_seq_params is not None
+                and getattr(packed_seq_params, "local_cp_size", None) is not None
+            ):
+                raise RuntimeError(
+                    "MTP precomputed decoder_input does not support dynamic context parallelism."
+                )
+            cp_rank = torch.distributed.get_rank(group=self.cp_group)
+            gathered = gather_from_sequence_parallel_region(
+                decoder_input.contiguous(),
+                tensor_parallel_output_grad=True,
+                group=self.cp_group,
+            )
+            local_length = int(decoder_input.shape[0])
+            ranked = gathered.view(cp_size, local_length, *decoder_input.shape[1:])
+
+            if packed_seq_params is None:
+                global_input = self._restore_cp_sequence(ranked, cp_size=cp_size)
+                global_input, _ = roll_tensor(global_input, shifts=-1, dims=0, cp_group=None)
+                decoder_input = self._select_cp_sequence(
+                    global_input, cp_size=cp_size, cp_rank=cp_rank
+                )
+            else:
+                cu = packed_seq_params.cu_seqlens_q_padded or packed_seq_params.cu_seqlens_q
+                if cu is None:
+                    raise RuntimeError(
+                        "Packed MTP decoder_input rolling requires cu_seqlens_q."
+                    )
+                boundaries = [int(v) for v in cu.tolist()]
+                global_length = local_length * cp_size
+                if boundaries[-1] < global_length:
+                    boundaries.append(global_length)
+
+                global_seqs = []
+                for start, end in zip(boundaries[:-1], boundaries[1:]):
+                    global_seqs.append(
+                        self._restore_cp_sequence(
+                            ranked[:, start // cp_size : end // cp_size],
+                            cp_size=cp_size,
+                        )
+                    )
+                global_input = torch.cat(global_seqs, dim=0)
+                global_input, _ = roll_tensor(
+                    global_input,
+                    shifts=-1,
+                    dims=0,
+                    cp_group=None,
+                    packed_seq_params=packed_seq_params,
+                )
+                local_seqs = []
+                for start, end in zip(boundaries[:-1], boundaries[1:]):
+                    local_seqs.append(
+                        self._select_cp_sequence(
+                            global_input[start:end], cp_size=cp_size, cp_rank=cp_rank
+                        )
+                    )
+                decoder_input = torch.cat(local_seqs, dim=0)
+
+        if self.sequence_parallel and tp_size > 1:
+            decoder_input = scatter_to_sequence_parallel_region(
+                decoder_input, group=self.tp_group
+            )
+        return decoder_input
 
     def _concat_embeddings(self, hidden_states: torch.Tensor, decoder_input: torch.Tensor):
         """

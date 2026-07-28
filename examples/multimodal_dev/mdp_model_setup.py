@@ -13,43 +13,29 @@ def _set_model_attrs(model, **attrs) -> None:
         setattr(model, name, value)
 
 
-def _disable_unsafe_packed_vision_overlap(args, vision_model, *, mdp_enabled: bool) -> None:
-    """Disable DDP overlap before the model is wrapped by DDP.
+def _mark_vision_params_no_overlap(args, vision_model) -> None:
+    """Tag trainable vision parameters to use synchronous DDP buckets.
 
-    Loader-side image ownership can leave a CP rank with no local vision
-    work. Async DDP hooks cannot safely assume identical vision-module use
-    across those ranks, so the canonical b436 path disables both overlap
-    modes while ``model_provider`` still owns the mutable argument object.
+    CP rank image ownership varies across microbatches, so async grad-reduce
+    hooks on vision parameters are not safe.  Marking them with
+    ``disable_ddp_overlap=True`` places them in a separate synchronous bucket
+    while the decoder keeps full DDP overlap.
     """
-    trainable_vision_params = (
-        any(param.requires_grad for param in vision_model.parameters())
-        if vision_model is not None
-        else not bool(getattr(args, "freeze_ViT", False))
+    if vision_model is None or bool(getattr(args, "text_only", False)):
+        return
+    overlap_requested = bool(getattr(args, "overlap_grad_reduce", False)) or bool(
+        getattr(args, "overlap_param_gather", False)
     )
-    if not (
-        trainable_vision_params
-        and not bool(getattr(args, "text_only", False))
-        and (mdp_enabled or bool(getattr(args, "use_packed_sequence", False)))
-    ):
+    if not overlap_requested:
         return
-
-    disabled = []
-    for name, flag in (
-        ("overlap_grad_reduce", "--overlap-grad-reduce"),
-        ("overlap_param_gather", "--overlap-param-gather"),
-        ("overlap_param_gather_with_optimizer_step", "--overlap-param-gather-with-optimizer-step"),
-    ):
-        if bool(getattr(args, name, False)):
-            setattr(args, name, False)
-            disabled.append(flag)
-    if not disabled:
+    trainable = [p for p in vision_model.parameters() if p.requires_grad]
+    if not trainable:
         return
-
+    for param in trainable:
+        param.disable_ddp_overlap = True
     print_rank_0(
-        "> Multimodal MDP: disabled "
-        + ", ".join(disabled)
-        + " before DDP setup because CP owner ranks can execute different "
-        "vision-module graphs."
+        "> Multimodal MDP: vision parameters placed in synchronous DDP buckets; "
+        "decoder grad/param overlap remains enabled."
     )
 
 
@@ -74,7 +60,13 @@ def _validate_mdp_off_pp_batch_sidecar(args, *, mdp_enabled: bool) -> None:
 
 
 def configure_mdp_model(model, args):
-    """Attach the b436 MDP process-group contract to ``model``."""
+    """Attach the MDP process-group contract to ``model``.
+
+    For VPP (virtual pipeline parallelism), only the chunk that owns
+    ``pre_process=True`` (vp_stage 0 on PP0) acts as the sidecar.  All
+    other VPP chunks receive a no-sidecar configuration so the encoder
+    fires exactly once per optimization step.
+    """
     if getattr(args, "model_arch", None) == "qwen3":
         args.text_only = True
     mdp_enabled = bool(getattr(args, "mdp_encoder_mode", True))
@@ -83,6 +75,33 @@ def configure_mdp_model(model, args):
     inner_dp_scope = getattr(args, "mdp_inner_dp_scope", "cp")
     dataset_provider = getattr(args, "dataset_provider", "energon")
     vision_model = getattr(model, "vision_model", None)
+
+    # VPP: non-sidecar chunks have no encoder work; disable the sidecar path
+    # for them so the encoding only runs once (on vp_stage 0).
+    virtual_size = getattr(args, "virtual_pipeline_model_parallel_size", None)
+    vp_stage = getattr(model, "vp_stage", None)
+    is_vpp_non_sidecar_chunk = (
+        mdp_enabled
+        and pp_size > 1
+        and inner_dp_scope == "pp_cp"
+        and virtual_size is not None
+        and vp_stage not in (None, 0)
+    )
+    if is_vpp_non_sidecar_chunk:
+        _set_model_attrs(
+            model,
+            _mdp_enabled=False,
+            _mdp_inner_dp_group=None,
+            _mdp_tp_source_group=None,
+            _mdp_tp_source_group_device=None,
+            _mdp_pp_cp_inner=False,
+            _mdp_cp_fused_sidecar=False,
+            _pp_cp_batch_sidecar=False,
+            _pipeline_sidecar_enabled=False,
+            _mdp_rank_assignment=None,
+            _mdp_rank_assignment_row_counts=None,
+        )
+        return model
 
     if bool(getattr(args, "text_only", False)):
         # Text-only models such as qwen3 share this training entrypoint but
@@ -182,7 +201,7 @@ def configure_mdp_model(model, args):
 
     _validate_mdp_off_pp_batch_sidecar(args, mdp_enabled=mdp_enabled)
 
-    _disable_unsafe_packed_vision_overlap(args, vision_model, mdp_enabled=mdp_enabled)
+    _mark_vision_params_no_overlap(args, vision_model)
 
     if not mdp_enabled:
         pp_batch_sidecar = (
