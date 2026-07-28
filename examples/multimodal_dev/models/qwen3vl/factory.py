@@ -96,9 +96,8 @@ def build_model(args, language_config, vision_config, **kwargs):
     pre_process = kwargs.get("pre_process", True)
     post_process = kwargs.get("post_process", True)
     vp_stage = kwargs.get("vp_stage", None)
-    replicate_vision = pp_cp_replicated_vision_requested(args)
-    # VPP is now supported: non-sidecar chunks are filtered by pre_process in
-    # mdp_model_setup.configure_mdp_model before this factory is called.
+    is_vp_first = vp_stage is None or int(vp_stage) == 0
+    replicate_vision = is_vp_first and pp_cp_replicated_vision_requested(args)
 
     return Qwen35VLModel(
         language_config=language_config,
