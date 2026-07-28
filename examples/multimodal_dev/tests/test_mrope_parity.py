@@ -667,10 +667,10 @@ def test_vision_rope_wrapper_forwards_max_seqlen_to_thd(monkeypatch):
     config = SimpleNamespace(
         rotary_interleaved=False,
         multi_latent_attention=False,
-        # apply_rotary_pos_emb now probes these on the common path
-        # (_is_raw_mrope_freqs_thd and the fused-kernel dispatch), so the
-        # stub must honour the TransformerConfig contract, where both
-        # default to None / False.
+        # Materialized (non-raw) mRoPE freqs with fusion off: keeps this test
+        # on the unfused legacy THD path. rope_utils reads both attributes
+        # directly to choose the raw-mRoPE / fused paths, so the stub must
+        # carry them just as a real TransformerConfig does.
         mrope_section=None,
         apply_rope_fusion=False,
     )
