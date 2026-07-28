@@ -645,6 +645,10 @@ class GPTModel(LanguageModule):
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
                 embedding=self.embedding,
+                # Pass the already-built decoder_input (with vision tokens
+                # scattered in for VLMs) so MTP does not re-embed input_ids
+                # and incorrectly use text embeddings for image placeholders.
+                decoder_input=decoder_input,
                 **(extra_block_kwargs or {}),
             )
 

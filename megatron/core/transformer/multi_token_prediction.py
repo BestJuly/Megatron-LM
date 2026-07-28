@@ -1219,7 +1219,7 @@ class MultiTokenPredictionLayer(MegatronModule):
 
     def forward(
         self,
-        input_ids: Tensor,
+        input_ids: Optional[Tensor],
         position_ids: Tensor,
         hidden_states: Tensor,
         attention_mask: Tensor,
@@ -1233,28 +1233,21 @@ class MultiTokenPredictionLayer(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         embedding=None,
+        decoder_input: Optional[Tensor] = None,
     ):
-        """
-        Execute the forward pass through the Multi-Token Prediction (MTP) layer.
+        """Execute the forward pass through one Multi-Token Prediction layer.
 
         Args:
-            input_ids (Tensor): Input token IDs .
-            position_ids (Tensor): Positional IDs of the input tokens.
-            hidden_states (Tensor): Hidden states tensor of shape [s, b, h] where s is the
-                sequence length, b is the batch size, and h is the hidden size.
-            attention_mask (Tensor): Boolean tensor of shape [1, 1, s, s] for masking
-                self-attention.
-            context (Tensor, optional): Context tensor for cross-attention, if applicable.
-            context_mask (Tensor, optional): Mask for cross-attention context, if applicable.
-            rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
-            rotary_pos_cos (Tensor, optional): Cosine component of rotary positional embeddings.
-            rotary_pos_sin (Tensor, optional): Sine component of rotary positional embeddings.
-            sequence_len_offset (Tensor, optional): Offset for sequence length, if applicable.
-            embedding (Callable): The embedding module from gpt model to compute the decoder input.
-
-        Returns:
-            Union[Tensor, Tuple[Tensor, Tensor]]: The output hidden states tensor of shape
-            [s, b, h], and optionally the updated context tensor if cross-attention is used.
+            input_ids: Input token IDs. May be None when ``decoder_input`` is
+                provided (e.g. for VLMs where vision tokens are already embedded).
+            position_ids: Positional IDs of the input tokens.
+            hidden_states: ``[s, b, h]`` hidden states from the main decoder.
+            attention_mask: Self-attention mask ``[1, 1, s, s]``.
+            embedding: GPT embedding callable. Required when ``decoder_input``
+                is None.
+            decoder_input: Pre-built embeddings (with vision tokens scattered in).
+                When provided, the embedding lookup for MTP is skipped and this
+                tensor is shifted by one position instead.
         """
         assert context is None, "multi token prediction + cross attention is not yet supported."
         _orig_cp_group = self.cp_group
@@ -1266,6 +1259,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             embedding=embedding,
             hidden_states=hidden_states,
             packed_seq_params=packed_seq_params,
+            decoder_input=decoder_input,
         )
 
         if self.config.recompute_granularity == 'full' and self.training:
@@ -1529,7 +1523,7 @@ class MultiTokenPredictionBlock(MegatronModule):
 
     def forward(
         self,
-        input_ids: Tensor,
+        input_ids: Optional[Tensor],
         position_ids: Tensor,
         hidden_states: Tensor,
         attention_mask: Tensor,
@@ -1544,18 +1538,18 @@ class MultiTokenPredictionBlock(MegatronModule):
         sequence_len_offset: Optional[Tensor] = None,
         extra_block_kwargs: Optional[dict] = None,
         embedding=None,
+        decoder_input: Optional[Tensor] = None,
     ) -> Tensor:
-        """
-        Perform the forward pass through all of the MTP modules.
+        """Perform the forward pass through all MTP prediction layers.
 
         Args:
-            hidden_states (Tensor): Hidden states for input token with the shape [s, b, h]
-                where s is the sequence length, b is the batch size, and h is the hidden size.
-            attention_mask (Tensor): Boolean tensor of shape [1, 1, s, s] for masking
-                self-attention.
-
-        Returns:
-            (Tensor): The mtp loss tensor of shape [b, s].
+            input_ids: Input token IDs ``[b, s]`` or ``[1, T]`` in THD mode.
+                May be None when ``decoder_input`` is supplied.
+            hidden_states: ``[s, b, h]`` hidden states from the main decoder.
+            embedding: GPT embedding callable. Required when decoder_input is None.
+            decoder_input: Pre-built embeddings (vision tokens already scattered).
+                Passed through to each MTP layer so image placeholder tokens are
+                not re-embedded with text representations.
         """
         # get hidden states from previous mtp stages
         offset = get_mtp_layer_offset(self.config, self.vp_stage)
@@ -1575,8 +1569,12 @@ class MultiTokenPredictionBlock(MegatronModule):
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
                 embedding=embedding,
+                decoder_input=decoder_input,
                 **(extra_block_kwargs or {}),
             )
+            # After the first MTP layer has consumed decoder_input, subsequent
+            # layers use the rolled input_ids it returned.
+            decoder_input = None
 
             # append the output hidden states of the current mtp layer
             # to the hidden_states_list

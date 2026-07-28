@@ -76,16 +76,19 @@ def configure_mdp_model(model, args):
     dataset_provider = getattr(args, "dataset_provider", "energon")
     vision_model = getattr(model, "vision_model", None)
 
-    # VPP: non-sidecar chunks have no encoder work; disable the sidecar path
-    # for them so the encoding only runs once (on vp_stage 0).
+    # VPP: only the chunk with pre_process=True owns the sidecar.  Non-sidecar
+    # chunks must have _pipeline_sidecar_enabled=False so the interleaved
+    # schedule does not fire the encoder twice per step.
+    # Note: model.vp_stage is set by training.py AFTER model_provider returns,
+    # so we cannot use it here.  model.pre_process is set during construction.
     virtual_size = getattr(args, "virtual_pipeline_model_parallel_size", None)
-    vp_stage = getattr(model, "vp_stage", None)
+    model_pre_process = getattr(model, "pre_process", True)
     is_vpp_non_sidecar_chunk = (
         mdp_enabled
         and pp_size > 1
         and inner_dp_scope == "pp_cp"
         and virtual_size is not None
-        and vp_stage not in (None, 0)
+        and not model_pre_process
     )
     if is_vpp_non_sidecar_chunk:
         _set_model_attrs(
