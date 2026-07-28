@@ -454,11 +454,17 @@ class DistributedDataParallel(_BaseDataParallel):
                 # by start_param_sync calls in core/pipeline_parallelism/schedules.py.
                 # If overlapping param all-gather with optimizer step, then all-gather has
                 # already been dispatched in optimizer step.
+                bucket_group = self.param_to_bucket_group[param]
+                if not bucket_group.ddp_config.overlap_param_gather:
+                    # No-overlap params (e.g. vision encoder) use synchronous
+                    # param sync; their all-gather is not launched from the
+                    # optimizer step, so there is nothing to finish here.
+                    continue
                 skip_next_bucket_dispatch = (
                     self.ddp_config.align_param_gather
                     or self.overlap_param_gather_with_optimizer_step
                 )
-                self.param_to_bucket_group[param].finish_param_sync(
+                bucket_group.finish_param_sync(
                     skip_next_bucket_dispatch=skip_next_bucket_dispatch
                 )
 
