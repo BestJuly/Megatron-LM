@@ -500,25 +500,39 @@ class MultimodalModel(MegatronModule):
             not self.pre_process
             and bool(getattr(self, "_mdp_pp_cp_inner", False))
         )
+        global_row_counts = getattr(
+            self, "_mdp_rank_assignment_row_counts", None
+        )
         if is_pp_cp_non_sidecar:
-            # Non-sidecar PP rank: encode locally for gradient flow but do NOT
-            # enter the all-gather collective.  Calling gather_to_inner_dp_zero
-            # with return_zero_dependency_only=True triggers a reduce-scatter in
-            # the backward that is NOT synchronized with the sidecar PP0 rank in
-            # VPP interleaved schedules (they are at different microbatch indices
-            # when the post-backward hook fires).  Instead, produce a zero
-            # dependency directly from the trainable vision params without any
-            # collective; vision param gradients flow via param.shared=True +
-            # finalize_model_grads after the full backward completes.
+            # Non-sidecar PP rank (PP1+VP0 in VPP mode): must participate in
+            # the NCCL all-gather (forward collective) but must NOT trigger the
+            # backward reduce-scatter during the VPP interleaved pipeline
+            # schedule.  The reduce-scatter fires via autograd at different
+            # microbatch indices for PP0 vs PP1, causing an NCCL collective
+            # ordering mismatch.
+            #
+            # Fix: call the all-gather inside torch.no_grad() so the NCCL
+            # collective participates (satisfying the NCCL invariant) but no
+            # autograd node is created.  Then return a zero dependency directly
+            # from trainable vision params so gradients flow via param.shared=True
+            # + finalize_model_grads after the full backward completes.
+            with torch.no_grad():
+                _ = gather_to_inner_dp_zero(
+                    local_embeddings=local_embeddings.detach()
+                    if local_embeddings.requires_grad
+                    else local_embeddings,
+                    rank_assignment=rank_assignment,
+                    encoder_dp_group=gather_group,
+                    global_per_image_row_counts=global_row_counts,
+                    local_zero_dep=None,
+                    return_zero_dependency_only=False,
+                )
             if has_local_imgs:
                 return _zero_dep_on_tensor(local_embeddings)
             if zero_dep is not None:
                 return zero_dep
             return _zero_dep_on_trainable_params(self.vision_model)
 
-        global_row_counts = getattr(
-            self, "_mdp_rank_assignment_row_counts", None
-        )
         vision_embeddings = gather_to_inner_dp_zero(
             local_embeddings=local_embeddings,
             rank_assignment=rank_assignment,
