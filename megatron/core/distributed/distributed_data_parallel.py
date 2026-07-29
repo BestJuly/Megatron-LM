@@ -122,6 +122,10 @@ class DistributedDataParallel(_BaseDataParallel):
             param_to_name[param] = name
 
             if getattr(param, 'allreduce', True) and getattr(param, 'disable_ddp_overlap', False):
+                # Synchronous bucket for vision params whose CP rank image
+                # ownership varies across microbatches (e.g. MDP sidecar).
+                # Expert-parallel params (allreduce=False) do not support
+                # disable_ddp_overlap — they fall through to expert_parallel_params.
                 dense_params_no_overlap.append((param, name))
             elif getattr(param, 'allreduce', True):
                 dense_params.append((param, name))
@@ -334,7 +338,6 @@ class DistributedDataParallel(_BaseDataParallel):
                 self.intra_dp_cp_group,
                 gradient_scaling_factor=gradient_scaling_factor,
                 buffer_ddp_config=no_overlap_config,
-                buffer_bucket_size=None,
             )
             self.no_overlap_bucket_groups = no_overlap_bucket_groups
 
@@ -503,6 +506,11 @@ class DistributedDataParallel(_BaseDataParallel):
     def no_sync(self):
         """
         Context manager that turns off gradient synchronization.
+
+        ``no_overlap_bucket_groups`` (vision params with ``disable_ddp_overlap=True``)
+        are intentionally excluded: their ``overlap_grad_reduce=False`` config means
+        ``is_last_microbatch`` has no effect on when they sync — they are flushed
+        explicitly by ``start_grad_sync`` after all microbatches complete.
         """
         for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.is_last_microbatch = False

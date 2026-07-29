@@ -202,7 +202,14 @@ def test_non_consuming_stage_runs_zero_gradient_sidecar_backward():
     torch.testing.assert_close(leaf.grad, torch.zeros_like(leaf))
 
 
-def test_non_consuming_frozen_vision_requests_zero_dependency_gather(monkeypatch):
+def test_non_pp0_gather_rank_skips_collective(monkeypatch):
+    """PP1 (non-sidecar) with frozen vision must NOT call gather_to_inner_dp_zero.
+
+    The encoder-CP design restricts the gather group to PP0 CP ranks only.
+    PP1 is not in that group.  _run_mdp_vision_bridge must return a zero-dep
+    scalar from the local encoder output without invoking any NCCL collective.
+    """
+
     class FrozenVision(torch.nn.Linear):
         def forward(self, pixel_values, image_grid_thw):
             del image_grid_thw
@@ -212,19 +219,19 @@ def test_non_consuming_frozen_vision_requests_zero_dependency_gather(monkeypatch
     torch.nn.Module.__init__(model)
     model.pre_process = False
     model._mdp_pp_cp_inner = True
+    model._mdp_is_pp0_gather_rank = False  # PP1 — not in the gather group
     model.vision_model = FrozenVision(3, 2, bias=False)
     model.vision_model.requires_grad_(False)
     model.language_model = torch.nn.Linear(2, 2, bias=False)
     model._mdp_rank_assignment = {0: [(0, 0)]}
     model._mdp_rank_assignment_row_counts = [1]
-    observed = {}
+
+    gather_called = []
 
     def gather(**kwargs):
-        observed.update(kwargs)
-        assert kwargs["local_embeddings"].requires_grad is True
+        gather_called.append(True)
         return kwargs["local_embeddings"].reshape(-1)[:1].sum() * 0.0
 
-    monkeypatch.setattr(base, "get_mdp_images_to_language_group", lambda _model: object())
     monkeypatch.setattr(base, "gather_to_inner_dp_zero", gather)
 
     result = model._run_mdp_vision_bridge(
@@ -232,8 +239,9 @@ def test_non_consuming_frozen_vision_requests_zero_dependency_gather(monkeypatch
         image_grid_thw=torch.tensor([[1, 1, 1]]),
     )
 
-    assert result.ndim == 0
-    assert observed["return_zero_dependency_only"] is True
+    # PP1 with frozen (no-grad) vision returns None — no backward dep needed.
+    assert result is None, f"expected None for frozen PP1, got {result}"
+    assert not gather_called, "gather_to_inner_dp_zero must NOT be called for PP1"
 
 
 def test_forward_only_sidecar_does_not_leave_backward_dependency():

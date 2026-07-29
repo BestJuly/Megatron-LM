@@ -117,15 +117,14 @@ def _build_pp_cp_groups(args):
         order=order,
     )
 
-    # enc_gather_groups contains only PP0 ranks; all ranks must call new_group()
-    # for collective consistency even if not in the group.
-    import torch as _torch
+    # enc_gather_groups contains only PP0 ranks; ALL ranks must call new_group()
+    # for collective consistency even if not included in the group.
     enc_gather_group = None
-    for _grp in enc_gather_groups:
-        _ranks = [int(r) for r in _grp]
-        _pg = _torch.distributed.new_group(ranks=_ranks)
-        if rank in _ranks:
-            enc_gather_group = _pg
+    for grp in enc_gather_groups:
+        ranks = [int(r) for r in grp]
+        pg = torch.distributed.new_group(ranks=ranks)
+        if rank in ranks:
+            enc_gather_group = pg
 
     pp_vision_sync_group, _, _ = build_local_process_group(
         rank_groups=pp_sync_groups, this_rank=rank
@@ -146,31 +145,18 @@ def _build_pp_cp_groups(args):
 
 
 def configure_pp_cp_replicated_vision(model, args) -> bool:
-    """Attach PP x CP InnerDP, replica, checkpoint, and schedule metadata.
+    """Attach encoder-CP gather group and PP vision sync group to ``model``.
 
-    For VPP, this is called once per model chunk.  The VPP sidecar detection
-    in mdp_model_setup.configure_mdp_model returns early for non-sidecar
-    chunks (pre_process=False), so this function only runs for the owning
-    chunk.  No VPP restriction is needed here.
+    Called for every VP0 chunk (both PP0 and PP1) so that new_group() collectives
+    run on all ranks.  PP0 uses enc_gather_group for the embedding all-gather;
+    PP1 records _mdp_inner_dp_group=None and returns a zero-dep scalar from
+    _run_mdp_vision_bridge instead of calling the collective.
+
+    For VPP, higher virtual-stage chunks (vp_stage>0) are skipped by
+    configure_mdp_model before this function is ever called.
     """
     if not pp_cp_replicated_vision_requested(args):
         return False
-    if not bool(getattr(args, "use_packed_sequence", False)):
-        raise RuntimeError(
-            "PP x CP replicated vision requires packed THD input"
-        )
-    if bool(getattr(args, "use_megatron_fsdp", False)) or bool(
-        getattr(args, "use_torch_fsdp2", False)
-    ):
-        raise RuntimeError("PP x CP replicated vision does not support FSDP")
-    if not torch.distributed.is_initialized():
-        raise RuntimeError(
-            "PP x CP replicated vision setup requires torch.distributed"
-        )
-    if getattr(model, "vision_model", None) is None:
-        raise RuntimeError(
-            "PP x CP replicated vision requires vision_model on every pipeline stage"
-        )
 
     enc_gather_group, pp_vision_sync_group, tp_source_group = _build_pp_cp_groups(args)
     pp_group = ps.get_pipeline_model_parallel_group()
@@ -180,8 +166,7 @@ def configure_pp_cp_replicated_vision(model, args) -> bool:
 
     attrs = {
         "_mdp_enabled": True,
-        # PP0 participates in the encoder CP gather; PP1+ run the encoder
-        # locally for gradient flow but do not join the all-gather collective.
+        # PP0 owns the encoder CP gather; PP1 records None and skips the collective.
         "_mdp_inner_dp_group": enc_gather_group if pp_rank == 0 else None,
         "_mdp_pp_vision_sync_group": pp_vision_sync_group,
         "_mdp_is_pp0_gather_rank": pp_rank == 0,

@@ -76,20 +76,17 @@ def configure_mdp_model(model, args):
     dataset_provider = getattr(args, "dataset_provider", "energon")
     vision_model = getattr(model, "vision_model", None)
 
-    # VPP: only the chunk with pre_process=True owns the sidecar.  Non-sidecar
-    # chunks must have _pipeline_sidecar_enabled=False.
+    # VPP sidecar ownership: only the first virtual stage (vp_stage=0) runs the
+    # vision encoder sidecar.  Higher stages are pure-decoder and must not
+    # participate in the group-creation or encoder-gather collectives.
     #
-    # COLLECTIVE INVARIANT: torch.distributed.new_group() is a collective —
-    # every rank in the global world must call it for the same set of group
-    # lists in the same order, at the same time.  With VPP, model_provider is
-    # called once per VPP chunk for EVERY rank.  For the first VPP chunk
-    # (vp_stage=0), all ranks (both PP0 and PP1) must participate in group
-    # creation even though PP1 does not own the sidecar.  For higher VPP chunks
-    # (vp_stage>0), NO ranks need to create groups.
+    # torch.distributed.new_group() is a global collective — every rank must
+    # call it for the same groups in the same order.  For vp_stage=0, all ranks
+    # (PP0 and PP1) must call configure_pp_cp_replicated_vision so that the
+    # enc_gather_group and pp_vision_sync_group are built consistently.
     #
-    # vp_stage is passed to the model factory as a kwarg and stored on
-    # model.language_model.vp_stage at construction time (before training.py
-    # sets model.vp_stage after model_provider returns).
+    # vp_stage is stored on model.language_model.vp_stage at construction time
+    # (training.py sets model.vp_stage only AFTER model_provider returns).
     virtual_size = getattr(args, "virtual_pipeline_model_parallel_size", None)
     model_pre_process = getattr(model, "pre_process", True)
     vp_stage_from_model = getattr(
@@ -114,13 +111,11 @@ def configure_mdp_model(model, args):
             _mdp_rank_assignment_row_counts=None,
         )
         return model
-    # For VP0 chunks, ALL PP ranks (PP0 and PP1) must call configure_pp_cp_replicated_vision
-    # to participate in the group-creation collectives AND to participate in the
-    # all-gather inside _run_mdp_vision_bridge.  The existing code already handles
-    # PP1 correctly: _run_mdp_vision_bridge sets return_zero_dependency_only=True
-    # when pre_process=False, so PP1 participates in the all-gather but discards
-    # the result.  We must NOT disable the sidecar for PP1+VP0 — doing so would
-    # prevent PP1 from calling the all-gather, causing an NCCL deadlock.
+    # For vp_stage=0 all PP ranks call configure_pp_cp_replicated_vision so the
+    # group-creation collectives fire on every rank.  PP1 is not in enc_gather_group
+    # (_mdp_inner_dp_group=None for PP1), so _run_mdp_vision_bridge returns a
+    # zero-dep scalar without calling the all-gather.  PP1 vision params receive
+    # gradients via param.shared=True + finalize_model_grads after backward.
 
     if bool(getattr(args, "text_only", False)):
         # Text-only models such as qwen3 share this training entrypoint but
