@@ -496,6 +496,26 @@ class MultimodalModel(MegatronModule):
             else:
                 zero_dep = _zero_dep_on_trainable_params(self.vision_model)
 
+        is_pp_cp_non_sidecar = (
+            not self.pre_process
+            and bool(getattr(self, "_mdp_pp_cp_inner", False))
+        )
+        if is_pp_cp_non_sidecar:
+            # Non-sidecar PP rank: encode locally for gradient flow but do NOT
+            # enter the all-gather collective.  Calling gather_to_inner_dp_zero
+            # with return_zero_dependency_only=True triggers a reduce-scatter in
+            # the backward that is NOT synchronized with the sidecar PP0 rank in
+            # VPP interleaved schedules (they are at different microbatch indices
+            # when the post-backward hook fires).  Instead, produce a zero
+            # dependency directly from the trainable vision params without any
+            # collective; vision param gradients flow via param.shared=True +
+            # finalize_model_grads after the full backward completes.
+            if has_local_imgs:
+                return _zero_dep_on_tensor(local_embeddings)
+            if zero_dep is not None:
+                return zero_dep
+            return _zero_dep_on_trainable_params(self.vision_model)
+
         global_row_counts = getattr(
             self, "_mdp_rank_assignment_row_counts", None
         )
@@ -505,15 +525,8 @@ class MultimodalModel(MegatronModule):
             encoder_dp_group=gather_group,
             global_per_image_row_counts=global_row_counts,
             local_zero_dep=zero_dep if not has_local_imgs else None,
-            return_zero_dependency_only=(
-                not self.pre_process
-                and bool(getattr(self, "_mdp_pp_cp_inner", False))
-            ),
+            return_zero_dependency_only=False,
         )
-        if not self.pre_process and bool(
-            getattr(self, "_mdp_pp_cp_inner", False)
-        ):
-            return vision_embeddings
         if global_row_counts is not None:
             local_per_image_row_counts = None
         elif image_grid_thw is not None and image_grid_thw.numel() > 0:
