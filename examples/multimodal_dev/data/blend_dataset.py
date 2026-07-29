@@ -1006,9 +1006,19 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         and dataloader_sequence_packing
         and inner_scope == "pp_cp"
     ):
-        prepartition_rank = _pp_cp_prepartition_rank(args, pp_size, cp_size)
-        prepartition_world = int(pp_size) * int(cp_size)
-        prepartition_encoder_stage = True
+        enc_cp_size = int(
+            getattr(args, "encoder_context_parallel_size", None) or cp_size
+        )
+        if enc_cp_size < int(pp_size) * int(cp_size):
+            # PP0-only gather: only PP0 CP ranks encode; assign images to them only.
+            prepartition_rank = int(cp_rank)
+            prepartition_world = int(enc_cp_size)
+            prepartition_encoder_stage = (pp_rank == 0 or pp_size == 1)
+        else:
+            # Original PP×CP: all PP stages encode.
+            prepartition_rank = _pp_cp_prepartition_rank(args, pp_size, cp_size)
+            prepartition_world = int(pp_size) * int(cp_size)
+            prepartition_encoder_stage = True
 
     kwargs = dict(
         backend=backend,
