@@ -509,14 +509,6 @@ class MultimodalModel(MegatronModule):
         global_row_counts = getattr(
             self, "_mdp_rank_assignment_row_counts", None
         )
-        if not is_pp_cp_non_sidecar and is_pp0_gather_rank and zero_dep is None:
-            pass  # zero_dep already set or not needed
-            return _zero_dep_on_trainable_params(self.vision_model)
-
-        if gather_group is None:
-            raise RuntimeError(
-                "MDP PP0 gather rank requires _mdp_inner_dp_group to be set."
-            )
 
         vision_embeddings = gather_to_inner_dp_zero(
             local_embeddings=local_embeddings,
