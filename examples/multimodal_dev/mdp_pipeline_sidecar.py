@@ -48,6 +48,14 @@ def broadcast_vision_state(model, group, group_name: str = "PP") -> None:
         )
     source = int(torch.distributed.get_process_group_ranks(group)[0])
 
+    # Warm up NCCL topology discovery with a scalar all-reduce before
+    # broadcasting large tensors.  Without this, the first broadcast on a
+    # cold GPU (no prior NCCL collective in the group) triggers rendezvous
+    # which can take O(minutes) on multi-node setups.
+    device = torch.device("cuda", torch.cuda.current_device())
+    warmup = torch.zeros(1, device=device)
+    torch.distributed.all_reduce(warmup, group=group)
+
     def broadcast_tensor(tensor):
         if tensor.is_cuda:
             torch.distributed.broadcast(tensor, src=source, group=group)
@@ -56,10 +64,7 @@ def broadcast_vision_state(model, group, group_name: str = "PP") -> None:
             raise RuntimeError(
                 f"replicated vision {group_name} broadcast requires CUDA for CPU staging"
             )
-        staged = tensor.to(
-            device=torch.device("cuda", torch.cuda.current_device()),
-            non_blocking=False,
-        )
+        staged = tensor.to(device=device, non_blocking=False)
         torch.distributed.broadcast(staged, src=source, group=group)
         tensor.copy_(staged.cpu())
 
