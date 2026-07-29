@@ -414,7 +414,8 @@ class MultimodalModel(MegatronModule):
             return
         queue = getattr(self, '_mdp_pp_cp_sidecar_backward_cache', None)
         if not queue:
-            if self.pre_process:
+            # PP0 with no images, or PP1 with frozen encoder (no zero-dep tensor produced).
+            if self.pre_process or bool(getattr(self, "_mdp_pp_cp_inner", False)):
                 return
             raise RuntimeError("PP x CP vision sidecar backward cache is empty")
         dependency = queue.popleft()
