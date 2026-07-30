@@ -124,15 +124,24 @@ def _build_pp_cp_groups(args):
 
     # enc_gather_groups contains only PP0 ranks; ALL ranks must call new_group()
     # for collective consistency even if not included in the group.
+    # A scalar all_reduce immediately after each new_group() forces eager NCCL
+    # communicator initialization.  Without this, lazy NCCL init on cold
+    # multi-node GPUs hangs when the first real collective fires later
+    # (reproducible with VPP=2 on 16+ nodes).
+    device = torch.device("cuda", torch.cuda.current_device())
     enc_gather_group = None
     for grp in enc_gather_groups:
         ranks = [int(r) for r in grp]
         pg = torch.distributed.new_group(ranks=ranks)
+        torch.distributed.all_reduce(torch.zeros(1, device=device), group=pg)
         if rank in ranks:
             enc_gather_group = pg
 
     pp_vision_sync_group, _, _ = build_local_process_group(
         rank_groups=pp_sync_groups, this_rank=rank
+    )
+    torch.distributed.all_reduce(
+        torch.zeros(1, device=device), group=pp_vision_sync_group
     )
 
     if tp_size > 1:
