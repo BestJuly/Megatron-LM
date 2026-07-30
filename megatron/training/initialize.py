@@ -375,6 +375,11 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             init_process_group_kwargs['backend'] = 'fake'
             init_process_group_kwargs['store'] = store
 
+        # Pass device_id so NCCL uses eager communicator init with the
+        # correct GPU — prevents the "Guessing device ID" warning and the
+        # associated cold-start hang on multi-node VPP=2 configurations.
+        if device_id is not None and args.distributed_backend == "nccl":
+            init_process_group_kwargs["device_id"] = device_id
         torch.distributed.init_process_group(**init_process_group_kwargs)
         inprocess_restart.maybe_force_nccl_backend_init(device_id)
 
