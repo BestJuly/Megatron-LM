@@ -551,6 +551,7 @@ class GPTModel(LanguageModule):
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
+        mtp_decoder_input: Optional[Tensor] = None,
         output_processor: Optional[Callable[..., Tensor]] = None,
         output_processor_context: Optional[Any] = None,
     ) -> Tensor:
@@ -566,6 +567,12 @@ class GPTModel(LanguageModule):
             padding_mask (Tensor, optional): Padding mask for MoE routing.
                 Shape [bsz, seq_length]. True = padding (exclude), False = valid (include).
                 Only used for MoE layers to exclude padding tokens from routing computations.
+            mtp_decoder_input (Tensor, optional): Decoder embeddings [s, b, h] that MTP shifts
+                to build its next-token inputs, instead of re-embedding the token IDs. Needed
+                when embeddings are modified before the decoder, as a multimodal model does
+                when it replaces image placeholders with vision embeddings. Note this cannot
+                be derived from `decoder_input`, which holds the pipeline input tensor rather
+                than embeddings on non-first pipeline stages.
             output_processor (Callable, optional): Custom postprocess hook that receives
                 decoder hidden states and output-layer helpers, then returns the model output.
             output_processor_context (Any, optional): User-defined context object forwarded to
@@ -637,6 +644,7 @@ class GPTModel(LanguageModule):
             mtp_in_postprocess=self.mtp_process,
             loss_mask=loss_mask,
             decoder_input=decoder_input,
+            mtp_decoder_input=mtp_decoder_input,
             attention_mask=attention_mask,
             padding_mask=padding_mask,
             inference_params=inference_params,
@@ -662,6 +670,7 @@ class GPTModel(LanguageModule):
         mtp_in_postprocess=None,
         loss_mask=None,
         decoder_input=None,
+        mtp_decoder_input=None,
         attention_mask=None,
         padding_mask=None,
         inference_params=None,
@@ -712,6 +721,7 @@ class GPTModel(LanguageModule):
                 sequence_len_offset=sequence_len_offset,
                 padding_mask=padding_mask,
                 embedding=self.embedding,
+                decoder_input=mtp_decoder_input,
                 **(extra_block_kwargs or {}),
             )
 
@@ -853,6 +863,7 @@ class GPTModel(LanguageModule):
         loss_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
         *,
+        mtp_decoder_input: Optional[Tensor] = None,
         output_processor: Optional[Callable[..., Tensor]] = None,
         output_processor_context: Optional[Any] = None,
     ):
@@ -881,6 +892,8 @@ class GPTModel(LanguageModule):
                 Parameters for inference. Defaults to None.
             loss_mask (Optional[Tensor], optional): Loss mask. Defaults to None.
             padding_mask (Optional[Tensor], optional): Padding mask. Defaults to None.
+            mtp_decoder_input (Optional[Tensor], optional): Decoder embeddings that MTP shifts
+                to build its next-token inputs. See :meth:`forward`. Defaults to None.
             output_processor (Callable, optional): Custom postprocess hook to run in the
                 schedule-plan postprocess node instead of the default logits/loss path.
             output_processor_context (Any, optional): User-defined context object forwarded to
@@ -909,6 +922,7 @@ class GPTModel(LanguageModule):
             runtime_gather_output,
             loss_mask,
             padding_mask,
+            mtp_decoder_input=mtp_decoder_input,
             output_processor=output_processor,
             output_processor_context=output_processor_context,
         )

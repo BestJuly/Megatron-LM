@@ -217,9 +217,21 @@ class MultimodalModel(MegatronModule):
         cp_size = parallel_state.get_context_parallel_world_size()
         if cp_size <= 1:
             return (
-                decoder_input, input_ids, labels, loss_mask,
-                attention_mask, position_ids, padding_mask,
+                decoder_input,
+                input_ids,
+                labels,
+                loss_mask,
+                attention_mask,
+                position_ids,
+                padding_mask,
             )
+        # ``decoder_input`` arrives already scattered over the SP shards of the *global*
+        # sequence, so zigzag-splitting it here yields a different token set than the CP
+        # split of ``input_ids``.  MCore expects the opposite nesting (CP outer, SP inner).
+        assert not (
+            self.config.sequence_parallel
+            and parallel_state.get_tensor_model_parallel_world_size() > 1
+        ), "sequence parallelism combined with context parallelism is not supported yet"
         cp_rank = parallel_state.get_context_parallel_rank()
 
         if packed_seq_params is not None:
@@ -256,8 +268,13 @@ class MultimodalModel(MegatronModule):
             padding_mask = _split(padding_mask, 1)
 
         return (
-            decoder_input, input_ids, labels, loss_mask,
-            attention_mask, position_ids, padding_mask,
+            decoder_input,
+            input_ids,
+            labels,
+            loss_mask,
+            attention_mask,
+            position_ids,
+            padding_mask,
         )
 
     @staticmethod
@@ -362,8 +379,13 @@ class MultimodalModel(MegatronModule):
                 decoder_input = text_embeddings
 
         (
-            decoder_input, input_ids, labels, loss_mask,
-            attention_mask, position_ids, padding_mask,
+            decoder_input,
+            input_ids,
+            labels,
+            loss_mask,
+            attention_mask,
+            position_ids,
+            padding_mask,
         ) = self._cp_split_for_forward(
             decoder_input=decoder_input,
             input_ids=input_ids,
@@ -385,4 +407,5 @@ class MultimodalModel(MegatronModule):
                 loss_mask=loss_mask,
                 padding_mask=padding_mask,
                 packed_seq_params=packed_seq_params,
+                mtp_decoder_input=decoder_input,
             )
