@@ -21,6 +21,7 @@ from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import (
+    gather_from_sequence_parallel_region,
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
 )
@@ -37,6 +38,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import (
     get_pg_rank,
+    get_pg_size,
     is_torch_min_version,
     make_tp_sharded_tensor_for_checkpoint,
     make_viewless_tensor,
@@ -135,6 +137,40 @@ def tie_output_layer_state_dict(
     )
 
 
+def _exchange_cp_boundary_tokens(boundaries, cp_group):
+    """Fetch the tokens that follow this rank's two zigzag chunks from its CP neighbours.
+
+    Args:
+        boundaries (Tensor): This rank's two chunk-leading tokens stacked as ``[2, ...]``.
+            Entry 0 belongs to the front chunk and entry 1 to the mirrored tail chunk.
+        cp_group (ProcessGroup): The context parallelism process group.
+
+    Returns:
+        tuple: (token following the front chunk, token following the tail chunk)
+
+    Under the zigzag CP layout the token that follows this rank's front chunk is the
+    front-chunk head of the next rank, and the token that follows its mirrored tail chunk
+    is the tail-chunk head of the previous rank. The last rank wraps onto its own tail
+    chunk, and the first rank owns the end of the global sequence and is zero-filled.
+
+    An all-gather of the boundary tokens is used rather than point-to-point sends so that
+    the transfer is differentiable: rolling precomputed embeddings has to propagate
+    gradients back to the CP rank that owns the boundary token. The gathered volume is
+    two tokens per rank, so this is not a full-sequence collective.
+    """
+    cp_size = cp_group.size()
+    cp_rank = get_pg_rank(cp_group)
+    # Rank-major gather: entry 2 * r + i holds rank r's chunk-i boundary token.
+    gathered = gather_from_sequence_parallel_region(
+        boundaries, tensor_parallel_output_grad=True, group=cp_group
+    )
+    after_front = boundaries[1] if cp_rank == cp_size - 1 else gathered[2 * (cp_rank + 1)]
+    after_tail = (
+        torch.zeros_like(boundaries[1]) if cp_rank == 0 else gathered[2 * (cp_rank - 1) + 1]
+    )
+    return after_front, after_tail
+
+
 def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=None):
     """Roll the tensor input along the sequence dimension with Context Parallelism (CP) support.
 
@@ -181,47 +217,10 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
     for i in range(len(tensor_list)):
         rolled_tensor_list.append(torch.roll(tensor_list[i], shifts=shifts, dims=dims))
 
-    # Prepare tensors for communication between CP ranks
-    # Each CP rank needs to send boundary elements to adjacent ranks
-    tensor_send_list = []
-    tensor_recv_list = []
-    for i in range(len(rolled_tensor_list)):
-        tensor_send_list.append(rolled_tensor_list[i].select(dims, shifts).contiguous())
-        empty_tensor = torch.empty(
-            tensor_send_list[i].shape,
-            dtype=tensor_send_list[i].dtype,
-            device=torch.cuda.current_device(),
-        )
-        tensor_recv_list.append(empty_tensor)
-
-    # Get the global rank of next and prev process in the cp group
-    global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
-    local_rank = torch.distributed.get_rank(group=cp_group)
-    next_rank = global_ranks[(local_rank + 1) % len(global_ranks)]
-    prev_rank = global_ranks[(local_rank - 1) % len(global_ranks)]
-
-    # Start send and recv ops
-    ops = []
-    if local_rank != 0:
-        req_send_first_part = torch.distributed.isend(tensor=tensor_send_list[0], dst=prev_rank)
-        ops.append(req_send_first_part)
-        req_recv_second_part = torch.distributed.irecv(tensor=tensor_recv_list[1], src=prev_rank)
-        ops.append(req_recv_second_part)
-    else:
-        # Inserted elements are set to be 0.0.
-        tensor_recv_list[1] = 0
-    if local_rank != len(global_ranks) - 1:
-        req_recv_first_part = torch.distributed.irecv(tensor=tensor_recv_list[0], src=next_rank)
-        ops.append(req_recv_first_part)
-        req_send_second_part = torch.distributed.isend(tensor=tensor_send_list[1], dst=next_rank)
-        ops.append(req_send_second_part)
-    else:
-        # For the last CP rank, the removed elements of second part go into the first part
-        tensor_recv_list[0] = tensor_send_list[1]
-
-    # Wait for all communication operations to complete
-    for op in ops:
-        op.wait()
+    # Rolling wrapped each chunk's leading element into its trailing slot; exchange those
+    # elements so every trailing slot holds the token that actually follows the chunk.
+    boundaries = torch.stack([chunk.select(dims, 0) for chunk in tensor_list])
+    tensor_recv_list = _exchange_cp_boundary_tokens(boundaries, cp_group)
 
     # Splicing: Replace boundary elements with received elements from adjacent ranks
     # This ensures proper sequence continuity across CP boundaries
@@ -243,9 +242,6 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
 
     # Notice: This is a naive implementation to test the correctness,
     # a better solution will only sync the boundary tokens once.
-    assert (
-        dims == -1 or dims == tensor.dim() - 1
-    ), "Packed sequence roll only supports the last dimension."
     assert shifts == -1, "Packed sequence roll only supports a single-token left shift."
     # Prefer the padded cumulative seqlens because, with CP, the local THD layout is
     # produced by `tex.thd_get_partitioned_indices(cu_seqlens_padded, ...)` and requires
@@ -265,25 +261,20 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
     if cp_size == 1:
         # CP disabled: roll each packed sequence independently within its boundaries
         for i in range(len(cu_seqlens) - 1):
-            start_idx = cu_seqlens[i]
-            end_idx = cu_seqlens[i + 1]
-            seq_slice = tensor[..., start_idx:end_idx]
+            start_idx = int(cu_seqlens[i])
+            end_idx = int(cu_seqlens[i + 1])
+            seq_slice = tensor.narrow(dims, start_idx, end_idx - start_idx)
             rolled_seq = torch.roll(seq_slice, shifts=shifts, dims=dims)
             # Zero out the last position(s) that would cross sequence boundaries
-            rolled_seq[..., shifts:] = 0
-            rolled_tensor[..., start_idx:end_idx] = rolled_seq
+            rolled_seq.select(dims, shifts).zero_()
+            rolled_tensor.narrow(dims, start_idx, end_idx - start_idx).copy_(rolled_seq)
         return rolled_tensor, rolled_tensor.sum()
 
     # CP enabled: each rank owns two chunks per sequence (front and mirrored tail).
-    local_rank = torch.distributed.get_rank(group=cp_group)
-    global_ranks = torch.distributed.get_process_group_ranks(group=cp_group)
-    next_rank = global_ranks[(local_rank + 1) % cp_size]
-    prev_rank = global_ranks[(local_rank - 1) % cp_size]
-
     # Iterate over each sequence individually
     for i in range(len(cu_seqlens) - 1):
-        start_idx = cu_seqlens[i]
-        end_idx = cu_seqlens[i + 1]
+        start_idx = int(cu_seqlens[i])
+        end_idx = int(cu_seqlens[i + 1])
 
         # the idx has been multiplied by cp_size, need to divide it by cp_size to get the local idx
         local_start_idx = start_idx // cp_size
@@ -295,43 +286,25 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
         if local_seq_len == 0:
             continue
 
-        tensor_slice = rolled_tensor[..., local_start_idx:local_end_idx].clone()
+        tensor_slice = tensor.narrow(dims, local_start_idx, local_seq_len)
 
         # The following code is very similar as the code in roll_tensor function
         local_chunks = tensor_slice.chunk(2, dim=dims)
         rolled_chunks = [torch.roll(chunk, shifts=shifts, dims=dims) for chunk in local_chunks]
 
-        tensor_send_list = []
-        tensor_recv_list = []
-        for chunk in rolled_chunks:
-            # Skip empty chunks that can occur when the sequence slice is very small
-            if chunk.size(dims) == 0:
-                tensor_send_list.append(
-                    torch.empty(chunk.shape[:-1], dtype=chunk.dtype, device=chunk.device)
-                )
-                tensor_recv_list.append(
-                    torch.empty(chunk.shape[:-1], dtype=chunk.dtype, device=chunk.device)
-                )
-                continue
-            boundary = chunk.select(dims, shifts).contiguous().clone()
-            tensor_send_list.append(boundary)
-            tensor_recv_list.append(torch.empty_like(boundary))
-
-        ops = []
-        if local_rank != 0:
-            ops.append(torch.distributed.isend(tensor=tensor_send_list[0], dst=prev_rank))
-            ops.append(torch.distributed.irecv(tensor=tensor_recv_list[1], src=prev_rank))
-        else:
-            tensor_recv_list[1].zero_()
-
-        if local_rank != cp_size - 1:
-            ops.append(torch.distributed.irecv(tensor=tensor_recv_list[0], src=next_rank))
-            ops.append(torch.distributed.isend(tensor=tensor_send_list[1], dst=next_rank))
-        else:
-            tensor_recv_list[0].copy_(tensor_send_list[1])
-
-        for op in ops:
-            op.wait()
+        # Rolling wrapped each chunk's leading element into its trailing slot; exchange
+        # those elements with the CP neighbours that own the following token. The tail
+        # chunk can be empty for a single-token local slice, in which case it has no
+        # boundary of its own and only contributes a placeholder to the exchange.
+        first_boundary = local_chunks[0].select(dims, 0)
+        second_boundary = (
+            local_chunks[1].select(dims, 0)
+            if local_chunks[1].size(dims) > 0
+            else torch.zeros_like(first_boundary)
+        )
+        tensor_recv_list = _exchange_cp_boundary_tokens(
+            torch.stack([first_boundary, second_boundary]), cp_group
+        )
 
         index = [slice(None)] * rolled_chunks[0].dim()
         index[dims] = shifts
@@ -344,7 +317,7 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
         seq_result = torch.cat(rolled_chunks, dim=dims)
 
         # update the rolled tensor
-        rolled_tensor[..., local_start_idx:local_end_idx] = seq_result
+        rolled_tensor.narrow(dims, local_start_idx, local_seq_len).copy_(seq_result)
 
     return rolled_tensor, rolled_tensor.sum()
 
@@ -1252,6 +1225,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         hidden_states: torch.Tensor,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask: Optional[torch.Tensor] = None,
+        decoder_input: Optional[torch.Tensor] = None,
     ):
         """
         Preprocesses input data for the Multi-Token Prediction (MTP) layers.
@@ -1267,6 +1241,9 @@ class MultiTokenPredictionLayer(MegatronModule):
             hidden_states (torch.Tensor): hidden states tensor of shape [s, b, h] where s is the
                 sequence length, b is the batch size, and h is the hidden size.
             packed_seq_params (PackedSeqParams): Parameters for packed sequence processing.
+            decoder_input (torch.Tensor, optional): Next-token embeddings of shape [s, b, h],
+                already shifted by :meth:`shift_decoder_input`. When given, the token embedding
+                lookup is skipped so embeddings that were modified before the decoder are kept.
         """
         cp_group = resolve_cp_group(self.cp_group, packed_seq_params)
 
@@ -1285,7 +1262,8 @@ class MultiTokenPredictionLayer(MegatronModule):
                 packed_seq_params=packed_seq_params,
             )
         # embedding
-        decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
+        if decoder_input is None:
+            decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
 
         if self.config.mtp_detach_heads:
             decoder_input = decoder_input.detach()
@@ -1300,6 +1278,46 @@ class MultiTokenPredictionLayer(MegatronModule):
             hidden_states.requires_grad_(True)
 
         return input_ids, position_ids, padding_mask, decoder_input, hidden_states
+
+    def shift_decoder_input(
+        self, decoder_input: Tensor, packed_seq_params: Optional[PackedSeqParams] = None
+    ) -> Tensor:
+        """Shift precomputed decoder embeddings onto the next-token MTP timeline.
+
+        Callers that build the decoder input themselves, such as a multimodal model that
+        replaces image placeholder embeddings with vision embeddings, pass the result
+        through this once per MTP depth instead of letting MTP re-embed the token IDs.
+
+        Args:
+            decoder_input (Tensor): Decoder embeddings of shape [s, b, h], sharded the same
+                way as the decoder input of this rank.
+            packed_seq_params (PackedSeqParams, optional): Parameters for packed sequences.
+
+        Returns:
+            Tensor: The embeddings shifted left by one token, in the caller's layout.
+
+        Sequence-parallel shards are gathered before the shift and scattered afterwards so
+        the shift can cross shard boundaries. Context-parallel boundaries are handled by
+        :func:`roll_tensor`, whose boundary exchange is differentiable, so the gradient of
+        a boundary token reaches the rank that owns it.
+        """
+        gather_sequence_parallel = self.sequence_parallel and get_pg_size(self.tp_group) > 1
+        if gather_sequence_parallel:
+            decoder_input = gather_from_sequence_parallel_region(
+                decoder_input, tensor_parallel_output_grad=False, group=self.tp_group
+            )
+
+        decoder_input, _ = roll_tensor(
+            decoder_input,
+            shifts=-1,
+            dims=0,
+            cp_group=resolve_cp_group(self.cp_group, packed_seq_params),
+            packed_seq_params=packed_seq_params,
+        )
+
+        if gather_sequence_parallel:
+            decoder_input = scatter_to_sequence_parallel_region(decoder_input, group=self.tp_group)
+        return decoder_input
 
     def _concat_embeddings(self, hidden_states: torch.Tensor, decoder_input: torch.Tensor):
         """
@@ -1698,6 +1716,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
         embedding=None,
+        decoder_input: Optional[Tensor] = None,
     ):
         """
         Execute the forward pass through the Multi-Token Prediction (MTP) layer.
@@ -1716,6 +1735,8 @@ class MultiTokenPredictionLayer(MegatronModule):
             rotary_pos_sin (Tensor, optional): Sine component of rotary positional embeddings.
             sequence_len_offset (Tensor, optional): Offset for sequence length, if applicable.
             embedding (Callable): The embedding module from gpt model to compute the decoder input.
+            decoder_input (Tensor, optional): Next-token embeddings already shifted by
+                :meth:`shift_decoder_input`, used instead of re-embedding the token IDs.
 
         Returns:
             Union[Tensor, Tuple[Tensor, Tensor]]: The output hidden states tensor of shape
@@ -1731,6 +1752,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             embedding=embedding,
             hidden_states=hidden_states,
             packed_seq_params=packed_seq_params,
+            decoder_input=decoder_input,
         )
 
         if self.config.recompute_granularity == 'full' and self.training:
@@ -2042,6 +2064,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         extra_block_kwargs: Optional[dict] = None,
         embedding=None,
         mhc_multistream: Optional[Tensor] = None,
+        decoder_input: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Perform the forward pass through all of the MTP modules.
@@ -2054,6 +2077,9 @@ class MultiTokenPredictionBlock(MegatronModule):
                 multi-stream decoder output [s, b, n*h] used as input to MTP depths.
             attention_mask (Tensor): Boolean tensor of shape [1, 1, s, s] for masking
                 self-attention.
+            decoder_input (Tensor, optional): The decoder embeddings of the current tokens.
+                When given, every depth shifts this tensor by one more token instead of
+                re-embedding the token IDs.
 
         Returns:
             (Tensor): The mtp loss tensor of shape [b, s].
@@ -2073,6 +2099,10 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
+            if decoder_input is not None:
+                decoder_input = self.layers[layer_idx].shift_decoder_input(
+                    decoder_input, packed_seq_params=packed_seq_params
+                )
             (hidden_states, input_ids, position_ids, padding_mask) = self.layers[layer_idx](
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -2086,6 +2116,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
                 embedding=embedding,
+                decoder_input=decoder_input,
                 **(extra_block_kwargs or {}),
             )
 

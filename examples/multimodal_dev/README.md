@@ -109,6 +109,16 @@ The `forward_step` is also model-agnostic — it uses the model's
 `compute_position_ids()` method polymorphically and passes a standard
 batch dict.
 
+### Multi-token prediction inputs
+
+The decoder input carries vision embeddings at the image placeholder
+positions, so MTP must not rebuild its next-token inputs by re-embedding
+the placeholder IDs. The model therefore passes that tensor to `GPTModel`
+as `mtp_decoder_input`, and each MTP depth shifts it by one more token,
+respecting sequence-parallel, context-parallel and packed-sequence
+boundaries. Callers that omit `mtp_decoder_input` keep the standard
+roll-and-embed path.
+
 ## Adding a New Model Architecture
 
 Adding a new model (e.g. `llava_next`) requires **no changes** to

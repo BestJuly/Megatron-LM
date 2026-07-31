@@ -208,6 +208,7 @@ class MultimodalModel(MegatronModule):
                 loss_mask=loss_mask,
                 padding_mask=padding_mask,
                 packed_seq_params=packed_seq_params,
+                mtp_decoder_input=decoder_input,
             )
 
     def _scatter_vision_embeddings(
@@ -285,6 +286,13 @@ class MultimodalModel(MegatronModule):
                 decoder_input, input_ids, labels, loss_mask,
                 attention_mask, position_ids, padding_mask,
             )
+        # ``decoder_input`` arrives already scattered over the SP shards of the *global*
+        # sequence, so zigzag-splitting it here yields a different token set than the CP
+        # split of ``input_ids``.  MCore expects the opposite nesting (CP outer, SP inner).
+        assert not (
+            self.config.sequence_parallel
+            and parallel_state.get_tensor_model_parallel_world_size() > 1
+        ), "sequence parallelism combined with context parallelism is not supported yet"
         cp_rank = parallel_state.get_context_parallel_rank()
 
         if packed_seq_params is not None:
@@ -450,4 +458,5 @@ class MultimodalModel(MegatronModule):
                 loss_mask=loss_mask,
                 padding_mask=padding_mask,
                 packed_seq_params=packed_seq_params,
+                mtp_decoder_input=decoder_input,
             )

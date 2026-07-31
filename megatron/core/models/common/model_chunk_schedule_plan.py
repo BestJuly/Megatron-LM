@@ -326,6 +326,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         loss_mask: Optional[Tensor] = None,
         padding_mask=None,
         *,
+        mtp_decoder_input: Optional[Tensor] = None,
         output_processor: Optional[Callable[..., Tensor]] = None,
         output_processor_context: Optional[Any] = None,
     ):
@@ -345,6 +346,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             extra_block_kwargs: Additional keyword arguments for blocks.
             runtime_gather_output: Whether to gather output at runtime.
             loss_mask (torch.Tensor): Used to mask out some portions of the loss
+            mtp_decoder_input: Decoder embeddings that MTP shifts to build its next-token
+                inputs, instead of re-embedding the token IDs.
             output_processor (Callable): Custom postprocess hook to run instead of the
                 default logits/loss path.
             output_processor_context (Any): User-defined context object forwarded to
@@ -367,6 +370,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self._model_chunk_state.position_ids = position_ids
         self._model_chunk_state.attention_mask = attention_mask
         self._model_chunk_state.decoder_input = decoder_input
+        self._model_chunk_state.mtp_decoder_input = mtp_decoder_input
         self._model_chunk_state.labels = labels
         self._model_chunk_state.mtp_hidden_states = None
         self._model_chunk_state.loss_mask = loss_mask

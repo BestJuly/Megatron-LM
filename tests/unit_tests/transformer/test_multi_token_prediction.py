@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch import Tensor
 
+from megatron.core import tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -53,6 +54,20 @@ else:
 _SEED = 42
 
 
+def _zigzag_cp_shard(tensor, cp_size, cp_rank):
+    """Select one CP rank's two zigzag chunks from a sequence-first global tensor."""
+    chunks = tensor.chunk(2 * cp_size, dim=0)
+    return torch.cat((chunks[cp_rank], chunks[2 * cp_size - cp_rank - 1]), dim=0)
+
+
+def _sequence_first_arange(seq_len, batch_size, hidden_size):
+    """Build a deterministic [s, b, h] tensor with a distinct value per element."""
+    numel = seq_len * batch_size * hidden_size
+    return torch.arange(numel, dtype=torch.float32, device="cuda").view(
+        seq_len, batch_size, hidden_size
+    )
+
+
 class TestMultiTokenPredictionLayer:
     def setup_method(self, method):
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
@@ -62,9 +77,10 @@ class TestMultiTokenPredictionLayer:
         destroy_global_vars()
         destroy_num_microbatches_calculator()
 
-    def _create_config_and_mtp_block_spec(self, tp, cp, use_te=False):
+    def _create_config_and_mtp_block_spec(self, tp, cp, use_te=False, **config_kwargs):
         Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
         config = TransformerConfig(
+            **config_kwargs,
             mtp_num_layers=2,
             num_layers=4,
             hidden_size=64,
@@ -263,6 +279,192 @@ class TestMultiTokenPredictionLayer:
         expected_padding_mask, _ = roll_tensor(padding_mask, shifts=-1, dims=-1)
         assert torch.equal(seen["padding_mask"], expected_padding_mask)
         assert torch.equal(returned_padding_mask, expected_padding_mask)
+
+    def test_get_embeddings_uses_precomputed_decoder_input(self):
+        """A precomputed decoder input replaces the token embedding lookup.
+
+        A multimodal decoder input carries vision embeddings at the image placeholder
+        positions, so re-embedding the placeholder IDs would silently discard them.
+        """
+        torch.manual_seed(_SEED)
+        config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
+        mtp_layer = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec).layers[0]
+
+        seq_len = 6
+        batch_size = 2
+        image_token_id = 99
+        input_ids = torch.tensor(
+            [[1, 2, image_token_id, image_token_id, 5, 6], [7, image_token_id, 9, 10, 11, 12]],
+            dtype=torch.int64,
+        )
+        position_ids = torch.arange(seq_len, dtype=torch.int64).repeat(batch_size, 1)
+        hidden_states = torch.randn(seq_len, batch_size, config.hidden_size)
+        decoder_input = torch.randn(seq_len, batch_size, config.hidden_size)
+
+        def unexpected_embedding(**_kwargs):
+            raise AssertionError("MTP re-embedded token IDs instead of using decoder_input")
+
+        rolled_input_ids, rolled_position_ids, _, returned, _ = mtp_layer._get_embeddings(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            embedding=unexpected_embedding,
+            hidden_states=hidden_states,
+            decoder_input=decoder_input,
+        )
+
+        assert returned is decoder_input
+        # The token IDs are still rolled so the next depth keeps its own timeline.
+        expected_input_ids, _ = roll_tensor(input_ids, shifts=-1, dims=-1)
+        expected_position_ids, _ = roll_tensor(position_ids, shifts=-1, dims=-1)
+        assert torch.equal(rolled_input_ids, expected_input_ids)
+        assert torch.equal(rolled_position_ids, expected_position_ids)
+
+    def test_block_shifts_decoder_input_once_per_depth(self, monkeypatch):
+        """Each MTP depth sees the decoder embeddings shifted one token further."""
+        torch.manual_seed(_SEED)
+        config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
+        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+
+        seq_len = 6
+        batch_size = 2
+        input_ids = torch.arange(batch_size * seq_len, dtype=torch.int64).view(batch_size, seq_len)
+        position_ids = torch.arange(seq_len, dtype=torch.int64).repeat(batch_size, 1)
+        hidden_states = torch.randn(seq_len, batch_size, config.hidden_size)
+        decoder_input = torch.randn(seq_len, batch_size, config.hidden_size)
+        seen_decoder_inputs = []
+
+        def fake_forward(
+            self,
+            input_ids,
+            position_ids,
+            hidden_states,
+            attention_mask,
+            padding_mask=None,
+            decoder_input=None,
+            **_kwargs,
+        ):
+            seen_decoder_inputs.append(decoder_input.clone())
+            return hidden_states, input_ids, position_ids, padding_mask
+
+        for layer in mtp.layers:
+            monkeypatch.setattr(layer, "forward", types.MethodType(fake_forward, layer))
+
+        mtp(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            attention_mask=None,
+            embedding=None,
+            decoder_input=decoder_input,
+        )
+
+        expected_first, _ = roll_tensor(decoder_input, shifts=-1, dims=0)
+        expected_second, _ = roll_tensor(expected_first, shifts=-1, dims=0)
+        assert len(seen_decoder_inputs) == config.mtp_num_layers
+        assert torch.equal(seen_decoder_inputs[0], expected_first)
+        assert torch.equal(seen_decoder_inputs[1], expected_second)
+
+    @pytest.mark.parametrize("tp", [1, 2, 4])
+    def test_shift_decoder_input_sequence_parallel(self, tp):
+        """The shift crosses sequence-parallel shard boundaries and stays differentiable."""
+        config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=tp, cp=1)
+        layer = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec).layers[0]
+
+        global_input = _sequence_first_arange(8, 2, config.hidden_size).requires_grad_(True)
+        local_input = (
+            tensor_parallel.scatter_to_sequence_parallel_region(global_input)
+            if tp > 1
+            else global_input
+        )
+
+        shifted = layer.shift_decoder_input(local_input)
+
+        expected_global, _ = roll_tensor(global_input.detach(), shifts=-1, dims=0)
+        expected = (
+            tensor_parallel.scatter_to_sequence_parallel_region(expected_global)
+            if tp > 1
+            else expected_global
+        )
+        assert torch.equal(shifted, expected)
+
+        # Every token except the first feeds the shifted timeline exactly once, even when
+        # its consumer lives on a different sequence-parallel shard.
+        shifted.sum().backward()
+        expected_grad = torch.ones_like(global_input)
+        expected_grad[0].zero_()
+        assert torch.equal(global_input.grad, expected_grad)
+
+    @pytest.mark.parametrize("cp", [1, 2, 4])
+    def test_shift_decoder_input_context_parallel(self, cp):
+        """The shift crosses CP zigzag boundaries and keeps boundary-token gradients.
+
+        The token-ID roll exchanges boundaries with plain isend/irecv, which is enough for
+        non-differentiable IDs. Embeddings additionally need the gradient of a boundary
+        token to reach the CP rank that owns it.
+        """
+        config, mtp_block_spec = self._create_config_and_mtp_block_spec(
+            tp=1, cp=cp, attention_dropout=0.0
+        )
+        layer = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec).layers[0]
+        cp_rank = torch.distributed.get_rank(group=layer.cp_group)
+
+        global_input = _sequence_first_arange(16, 2, config.hidden_size)
+        local_input = _zigzag_cp_shard(global_input, cp, cp_rank).clone().requires_grad_(True)
+
+        shifted = layer.shift_decoder_input(local_input)
+
+        expected_global, _ = roll_tensor(global_input, shifts=-1, dims=0)
+        assert torch.equal(shifted, _zigzag_cp_shard(expected_global, cp, cp_rank))
+
+        shifted.sum().backward()
+        expected_global_grad = torch.ones_like(global_input)
+        expected_global_grad[0].zero_()
+        assert torch.equal(local_input.grad, _zigzag_cp_shard(expected_global_grad, cp, cp_rank))
+
+    @pytest.mark.parametrize("cp", [1, 2])
+    def test_shift_decoder_input_packed_sequences(self, cp):
+        """The shift stops at packed sample boundaries instead of leaking across samples."""
+        config, mtp_block_spec = self._create_config_and_mtp_block_spec(
+            tp=1, cp=cp, attention_dropout=0.0
+        )
+        layer = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec).layers[0]
+        cp_rank = torch.distributed.get_rank(group=layer.cp_group)
+
+        boundaries = [0, 4, 12]
+        cu_seqlens = torch.tensor(boundaries, dtype=torch.int32, device="cuda")
+        packed_seq_params = PackedSeqParams(
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=8,
+            max_seqlen_kv=8,
+            qkv_format="thd",
+        )
+
+        def to_local(tensor):
+            return torch.cat(
+                [
+                    _zigzag_cp_shard(tensor[start:end], cp, cp_rank)
+                    for start, end in zip(boundaries[:-1], boundaries[1:])
+                ],
+                dim=0,
+            )
+
+        global_input = _sequence_first_arange(boundaries[-1], 1, config.hidden_size)
+        local_input = to_local(global_input).clone().requires_grad_(True)
+
+        shifted = layer.shift_decoder_input(local_input, packed_seq_params=packed_seq_params)
+
+        expected_global, _ = roll_tensor(
+            global_input, shifts=-1, dims=0, packed_seq_params=packed_seq_params
+        )
+        assert torch.equal(shifted, to_local(expected_global))
+
+        # The first token of every packed sample has no consumer in the shifted timeline.
+        shifted.sum().backward()
+        expected_global_grad = torch.ones_like(global_input)
+        for start in boundaries[:-1]:
+            expected_global_grad[start].zero_()
+        assert torch.equal(local_input.grad, to_local(expected_global_grad))
 
     def test_get_embeddings_detaches_decoder_input(self):
         """With mtp_detach_heads=True, _get_embeddings detaches decoder_input (severing
