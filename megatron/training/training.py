@@ -2757,12 +2757,15 @@ def _verify_engram_table_training_state(snapshots, iteration):
     """Require every local table to receive a finite gradient and change after the step."""
     device = snapshots[0][1].device
     local_grad_square_sum = torch.zeros((), dtype=torch.float32, device=device)
+    local_table_checksums = torch.zeros(4, dtype=torch.float32, device=device)
     local_all_nonzero = True
     local_all_changed = True
     for _, parameter, grad_square_sum, old_checksum in snapshots:
         value = parameter.detach().float()
         new_checksum = torch.stack((value.sum(), value.square().sum()))
         local_grad_square_sum += grad_square_sum
+        local_table_checksums[:2] += old_checksum
+        local_table_checksums[2:] += new_checksum
         local_all_nonzero = local_all_nonzero and bool(
             torch.isfinite(grad_square_sum).item() and grad_square_sum.item() > 0.0
         )
@@ -2773,6 +2776,7 @@ def _verify_engram_table_training_state(snapshots, iteration):
     )
     peak_memory = torch.tensor(torch.cuda.max_memory_allocated(), dtype=torch.int64, device=device)
     torch.distributed.all_reduce(local_grad_square_sum, op=torch.distributed.ReduceOp.SUM)
+    torch.distributed.all_reduce(local_table_checksums, op=torch.distributed.ReduceOp.SUM)
     torch.distributed.all_reduce(status, op=torch.distributed.ReduceOp.MIN)
     torch.distributed.all_reduce(peak_memory, op=torch.distributed.ReduceOp.MAX)
     if torch.distributed.get_rank() == 0:
@@ -2780,6 +2784,10 @@ def _verify_engram_table_training_state(snapshots, iteration):
             "[Engram verify] "
             f"iteration={iteration} global_grad_norm={local_grad_square_sum.sqrt().item():.8e} "
             f"all_tables_nonzero={status[0].item()} all_tables_changed={status[1].item()} "
+            f"table_sum_before={local_table_checksums[0].item():.8e} "
+            f"table_square_sum_before={local_table_checksums[1].item():.8e} "
+            f"table_sum_after={local_table_checksums[2].item():.8e} "
+            f"table_square_sum_after={local_table_checksums[3].item():.8e} "
             f"peak_memory_bytes={peak_memory.item()}",
             flush=True,
         )

@@ -8,6 +8,7 @@ import time
 _PROGRAM_START_TIME = time.time()
 
 import json
+import logging
 
 # Suppress warnings on all ranks but rank 0.
 import os
@@ -75,6 +76,7 @@ except ImportError:
     has_nvidia_modelopt = False
 
 stimer = StragglerDetector()
+logger = logging.getLogger(__name__)
 
 
 def get_batch(data_iterator, vp_stage: Optional[int] = None):
@@ -382,6 +384,18 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
             get_batch(data_iterator, vp_stage)
         )
     timers('batch-generator').stop()
+
+    if args.engram_verify_training:
+        flat_tokens = tokens.reshape(-1).to(torch.int64)
+        positions = torch.arange(
+            1, flat_tokens.numel() + 1, dtype=torch.int64, device=flat_tokens.device
+        )
+        logger.info(
+            "[Engram batch] "
+            f"rank={torch.distributed.get_rank()} iteration={args.curr_iteration + 1} "
+            f"token_sum={flat_tokens.sum().item()} "
+            f"token_ordered_checksum={(flat_tokens * positions).sum().item()}"
+        )
 
     with stimer:
         if return_schedule_plan:
