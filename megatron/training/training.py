@@ -2730,8 +2730,20 @@ def dummy_train_step(data_iterator):
             )
 
 
+def _model_parameter_checksum(model):
+    """Return FP64 sum and square-sum checksums for all local model parameters."""
+    first_parameter = next(unwrap_model(model[0]).parameters())
+    checksum = torch.zeros(2, dtype=torch.float64, device=first_parameter.device)
+    for model_chunk in model:
+        for parameter in unwrap_model(model_chunk).parameters():
+            value = parameter.detach()
+            checksum[0] += value.sum(dtype=torch.float64)
+            checksum[1] += value.float().square().sum(dtype=torch.float64)
+    return checksum
+
+
 def _capture_engram_table_training_state(model):
-    """Capture cheap scalar evidence before an Engram optimizer step."""
+    """Capture scalar evidence before an Engram optimizer step."""
     snapshots = []
     for model_chunk in model:
         for name, parameter in unwrap_model(model_chunk).named_parameters():
@@ -2750,11 +2762,12 @@ def _capture_engram_table_training_state(model):
             snapshots.append((name, parameter, grad_square_sum, checksum))
     if not snapshots:
         raise RuntimeError("Engram training verification found no sparse table parameters.")
-    return snapshots
+    return snapshots, _model_parameter_checksum(model)
 
 
-def _verify_engram_table_training_state(snapshots, iteration):
+def _verify_engram_table_training_state(training_state, model, iteration):
     """Require every local table to receive a finite gradient and change after the step."""
+    snapshots, model_checksum_before = training_state
     device = snapshots[0][1].device
     local_grad_square_sum = torch.zeros((), dtype=torch.float32, device=device)
     local_table_checksums = torch.zeros(4, dtype=torch.float32, device=device)
@@ -2775,8 +2788,10 @@ def _verify_engram_table_training_state(snapshots, iteration):
         [int(local_all_nonzero), int(local_all_changed)], dtype=torch.int32, device=device
     )
     peak_memory = torch.tensor(torch.cuda.max_memory_allocated(), dtype=torch.int64, device=device)
+    model_checksums = torch.cat((model_checksum_before, _model_parameter_checksum(model)))
     torch.distributed.all_reduce(local_grad_square_sum, op=torch.distributed.ReduceOp.SUM)
     torch.distributed.all_reduce(local_table_checksums, op=torch.distributed.ReduceOp.SUM)
+    torch.distributed.all_reduce(model_checksums, op=torch.distributed.ReduceOp.SUM)
     torch.distributed.all_reduce(status, op=torch.distributed.ReduceOp.MIN)
     torch.distributed.all_reduce(peak_memory, op=torch.distributed.ReduceOp.MAX)
     if torch.distributed.get_rank() == 0:
@@ -2788,6 +2803,10 @@ def _verify_engram_table_training_state(snapshots, iteration):
             f"table_square_sum_before={local_table_checksums[1].item():.8e} "
             f"table_sum_after={local_table_checksums[2].item():.8e} "
             f"table_square_sum_after={local_table_checksums[3].item():.8e} "
+            f"model_sum_before={model_checksums[0].item():.16e} "
+            f"model_square_sum_before={model_checksums[1].item():.16e} "
+            f"model_sum_after={model_checksums[2].item():.16e} "
+            f"model_square_sum_after={model_checksums[3].item():.16e} "
             f"peak_memory_bytes={peak_memory.item()}",
             flush=True,
         )
@@ -3032,7 +3051,7 @@ def train_step(
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
     if engram_training_state is not None:
-        _verify_engram_table_training_state(engram_training_state, iteration + 1)
+        _verify_engram_table_training_state(engram_training_state, model, iteration + 1)
 
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step

@@ -101,9 +101,9 @@ Sparse table weights have `allreduce=False`, so DDP synchronizes matching shards
 not across EP owners. The weights are replicated over TP in this milestone. With SP, their and all
 dense Engram parameter gradients are summed across TP by the existing sequence-parallel finalizer.
 All other Engram parameters use normal dense DP synchronization. The opt-in training verifier logs
-per-rank ordered token checksums plus global sparse-table checksums before and after every optimizer
-step, in addition to gradient, update, and peak-memory evidence. Normal training does not compute
-these diagnostics.
+per-rank ordered token checksums plus global sparse-table and FP64 full-model checksums before and
+after every optimizer step, in addition to gradient, update, and peak-memory evidence. Normal
+training does not compute these diagnostics.
 
 ## TP, SP, and PP data flow
 
