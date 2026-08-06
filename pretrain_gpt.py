@@ -59,10 +59,10 @@ from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetC
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 from megatron.training.utils import (
-    broadcast_tokens_across_pipeline,
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
     get_blend_and_blend_per_split,
+    get_pipeline_prefetched_tokens,
     is_first_or_last_pipeline_stage,
 )
 from model_provider import model_provider
@@ -167,12 +167,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         )
 
     if args.engram_enabled:
-        batch['tokens'] = broadcast_tokens_across_pipeline(
-            batch.get('tokens'),
-            args.micro_batch_size,
-            args.seq_length,
-            mpu.get_pipeline_model_parallel_group(),
-        )
+        batch['tokens'] = get_pipeline_prefetched_tokens(data_iterator)
 
     cu_seqlens = batch.pop('cu_seqlens', None)
     cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)

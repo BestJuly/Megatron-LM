@@ -5,10 +5,10 @@ import json
 import os
 import sys
 import warnings
-from collections import defaultdict
+from collections import defaultdict, deque
 from contextlib import contextmanager
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 
@@ -531,35 +531,108 @@ def get_blend_and_blend_per_split(args):
     return blend, blend_per_split
 
 
-def broadcast_tokens_across_pipeline(
-    tokens: Optional[torch.Tensor], micro_batch_size: int, sequence_length: int, pp_group
-) -> torch.Tensor:
-    """Broadcast one fixed-shape token batch from PP stage zero to its matching PP group.
+class PipelineTokenPrefetchIterator:
+    """Replay prefetched data while exposing PP-distributed tokens to ``get_batch``.
 
-    Pipeline groups preserve the data, tensor, context, and expert coordinates. Broadcasting
-    over that explicit group therefore delivers the correct microbatch token IDs to every stage
-    without storing per-forward state on the model.
+    Only the first PP stage's TP source consumes its data iterator during prefetch. The
+    scheduler later receives those same batches from ``_prefetched_batches``; all other ranks
+    continue consuming their original iterator normally. The wrapper is scoped to one
+    forward/backward schedule and deliberately carries no model state.
     """
-    expected_shape = (micro_batch_size, sequence_length)
-    pp_size = get_pg_size(pp_group)
-    pp_rank = get_pg_rank(pp_group)
-    if pp_rank == 0:
-        if tokens is None:
-            raise RuntimeError("The first pipeline stage must own tokens for Engram broadcast.")
-        if tuple(tokens.shape) != expected_shape:
-            raise ValueError(
-                f"Engram expected token shape {expected_shape}, got {tuple(tokens.shape)}."
-            )
-        tokens = tokens.contiguous()
-    else:
-        device = torch.cuda.current_device() if torch.cuda.is_available() else torch.device("cpu")
-        tokens = torch.empty(expected_shape, dtype=torch.int64, device=device)
 
-    if pp_size > 1:
-        torch.distributed.broadcast(
-            tokens, src=torch.distributed.get_global_rank(pp_group, 0), group=pp_group
+    def __init__(
+        self, data_iterator, prefetched_batches: list[Any], pipeline_tokens: list[torch.Tensor]
+    ) -> None:
+        self._data_iterator = data_iterator
+        self._prefetched_batches = deque(prefetched_batches)
+        self._pipeline_tokens = deque(pipeline_tokens)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._prefetched_batches:
+            return self._prefetched_batches.popleft()
+        if self._data_iterator is None:
+            raise StopIteration
+        return next(self._data_iterator)
+
+    def pop_pipeline_tokens(self) -> torch.Tensor:
+        """Return the tokens prepared for the next scheduled microbatch."""
+        if not self._pipeline_tokens:
+            raise RuntimeError("Engram pipeline token prefetch queue is exhausted.")
+        return self._pipeline_tokens.popleft()
+
+
+def prepare_tokens_for_pipeline(
+    data_iterator,
+    num_microbatches: int,
+    micro_batch_size: int,
+    sequence_length: int,
+    pp_group,
+    tp_group,
+) -> PipelineTokenPrefetchIterator:
+    """Distribute every Engram microbatch's tokens before pipeline scheduling starts.
+
+    A blocking PP collective inside ``forward_step`` deadlocks a non-interleaved pipeline:
+    stage zero enters the collective before sending its activation while the next stage waits
+    for that activation. This helper performs all token collectives before the schedule. On the
+    first PP stage, the TP source prefetches raw batches and broadcasts tokens to its TP peers;
+    each TP coordinate then broadcasts to the matching PP group.
+    """
+    if isinstance(data_iterator, list):
+        raise RuntimeError("Engram pipeline token prefetch does not support VPP data iterators.")
+
+    expected_shape = (micro_batch_size, sequence_length)
+    pp_rank = get_pg_rank(pp_group)
+    tp_rank = get_pg_rank(tp_group)
+    pp_size = get_pg_size(pp_group)
+    tp_size = get_pg_size(tp_group)
+    device = torch.cuda.current_device() if torch.cuda.is_available() else torch.device("cpu")
+    prefetched_batches = []
+    pipeline_tokens = []
+
+    for _ in range(num_microbatches):
+        if pp_rank == 0 and tp_rank == 0:
+            if data_iterator is None:
+                raise RuntimeError("The first pipeline stage TP source must own Engram data.")
+            batch = next(data_iterator)
+            prefetched_batches.append(batch)
+            if "tokens" not in batch:
+                raise RuntimeError("Engram data batches must contain token IDs.")
+            tokens = batch["tokens"].to(device=device, dtype=torch.int64, non_blocking=True)
+            if tuple(tokens.shape) != expected_shape:
+                raise ValueError(
+                    f"Engram expected token shape {expected_shape}, got {tuple(tokens.shape)}."
+                )
+            tokens = tokens.contiguous()
+        else:
+            tokens = torch.empty(expected_shape, dtype=torch.int64, device=device)
+
+        if pp_rank == 0 and tp_size > 1:
+            torch.distributed.broadcast(
+                tokens, src=torch.distributed.get_global_rank(tp_group, 0), group=tp_group
+            )
+        if pp_size > 1:
+            torch.distributed.broadcast(
+                tokens, src=torch.distributed.get_global_rank(pp_group, 0), group=pp_group
+            )
+        pipeline_tokens.append(tokens)
+
+    return PipelineTokenPrefetchIterator(
+        data_iterator=data_iterator,
+        prefetched_batches=prefetched_batches,
+        pipeline_tokens=pipeline_tokens,
+    )
+
+
+def get_pipeline_prefetched_tokens(data_iterator) -> torch.Tensor:
+    """Consume the token batch prepared before the current pipeline schedule."""
+    if not isinstance(data_iterator, PipelineTokenPrefetchIterator):
+        raise RuntimeError(
+            "Engram requires pipeline tokens to be prepared before forward/backward scheduling."
         )
-    return tokens
+    return data_iterator.pop_pipeline_tokens()
 
 
 def get_batch_on_this_tp_rank(

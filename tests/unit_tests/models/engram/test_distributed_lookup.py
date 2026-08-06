@@ -12,7 +12,7 @@ from megatron.core.models.engram.distributed_embedding import (
     EPShardedMultiTableEmbedding,
     get_contiguous_row_range,
 )
-from megatron.training.utils import broadcast_tokens_across_pipeline
+from megatron.training.utils import get_pipeline_prefetched_tokens, prepare_tokens_for_pipeline
 from tests.unit_tests.test_utilities import Utils
 
 pytestmark = pytest.mark.skipif(
@@ -31,12 +31,22 @@ def _full_table(table_id: int, rows: int, dim: int, device) -> torch.Tensor:
     return table_id * 1000.0 + row * 10.0 + column
 
 
-def test_pipeline_group_broadcasts_matching_tokens():
-    rank, _ = _initialize()
+def test_pipeline_group_prefetches_matching_tokens_before_schedule():
+    rank, world_size = _initialize()
     group = torch.distributed.group.WORLD
-    tokens = torch.arange(8, device="cuda", dtype=torch.int64).view(2, 4) if rank == 0 else None
-    received = broadcast_tokens_across_pipeline(tokens, 2, 4, group)
+    tp_group = None
+    for group_rank in range(world_size):
+        candidate = torch.distributed.new_group(ranks=[group_rank])
+        if group_rank == rank:
+            tp_group = candidate
+    assert tp_group is not None
+    tokens = torch.arange(8, device="cuda", dtype=torch.int64).view(2, 4)
+    data_iterator = iter([{"tokens": tokens}]) if rank == 0 else None
+    iterator = prepare_tokens_for_pipeline(data_iterator, 1, 2, 4, group, tp_group)
+    received = get_pipeline_prefetched_tokens(iterator)
     torch.testing.assert_close(received, torch.arange(8, device="cuda").view(2, 4))
+    if rank == 0:
+        assert next(iterator)["tokens"].data_ptr() == tokens.data_ptr()
 
 
 def test_variable_lookup_gradients_and_adam_step_match_full_reference():

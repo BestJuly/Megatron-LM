@@ -150,7 +150,7 @@ from megatron.training.initialize import (
     set_jit_fusion_options,
     write_args_to_tensorboard,
 )
-from megatron.training.utils import is_hybrid_model
+from megatron.training.utils import is_hybrid_model, prepare_tokens_for_pipeline
 
 # Local.
 from . import ft_integration, one_logger_utils
@@ -2967,6 +2967,15 @@ def train_step(
             seqlen_sum_this_global_batch = args.seq_length * args.global_batch_size
             seqlen_squared_sum_this_global_batch = args.seq_length**2 * args.global_batch_size
             forward_backward_data_iterator = data_iterator
+        if args.engram_enabled:
+            forward_backward_data_iterator = prepare_tokens_for_pipeline(
+                forward_backward_data_iterator,
+                num_microbatches,
+                args.micro_batch_size,
+                args.seq_length,
+                mpu.get_pipeline_model_parallel_group(),
+                mpu.get_tensor_model_parallel_group(),
+            )
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=forward_backward_data_iterator,
@@ -4864,6 +4873,15 @@ def evaluate(
             else:
                 packed_data_iterator = data_iterator
                 scheduled_eval_num_microbatches = eval_num_microbatches
+            if args.engram_enabled:
+                packed_data_iterator = prepare_tokens_for_pipeline(
+                    packed_data_iterator,
+                    scheduled_eval_num_microbatches,
+                    eval_micro_batch_size,
+                    args.seq_length,
+                    mpu.get_pipeline_model_parallel_group(),
+                    mpu.get_tensor_model_parallel_group(),
+                )
             loss_dicts = forward_backward_func(
                 forward_step_func=forward_step_func,
                 data_iterator=packed_data_iterator,

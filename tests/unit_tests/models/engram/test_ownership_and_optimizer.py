@@ -16,7 +16,7 @@ from megatron.core.optimizer import (
     _group_param_groups_by_optimizer,
     get_engram_config_overrides,
 )
-from megatron.training.utils import broadcast_tokens_across_pipeline
+from megatron.training.utils import get_pipeline_prefetched_tokens, prepare_tokens_for_pipeline
 
 from ._test_utils import make_module_config
 
@@ -85,12 +85,24 @@ def test_standard_optimizer_groups_honor_sparse_adam_override():
     assert grouped == {"sgd": [dense_group], "adam": [sparse_group]}
 
 
-def test_pp_token_helper_has_no_cached_state(monkeypatch):
+def test_pp_token_prefetch_replays_source_batches_in_order(monkeypatch):
     monkeypatch.setattr("megatron.training.utils.common_utils.get_pg_size", lambda _: 1)
     monkeypatch.setattr("megatron.training.utils.common_utils.get_pg_rank", lambda _: 0)
-    tokens = torch.arange(8).view(2, 4)
-    output = broadcast_tokens_across_pipeline(tokens, 2, 4, object())
-    assert output.data_ptr() == tokens.data_ptr()
-    assert not hasattr(broadcast_tokens_across_pipeline, "cache")
+    batches = [
+        {"tokens": torch.arange(8).view(2, 4), "id": 0},
+        {"tokens": torch.arange(8, 16).view(2, 4), "id": 1},
+    ]
+    iterator = prepare_tokens_for_pipeline(iter(batches), 2, 2, 4, object(), object())
+
+    assert next(iterator) is batches[0]
+    first_tokens = get_pipeline_prefetched_tokens(iterator)
+    torch.testing.assert_close(first_tokens, batches[0]["tokens"].to(first_tokens.device))
+    assert next(iterator) is batches[1]
+    second_tokens = get_pipeline_prefetched_tokens(iterator)
+    torch.testing.assert_close(second_tokens, batches[1]["tokens"].to(second_tokens.device))
+    with pytest.raises(RuntimeError, match="queue is exhausted"):
+        get_pipeline_prefetched_tokens(iterator)
+
+    malformed = iter([{"tokens": torch.arange(8).view(2, 4)}])
     with pytest.raises(ValueError, match="expected token shape"):
-        broadcast_tokens_across_pipeline(tokens, 1, 8, object())
+        prepare_tokens_for_pipeline(malformed, 1, 1, 8, object(), object())

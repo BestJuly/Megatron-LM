@@ -113,9 +113,13 @@ training does not compute these diagnostics.
 TP does not shard Engram tables or dense Engram projections. SP hashes full `tokens[B,S]`, then
 selects the same contiguous sequence interval used by MCore's sequence-parallel hidden state.
 
-Before pipeline scheduling, the first PP stage broadcasts token IDs through the existing matching
-PP group. A PP group fixes the data shard and TP/EP coordinates, so every stage receives the same
-microbatch tokens without a model-forward collective or mutable module cache. Layers use their
+Before each training or evaluation pipeline schedule, the first PP stage's TP source prefetches
+all raw microbatches, broadcasts token IDs across its TP group, and then each TP coordinate
+broadcasts through the matching PP group. The scheduler consumes a short-lived replay iterator,
+so the source sees the prefetched raw batches in their original order and rerun-state-machine
+rewinds remain exact. A PP group fixes the data shard and TP/EP coordinates, so every stage
+receives the same microbatch tokens without a model-forward collective or mutable module cache.
+Layers use their
 global 1-based `layer_number`; therefore selected layers on middle and last stages work without
 stage-specific layer specs or saved per-forward state.
 
