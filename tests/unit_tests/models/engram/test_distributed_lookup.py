@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Run with: torchrun --standalone --nproc-per-node=4 -m pytest -q <this file>."""
+"""Run with: torchrun --standalone --nproc-per-node={2,4} -m pytest -q <this file>."""
 
 import os
 from types import SimpleNamespace
@@ -16,7 +16,8 @@ from megatron.training.utils import get_pipeline_prefetched_tokens, prepare_toke
 from tests.unit_tests.test_utilities import Utils
 
 pytestmark = pytest.mark.skipif(
-    int(os.environ.get("WORLD_SIZE", "1")) != 4, reason="requires torchrun with exactly four ranks"
+    int(os.environ.get("WORLD_SIZE", "1")) not in (2, 4),
+    reason="requires torchrun with exactly two or four ranks",
 )
 
 

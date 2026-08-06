@@ -94,7 +94,9 @@ A module batches requests for all of its head tables into one routing exchange:
 5. invert the owner sort and restore `[B,S_local,num_tables,head_dim]`.
 
 The protocol permits duplicate rows, unequal request counts, empty peer splits, uneven tables,
-and EP=1. Backward through the return all-to-all sends gradients to the owning lookup operations,
+and EP=1. The distributed reference test runs at both EP2 and EP4 and checks outputs, sparse and
+dense gradients, and one Adam step against complete-table references. Backward through the return
+all-to-all sends gradients to the owning lookup operations,
 where embedding accumulation combines duplicates. In deterministic mode, the owner sorts local row
 IDs, sums each repeated-row gradient with a segmented reduction, and writes only unique rows. This
 avoids CUDA embedding atomic-add ordering differences across checkpoint restarts without deduplicating
@@ -148,6 +150,11 @@ sharded metadata, enabling Adam moment and master-weight resharding without gath
 onto one rank. Optimizer restore also preserves occurrence order for parameter groups that share
 the legacy weight-decay/expert identifier, so the Engram 5x LR group remains distinct from an
 otherwise identical ordinary Adam expert group.
+
+For the BF16 proxy, allocation reports count 14 bytes of scalable sparse payload per owned
+parameter: 2 bytes for the model value plus 12 bytes for the FP32 master value and two Adam
+moments. They report this payload for every global table and each Engram module at EP8 and EP4;
+fixed-size Adam step scalars are excluded because they do not scale with a table's row shard.
 
 ## Supported and deferred combinations
 

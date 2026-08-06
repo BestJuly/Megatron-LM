@@ -11,8 +11,38 @@ from megatron.core.models.engram.hashing import (
     compress_token_ids,
     slice_hashes_for_sequence_parallel,
 )
+from tools.engram.generate_tokenizer_map import build_remap
 
 from ._test_utils import write_tokenizer_map
+
+
+class _FakeTokenizer:
+    def __init__(self, decoded_tokens, raw_tokens):
+        self.decoded_tokens = decoded_tokens
+        self.raw_tokens = raw_tokens
+
+    def __len__(self):
+        return len(self.decoded_tokens)
+
+    def decode(self, token_ids, skip_special_tokens=False):
+        assert not skip_special_tokens
+        assert len(token_ids) == 1
+        return self.decoded_tokens[token_ids[0]]
+
+    def convert_ids_to_tokens(self, token_id):
+        return self.raw_tokens[token_id]
+
+
+def test_official_tokenizer_compression_uses_first_normalized_occurrence():
+    tokenizer = _FakeTokenizer(
+        decoded_tokens=["É", "e\u0301", " \t\n", " ", "", "�"],
+        raw_tokens=["tok0", "tok1", "tok2", "tok3", "tok4", "raw-invalid"],
+    )
+
+    remap, compressed_vocab_size = build_remap(tokenizer)
+
+    assert remap == [0, 0, 1, 1, 2, 3]
+    assert compressed_vocab_size == 4
 
 
 def test_official_fixed_hash_vector():
