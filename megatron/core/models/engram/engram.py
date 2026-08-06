@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 
 import torch
@@ -16,6 +17,8 @@ from megatron.core.transformer.module import MegatronModule
 from .config import EngramConfig
 from .distributed_embedding import EPShardedMultiTableEmbedding
 from .hashing import build_ngram_hashes, slice_hashes_for_sequence_parallel
+
+logger = logging.getLogger(__name__)
 
 
 class Engram(MegatronModule):
@@ -143,14 +146,18 @@ class Engram(MegatronModule):
         )
         local_rows = [table.local_num_embeddings for table in self.embedding.tables]
         row_ranges = [(table.row_start, table.row_end) for table in self.embedding.tables]
-        print(
-            "[Engram allocation] "
-            f"rank={global_rank} layer={self.layer_number} ep_rank={ep_rank} "
-            f"local_rows={local_rows} row_ranges={row_ranges} "
-            f"global_rows={list(self.embedding.table_sizes)} "
-            f"local_sparse_parameters={self.local_sparse_parameter_count} "
-            f"global_sparse_parameters={self.global_sparse_parameter_count}",
-            flush=True,
+        logger.info(
+            "[Engram allocation] rank=%s layer=%s ep_rank=%s local_rows=%s "
+            "row_ranges=%s global_rows=%s local_sparse_parameters=%s "
+            "global_sparse_parameters=%s",
+            global_rank,
+            self.layer_number,
+            ep_rank,
+            local_rows,
+            row_ranges,
+            list(self.embedding.table_sizes),
+            self.local_sparse_parameter_count,
+            self.global_sparse_parameter_count,
         )
 
     def _short_convolution(self, value: Tensor) -> Tensor:

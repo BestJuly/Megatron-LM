@@ -90,6 +90,16 @@ from .optimizer_config import (
 logger = logging.getLogger(__name__)
 
 
+def _group_param_groups_by_optimizer(
+    param_groups: List[Dict], default_optimizer: str
+) -> Dict[str, List[Dict]]:
+    """Bucket parameter groups by an optional per-group optimizer override."""
+    grouped_param_groups = defaultdict(list)
+    for param_group in param_groups:
+        grouped_param_groups[param_group.get('optimizer', default_optimizer)].append(param_group)
+    return grouped_param_groups
+
+
 def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, ParamGroupOverride]:
     """Get standard config overrides for the optimizer, handling decoupled LR and common wd skips.
 
@@ -1109,8 +1119,17 @@ def get_megatron_optimizer(
                 buffer_name='buffers',
             )
 
+            grouped_param_groups = _group_param_groups_by_optimizer(param_groups, config.optimizer)
+            if len(grouped_param_groups) != 1:
+                raise ValueError(
+                    "Per-parameter mixed optimizers are not supported with Megatron FSDP."
+                )
+            optimizer_name, param_groups = next(iter(grouped_param_groups.items()))
+            optimizer_config = copy.copy(config)
+            optimizer_config.optimizer = optimizer_name
+
             optimizer_part = _get_megatron_optimizer_based_on_param_groups(
-                config=config,
+                config=optimizer_config,
                 model_chunks=model_chunk,
                 param_groups=param_groups,
                 per_model_buffers=buffers,
@@ -1122,6 +1141,7 @@ def get_megatron_optimizer(
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
                 pg_collection=pg_collection,
             )
+            optimizer_part.config = config
             if (
                 not USING_PYTORCH_OPTIMIZER
                 and config.use_precision_aware_optimizer
@@ -1208,11 +1228,21 @@ def get_megatron_optimizer(
             expt_data_parallel_group_gloo = intra_expt_dp_group_gloo
         else:
             expt_data_parallel_group_gloo = None
-        optimizers.append(
-            _get_megatron_optimizer_based_on_param_groups(
-                config=config,
+        grouped_moe_param_groups = _group_param_groups_by_optimizer(
+            moe_param_groups, config.optimizer
+        )
+        if config.use_distributed_optimizer and len(grouped_moe_param_groups) != 1:
+            raise ValueError(
+                "Per-parameter mixed optimizers for expert-parallel parameters are not "
+                "supported with DistributedOptimizer."
+            )
+        for optimizer_name, optimizer_param_groups in grouped_moe_param_groups.items():
+            optimizer_config = copy.copy(config)
+            optimizer_config.optimizer = optimizer_name
+            optimizer_part = _get_megatron_optimizer_based_on_param_groups(
+                config=optimizer_config,
                 model_chunks=model_chunks,
-                param_groups=moe_param_groups,
+                param_groups=optimizer_param_groups,
                 per_model_buffers=moe_buffers,
                 model_parallel_group=expt_tp_pp_group,
                 data_parallel_group=intra_expt_dp_group,
@@ -1222,7 +1252,8 @@ def get_megatron_optimizer(
                 distributed_optimizer_instance_id=distributed_optimizer_instance_id,
                 pg_collection=pg_collection,
             )
-        )
+            optimizer_part.config = config
+            optimizers.append(optimizer_part)
 
     if dump_param_to_param_group_map is not None:
         torch.distributed.checkpoint.save(

@@ -119,7 +119,10 @@ Only sparse table weights carry `is_engram_embedding=True`. A `ParamKey` overrid
 parameters, routes them to Adam, sets both maximum and minimum LR schedule endpoints to the model
 endpoint multiplied by the configured factor (default 5), and applies the configured fixed weight
 decay (default zero). Value/key projections, gates, norms, and convolution remain in the model's
-selected optimizer and ordinary LR/weight-decay policy.
+selected optimizer and ordinary LR/weight-decay policy. The standard non-distributed optimizer path
+splits mixed model/Engram policies into chained optimizer instances. Mixed optimizer types over
+expert-parallel parameters are rejected with DistributedOptimizer, and mixed optimizer types are
+rejected with Megatron FSDP, because those paths cannot safely split their shared gradient buffers.
 
 ## Distributed checkpointing
 

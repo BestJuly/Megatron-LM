@@ -5,15 +5,37 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core.models.engram.distributed_embedding import get_contiguous_row_range
-from megatron.core.optimizer import OptimizerConfig, ParamKey, get_engram_config_overrides
+from megatron.core.models.engram.distributed_embedding import (
+    EPShardedMultiTableEmbedding,
+    get_contiguous_row_range,
+)
+from megatron.core.optimizer import (
+    OptimizerConfig,
+    ParamKey,
+    _group_param_groups_by_optimizer,
+    get_engram_config_overrides,
+)
 from megatron.training.utils import broadcast_tokens_across_pipeline
+
+from ._test_utils import make_module_config
 
 
 def test_uneven_row_ownership_exactly_covers_global_table():
     ranges = [get_contiguous_row_range(11, rank, 4) for rank in range(4)]
     assert ranges == [(0, 3), (3, 6), (6, 9), (9, 11)]
     assert [row for start, end in ranges for row in range(start, end)] == list(range(11))
+
+
+def test_multi_table_checkpoint_keeps_global_logical_shape():
+    embedding = EPShardedMultiTableEmbedding(
+        config=make_module_config(dtype=torch.float32),
+        table_sizes=(11, 13),
+        embedding_dim=3,
+        init_method=lambda _: None,
+    )
+    state = embedding.sharded_state_dict()
+    assert state["tables.0.weight"].global_shape == (11, 3)
+    assert state["tables.1.weight"].global_shape == (13, 3)
 
 
 def test_engram_optimizer_override_is_sparse_only():
@@ -35,6 +57,13 @@ def test_engram_optimizer_override_is_sparse_only():
         "end_wd": 0.0,
         "wd_mult": 1.0,
     }
+
+
+def test_standard_optimizer_groups_honor_sparse_adam_override():
+    dense_group = {"params": [torch.nn.Parameter(torch.zeros(1))]}
+    sparse_group = {"params": [torch.nn.Parameter(torch.zeros(1))], "optimizer": "adam"}
+    grouped = _group_param_groups_by_optimizer([dense_group, sparse_group], "sgd")
+    assert grouped == {"sgd": [dense_group], "adam": [sparse_group]}
 
 
 def test_pp_token_helper_has_no_cached_state(monkeypatch):

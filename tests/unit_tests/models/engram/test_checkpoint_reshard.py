@@ -1,8 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Run with: torchrun --standalone --nproc-per-node=4 -m pytest -q <this file>."""
+"""Checkpoint restart phases driven by ``run_checkpoint_reshard.sh``."""
 
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -17,16 +18,14 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
-pytestmark = pytest.mark.skipif(
-    int(os.environ.get("WORLD_SIZE", "1")) != 4, reason="requires torchrun with exactly four ranks"
-)
-
-
 TABLE_SIZES = (11, 13)
 EMBEDDING_DIM = 3
 
 
 def _initialize(ep_size: int):
+    if not torch.distributed.is_initialized():
+        Utils.initialize_distributed()
+    assert torch.distributed.get_world_size() % ep_size == 0
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=1,
@@ -75,7 +74,17 @@ def _init_adam_state(optimizer, config=None):
 def _build_optimizer(embedding):
     config = OptimizerConfig(optimizer="adam", lr=1.0e-3, min_lr=0.0)
     inner = torch.optim.Adam(
-        [table.weight for table in embedding.tables], lr=1.0e-3, betas=(0.9, 0.999)
+        [
+            {
+                "params": [table.weight for table in embedding.tables],
+                "wd_mult": 1.0,
+                "lr_mult": 1.0,
+                "is_expert_parallel": True,
+                "is_decoupled_lr": False,
+            }
+        ],
+        lr=1.0e-3,
+        betas=(0.9, 0.999),
     )
     return FP32Optimizer(inner, config, _init_adam_state)
 
@@ -113,10 +122,103 @@ def _step_full_reference(parameters, optimizer, scale):
     optimizer.zero_grad(set_to_none=True)
 
 
-@pytest.mark.parametrize("source_ep", [1, 2])
-def test_model_and_adam_state_reshard_to_ep4(tmp_path_dist_ckpt, source_ep):
+def _checkpoint_dir(source_ep):
+    root = os.environ.get("ENGRAM_CHECKPOINT_DIR")
+    if root is None:
+        pytest.skip("run with tests/unit_tests/models/engram/run_checkpoint_reshard.sh")
+    return Path(root) / f"ep{source_ep}"
+
+
+def _require_phase(expected):
+    if os.environ.get("ENGRAM_CHECKPOINT_PHASE") != expected:
+        pytest.skip(f"checkpoint phase {expected} was not requested")
+
+
+def _load_under_ep4_and_continue(checkpoint_dir):
+    pg_collection = _initialize(4)
     full_parameters, full_optimizer = _build_full_reference()
     _step_full_reference(full_parameters, full_optimizer, scale=1.0)
+
+    embedding = _build_embedding(pg_collection)
+    optimizer = _build_optimizer(embedding)
+    model_state = _model_sharded_state_dict(embedding)
+    loaded = load(
+        {
+            "model": model_state,
+            "optimizer": optimizer.sharded_state_dict(model_state, is_loading=True),
+        },
+        checkpoint_dir,
+    )
+    embedding.load_state_dict(loaded["model"])
+    optimizer.load_state_dict(loaded["optimizer"])
+
+    for table_id, table in enumerate(embedding.tables):
+        torch.testing.assert_close(
+            table.weight, full_parameters[table_id][table.row_start : table.row_end]
+        )
+
+    rank = torch.distributed.get_rank(pg_collection.ep)
+    hash_ids = torch.tensor(
+        [[[rank % TABLE_SIZES[0], (rank * 3 + 1) % TABLE_SIZES[1]]]],
+        dtype=torch.int64,
+        device="cuda",
+    )
+    output = embedding(hash_ids)
+    expected = torch.stack(
+        (full_parameters[0][hash_ids[..., 0]], full_parameters[1][hash_ids[..., 1]]), dim=-2
+    )
+    torch.testing.assert_close(output, expected)
+
+    _set_global_row_grads(embedding, scale=0.5)
+    optimizer.optimizer.step()
+    _step_full_reference(full_parameters, full_optimizer, scale=0.5)
+    for table_id, table in enumerate(embedding.tables):
+        torch.testing.assert_close(
+            table.weight,
+            full_parameters[table_id][table.row_start : table.row_end],
+            rtol=1e-6,
+            atol=1e-7,
+        )
+
+    Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("source_ep", [1, 2])
+def test_save_model_and_adam_state(source_ep):
+    _require_phase(f"save_ep{source_ep}")
+    pg_collection = _initialize(source_ep)
+    embedding = _build_embedding(pg_collection)
+    optimizer = _build_optimizer(embedding)
+    _set_global_row_grads(embedding, scale=1.0)
+    optimizer.optimizer.step()
+    optimizer.optimizer.zero_grad(set_to_none=True)
+
+    checkpoint_dir = _checkpoint_dir(source_ep)
+    if torch.distributed.get_rank() == 0:
+        checkpoint_dir.mkdir(parents=True, exist_ok=False)
+    torch.distributed.barrier()
+    model_state = _model_sharded_state_dict(embedding)
+    save(
+        {"model": model_state, "optimizer": optimizer.sharded_state_dict(model_state)},
+        checkpoint_dir,
+    )
+    torch.distributed.barrier()
+    assert (checkpoint_dir / ".metadata").is_file()
+    Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("source_ep", [1, 2])
+def test_load_under_ep4_and_continue_adam(source_ep):
+    _require_phase(f"load_ep{source_ep}")
+    _load_under_ep4_and_continue(_checkpoint_dir(source_ep))
+
+
+@pytest.mark.parametrize("source_ep", [1, 2])
+def test_in_process_reshard_to_ep4(source_ep):
+    if os.environ.get("ENGRAM_CHECKPOINT_PHASE") is not None:
+        pytest.skip("the cross-process checkpoint runner requested a specific phase")
+    if int(os.environ.get("WORLD_SIZE", "1")) != 4:
+        pytest.skip("requires torchrun with exactly four ranks")
 
     source_pg = _initialize(source_ep)
     source = _build_embedding(source_pg)
@@ -125,8 +227,9 @@ def test_model_and_adam_state_reshard_to_ep4(tmp_path_dist_ckpt, source_ep):
     source_optimizer.optimizer.step()
     source_optimizer.optimizer.zero_grad(set_to_none=True)
 
+    checkpoint_root = Path.cwd() / ".pytest_cache" / "engram_dist_checkpoint"
     checkpoint_name = f"engram_ep{source_ep}_to_ep4"
-    with TempNamedDir(tmp_path_dist_ckpt / checkpoint_name, sync=True) as checkpoint_dir:
+    with TempNamedDir(checkpoint_root / checkpoint_name, sync=True) as checkpoint_dir:
         source_model_state = _model_sharded_state_dict(source)
         save(
             {
@@ -135,52 +238,8 @@ def test_model_and_adam_state_reshard_to_ep4(tmp_path_dist_ckpt, source_ep):
             },
             checkpoint_dir,
         )
+        torch.distributed.barrier()
+        assert (checkpoint_dir / ".metadata").is_file()
         del source_optimizer, source
         Utils.destroy_model_parallel()
-
-        destination_pg = _initialize(4)
-        destination = _build_embedding(destination_pg)
-        destination_optimizer = _build_optimizer(destination)
-        destination_model_state = _model_sharded_state_dict(destination)
-        loaded = load(
-            {
-                "model": destination_model_state,
-                "optimizer": destination_optimizer.sharded_state_dict(
-                    destination_model_state, is_loading=True
-                ),
-            },
-            checkpoint_dir,
-        )
-        destination.load_state_dict(loaded["model"])
-        destination_optimizer.load_state_dict(loaded["optimizer"])
-
-        for table_id, table in enumerate(destination.tables):
-            torch.testing.assert_close(
-                table.weight, full_parameters[table_id][table.row_start : table.row_end]
-            )
-
-        # Lookup output proves that the loaded irregular shards route as one logical table.
-        rank = torch.distributed.get_rank(destination_pg.ep)
-        hash_ids = torch.tensor(
-            [[[rank % TABLE_SIZES[0], (rank * 3 + 1) % TABLE_SIZES[1]]]],
-            dtype=torch.int64,
-            device="cuda",
-        )
-        output = destination(hash_ids)
-        expected = torch.stack(
-            (full_parameters[0][hash_ids[..., 0]], full_parameters[1][hash_ids[..., 1]]), dim=-2
-        )
-        torch.testing.assert_close(output, expected)
-
-        _set_global_row_grads(destination, scale=0.5)
-        destination_optimizer.optimizer.step()
-        _step_full_reference(full_parameters, full_optimizer, scale=0.5)
-        for table_id, table in enumerate(destination.tables):
-            torch.testing.assert_close(
-                table.weight,
-                full_parameters[table_id][table.row_start : table.row_end],
-                rtol=1e-6,
-                atol=1e-7,
-            )
-
-    Utils.destroy_model_parallel()
+        _load_under_ep4_and_continue(checkpoint_dir)

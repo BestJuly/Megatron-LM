@@ -179,6 +179,21 @@ class EPShardedMultiTableEmbedding(MegatronModule):
         """Global logical sparse parameter count."""
         return sum(self.table_sizes) * self.embedding_dim
 
+    def sharded_state_dict(
+        self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None
+    ) -> ShardedStateDict:
+        """Preserve each table's irregular EP row metadata through the ModuleList container."""
+        sharded_state_dict = {}
+        for table_id, table in enumerate(self.tables):
+            sharded_state_dict.update(
+                table.sharded_state_dict(
+                    prefix=f"{prefix}tables.{table_id}.",
+                    sharded_offsets=sharded_offsets,
+                    metadata=metadata,
+                )
+            )
+        return sharded_state_dict
+
     def _lookup_received_requests(self, requests: Tensor) -> Tensor:
         output = self.tables[0].weight.new_empty((requests.shape[0], self.embedding_dim))
         received_table_ids = requests[:, 0]
