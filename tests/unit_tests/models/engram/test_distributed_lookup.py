@@ -50,6 +50,7 @@ def test_variable_lookup_gradients_and_adam_step_match_full_reference():
         params_dtype=torch.float64,
         perform_initialization=False,
         sequence_parallel=False,
+        deterministic_mode=True,
     )
     embedding = EPShardedMultiTableEmbedding(
         config=config,

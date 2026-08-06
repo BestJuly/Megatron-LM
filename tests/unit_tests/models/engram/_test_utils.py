@@ -48,7 +48,11 @@ def write_tokenizer_map(
 
 
 def make_module_config(
-    *, num_streams: int = 1, sequence_parallel: bool = False, dtype=torch.float64
+    *,
+    num_streams: int = 1,
+    sequence_parallel: bool = False,
+    deterministic_mode: bool = False,
+    dtype=torch.float64,
 ):
     """Return the minimal TransformerConfig interface consumed by Engram."""
     return SimpleNamespace(
@@ -61,6 +65,7 @@ def make_module_config(
         num_residual_streams=num_streams,
         layernorm_epsilon=1e-5,
         sequence_parallel=sequence_parallel,
+        deterministic_mode=deterministic_mode,
     )
 
 

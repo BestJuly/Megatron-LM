@@ -95,7 +95,10 @@ A module batches requests for all of its head tables into one routing exchange:
 
 The protocol permits duplicate rows, unequal request counts, empty peer splits, uneven tables,
 and EP=1. Backward through the return all-to-all sends gradients to the owning lookup operations,
-where ordinary embedding accumulation combines duplicates.
+where embedding accumulation combines duplicates. In deterministic mode, the owner sorts local row
+IDs, sums each repeated-row gradient with a segmented reduction, and writes only unique rows. This
+avoids CUDA embedding atomic-add ordering differences across checkpoint restarts without deduplicating
+or changing the forward request protocol.
 
 Sparse table weights have `allreduce=False`, so DDP synchronizes matching shards over expert-DP,
 not across EP owners. The weights are replicated over TP in this milestone. With SP, their and all

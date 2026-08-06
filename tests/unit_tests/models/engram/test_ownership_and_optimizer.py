@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from megatron.core.models.engram.distributed_embedding import (
+    EPShardedEmbeddingTable,
     EPShardedMultiTableEmbedding,
     get_contiguous_row_range,
 )
@@ -36,6 +37,24 @@ def test_multi_table_checkpoint_keeps_global_logical_shape():
     state = embedding.sharded_state_dict()
     assert state["tables.0.weight"].global_shape == (11, 3)
     assert state["tables.1.weight"].global_shape == (13, 3)
+
+
+def test_deterministic_embedding_backward_accumulates_repeated_rows():
+    table = EPShardedEmbeddingTable(
+        config=make_module_config(dtype=torch.float32, deterministic_mode=True),
+        global_num_embeddings=7,
+        embedding_dim=3,
+        init_method=torch.nn.init.zeros_,
+    )
+    row_ids = torch.tensor([2, 1, 2, 5, 2, 1], dtype=torch.int64)
+    output_grad = torch.arange(18, dtype=torch.float32).view(6, 3)
+
+    table(row_ids).backward(output_grad)
+
+    expected = torch.zeros_like(table.weight)
+    for row_id, row_grad in zip(row_ids, output_grad):
+        expected[row_id] += row_grad
+    torch.testing.assert_close(table.weight.grad, expected, rtol=0, atol=0)
 
 
 def test_engram_optimizer_override_is_sparse_only():

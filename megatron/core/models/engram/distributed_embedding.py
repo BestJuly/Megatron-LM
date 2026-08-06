@@ -16,6 +16,37 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_pg_rank, get_pg_size
 
 
+class _DeterministicEmbedding(torch.autograd.Function):
+    """Embedding lookup with sorted, segmented accumulation for repeated-row gradients."""
+
+    @staticmethod
+    def forward(ctx, weight: Tensor, row_ids: Tensor) -> Tensor:
+        ctx.save_for_backward(row_ids)
+        ctx.weight_shape = weight.shape
+        ctx.weight_dtype = weight.dtype
+        return weight.index_select(0, row_ids)
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor) -> tuple[Tensor, None]:
+        (row_ids,) = ctx.saved_tensors
+        accumulation_dtype = (
+            torch.float32
+            if grad_output.dtype in (torch.float16, torch.bfloat16)
+            else grad_output.dtype
+        )
+        grad_weight = torch.zeros(
+            ctx.weight_shape, dtype=accumulation_dtype, device=grad_output.device
+        )
+        if row_ids.numel() > 0:
+            order = torch.argsort(row_ids, stable=True)
+            sorted_rows = row_ids.index_select(0, order)
+            sorted_grads = grad_output.index_select(0, order).to(accumulation_dtype)
+            unique_rows, counts = torch.unique_consecutive(sorted_rows, return_counts=True)
+            row_grads = torch.segment_reduce(sorted_grads, "sum", lengths=counts)
+            grad_weight.index_copy_(0, unique_rows, row_grads)
+        return grad_weight.to(ctx.weight_dtype), None
+
+
 def get_contiguous_row_range(global_rows: int, rank: int, world_size: int) -> tuple[int, int]:
     """Return the balanced, unpadded contiguous row interval owned by ``rank``."""
     if global_rows < 0:
@@ -49,6 +80,7 @@ class EPShardedEmbeddingTable(MegatronModule):
         self.ep_group = ep_group
         self.tp_group = tp_group
         self.expt_dp_group = expt_dp_group
+        self.deterministic_mode = getattr(config, "deterministic_mode", False)
         self.ep_rank = get_pg_rank(ep_group)
         self.ep_size = get_pg_size(ep_group)
         self.row_start, self.row_end = get_contiguous_row_range(
@@ -82,6 +114,8 @@ class EPShardedEmbeddingTable(MegatronModule):
 
     def forward(self, local_row_ids: Tensor) -> Tensor:
         """Look up owner-local row IDs."""
+        if self.deterministic_mode:
+            return _DeterministicEmbedding.apply(self.weight, local_row_ids)
         return F.embedding(local_row_ids, self.weight)
 
     def sharded_state_dict(
