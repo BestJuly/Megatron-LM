@@ -274,11 +274,10 @@ class TransformerLayerSubmodules:
             after the MLP.
         sharded_state_dict_keys_map (Dict[str, str]): Mapping for sharded tensor keys to be applied
             in the `sharded_state_dict` method.
+        engram (Union[ModuleSpec, type]): Optional residual injection before attention. Kept last
+            to preserve the established positional constructor order.
     """
 
-    # Optional residual injection immediately before attention. Engram composes here so it can
-    # consume the real multi-stream residual before native mHC applies H_pre.
-    engram: Union[ModuleSpec, type] = IdentityOp
     input_layernorm: LayerNormBuilder = IdentityOp
     self_attention_hyper_connection: Union[ModuleSpec, type] = IdentityOp
     self_attention: Union[ModuleSpec, type] = IdentityOp
@@ -296,6 +295,10 @@ class TransformerLayerSubmodules:
 
     # Mapping for sharded tensor keys to be applied in `sharded_state_dict` method
     sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
+
+    # Keep extension points after the established positional fields for backward compatibility.
+    # Engram consumes the real multi-stream residual before native mHC applies H_pre.
+    engram: Union[ModuleSpec, type] = IdentityOp
 
 
 class BaseTransformerLayer(ABC):
@@ -364,12 +367,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         self.engram = None
         if submodules.engram is not IdentityOp:
-            engram_config = submodules.engram.params.get("engram_config")
+            if not isinstance(submodules.engram, ModuleSpec):
+                raise TypeError("The Engram composition point must be a ModuleSpec or IdentityOp.")
+            engram_spec = submodules.engram
+            engram_config = engram_spec.params.get("engram_config")
             if engram_config is None:
                 raise ValueError("The Engram ModuleSpec must provide engram_config.")
             if self.layer_number in engram_config.layer_ids:
                 self.engram = build_module(
-                    submodules.engram,
+                    engram_spec,
                     config=self.config,
                     layer_number=self.layer_number,
                     pg_collection=pg_collection,

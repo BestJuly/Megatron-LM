@@ -109,7 +109,7 @@ def get_standard_config_overrides(config: OptimizerConfig) -> Dict[ParamKey, Par
     Returns:
         Dict[ParamKey, ParamGroupOverride]: standard config overrides.
     """
-    config_overrides: Optional[Dict[ParamKey, ParamGroupOverride]] = {}
+    config_overrides: Dict[ParamKey, ParamGroupOverride] = {}
     # First, figure out how we are going to do wd skipping. The two main approaches are:
     #  1. The classic megatron approach of skipping all len 1 and bias parameters.
     #  2. The Qwen3-Next approach of doing 1, other than qk layernorm parameters.

@@ -28,6 +28,10 @@ def apply_engram_to_layer_spec(spec, engram_config: EngramConfig):
             _attach_to_layer_spec(layer_spec, engram_spec)
         return spec
     if isinstance(spec, ModuleSpec) and issubclass(spec.module, TransformerBlock):
+        if not isinstance(spec.submodules, TransformerBlockSubmodules):
+            raise TypeError("TransformerBlock ModuleSpec must provide TransformerBlockSubmodules.")
+        if spec.submodules.layer_specs is None:
+            raise TypeError("TransformerBlockSubmodules must provide layer_specs.")
         for layer_spec in spec.submodules.layer_specs:
             _attach_to_layer_spec(layer_spec, engram_spec)
         return spec
