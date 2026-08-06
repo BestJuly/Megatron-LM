@@ -71,6 +71,7 @@ from megatron.core.num_microbatches_calculator import (
 from megatron.core.optimizer import (
     OptimizerConfig,
     ParamKey,
+    get_engram_config_overrides,
     get_megatron_optimizer,
     get_mup_config_overrides,
     get_standard_config_overrides,
@@ -2369,6 +2370,14 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
     # Construct the appropriate config_overrides object. This default handles many cases, but
     #  can be added to as needed by the user, or replaced entirely with a custom override.
     config_overrides = get_standard_config_overrides(config=config)
+    if getattr(args, "engram_enabled", False):
+        config_overrides.update(
+            get_engram_config_overrides(
+                config,
+                lr_multiplier=args.engram_embedding_lr_multiplier,
+                weight_decay=args.engram_embedding_weight_decay,
+            )
+        )
 
     return config, config_overrides
 
@@ -2721,6 +2730,66 @@ def dummy_train_step(data_iterator):
             )
 
 
+def _capture_engram_table_training_state(model):
+    """Capture cheap scalar evidence before an Engram optimizer step."""
+    snapshots = []
+    for model_chunk in model:
+        for name, parameter in unwrap_model(model_chunk).named_parameters():
+            if not getattr(parameter, 'is_engram_embedding', False):
+                continue
+            gradient = getattr(parameter, 'main_grad', None)
+            if gradient is None:
+                gradient = parameter.grad
+            grad_square_sum = (
+                torch.zeros((), dtype=torch.float32, device=parameter.device)
+                if gradient is None
+                else gradient.detach().float().square().sum()
+            )
+            value = parameter.detach().float()
+            checksum = torch.stack((value.sum(), value.square().sum()))
+            snapshots.append((name, parameter, grad_square_sum, checksum))
+    if not snapshots:
+        raise RuntimeError("Engram training verification found no sparse table parameters.")
+    return snapshots
+
+
+def _verify_engram_table_training_state(snapshots, iteration):
+    """Require every local table to receive a finite gradient and change after the step."""
+    device = snapshots[0][1].device
+    local_grad_square_sum = torch.zeros((), dtype=torch.float32, device=device)
+    local_all_nonzero = True
+    local_all_changed = True
+    for _, parameter, grad_square_sum, old_checksum in snapshots:
+        value = parameter.detach().float()
+        new_checksum = torch.stack((value.sum(), value.square().sum()))
+        local_grad_square_sum += grad_square_sum
+        local_all_nonzero = local_all_nonzero and bool(
+            torch.isfinite(grad_square_sum).item() and grad_square_sum.item() > 0.0
+        )
+        local_all_changed = local_all_changed and not torch.equal(old_checksum, new_checksum)
+
+    status = torch.tensor(
+        [int(local_all_nonzero), int(local_all_changed)], dtype=torch.int32, device=device
+    )
+    peak_memory = torch.tensor(torch.cuda.max_memory_allocated(), dtype=torch.int64, device=device)
+    torch.distributed.all_reduce(local_grad_square_sum, op=torch.distributed.ReduceOp.SUM)
+    torch.distributed.all_reduce(status, op=torch.distributed.ReduceOp.MIN)
+    torch.distributed.all_reduce(peak_memory, op=torch.distributed.ReduceOp.MAX)
+    if torch.distributed.get_rank() == 0:
+        print(
+            "[Engram verify] "
+            f"iteration={iteration} global_grad_norm={local_grad_square_sum.sqrt().item():.8e} "
+            f"all_tables_nonzero={status[0].item()} all_tables_changed={status[1].item()} "
+            f"peak_memory_bytes={peak_memory.item()}",
+            flush=True,
+        )
+    if not bool(status.all().item()):
+        raise RuntimeError(
+            "Engram sparse-table verification failed: every table must receive a finite nonzero "
+            "gradient and change during the optimizer step."
+        )
+
+
 def train_step(
     forward_step_func,
     data_iterator,
@@ -2949,8 +3018,13 @@ def train_step(
 
     # Update parameters.
 
+    engram_training_state = (
+        _capture_engram_table_training_state(model) if args.engram_verify_training else None
+    )
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    if engram_training_state is not None:
+        _verify_engram_table_training_state(engram_training_state, iteration + 1)
 
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step

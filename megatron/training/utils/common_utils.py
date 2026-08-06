@@ -43,6 +43,7 @@ from megatron.core.utils import (
     get_batch_on_this_cp_rank,
     get_data_parallel_group_if_dtensor,
     get_pg_rank,
+    get_pg_size,
     to_local_if_dtensor,
     unwrap_model,
 )
@@ -528,6 +529,37 @@ def get_blend_and_blend_per_split(args):
         blend, blend_per_split = None, None
 
     return blend, blend_per_split
+
+
+def broadcast_tokens_across_pipeline(
+    tokens: Optional[torch.Tensor], micro_batch_size: int, sequence_length: int, pp_group
+) -> torch.Tensor:
+    """Broadcast one fixed-shape token batch from PP stage zero to its matching PP group.
+
+    Pipeline groups preserve the data, tensor, context, and expert coordinates. Broadcasting
+    over that explicit group therefore delivers the correct microbatch token IDs to every stage
+    without storing per-forward state on the model.
+    """
+    expected_shape = (micro_batch_size, sequence_length)
+    pp_size = get_pg_size(pp_group)
+    pp_rank = get_pg_rank(pp_group)
+    if pp_rank == 0:
+        if tokens is None:
+            raise RuntimeError("The first pipeline stage must own tokens for Engram broadcast.")
+        if tuple(tokens.shape) != expected_shape:
+            raise ValueError(
+                f"Engram expected token shape {expected_shape}, got {tuple(tokens.shape)}."
+            )
+        tokens = tokens.contiguous()
+    else:
+        device = torch.cuda.current_device() if torch.cuda.is_available() else torch.device("cpu")
+        tokens = torch.empty(expected_shape, dtype=torch.int64, device=device)
+
+    if pp_size > 1:
+        torch.distributed.broadcast(
+            tokens, src=torch.distributed.get_global_rank(pp_group, 0), group=pp_group
+        )
+    return tokens
 
 
 def get_batch_on_this_tp_rank(

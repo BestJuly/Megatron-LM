@@ -78,6 +78,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_biencoder_args(parser)
     parser = _add_vision_args(parser)
     parser = _add_moe_args(parser)
+    parser = _add_engram_args(parser)
     parser = _add_mla_args(parser)
     parser = _add_experimental_attention_variant_args(parser)
     parser = _add_heterogeneous_args(parser)
@@ -160,6 +161,9 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     # Args from environment
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
+    # Engram activation is intentionally derived from table vocabulary configuration rather than
+    # a second boolean switch. TransformerConfig uses this before model construction to permit EP.
+    args.engram_enabled = getattr(args, "engram_vocab_sizes", None) is not None
 
     # Args to enable MSC (opt-in: disabled by default)
     if args.disable_msc_deprecated:
@@ -1710,11 +1714,12 @@ def validate_args(args, defaults={}):
     # Expert parallelism check
     if args.expert_model_parallel_size > 1:
         assert (
-            args.num_experts is not None
-        ), "num_experts must be non None to use expert model parallelism"
-        assert (
-            args.num_experts % args.expert_model_parallel_size == 0
-        ), "Number of experts should be a multiple of expert model parallel_size."
+            args.num_experts is not None or args.engram_enabled
+        ), "num_experts must be non None to use expert model parallelism unless Engram is enabled"
+        if args.num_experts is not None:
+            assert (
+                args.num_experts % args.expert_model_parallel_size == 0
+            ), "Number of experts should be a multiple of expert model parallel_size."
 
     # MoE router check
     if (
@@ -4791,6 +4796,44 @@ def _add_moe_args(parser):
         default=1,
         help='This param sepecifics how many times smaller is the expert hidden size compared with the original dense FFN hidden size. '
         'For using granular upcycling strategy, please set this param as a positive integer. If this param is set to 1, it means using the default upcycling strategy.',
+    )
+    return parser
+
+
+def _add_engram_args(parser):
+    group = parser.add_argument_group(title="engram")
+    group.add_argument(
+        '--engram-vocab-sizes',
+        type=int,
+        nargs='+',
+        default=None,
+        help='Global table vocabulary budget for each Engram n-gram order; enables Engram.',
+    )
+    group.add_argument(
+        '--engram-layer-ids',
+        type=int,
+        nargs='+',
+        default=None,
+        help='Selected 1-based global transformer layer IDs.',
+    )
+    group.add_argument('--engram-max-ngram-order', type=int, default=3)
+    group.add_argument('--engram-num-hash-heads', type=int, default=8)
+    group.add_argument('--engram-memory-dim', type=int, default=512)
+    group.add_argument('--engram-kernel-size', type=int, default=4)
+    group.add_argument('--engram-hash-seed', type=int, default=0)
+    group.add_argument('--engram-pad-token-id', type=int, default=0)
+    group.add_argument(
+        '--engram-tokenizer-map',
+        type=str,
+        default=None,
+        help='Versioned token-ID compression and hash-constant artifact.',
+    )
+    group.add_argument('--engram-embedding-lr-multiplier', type=float, default=5.0)
+    group.add_argument('--engram-embedding-weight-decay', type=float, default=0.0)
+    group.add_argument(
+        '--engram-verify-training',
+        action='store_true',
+        help='Synchronously verify and log sparse-table gradients and updates each step.',
     )
     return parser
 

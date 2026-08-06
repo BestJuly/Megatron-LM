@@ -276,6 +276,9 @@ class TransformerLayerSubmodules:
             in the `sharded_state_dict` method.
     """
 
+    # Optional residual injection immediately before attention. Engram composes here so it can
+    # consume the real multi-stream residual before native mHC applies H_pre.
+    engram: Union[ModuleSpec, type] = IdentityOp
     input_layernorm: LayerNormBuilder = IdentityOp
     self_attention_hyper_connection: Union[ModuleSpec, type] = IdentityOp
     self_attention: Union[ModuleSpec, type] = IdentityOp
@@ -358,6 +361,19 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
         self.is_mtp_layer = is_mtp_layer
+
+        self.engram = None
+        if submodules.engram is not IdentityOp:
+            engram_config = submodules.engram.params.get("engram_config")
+            if engram_config is None:
+                raise ValueError("The Engram ModuleSpec must provide engram_config.")
+            if self.layer_number in engram_config.layer_ids:
+                self.engram = build_module(
+                    submodules.engram,
+                    config=self.config,
+                    layer_number=self.layer_number,
+                    pg_collection=pg_collection,
+                )
 
         # [Module 1: Input Layernorm] Optional Layernorm on the input data
         # TODO: add pytorch only layernorm
@@ -723,6 +739,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 otherwise None.
         """
         inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        if self.engram is not None:
+            if input_ids is None:
+                raise RuntimeError(
+                    f"Engram layer {self.layer_number} requires input token IDs "
+                    "for this microbatch."
+                )
+            if packed_seq_params is not None:
+                raise RuntimeError("Engram does not yet support packed sequences.")
+            hidden_states = hidden_states + self.engram(hidden_states, input_ids)
 
         # Optional Input Layer norm
         attn_norm_manager = self.off_interface(self.offload_attn_norm, hidden_states, "attn_norm")
@@ -2031,6 +2057,16 @@ class HyperConnectionTransformerLayer(TransformerLayer):
     ):
         """Forward attention with hyper connection pre/post processing on self-attention."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        if self.engram is not None:
+            if input_ids is None:
+                raise RuntimeError(
+                    f"Engram layer {self.layer_number} requires input token IDs "
+                    "for this microbatch."
+                )
+            if packed_seq_params is not None:
+                raise RuntimeError("Engram does not yet support packed sequences.")
+            hidden_states = hidden_states + self.engram(hidden_states, input_ids)
 
         nvtx_range_push(suffix="self_attention_hyper_connection")
         hidden_states, self_attn_h_res, self_attn_hc_h_post, residual = (

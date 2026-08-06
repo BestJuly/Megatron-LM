@@ -2,6 +2,7 @@
 
 from megatron.training.utils.common_utils import (
     average_losses_across_data_parallel_group,
+    broadcast_tokens_across_pipeline,
     calc_dtensor_params_l2_norm,
     calc_params_l2_norm,
     check_adlr_autoresume_termination,

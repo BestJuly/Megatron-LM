@@ -58,6 +58,7 @@ from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetC
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 from megatron.training.utils import (
+    broadcast_tokens_across_pipeline,
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
     get_blend_and_blend_per_split,
@@ -144,20 +145,32 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     # TODO: this is pretty hacky, find a better way
     is_packed_sequence = args.sft or (args.use_varlen_dataset and not args.varlen_sbhd_validation)
     needs_padding_mask = args.use_varlen_dataset and args.varlen_sbhd_validation
-    if (
+    middle_stage_without_batch = (
         not is_first_or_last_pipeline_stage(vp_stage)
         and not is_packed_sequence
         and not needs_padding_mask
         and ((not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)))
-    ):
+    )
+    if middle_stage_without_batch and not args.engram_enabled:
         return None, None, None, None, None, None, None
 
-    # get batches based on the TP rank you are on
-    batch = get_batch_on_this_tp_rank(
-        data_iterator,
-        mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
-        needs_padding_mask=needs_padding_mask,
-    )
+    if middle_stage_without_batch:
+        batch = {}
+    else:
+        # get batches based on the TP rank you are on
+        batch = get_batch_on_this_tp_rank(
+            data_iterator,
+            mtp_on_this_rank=mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage),
+            needs_padding_mask=needs_padding_mask,
+        )
+
+    if args.engram_enabled:
+        batch['tokens'] = broadcast_tokens_across_pipeline(
+            batch.get('tokens'),
+            args.micro_batch_size,
+            args.seq_length,
+            mpu.get_pipeline_model_parallel_group(),
+        )
 
     cu_seqlens = batch.pop('cu_seqlens', None)
     cu_seqlens_padded = batch.pop('cu_seqlens_padded', None)
