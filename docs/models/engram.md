@@ -135,7 +135,9 @@ padding in checkpoint metadata.
 Torch distributed checkpoint save/load therefore transfers intersecting slices directly between
 the saved and target layouts when EP changes. Optimizer state uses the model parameter's same
 sharded metadata, enabling Adam moment and master-weight resharding without gathering a full table
-onto one rank.
+onto one rank. Optimizer restore also preserves occurrence order for parameter groups that share
+the legacy weight-decay/expert identifier, so the Engram 5x LR group remains distinct from an
+otherwise identical ordinary Adam expert group.
 
 ## Supported and deferred combinations
 
