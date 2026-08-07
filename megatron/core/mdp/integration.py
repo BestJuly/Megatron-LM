@@ -115,13 +115,23 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
         or getattr(args, "fine_grained_activation_offloading", False)
         or getattr(args, "offload_optimizer_states", False)
     )
+    # Mirror initialize_model_parallel's order selection (initialize.py):
+    # --use-tp-pp-dp-mapping switches to 'tp-cp-ep-pp-dp', which MDP's rank
+    # mapping does not support — the snapshot must report the REAL order so
+    # validate_mdp_config's rejection can fire instead of building planning
+    # groups that no longer match the decoder replicas.
+    rank_order = (
+        "tp-cp-ep-pp-dp"
+        if getattr(args, "use_tp_pp_dp_mapping", False)
+        else SUPPORTED_RANK_ORDER
+    )
     return MdpCompatibilityOptions(
         world_size=args.world_size,
         tensor_parallel_size=args.tensor_model_parallel_size,
         pipeline_parallel_size=args.pipeline_model_parallel_size,
         context_parallel_size=args.context_parallel_size,
         expert_parallel_size=getattr(args, "expert_model_parallel_size", 1),
-        rank_order=SUPPORTED_RANK_ORDER,
+        rank_order=rank_order,
         virtual_pipeline_parallel_size=getattr(
             args, "virtual_pipeline_model_parallel_size", None
         ),

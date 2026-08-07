@@ -61,6 +61,13 @@ def test_bridge_supports_two_slices_of_one_item():
     neighbour as two slices (rows [0, 16) and [16, 24)), each with its own
     slice_id, coalesced on the same edge. The reassembled halves must equal
     the source rows exactly.
+
+    Deliberately constructed at the ledger layer: in v1 the plan cannot
+    represent a split (RouteSlice gains item_row_start/item_rows only when a
+    real split lands, API design 6.2), so build_ledger emits one entry per
+    route by definition. When decoder CP adds those fields, this test MUST be
+    extended to drive the split through MdpBatchPlan and build_ledger and to
+    assert the generated ledger before exchanging it.
     """
     rank = torch.distributed.get_rank()
     world = torch.distributed.get_world_size()

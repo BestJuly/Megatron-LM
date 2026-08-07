@@ -44,6 +44,8 @@ def test_weight_only_contract_is_enforced():
         no_save_rng=True,
         no_load_optim=True,
         no_load_rng=True,
+        ckpt_fully_parallel_save=False,
+        ckpt_fully_parallel_load=False,
     )
     assert_weight_only_checkpoint(good)
     for missing in ("no_save_optim", "no_save_rng"):
@@ -52,12 +54,54 @@ def test_weight_only_contract_is_enforced():
             load=None,
             no_save_optim=True,
             no_save_rng=True,
+            ckpt_fully_parallel_save=False,
         )
         setattr(args, missing, False)
         with pytest.raises(MdpCheckpointError, match=missing.replace("_", "-")):
             assert_weight_only_checkpoint(args)
+    # Megatron defaults ckpt_fully_parallel_save=True: it must be rejected
+    # when saving (the fully-parallel path shards over one DP-CP group for
+    # every child, which is wrong for the encoder's WORLD replica domain).
+    fully_parallel = SimpleNamespace(
+        save="/tmp/x",
+        load=None,
+        no_save_optim=True,
+        no_save_rng=True,
+        ckpt_fully_parallel_save=True,
+    )
+    with pytest.raises(MdpCheckpointError, match="fully-parallel-save"):
+        assert_weight_only_checkpoint(fully_parallel)
     no_ckpt = SimpleNamespace(save=None, load=None)
     assert_weight_only_checkpoint(no_ckpt)
+
+
+def test_unsupported_checkpoint_execution_modes_rejected():
+    # Design doc section 12: asynchronous, non-persistent, and constant-
+    # structure caching modes must fail at startup when a save/load is
+    # requested; checkpoint-free runs are unaffected.
+    base = dict(
+        save="/tmp/x",
+        load=None,
+        no_save_optim=True,
+        no_save_rng=True,
+        ckpt_fully_parallel_save=False,
+    )
+    for field, match in (
+        ("async_save", "async-save"),
+        ("ckpt_assume_constant_structure", "constant-structure"),
+    ):
+        args = SimpleNamespace(**base)
+        setattr(args, field, True)
+        with pytest.raises(MdpCheckpointError, match=match):
+            assert_weight_only_checkpoint(args)
+    args = SimpleNamespace(**base, non_persistent_ckpt_type="global")
+    with pytest.raises(MdpCheckpointError, match="non-persistent"):
+        assert_weight_only_checkpoint(args)
+    # The same flags are ignored when no checkpoint is requested.
+    quiet = SimpleNamespace(
+        save=None, load=None, async_save=True, ckpt_assume_constant_structure=True
+    )
+    assert_weight_only_checkpoint(quiet)
 
 
 def test_add_encoder_state_rejects_duplicates():

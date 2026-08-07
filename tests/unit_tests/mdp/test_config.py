@@ -187,3 +187,60 @@ def test_apply_overrides_rejects_keys_outside_allowlist():
     assert "hidden_size" not in VISION_CONFIG_OVERRIDE_ALLOWLIST
     with pytest.raises(MdpConfigurationError, match="allowlist"):
         apply_vision_config_overrides(_FakeTransformerConfig(), (("hidden_size", 128),))
+
+
+# ---------------------- args snapshot (integration) ----------------------
+
+
+def _fake_args(**overrides):
+    from types import SimpleNamespace
+
+    base = dict(
+        world_size=8,
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=2,
+        context_parallel_size=1,
+        expert_model_parallel_size=1,
+        use_tp_pp_dp_mapping=False,
+        virtual_pipeline_model_parallel_size=None,
+        calculate_per_token_loss=True,
+        use_distributed_optimizer=True,
+        num_distributed_optimizer_instances=1,
+        fp16=False,
+        bf16=True,
+        use_torch_fsdp2=False,
+        use_custom_fsdp=False,
+        use_megatron_fsdp=False,
+        fp8=None,
+        cuda_graph_impl="none",
+        cpu_offloading=False,
+        fine_grained_activation_offloading=False,
+        offload_optimizer_states=False,
+        overlap_grad_reduce=False,
+        overlap_param_gather=False,
+        delay_grad_reduce=False,
+        ckpt_format="torch_dist",
+        save=None,
+        load=None,
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def test_snapshot_reports_the_real_rank_order():
+    # --use-tp-pp-dp-mapping switches initialize_model_parallel to
+    # 'tp-cp-ep-pp-dp'; the snapshot must report it so the rank-order guard
+    # fires instead of building planning groups that do not match the real
+    # decoder replicas.
+    from megatron.core.mdp.integration import compatibility_options_from_args
+
+    default_options = compatibility_options_from_args(_fake_args())
+    assert default_options.rank_order == "tp-cp-ep-dp-pp"
+    validate_mdp_config(MdpConfig(enable=True), default_options)
+
+    remapped_options = compatibility_options_from_args(
+        _fake_args(use_tp_pp_dp_mapping=True)
+    )
+    assert remapped_options.rank_order == "tp-cp-ep-pp-dp"
+    with pytest.raises(MdpConfigurationError, match="rank_order"):
+        validate_mdp_config(MdpConfig(enable=True), remapped_options)

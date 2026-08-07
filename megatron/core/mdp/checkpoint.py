@@ -54,16 +54,44 @@ def assert_weight_only_checkpoint(args) -> None:
     start fresh after load. The native flags express exactly that.
     """
     problems = []
+    save_or_load = (
+        getattr(args, "save", None) is not None or getattr(args, "load", None) is not None
+    )
+    if save_or_load:
+        # Design doc section 12: only the synchronous, persistent, global
+        # torch_dist mode is supported. Asynchronous, non-persistent, and
+        # constant-structure caching modes are rejected at startup (scoped to
+        # save/load so checkpoint-free runs are unaffected by defaults).
+        if getattr(args, "async_save", False):
+            problems.append("no --async-save (asynchronous save is unsupported)")
+        if getattr(args, "non_persistent_ckpt_type", None) is not None:
+            problems.append(
+                "no --non-persistent-ckpt-type (non-persistent checkpoints are "
+                "unsupported)"
+            )
+        if getattr(args, "ckpt_assume_constant_structure", False):
+            problems.append(
+                "no --ckpt-assume-constant-structure (MDP's plan-derived "
+                "structures change per iteration; a cached structure goes stale)"
+            )
     if getattr(args, "save", None) is not None:
         if not getattr(args, "no_save_optim", False):
             problems.append("--no-save-optim")
         if not getattr(args, "no_save_rng", False):
             problems.append("--no-save-rng")
+        # Megatron defaults ckpt_fully_parallel_save=True; the fully-parallel
+        # path shards across one DP-CP group for every child, which is wrong
+        # for the encoder's WORLD replica domain. Scoped to save/load so runs
+        # that never touch a checkpoint are not rejected by the default.
+        if getattr(args, "ckpt_fully_parallel_save", False):
+            problems.append("--no-ckpt-fully-parallel-save")
     if getattr(args, "load", None) is not None:
         if not getattr(args, "no_load_optim", False):
             problems.append("--no-load-optim")
         if not getattr(args, "no_load_rng", False):
             problems.append("--no-load-rng")
+        if getattr(args, "ckpt_fully_parallel_load", False):
+            problems.append("--no-ckpt-fully-parallel-load (or omit --ckpt-fully-parallel-load)")
     if problems:
         raise MdpCheckpointError(
             "MDP: the checkpoint facade is a weight-only restart contract; run with "

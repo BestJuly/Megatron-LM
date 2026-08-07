@@ -323,6 +323,10 @@ class ModalityBridge:
             requests = dist.batch_isend_irecv(p2p_ops)
             for request in requests:
                 request.wait()
+            # Batched P2P can leave the copies on a side stream on some
+            # NCCL/PyTorch combinations; sync before anything reads the
+            # receive buffers. The exchange is phase-synchronous anyway.
+            torch.cuda.synchronize()
         # Send buffers stayed alive until the waits above completed.
         for staging in send_staging:
             self._allocator.release(staging)
