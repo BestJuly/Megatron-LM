@@ -119,16 +119,19 @@ def test_text_only_microbatch_gets_empty_layout():
     assert not plan.layout_for_microbatch(1).text_only
 
 
-def test_producer_layout_offsets_follow_capacity_policy():
+def test_producer_layout_offsets_are_valid_row_cumulative():
+    # The encoder consumes a contiguous pack whose frame boundaries derive
+    # from grid_thw alone, so segment offsets accumulate valid rows even
+    # under a non-trivial capacity policy; capacity sizes buffers only.
     descriptors = [_descriptor(0, cost=10), _descriptor(1, cost=9)]
     single_worker = _view(worker_ids=(0,), group=(0,))
     plan = _planner(alignment=16, view=single_worker).build_plan(0, descriptors, [0])
     layout = plan.encoder_layout_for_producer(0)
     assert len(layout.segments) == 2
     first, second = layout.segments
-    # 16 payload rows align to 16; 4 output rows align to 16.
-    assert second.payload_row_start == 16
-    assert second.output_row_start == 16
+    assert second.payload_row_start == first.payload_rows == 16
+    assert second.output_row_start == first.output_rows == 4
+    assert plan.capacity_policy.capacity_of(first.output_rows) == 16
 
 
 def test_cross_microbatch_packing_in_one_producer():

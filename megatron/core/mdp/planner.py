@@ -107,8 +107,12 @@ class MdpPlanner:
                         grid_thw=descriptor.grid_thw,
                     )
                 )
-                payload_offset += self._capacity_policy.capacity_of(descriptor.payload_rows)
-                output_offset += self._capacity_policy.capacity_of(descriptor.output_rows)
+                # Offsets accumulate VALID rows: the encoder consumes a
+                # contiguous pack whose frame boundaries derive from grid_thw
+                # alone. The capacity policy sizes buffers (bridge and pack
+                # tails), never inter-segment gaps.
+                payload_offset += descriptor.payload_rows
+                output_offset += descriptor.output_rows
             encoder_layouts.append(
                 EncoderThdLayout(producer_worker_id=worker_id, segments=tuple(segments))
             )
