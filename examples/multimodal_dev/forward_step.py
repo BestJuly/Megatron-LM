@@ -170,11 +170,101 @@ def _build_packed_seq_params_from_cu_seqlens(
     )
 
 
+def build_vision_sidecar(
+    batch: list[Dict[str, Any]],
+    cu_seqlens_padded: list[int],
+    image_token_id: int,
+    spatial_merge_size: int,
+) -> Dict[str, torch.Tensor]:
+    """Build the per-item vision sidecar for a THD-packed batch.
+
+    For every vision item, records ``(sample_index, image_ordinal, t, h, w,
+    payload_row_start)`` plus that item's decoder image-token positions in the
+    packed ``[1, T]`` layout, ordered by ``(sample_index, image_ordinal)``.
+    Both outputs are plain integer tensors so they survive the TP broadcast.
+
+    Consistency guards (fail the batch rather than silently degrade):
+
+    * pixel data and grid metadata are all-or-nothing per sample;
+    * per-sample pixel rows equal ``sum(t*h*w)`` over its grids;
+    * per-sample image-token slots equal ``sum(t*(h/m)*(w/m))``, so truncation
+      can never leave a cut image block;
+    * every item's token slots are contiguous in the sample.
+    """
+    meta_rows = []
+    position_chunks = []
+    payload_row_start = 0
+    merge = spatial_merge_size
+    for sample_index, sample in enumerate(batch):
+        grids = sample.get("image_grid_thw")
+        pixels = sample.get("pixel_values")
+        num_items = 0 if grids is None else int(grids.shape[0])
+        pixel_rows = 0 if pixels is None else int(pixels.shape[0])
+        if (num_items == 0) != (pixel_rows == 0):
+            raise ValueError(
+                f"sample {sample_index}: pixel data and grid metadata must either both "
+                f"exist or both be absent (items={num_items}, pixel_rows={pixel_rows})"
+            )
+        input_ids = sample["input_ids"]
+        image_positions = (input_ids == image_token_id).nonzero(as_tuple=True)[0]
+        expected_rows = 0
+        expected_slots = 0
+        item_slot_counts = []
+        for ordinal in range(num_items):
+            t, h, w = (int(v) for v in grids[ordinal])
+            if h % merge != 0 or w % merge != 0:
+                raise ValueError(
+                    f"sample {sample_index} item {ordinal}: grid ({t},{h},{w}) not "
+                    f"divisible by spatial_merge_size={merge}"
+                )
+            expected_rows += t * h * w
+            item_slot_counts.append(t * (h // merge) * (w // merge))
+            expected_slots += item_slot_counts[-1]
+        if expected_rows != pixel_rows:
+            raise ValueError(
+                f"sample {sample_index}: pixel rows {pixel_rows} != sum(t*h*w) "
+                f"{expected_rows} over its grids"
+            )
+        if int(image_positions.numel()) != expected_slots:
+            raise ValueError(
+                f"sample {sample_index}: {int(image_positions.numel())} image-token "
+                f"slots != sum(t*(h/m)*(w/m)) {expected_slots}; truncation must never "
+                "cut an image-token block"
+            )
+        slot_cursor = 0
+        for ordinal in range(num_items):
+            t, h, w = (int(v) for v in grids[ordinal])
+            slots = item_slot_counts[ordinal]
+            item_positions = image_positions[slot_cursor : slot_cursor + slots]
+            slot_cursor += slots
+            if slots and int(item_positions[-1] - item_positions[0]) != slots - 1:
+                raise ValueError(
+                    f"sample {sample_index} item {ordinal}: image-token slots are not "
+                    "contiguous"
+                )
+            meta_rows.append(
+                [sample_index, ordinal, t, h, w, payload_row_start]
+            )
+            payload_row_start += t * h * w
+            position_chunks.append(item_positions.to(torch.int64) + cu_seqlens_padded[sample_index])
+    if meta_rows:
+        return {
+            "vision_item_meta": torch.tensor(meta_rows, dtype=torch.int64),
+            "vision_decoder_positions": torch.cat(position_chunks),
+        }
+    return {
+        "vision_item_meta": torch.empty(0, 6, dtype=torch.int64),
+        "vision_decoder_positions": torch.empty(0, dtype=torch.int64),
+    }
+
+
 def pack_or_pad_batch(
     batch: Optional[list[Dict[str, Any]]],
     use_packed_sequence: bool = False,
     seq_length: Optional[int] = None,
     device="cuda",
+    pad_to_multiple: Optional[int] = None,
+    with_vision_sidecar: bool = False,
 ) -> Dict[str, Any]:
     """Pack or pad a ``[B, S]`` batch into ``[1, T]`` THD or ``[B, S]`` BSHD.
 
@@ -202,6 +292,8 @@ def pack_or_pad_batch(
         divisible_by = (tp_size * cp_size * 2) if has_sp else (cp_size * 2)
     else:
         divisible_by = tp_size if has_sp else 1
+    if pad_to_multiple is not None:
+        divisible_by = max(divisible_by, pad_to_multiple)
 
     if use_packed_sequence:
         packed_batch: Dict[str, Any] = {}
@@ -241,6 +333,23 @@ def pack_or_pad_batch(
                 pad_end = cu_seqlens_padded[i + 1]
                 if pad_end > pad_start:
                     padding_mask_thd[pad_start:pad_end] = True
+
+            if with_vision_sidecar:
+                try:
+                    args = get_args()
+                    sidecar_image_token_id = getattr(args, "image_token_id", 248056)
+                    sidecar_merge = getattr(args, "vision_spatial_merge_size", None) or 2
+                except AssertionError:
+                    sidecar_image_token_id = 248056
+                    sidecar_merge = 2
+                packed_batch.update(
+                    build_vision_sidecar(
+                        batch,
+                        cu_seqlens_padded,
+                        image_token_id=sidecar_image_token_id,
+                        spatial_merge_size=sidecar_merge,
+                    )
+                )
 
             packed_batch["input_ids"] = torch.concat(input_ids_list, dim=0).unsqueeze(0)
             packed_batch["labels"] = torch.concat(labels_list, dim=0).unsqueeze(0)
@@ -351,7 +460,13 @@ def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
         return None
 
     # Because broadcast will not broadcast packed_seq_params, we move it into pack_or_pad_batch
-    batch = pack_or_pad_batch(data, args.use_packed_sequence, args.seq_length, device=device)
+    batch = pack_or_pad_batch(
+        data,
+        args.use_packed_sequence,
+        args.seq_length,
+        device=device,
+        with_vision_sidecar=getattr(args, "mdp_enable", False),
+    )
 
     # Fix shapes produced by default_collate.
     if "position_ids" in batch and batch["position_ids"] is not None:
@@ -411,6 +526,10 @@ def forward_step(data_iterator, model):
 
     pixel_values = batch.get("pixel_values", None) if is_first else None
     image_grid_thw = batch.get("image_grid_thw", None)
+    # A text-only microbatch collates to zero pixel rows; take the text path.
+    if pixel_values is not None and pixel_values.shape[0] == 0:
+        pixel_values = None
+        image_grid_thw = None
     if (
         pixel_values is not None
         and pixel_values.is_floating_point()
