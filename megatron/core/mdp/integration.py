@@ -243,7 +243,10 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
         len(rank_view.worker_ids),
         list(mdp_config.vision_config_overrides),
     )
-    return optimizer
+
+    from megatron.core.mdp.optimizer import build_mdp_composite_optimizer
+
+    return build_mdp_composite_optimizer(optimizer, encoder_domain.encoder_optimizer)
 
 
 def maybe_wrap_forward_backward(forward_backward_func: Callable, config=None) -> Callable:
