@@ -281,3 +281,25 @@ def test_invalid_transitions_raise():
         runtime.capture_global_num_tokens(tokens)
     runtime.mark_decoder_complete()
     runtime.end_iteration()
+
+
+def test_iteration_metrics_are_populated():
+    runtime, view = _build_runtime()
+    assert runtime.last_iteration_metrics() is None
+    replay = runtime.begin_iteration(
+        iter(range(10)), num_microbatches=2, forward_only=False
+    )
+    _drive_decoder(runtime, view, replay, backward=True)
+    runtime.capture_global_num_tokens(torch.tensor(20.0, device="cuda"))
+    runtime.mark_decoder_complete()
+    runtime.end_iteration()
+    metrics = runtime.last_iteration_metrics()
+    assert metrics.iteration == 0
+    assert metrics.outer_dp_rank == view.outer_dp_rank
+    assert metrics.plan_build_ms >= 0.0
+    assert metrics.decoder_schedule_ms >= 0.0
+    assert len(metrics.worker_loads) == len(view.worker_ids)
+    assert sum(metrics.worker_loads) == 16 + 64 + 32  # all payload rows
+    assert set(metrics.bridge_stats) == {"pixel", "embedding", "gradient"}
+    assert metrics.bridge_stats["pixel"].total_bytes > 0
+    assert all(count == 0 for count in metrics.allocator_reuse.values())

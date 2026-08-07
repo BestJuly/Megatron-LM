@@ -15,6 +15,7 @@ empty ledgers, zero local encoder work, and zero encoder gradients.
 """
 
 import logging
+import time
 from enum import Enum, auto
 from typing import Iterator, Optional, Sequence, Union
 
@@ -32,6 +33,11 @@ from megatron.core.mdp.config import MdpConfig
 from megatron.core.mdp.encoder import EncoderDomain, finalize_encoder_grads
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
 from megatron.core.mdp.groups import MdpProcessGroups, broadcast_descriptors
+from megatron.core.mdp.observability import (
+    MdpIterationMetrics,
+    nvtx_phase,
+    worker_loads_from_plan,
+)
 from megatron.core.mdp.plan import MdpBatchPlan, split_encoder_layout
 from megatron.core.mdp.planner import MdpPlanner, assert_consistent_plan
 from megatron.core.mdp.protocols import MdpModelAdapter
@@ -98,6 +104,11 @@ class MdpRuntime:
         self._captured_num_tokens: Optional[torch.Tensor] = None
         self._token_capture_count = 0
         self._token_consumed = False
+        self._plan_build_ms = 0.0
+        self._encoder_forward_ms = 0.0
+        self._decoder_schedule_ms = 0.0
+        self._decoder_start = 0.0
+        self._last_metrics: Optional[MdpIterationMetrics] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -137,6 +148,7 @@ class MdpRuntime:
         self._token_consumed = False
 
         # P1: window capture, descriptor broadcast, plan, pixel dispatch.
+        plan_start = time.monotonic()
         window = MdpIterationWindow.capture(
             data_iterators,
             num_microbatches=num_microbatches,
@@ -171,6 +183,7 @@ class MdpRuntime:
             debug_payload_check=self.config.debug_plan_payload_check,
         )
         self._plan = plan
+        self._plan_build_ms = (time.monotonic() - plan_start) * 1000.0
 
         pixel_specs = self._tensor_specs(plan, pixels=True)
         sidecar = window.payload_sidecar()
@@ -195,6 +208,7 @@ class MdpRuntime:
         self._chunk_of_item = {}
         chunk_outputs = []
         encoder = self.encoder_domain.encoder_ddp
+        forward_start = time.monotonic()
         for chunk_index, chunk in enumerate(self._chunk_layouts):
             payload = self.allocator.acquire(
                 rows=plan.capacity_policy.capacity_of(chunk.total_payload_rows),
@@ -211,16 +225,19 @@ class MdpRuntime:
                 self._chunk_of_item[segment.global_item_id] = (chunk_index, segment)
             payload_valid = payload[: chunk.total_payload_rows]
             if forward_only:
-                with torch.no_grad():
+                with torch.no_grad(), nvtx_phase("p2_encoder_forward"):
                     output = self.adapter.encode(encoder, payload_valid, chunk)
             else:
-                output = self.adapter.encode(encoder, payload_valid, chunk)
+                with nvtx_phase("p2_encoder_forward"):
+                    output = self.adapter.encode(encoder, payload_valid, chunk)
                 if output.shape[0] and (not output.requires_grad or output.grad_fn is None):
                     raise MdpStateError(
                         "MDP: encoder chunk output is not graph-connected in training; "
                         "adapter.encode must run with gradients enabled."
                     )
             chunk_outputs.append(output)
+
+        self._encoder_forward_ms = (time.monotonic() - forward_start) * 1000.0
 
         if self._chunk_layouts and not forward_only:
             self._handle = EncoderForwardHandle(
@@ -272,6 +289,7 @@ class MdpRuntime:
             self._eval_outputs = ()
 
         self._state = MdpRuntimeState.DECODER_READY
+        self._decoder_start = time.monotonic()
         return window.replay_iterators()
 
     def capture_global_num_tokens(self, token_tensor: Optional[torch.Tensor]) -> None:
@@ -302,12 +320,14 @@ class MdpRuntime:
                 "MDP: the decoder schedule completed without exactly one global "
                 "token capture; is finalize_model_grads_func wrapped?"
             )
+        self._decoder_schedule_ms = (time.monotonic() - self._decoder_start) * 1000.0
         self._state = MdpRuntimeState.DECODER_DONE
 
     def end_iteration(self) -> None:
         """P5 (training) or cleanup (evaluation), then lifecycle asserts."""
         self._require_state(MdpRuntimeState.DECODER_DONE, "end_iteration")
         plan = self._plan
+        backward_start = time.monotonic()
         if self._forward_only:
             for layout in plan.layouts:
                 self.storage.release(layout.microbatch_id)
@@ -362,6 +382,23 @@ class MdpRuntime:
             )
             self._token_consumed = True
 
+        encoder_backward_ms = (
+            0.0 if self._forward_only else (time.monotonic() - backward_start) * 1000.0
+        )
+        worker_loads = worker_loads_from_plan(plan, len(self.rank_view.worker_ids))
+        self._last_metrics = MdpIterationMetrics(
+            iteration=self._iteration,
+            outer_dp_rank=self.rank_view.outer_dp_rank,
+            plan_build_ms=self._plan_build_ms,
+            encoder_forward_ms=self._encoder_forward_ms,
+            decoder_schedule_ms=self._decoder_schedule_ms,
+            encoder_backward_ms=encoder_backward_ms,
+            worker_loads=worker_loads,
+            empty_workers=sum(1 for load in worker_loads if load == 0),
+            bridge_stats=self.bridge.last_stats(),
+            allocator_reuse=self.allocator.reuse_stats(),
+        )
+        logger.debug("MDP metrics: %s", self._last_metrics)
         self._assert_iteration_boundary()
         self._window = None
         self._plan = None
@@ -372,6 +409,10 @@ class MdpRuntime:
         self._captured_num_tokens = None
         self._iteration += 1
         self._state = MdpRuntimeState.EMPTY
+
+    def last_iteration_metrics(self) -> Optional[MdpIterationMetrics]:
+        """Metrics of the most recently completed iteration."""
+        return self._last_metrics
 
     def consumed_num_tokens(self) -> Optional[torch.Tensor]:
         """The captured token tensor (test hook for the data_ptr assertion)."""

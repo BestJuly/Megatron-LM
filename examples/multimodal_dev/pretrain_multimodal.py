@@ -198,6 +198,9 @@ def _setup_mdp(args):
             "so the vision config flows through the MDP override channel"
         )
     mdp_integration.validate_from_args(args)
+    from megatron.core.mdp.checkpoint import assert_weight_only_checkpoint
+
+    assert_weight_only_checkpoint(args)
     mdp_integration.set_adapter_builder(_mdp_adapter_builder)
 
 
