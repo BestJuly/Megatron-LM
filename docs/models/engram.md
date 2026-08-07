@@ -156,6 +156,25 @@ parameter: 2 bytes for the model value plus 12 bytes for the FP32 master value a
 moments. They report this payload for every global table and each Engram module at EP8 and EP4;
 fixed-size Adam step scalars are excluded because they do not scale with a table's row shard.
 
+## Profiling evidence
+
+When `--nvtx-ranges` is enabled, Engram emits ranges for hashing, owner mapping, request-count
+exchange, request all-to-all, owner-local embedding, differentiable return all-to-all in both
+forward and backward, deterministic embedding-gradient accumulation, gate/value projection, and
+short convolution. With `--profile`, these ranges follow its selected iteration window. Without
+`--profile`, selected `--profile-ranks` emit the ranges for the complete training loop, allowing
+one outer nsys session to trace every torchrun worker without coordinating CUDA-profiler API
+start/stop calls across ranks.
+
+`--record-memory-history` starts allocator-history capture before legacy or config-container model
+construction. When `--profile-ranks` is nonempty, every selected rank writes a distinct
+`*_rank-<global-rank>.pickle` snapshot instead of racing on one output path. Engram profiling runs
+also write per-rank JSONL records after model/DDP construction, optimizer construction, the first
+optimizer step, and the final steady-state step. The records contain exact BF16 table, FP32 master
+parameter, and named Adam-state tensor bytes plus CUDA allocated/reserved/peak counters and the
+TP/PP/EP/dense-DP/expert-DP group coordinates. This separates EP row ownership from any further
+distributed-optimizer sharding over expert-DP.
+
 ## Supported and deferred combinations
 
 The first milestone supports BF16 GPT training with standard residuals or native mHC, EP, TP, PP,

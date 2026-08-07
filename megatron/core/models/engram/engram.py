@@ -13,6 +13,7 @@ from torch import Tensor, nn
 
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
+from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 from .config import EngramConfig
 from .distributed_embedding import EPShardedMultiTableEmbedding
@@ -186,32 +187,54 @@ class Engram(MegatronModule):
                 f"Engram expected hidden width {expected_hidden}, got {hidden_states.shape[-1]}."
             )
 
-        hash_ids = build_ngram_hashes(
-            input_ids=input_ids,
-            tokenizer_remap=self.tokenizer_remap,
-            multipliers=self.hash_multipliers,
-            table_sizes=self.table_sizes,
-            max_ngram_order=self.engram_config.max_ngram_order,
-            num_hash_heads=self.engram_config.num_hash_heads,
-            compressed_pad_token_id=self.engram_config.compressed_pad_token_id,
-        )
-        hash_ids = slice_hashes_for_sequence_parallel(
-            hash_ids, hidden_states.shape[0], self.tp_group
-        )
-        memory = self.embedding(hash_ids).flatten(start_dim=-2).transpose(0, 1).contiguous()
+        message = "engram.hash"
+        nvtx_range_push(message)
+        try:
+            hash_ids = build_ngram_hashes(
+                input_ids=input_ids,
+                tokenizer_remap=self.tokenizer_remap,
+                multipliers=self.hash_multipliers,
+                table_sizes=self.table_sizes,
+                max_ngram_order=self.engram_config.max_ngram_order,
+                num_hash_heads=self.engram_config.num_hash_heads,
+                compressed_pad_token_id=self.engram_config.compressed_pad_token_id,
+            )
+            hash_ids = slice_hashes_for_sequence_parallel(
+                hash_ids, hidden_states.shape[0], self.tp_group
+            )
+        finally:
+            nvtx_range_pop(message)
+
+        message = "engram.lookup"
+        nvtx_range_push(message)
+        try:
+            memory = self.embedding(hash_ids).flatten(start_dim=-2).transpose(0, 1).contiguous()
+        finally:
+            nvtx_range_pop(message)
         streams = hidden_states.view(
             hidden_states.shape[0], hidden_states.shape[1], self.num_streams, self.hidden_size
         )
 
-        shared_value = self.value_projection(memory)
-        gates = []
-        for stream_index in range(self.num_streams):
-            key = self.key_norms[stream_index](self.key_projections[stream_index](memory))
-            query = self.query_norms[stream_index](streams[:, :, stream_index])
-            score = (key * query).sum(dim=-1) / math.sqrt(self.hidden_size)
-            score = score.abs().clamp_min(1e-6).sqrt() * score.sign()
-            gates.append(score.sigmoid())
-        gate = torch.stack(gates, dim=2).unsqueeze(-1)
-        value = gate * shared_value.unsqueeze(2)
-        output = value + self._short_convolution(value)
+        message = "engram.gate-projection"
+        nvtx_range_push(message)
+        try:
+            shared_value = self.value_projection(memory)
+            gates = []
+            for stream_index in range(self.num_streams):
+                key = self.key_norms[stream_index](self.key_projections[stream_index](memory))
+                query = self.query_norms[stream_index](streams[:, :, stream_index])
+                score = (key * query).sum(dim=-1) / math.sqrt(self.hidden_size)
+                score = score.abs().clamp_min(1e-6).sqrt() * score.sign()
+                gates.append(score.sigmoid())
+            gate = torch.stack(gates, dim=2).unsqueeze(-1)
+            value = gate * shared_value.unsqueeze(2)
+        finally:
+            nvtx_range_pop(message)
+
+        message = "engram.short-conv"
+        nvtx_range_push(message)
+        try:
+            output = value + self._short_convolution(value)
+        finally:
+            nvtx_range_pop(message)
         return output.reshape(hidden_states.shape)

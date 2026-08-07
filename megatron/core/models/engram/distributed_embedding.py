@@ -11,9 +11,50 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict, ShardedTensor
-from megatron.core.tensor_parallel.mappings import all_to_all
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.utils import get_pg_rank, get_pg_size
+from megatron.core.utils import get_pg_rank, get_pg_size, nvtx_range_pop, nvtx_range_push
+
+
+class _DifferentiableEngramAllToAll(torch.autograd.Function):
+    """Variable-split all-to-all with Engram-specific forward/backward NVTX ranges."""
+
+    @staticmethod
+    def _exchange(group, input_: Tensor, output_splits: list[int], input_splits: list[int]):
+        output = input_.new_empty((sum(output_splits), *input_.shape[1:]))
+        torch.distributed.all_to_all_single(
+            output,
+            input_.contiguous(),
+            output_split_sizes=output_splits,
+            input_split_sizes=input_splits,
+            group=group,
+        )
+        return output
+
+    @staticmethod
+    def forward(ctx, group, input_: Tensor, output_splits: list[int], input_splits: list[int]):
+        ctx.group = group
+        ctx.output_splits = output_splits
+        ctx.input_splits = input_splits
+        message = "engram.lookup.return-a2a.forward"
+        nvtx_range_push(message)
+        try:
+            return _DifferentiableEngramAllToAll._exchange(
+                group, input_, output_splits, input_splits
+            )
+        finally:
+            nvtx_range_pop(message)
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        message = "engram.lookup.return-a2a.backward"
+        nvtx_range_push(message)
+        try:
+            grad_input = _DifferentiableEngramAllToAll._exchange(
+                ctx.group, grad_output, ctx.input_splits, ctx.output_splits
+            )
+        finally:
+            nvtx_range_pop(message)
+        return None, grad_input, None, None
 
 
 class _DeterministicEmbedding(torch.autograd.Function):
@@ -28,23 +69,28 @@ class _DeterministicEmbedding(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: Tensor) -> tuple[Tensor, None]:
-        (row_ids,) = ctx.saved_tensors
-        accumulation_dtype = (
-            torch.float32
-            if grad_output.dtype in (torch.float16, torch.bfloat16)
-            else grad_output.dtype
-        )
-        grad_weight = torch.zeros(
-            ctx.weight_shape, dtype=accumulation_dtype, device=grad_output.device
-        )
-        if row_ids.numel() > 0:
-            order = torch.argsort(row_ids, stable=True)
-            sorted_rows = row_ids.index_select(0, order)
-            sorted_grads = grad_output.index_select(0, order).to(accumulation_dtype)
-            unique_rows, counts = torch.unique_consecutive(sorted_rows, return_counts=True)
-            row_grads = torch.segment_reduce(sorted_grads, "sum", lengths=counts)
-            grad_weight.index_copy_(0, unique_rows, row_grads)
-        return grad_weight.to(ctx.weight_dtype), None
+        message = "engram.embedding.backward"
+        nvtx_range_push(message)
+        try:
+            (row_ids,) = ctx.saved_tensors
+            accumulation_dtype = (
+                torch.float32
+                if grad_output.dtype in (torch.float16, torch.bfloat16)
+                else grad_output.dtype
+            )
+            grad_weight = torch.zeros(
+                ctx.weight_shape, dtype=accumulation_dtype, device=grad_output.device
+            )
+            if row_ids.numel() > 0:
+                order = torch.argsort(row_ids, stable=True)
+                sorted_rows = row_ids.index_select(0, order)
+                sorted_grads = grad_output.index_select(0, order).to(accumulation_dtype)
+                unique_rows, counts = torch.unique_consecutive(sorted_rows, return_counts=True)
+                row_grads = torch.segment_reduce(sorted_grads, "sum", lengths=counts)
+                grad_weight.index_copy_(0, unique_rows, row_grads)
+            return grad_weight.to(ctx.weight_dtype), None
+        finally:
+            nvtx_range_pop(message)
 
 
 def get_contiguous_row_range(global_rows: int, rank: int, world_size: int) -> tuple[int, int]:
@@ -265,37 +311,56 @@ class EPShardedMultiTableEmbedding(MegatronModule):
             output = self._lookup_received_requests(requests)
             return output.view(*original_shape, self.embedding_dim)
 
-        owner_ends = self.row_ends.index_select(0, table_ids)
-        owners = torch.sum(rows.unsqueeze(-1) >= owner_ends, dim=-1).to(torch.int64)
-        owner_starts = self.row_starts[table_ids, owners]
-        local_rows = rows - owner_starts
+        message = "engram.lookup.owner-map"
+        nvtx_range_push(message)
+        try:
+            owner_ends = self.row_ends.index_select(0, table_ids)
+            owners = torch.sum(rows.unsqueeze(-1) >= owner_ends, dim=-1).to(torch.int64)
+            owner_starts = self.row_starts[table_ids, owners]
+            local_rows = rows - owner_starts
 
-        owner_order = torch.argsort(owners, stable=True)
-        sorted_owners = owners.index_select(0, owner_order)
-        requests = torch.stack(
-            (table_ids.index_select(0, owner_order), local_rows.index_select(0, owner_order)),
-            dim=-1,
-        )
-        send_counts = torch.bincount(sorted_owners, minlength=self.ep_size).to(torch.int64)
-        recv_counts = torch.empty_like(send_counts)
-        torch.distributed.all_to_all_single(recv_counts, send_counts, group=self.ep_group)
+            owner_order = torch.argsort(owners, stable=True)
+            sorted_owners = owners.index_select(0, owner_order)
+            requests = torch.stack(
+                (table_ids.index_select(0, owner_order), local_rows.index_select(0, owner_order)),
+                dim=-1,
+            )
+            send_counts = torch.bincount(sorted_owners, minlength=self.ep_size).to(torch.int64)
+            recv_counts = torch.empty_like(send_counts)
+        finally:
+            nvtx_range_pop(message)
+
+        message = "engram.lookup.count-a2a"
+        nvtx_range_push(message)
+        try:
+            torch.distributed.all_to_all_single(recv_counts, send_counts, group=self.ep_group)
+        finally:
+            nvtx_range_pop(message)
         send_splits = send_counts.tolist()
         recv_splits = recv_counts.tolist()
 
         received_requests = requests.new_empty((sum(recv_splits), 2))
-        torch.distributed.all_to_all_single(
-            received_requests,
-            requests.contiguous(),
-            output_split_sizes=recv_splits,
-            input_split_sizes=send_splits,
-            group=self.ep_group,
-        )
-        owner_embeddings = self._lookup_received_requests(received_requests)
-        sorted_embeddings = all_to_all(
-            self.ep_group,
-            owner_embeddings,
-            output_split_sizes_=send_splits,
-            input_split_sizes=recv_splits,
+        message = "engram.lookup.request-a2a"
+        nvtx_range_push(message)
+        try:
+            torch.distributed.all_to_all_single(
+                received_requests,
+                requests.contiguous(),
+                output_split_sizes=recv_splits,
+                input_split_sizes=send_splits,
+                group=self.ep_group,
+            )
+        finally:
+            nvtx_range_pop(message)
+
+        message = "engram.lookup.local-embedding"
+        nvtx_range_push(message)
+        try:
+            owner_embeddings = self._lookup_received_requests(received_requests)
+        finally:
+            nvtx_range_pop(message)
+        sorted_embeddings = _DifferentiableEngramAllToAll.apply(
+            self.ep_group, owner_embeddings, send_splits, recv_splits
         )
         output = torch.empty_like(sorted_embeddings)
         output.index_copy_(0, owner_order, sorted_embeddings)
