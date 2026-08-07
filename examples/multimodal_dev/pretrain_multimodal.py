@@ -71,6 +71,11 @@ def model_provider(
     if post_language_config_fn is not None:
         post_language_config_fn(language_config, args)
 
+    # Variable-length THD packs change the P2P tensor shape between
+    # microbatches; the pipeline schedule must negotiate shapes per send.
+    if getattr(args, "use_packed_sequence", False) and args.pipeline_model_parallel_size > 1:
+        language_config.variable_seq_lengths = True
+
     # --- vision config ---
     vision_config = registry["vision_config_fn"](
         num_layers_override=getattr(args, "vision_num_layers", None),
@@ -144,6 +149,58 @@ def datasets_provider(train_val_test_num_samples):
     return provider_fn(train_val_test_num_samples)
 
 
+def _mdp_adapter_builder(args):
+    """Build the Qwen3.5-VL MDP adapter plus its vision TransformerConfig.
+
+    Mirrors model_provider's vision-config assembly so the MDP encoder is
+    built from exactly the same configuration as the native path.
+    """
+    from examples.multimodal_dev.mdp_adapter import build_mdp_adapter
+    from examples.multimodal_dev.models import MODEL_REGISTRY
+
+    registry = MODEL_REGISTRY[getattr(args, "model_arch", "qwen35_vl")]
+    language_config = core_transformer_config_from_args(args)
+    post_language_config_fn = registry.get("post_language_config_fn")
+    if post_language_config_fn is not None:
+        post_language_config_fn(language_config, args)
+    vision_config = registry["vision_config_fn"](
+        num_layers_override=getattr(args, "vision_num_layers", None),
+        variant=getattr(args, "model_variant", None),
+    )
+    vision_config.bf16 = language_config.bf16
+    vision_config.fp16 = language_config.fp16
+    vision_config.apply_rope_fusion = language_config.apply_rope_fusion
+    vision_config.params_dtype = language_config.params_dtype
+    # The encoder DDP derives its gradient prescale from this flag; MDP
+    # requires prescale 1 (WORLD sum, normalized once by 1/T_global).
+    vision_config.calculate_per_token_loss = language_config.calculate_per_token_loss
+    return build_mdp_adapter(args, language_config), vision_config
+
+
+def _setup_mdp(args):
+    """Validate the MDP configuration and register the adapter builder."""
+    from megatron.core.mdp import integration as mdp_integration
+
+    if not getattr(args, "use_packed_sequence", False):
+        raise RuntimeError(
+            "--mdp-enable requires --use-packed-sequence: the dual-THD contract "
+            "packs decoder samples into [1, T]"
+        )
+    if not getattr(args, "use_vanilla_collate_fn", False):
+        raise RuntimeError(
+            "--mdp-enable requires --use-vanilla-collate-fn: pack_or_pad_batch "
+            "consumes the per-sample dict list only the identity collate produces"
+        )
+    if getattr(args, "recompute_vision", False):
+        raise RuntimeError(
+            "--recompute-vision is the native-path switch; with --mdp-enable use "
+            "--mdp-vision-config-override recompute_granularity=full (and friends) "
+            "so the vision config flows through the MDP override channel"
+        )
+    mdp_integration.validate_from_args(args)
+    mdp_integration.set_adapter_builder(_mdp_adapter_builder)
+
+
 if __name__ == "__main__":
     datasets_provider.is_distributed = True
 
@@ -151,6 +208,8 @@ if __name__ == "__main__":
         extra_args_provider=add_multimodal_args,
         args_defaults={},
     )
+    if getattr(args, "mdp_enable", False):
+        _setup_mdp(args)
     full_config = pretrain_cfg_container_from_args(args)
     pretrain(
         full_config,

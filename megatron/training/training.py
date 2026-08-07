@@ -2519,6 +2519,19 @@ def setup_model_and_optimizer(
             use_gloo_process_groups=args.use_gloo_process_groups,
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
         )
+        if getattr(args, "mdp_enable", False):
+            # MDP (modality decoupled parallelism): build the replicated
+            # encoder domain and its optimizer before the LR scheduler binds.
+            # No-op unless --mdp-enable is set.
+            from megatron.core.mdp import integration as mdp_integration
+
+            optimizer = mdp_integration.maybe_build_mdp_domain(
+                args=args,
+                model=model,
+                optimizer=optimizer,
+                optimizer_config=config,
+                ddp_config=get_megatron_ddp_config(args),
+            )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
     one_logger and one_logger.log_metrics(
@@ -4099,6 +4112,13 @@ def train(
     eval_iterations = 0
     # Wrap forward_backward_func for Full iteration CUDA graph
     forward_backward_func = get_forward_backward_func(schedule_pg_collection=pg_collection)
+    if getattr(args, "mdp_enable", False):
+        # MDP phase machine around the native schedule; no-op when MDP is off.
+        from megatron.core.mdp import integration as mdp_integration
+
+        forward_backward_func = mdp_integration.maybe_wrap_forward_backward(
+            forward_backward_func, config
+        )
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
@@ -4707,6 +4727,14 @@ def evaluate(
     eval_micro_batch_size = args.eval_micro_batch_size
     eval_num_microbatches = eval_batch_size // (eval_micro_batch_size * args.data_parallel_size)
     forward_backward_func = get_forward_backward_func(schedule_pg_collection=pg_collection)
+    if getattr(args, "mdp_enable", False):
+        # MDP phase machine around the native schedule (evaluation builds its
+        # own callable); no-op when MDP is off.
+        from megatron.core.mdp import integration as mdp_integration
+
+        forward_backward_func = mdp_integration.maybe_wrap_forward_backward(
+            forward_backward_func, config
+        )
     # Reductions source per-rank groups from the model (encoder rank -> encoder groups).
     eval_pgc = get_attr_wrapped_model(model[0], "pg_collection")
     if eval_pgc is None:

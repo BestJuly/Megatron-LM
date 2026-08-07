@@ -510,8 +510,58 @@ def loss_func(loss_mask, output_tensor):
 # -------------------------------------------------------------------
 
 
+def mdp_forward_step(runtime, data_iterator, model):
+    """Forward step over an MDP replay record.
+
+    The iterator yields immutable ``MdpMicrobatchRecord`` objects captured in
+    P1. Pixels never reach the decoder: the first PP stage receives the
+    pre-encoded detached leaf from endpoint storage instead.
+    """
+    record = next(data_iterator)
+    batch = dict(record.model_payload)
+
+    vision_embeddings = None
+    if is_pipeline_first_stage() and not record.text_only:
+        vision_embeddings = runtime.storage.get_leaf(record.microbatch_id)
+        if vision_embeddings is None:
+            raise RuntimeError(
+                f"MDP: microbatch {record.microbatch_id} has vision items but no "
+                "leaf in endpoint storage; P3 embedding routing did not complete"
+            )
+
+    output_tensor = model(
+        input_ids=batch["input_ids"],
+        position_ids=batch.get("position_ids"),
+        attention_mask=batch.get("attention_mask", None),
+        labels=batch.get("labels", None),
+        loss_mask=batch.get("loss_mask", None),
+        padding_mask=batch.get("padding_mask", None),
+        pixel_values=None,
+        image_grid_thw=batch.get("image_grid_thw", None),
+        packed_seq_params=record.decoder_packed_seq_params,
+        vision_embeddings=vision_embeddings,
+    )
+
+    loss_mask = batch.get("loss_mask", None)
+    if loss_mask is None:
+        loss_mask = torch.ones_like(batch["input_ids"], dtype=torch.float)
+    if is_pipeline_last_stage():
+        from examples.multimodal_dev.models.base import MultimodalModel
+
+        loss_mask = MultimodalModel.cp_split_loss_mask(
+            loss_mask, record.decoder_packed_seq_params
+        )
+    return output_tensor, partial(loss_func, loss_mask)
+
+
 def forward_step(data_iterator, model):
     """Forward step for multimodal_dev training."""
+    from megatron.core.mdp import integration as mdp_integration
+
+    mdp_runtime = mdp_integration.get_runtime()
+    if mdp_runtime is not None:
+        return mdp_forward_step(mdp_runtime, data_iterator, model)
+
     batch = get_batch(data_iterator)
 
     if batch is None:
