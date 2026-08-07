@@ -202,8 +202,17 @@ class MultimodalModel(MegatronModule):
 
         combined = text_embeddings.transpose(0, 1).contiguous()
         image_mask = input_ids == self.image_token_id
+        num_slots = int(image_mask.sum())
+        if num_slots != vision_embeddings.shape[0]:
+            raise RuntimeError(
+                f"image-token slot count {num_slots} != vision embedding rows "
+                f"{vision_embeddings.shape[0]}; masked_scatter would silently "
+                "mis-fill the sequence"
+            )
         mask_expanded = image_mask.unsqueeze(-1).expand_as(combined)
-        combined = combined.masked_scatter(mask_expanded, vision_embeddings)
+        combined = combined.masked_scatter(
+            mask_expanded, vision_embeddings.to(combined.dtype)
+        )
         combined = combined.transpose(0, 1).contiguous()
 
         if sp:
@@ -346,6 +355,7 @@ class MultimodalModel(MegatronModule):
         image_grid_thw: Tensor = None,
         decoder_input: Tensor = None,
         packed_seq_params=None,
+        vision_embeddings: Tensor = None,
         **kwargs,
     ):
         """Forward pass.
@@ -380,9 +390,12 @@ class MultimodalModel(MegatronModule):
             )
 
         if self.pre_process:
-            vision_embeddings = None
-            if self.vision_model is not None and pixel_values is not None:
-                vision_embeddings = self.vision_model(pixel_values, image_grid_thw)
+            # An MDP endpoint hands the pre-encoded detached leaf in through
+            # vision_embeddings; the native path encodes pixels here. Both
+            # feed the same scatter below.
+            if vision_embeddings is None:
+                if self.vision_model is not None and pixel_values is not None:
+                    vision_embeddings = self.vision_model(pixel_values, image_grid_thw)
 
             if decoder_input is None and self.language_model is not None:
                 text_embeddings = self.language_model.embedding(
@@ -394,6 +407,13 @@ class MultimodalModel(MegatronModule):
                         input_ids, text_embeddings, vision_embeddings
                     )
                 else:
+                    if bool((input_ids == self.image_token_id).any()):
+                        raise RuntimeError(
+                            "input_ids contain image-token slots but no vision "
+                            "source was provided (neither pixel_values nor "
+                            "vision_embeddings); the text path would silently "
+                            "train on placeholder embeddings"
+                        )
                     decoder_input = text_embeddings
         else:
             # Non-first PP stage: the activation arrives via
