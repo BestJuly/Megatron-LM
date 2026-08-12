@@ -395,16 +395,6 @@ class ModalityBridge:
                 )
             base += split
 
-        with nvtx_phase("bridge_pixel_alltoall"):
-            dist.all_to_all_single(
-                recv_buffer,
-                send_buffer,
-                output_split_sizes=output_splits,
-                input_split_sizes=input_splits,
-                group=group,
-            )
-        self._allocator.release(send_buffer)
-
         received: dict = {}
 
         def _unpack(entry: BridgeLedgerEntry, flat: Tensor):
@@ -412,8 +402,28 @@ class ModalityBridge:
                 entry, flat, tensor_specs, dest_views, received, ledger.phase.value
             )
 
+        # Issue the collective asynchronously and unpack the local edges while
+        # it is in flight: the local copies run on the current stream, the
+        # collective on NCCL's stream, and neither touches the other's
+        # buffers. work.wait() then stream-orders everything that reads the
+        # receive buffer, exactly like the synchronous form did.
+        with nvtx_phase("bridge_alltoall_launch"):
+            work = dist.all_to_all_single(
+                recv_buffer,
+                send_buffer,
+                output_split_sizes=output_splits,
+                input_split_sizes=input_splits,
+                group=group,
+                async_op=True,
+            )
         for entry in local_entries:
             _unpack(entry, self._entry_payload(local_tensors, entry))
+        with nvtx_phase("bridge_alltoall_wait"):
+            if work is not None:
+                work.wait()
+        # The send buffer stays alive until the wait ordered the collective
+        # ahead of any current-stream reuse of its block.
+        self._allocator.release(send_buffer)
         base = 0
         for rank, split in zip(group_ranks, output_splits):
             for entry in recv_by_src.get(rank, ()):
