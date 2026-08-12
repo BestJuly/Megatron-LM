@@ -326,11 +326,18 @@ class MdpRuntime:
                 emb_local[BridgeBufferKey(item_id)] = detached[chunk_index][
                     segment.output_row_start : segment.output_row_start + segment.output_rows
                 ]
-            self.bridge.exchange(
+            # One alltoall instead of batched P2P: same ledger and payload,
+            # but no per-edge kernel pairs and no torch.cuda.synchronize
+            # workaround (all_to_all_single stream-orders its receive buffer).
+            self.bridge.exchange_all_to_all(
                 self.bridge.build_ledger(BridgePhase.EMBEDDING, plan, self.rank_map, emb_specs),
                 emb_local,
                 tensor_specs=emb_specs,
+                group=self.process_groups.planning_group,
+                group_ranks=self.rank_view.planning_group_ranks,
                 global_rank=self.rank_view.global_rank,
+                dtype=self.params_dtype,
+                device=self.device,
                 dest_views=emb_dest,
             )
         # requires_grad only after every exchange copy into the leaf is done.
@@ -426,13 +433,17 @@ class MdpRuntime:
                                 segment.leaf_row_start : segment.leaf_row_start
                                 + segment.output_rows
                             ]
-                self.bridge.exchange(
+                self.bridge.exchange_all_to_all(
                     self.bridge.build_ledger(
                         BridgePhase.GRADIENT, plan, self.rank_map, grad_specs
                     ),
                     grad_local,
                     tensor_specs=grad_specs,
+                    group=self.process_groups.planning_group,
+                    group_ranks=self.rank_view.planning_group_ranks,
                     global_rank=self.rank_view.global_rank,
+                    dtype=self.params_dtype,
+                    device=self.device,
                     dest_views=grad_dest,
                 )
             if self._handle is not None:
