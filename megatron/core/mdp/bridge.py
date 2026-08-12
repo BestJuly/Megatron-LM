@@ -13,7 +13,7 @@ bridge phase exactly once — including members with an empty ledger.
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import Mapping
+from typing import Mapping, Optional
 
 import torch
 import torch.distributed as dist
@@ -223,6 +223,7 @@ class ModalityBridge:
         *,
         tensor_specs: Mapping[BridgeBufferKey, BridgeTensorSpec],
         global_rank: int,
+        dest_views: Optional[Mapping[BridgeBufferKey, Tensor]] = None,
     ) -> Mapping[BridgeBufferKey, Tensor]:
         """Execute this rank's part of the ledger and return received buffers.
 
@@ -230,13 +231,20 @@ class ModalityBridge:
         returns only after every request completes; unfinished handles never reach
         the schedule. Each returned tensor exposes exactly ``valid_rows`` rows of a
         capacity-sized allocation. A rank with no edges performs a no-op call.
+
+        ``dest_views`` optionally maps keys to caller-owned ``[valid_rows, width]``
+        views (e.g. rows of the encoder payload or the endpoint leaf); a received
+        item with a view is unpacked straight into it — the returned mapping then
+        aliases the caller's buffer — skipping the intermediate per-item buffer.
         """
         if self._in_flight:
             raise MdpBridgeError("MDP: bridge violates: one exchange at a time per phase.")
         self._in_flight = True
         start = time.monotonic()
         try:
-            received = self._exchange_impl(ledger, local_tensors, tensor_specs, global_rank)
+            received = self._exchange_impl(
+                ledger, local_tensors, tensor_specs, global_rank, dest_views
+            )
         finally:
             self._in_flight = False
         elapsed_ms = (time.monotonic() - start) * 1000.0
@@ -291,6 +299,7 @@ class ModalityBridge:
         global_rank: int,
         dtype: torch.dtype,
         device: torch.device,
+        dest_views: Optional[Mapping[BridgeBufferKey, Tensor]] = None,
     ) -> Mapping[BridgeBufferKey, Tensor]:
         """Execute this rank's part of the ledger with one ``all_to_all_single``.
 
@@ -313,7 +322,7 @@ class ModalityBridge:
         try:
             received = self._exchange_all_to_all_impl(
                 ledger, local_tensors, tensor_specs, group, group_ranks, global_rank,
-                dtype, device,
+                dtype, device, dest_views,
             )
         finally:
             self._in_flight = False
@@ -344,6 +353,7 @@ class ModalityBridge:
         global_rank: int,
         dtype: torch.dtype,
         device: torch.device,
+        dest_views: Optional[Mapping[BridgeBufferKey, Tensor]] = None,
     ) -> Mapping[BridgeBufferKey, Tensor]:
         group_ranks = tuple(group_ranks)
         send_by_dst: dict = {}
@@ -398,23 +408,9 @@ class ModalityBridge:
         received: dict = {}
 
         def _unpack(entry: BridgeLedgerEntry, flat: Tensor):
-            spec = tensor_specs[entry.key]
-            width = max(1, spec.width)
-            rows = entry.element_count // width
-            out = self._allocator.acquire(
-                rows=spec.capacity_rows,
-                width=spec.width,
-                dtype=spec.dtype,
-                device=spec.device,
-                tag=f"bridge_{ledger.phase.value}_out",
+            self._unpack_entry(
+                entry, flat, tensor_specs, dest_views, received, ledger.phase.value
             )
-            out_valid = out[:rows] if spec.width == 0 else out[:rows, :]
-            out_valid.copy_(flat.view(out_valid.shape))
-            if entry.key in received:
-                raise MdpBridgeError(
-                    f"MDP: key {entry.key} violates: one received buffer per key."
-                )
-            received[entry.key] = out_valid
 
         for entry in local_entries:
             _unpack(entry, self._entry_payload(local_tensors, entry))
@@ -433,6 +429,7 @@ class ModalityBridge:
         local_tensors: Mapping[BridgeBufferKey, Tensor],
         tensor_specs: Mapping[BridgeBufferKey, BridgeTensorSpec],
         global_rank: int,
+        dest_views: Optional[Mapping[BridgeBufferKey, Tensor]] = None,
     ) -> Mapping[BridgeBufferKey, Tensor]:
         recv_entries: dict = {}  # (src) -> [entries] for remote receives
         send_entries: dict = {}  # (dst) -> [entries] for remote sends
@@ -502,23 +499,9 @@ class ModalityBridge:
         received: dict = {}
 
         def _unpack(entry: BridgeLedgerEntry, flat: Tensor):
-            spec = tensor_specs[entry.key]
-            width = max(1, spec.width)
-            rows = entry.element_count // width
-            out = self._allocator.acquire(
-                rows=spec.capacity_rows,
-                width=spec.width,
-                dtype=spec.dtype,
-                device=spec.device,
-                tag=f"bridge_{ledger.phase.value}_out",
+            self._unpack_entry(
+                entry, flat, tensor_specs, dest_views, received, ledger.phase.value
             )
-            out_valid = out[:rows] if spec.width == 0 else out[:rows, :]
-            out_valid.copy_(flat.view(out_valid.shape))
-            if entry.key in received:
-                raise MdpBridgeError(
-                    f"MDP: key {entry.key} violates: one received buffer per key."
-                )
-            received[entry.key] = out_valid
 
         for entry in local_entries:
             _unpack(entry, self._entry_payload(local_tensors, entry))
@@ -530,6 +513,50 @@ class ModalityBridge:
                 offset += entry.element_count
             self._allocator.release(staging)
         return received
+
+    def _unpack_entry(
+        self,
+        entry: BridgeLedgerEntry,
+        flat: Tensor,
+        tensor_specs: Mapping[BridgeBufferKey, BridgeTensorSpec],
+        dest_views: Optional[Mapping[BridgeBufferKey, Tensor]],
+        received: dict,
+        phase_value: str,
+    ) -> None:
+        """Copy one received (or local) entry into its destination.
+
+        With a caller-provided destination view the wire data lands directly
+        in the consumer buffer (``copy_`` casts if the consumer dtype differs,
+        e.g. fp32 gradient-regroup buffers fed by a bf16 wire); otherwise an
+        intermediate capacity-sized buffer is allocated as before.
+        """
+        if entry.key in received:
+            raise MdpBridgeError(
+                f"MDP: key {entry.key} violates: one received buffer per key."
+            )
+        dest = dest_views.get(entry.key) if dest_views is not None else None
+        if dest is not None:
+            if dest.numel() != entry.element_count:
+                raise MdpBridgeError(
+                    f"MDP: destination view for key {entry.key} holds {dest.numel()} "
+                    f"elements; the ledger entry carries {entry.element_count}."
+                )
+            dest.copy_(flat.view(dest.shape))
+            received[entry.key] = dest
+            return
+        spec = tensor_specs[entry.key]
+        width = max(1, spec.width)
+        rows = entry.element_count // width
+        out = self._allocator.acquire(
+            rows=spec.capacity_rows,
+            width=spec.width,
+            dtype=spec.dtype,
+            device=spec.device,
+            tag=f"bridge_{phase_value}_out",
+        )
+        out_valid = out[:rows] if spec.width == 0 else out[:rows, :]
+        out_valid.copy_(flat.view(out_valid.shape))
+        received[entry.key] = out_valid
 
     @staticmethod
     def _entry_payload(
