@@ -514,22 +514,28 @@ class Qwen35VLVisionEncoder(VisionModule):
         grid_thw_list = grid_thw.tolist()
 
         max_hw = max(max(int(h), int(w)) for _, h, w in grid_thw_list)
-        if _GRID_CACHE_ENABLED:
-            freq_table = self._grid_cache.freqs(
+        # Tests call this method unbound on stub objects without _grid_cache;
+        # fall back to the original loop path when the cache is absent.
+        grid_cache = getattr(self, "_grid_cache", None)
+        if _GRID_CACHE_ENABLED and grid_cache is not None:
+            freq_table = grid_cache.freqs(
                 self.rot_pos_emb, max_hw, grid_thw.device
             )
             device = freq_table.device
             # (row, col) coordinates depend only on the grid; cached per grid.
             pos_ids = torch.cat(
                 [
-                    self._grid_cache.rope(int(t), int(h), int(w), merge, device)
+                    grid_cache.rope(int(t), int(h), int(w), merge, device)
                     for t, h, w in grid_thw_list
                 ]
             )
         else:
             freq_table = self.rot_pos_emb(max_hw, device=grid_thw.device)
             device = freq_table.device
-            pos_ids = self._rope_pos_ids_uncached(grid_thw_list, merge, device)
+            # Via the class, not self: tests call this method unbound on stubs.
+            pos_ids = Qwen35VLVisionEncoder._rope_pos_ids_uncached(
+                grid_thw_list, merge, device
+            )
 
         embeddings = freq_table[pos_ids]
         embeddings = embeddings.flatten(1)

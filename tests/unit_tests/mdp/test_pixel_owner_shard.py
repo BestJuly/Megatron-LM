@@ -251,13 +251,13 @@ def _view(worker_ids=(0, 1, 2, 3), group=(0, 2, 4, 6), endpoint=0):
     )
 
 
-def _descriptor(item_id, cost, mb=0, grid=(1, 4, 4), owner=0):
+def _descriptor(item_id, cost, mb=0, grid=(1, 4, 4), owner=0, lane=0):
     t, h, w = grid
     return VisionDescriptor(
         global_item_id=item_id,
         sample_id=item_id,
         image_ordinal=0,
-        owner_dp_lane=0,
+        owner_dp_lane=lane,
         microbatch_id=mb,
         estimated_cost_units=cost,
         payload_rows=t * h * w,
@@ -539,7 +539,9 @@ def test_shard_off_pixel_ledger_is_byte_identical_to_baseline():
     planner = MdpPlanner(
         view, locality_slack_permille=10, capacity_policy=RowCapacityPolicy()
     )
-    baseline = [_descriptor(i, cost=16 + i, mb=i) for i in range(4)]  # owner=0 default
+    baseline = [
+        _descriptor(i, cost=16 + i, mb=i, lane=view.outer_dp_rank) for i in range(4)
+    ]  # owner=0 default = endpoint worker
     bridge = ModalityBridge(DirectBufferAllocator())
     plan = planner.build_plan(0, baseline, [0, 1, 2, 3])
     specs = _dist_pixel_specs(plan, baseline)
