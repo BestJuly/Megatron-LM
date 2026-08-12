@@ -91,6 +91,15 @@ def broadcast_data_batch(data, device="cuda"):
     if data is None:
         data = {}
 
+    # Single-member TP group: every rank is the source; ~4 broadcasts per
+    # field (ndim/shape/dtype/payload) would be pure launch overhead. Keep
+    # only the device move.
+    if torch.distributed.get_world_size(group=group) == 1:
+        return {
+            key: value.to(device) if isinstance(value, torch.Tensor) else value
+            for key, value in data.items()
+        }
+
     if get_tensor_model_parallel_rank() == 0:
         keys = list(data.keys())
         key_str = ",".join(keys)
@@ -441,23 +450,32 @@ def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
     device = "cuda"
     args = get_args()
 
-    if get_tensor_model_parallel_rank() == 0:
+    group = get_tensor_model_parallel_group()
+    # Single-member TP group: skip the device flag tensor and the broadcast
+    # entirely. Behavior-identical, and it keeps the MDP window-capture
+    # prefetch thread free of NCCL calls (--mdp-overlap-window-capture).
+    if torch.distributed.get_world_size(group=group) == 1:
         try:
             data = next(data_iterator)
-            has_data = torch.tensor([1], dtype=torch.uint8, device=device)
         except StopIteration:
-            has_data = torch.tensor([0], dtype=torch.uint8, device=device)
-            data = None
+            return None
     else:
-        has_data = torch.empty(1, dtype=torch.uint8, device=device)
-        data = None
+        if get_tensor_model_parallel_rank() == 0:
+            try:
+                data = next(data_iterator)
+                has_data = torch.tensor([1], dtype=torch.uint8, device=device)
+            except StopIteration:
+                has_data = torch.tensor([0], dtype=torch.uint8, device=device)
+                data = None
+        else:
+            has_data = torch.empty(1, dtype=torch.uint8, device=device)
+            data = None
 
-    src = get_tensor_model_parallel_src_rank()
-    group = get_tensor_model_parallel_group()
-    torch.distributed.broadcast(has_data, src, group=group)
+        src = get_tensor_model_parallel_src_rank()
+        torch.distributed.broadcast(has_data, src, group=group)
 
-    if has_data.item() == 0:
-        return None
+        if has_data.item() == 0:
+            return None
 
     # Because broadcast will not broadcast packed_seq_params, we move it into pack_or_pad_batch
     batch = pack_or_pad_batch(

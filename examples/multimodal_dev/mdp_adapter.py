@@ -67,12 +67,14 @@ class Qwen35VLMdpAdapter:
 
         items = []
         position_cursor = 0
+        # One D2H transfer for the whole positions tensor; slicing the CPU
+        # copy per item avoids a device sync per vision item.
+        positions_cpu = positions.cpu().tolist()
         for row in meta.cpu().tolist():
             sample_id, ordinal, t, h, w, payload_row_start = (int(v) for v in row)
             output_rows = t * (h // merge) * (w // merge)
             decoder_positions = tuple(
-                int(p)
-                for p in positions[position_cursor : position_cursor + output_rows].cpu().tolist()
+                positions_cpu[position_cursor : position_cursor + output_rows]
             )
             position_cursor += output_rows
             items.append(

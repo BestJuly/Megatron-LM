@@ -395,7 +395,11 @@ class MultimodalModel(MegatronModule):
             # feed the same scatter below.
             if vision_embeddings is None:
                 if self.vision_model is not None and pixel_values is not None:
-                    vision_embeddings = self.vision_model(pixel_values, image_grid_thw)
+                    torch.cuda.nvtx.range_push("native.vision_encoder_forward")
+                    try:
+                        vision_embeddings = self.vision_model(pixel_values, image_grid_thw)
+                    finally:
+                        torch.cuda.nvtx.range_pop()
 
             if decoder_input is None and self.language_model is not None:
                 text_embeddings = self.language_model.embedding(
@@ -403,9 +407,13 @@ class MultimodalModel(MegatronModule):
                 )
 
                 if vision_embeddings is not None:
-                    decoder_input = self._scatter_vision_embeddings(
-                        input_ids, text_embeddings, vision_embeddings
-                    )
+                    torch.cuda.nvtx.range_push("native.scatter_vision_embeddings")
+                    try:
+                        decoder_input = self._scatter_vision_embeddings(
+                            input_ids, text_embeddings, vision_embeddings
+                        )
+                    finally:
+                        torch.cuda.nvtx.range_pop()
                 else:
                     if bool((input_ids == self.image_token_id).any()):
                         raise RuntimeError(

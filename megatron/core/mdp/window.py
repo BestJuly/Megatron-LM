@@ -13,6 +13,7 @@ from typing import Any, Iterator, Mapping, Optional, Sequence, Union
 from torch import Tensor
 
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
+from megatron.core.mdp.observability import nvtx_phase
 from megatron.core.mdp.protocols import CapturedMicrobatch, MdpModelAdapter, VisionDescriptor
 
 
@@ -117,7 +118,8 @@ class MdpIterationWindow:
         next_item_id = 0
         merge = adapter.spatial_merge_size
         for microbatch_id in range(num_microbatches):
-            captured = adapter.get_batch(iterator)
+            with nvtx_phase("p1_get_batch"):
+                captured = adapter.get_batch(iterator)
             if captured is None:
                 raise MdpStateError(
                     f"MDP: data iterator violates: {num_microbatches} microbatches per "
