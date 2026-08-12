@@ -98,6 +98,8 @@ class MdpRuntime:
         self._forward_only = False
         self._window: Optional[MdpIterationWindow] = None
         self._plan: Optional[MdpBatchPlan] = None
+        self._iter_specs: dict = {}
+        self._iter_ledgers: dict = {}
         self._handle: Optional[EncoderForwardHandle] = None
         self._eval_outputs: Sequence = ()
         self._chunk_layouts: Sequence = ()
@@ -198,6 +200,19 @@ class MdpRuntime:
                 debug_payload_check=self.config.debug_plan_payload_check,
             )
         self._plan = plan
+        # Specs and ledgers are pure functions of the plan; derive them once
+        # per iteration instead of once per phase (EMBEDDING and GRADIENT
+        # share identical specs, and each build_ledger re-sorted the routes).
+        pixel_specs = self._tensor_specs(plan, pixels=True)
+        io_specs = self._tensor_specs(plan, pixels=False)
+        self._iter_specs = {BridgePhase.PIXEL: pixel_specs}
+        self._iter_ledgers = {}
+        for phase in (BridgePhase.PIXEL, BridgePhase.EMBEDDING, BridgePhase.GRADIENT):
+            specs = pixel_specs if phase is BridgePhase.PIXEL else io_specs
+            self._iter_specs[phase] = specs
+            self._iter_ledgers[phase] = self.bridge.build_ledger(
+                phase, plan, self.rank_map, specs
+            )
         self._plan_build_ms = (time.monotonic() - plan_start) * 1000.0
 
         # The producer chunk layouts are known from the plan alone; carve the
@@ -230,15 +245,13 @@ class MdpRuntime:
                     self._chunk_of_item[segment.global_item_id] = (chunk_index, segment)
 
         with nvtx_phase("p1_pixel_dispatch"):
-            pixel_specs = self._tensor_specs(plan, pixels=True)
+            pixel_specs = self._iter_specs[BridgePhase.PIXEL]
             sidecar = window.payload_sidecar()
             pixel_local = {
                 BridgeBufferKey(item_id): tensor.to(self.params_dtype)
                 for item_id, tensor in sidecar.items()
             }
-            pixel_ledger = self.bridge.build_ledger(
-                BridgePhase.PIXEL, plan, self.rank_map, pixel_specs
-            )
+            pixel_ledger = self._iter_ledgers[BridgePhase.PIXEL]
             if self.config.pixel_owner_shard:
                 # Owners -> producers in one collective; every group member
                 # participates (with zero splits when it has nothing to move).
@@ -320,7 +333,7 @@ class MdpRuntime:
                         ]
                     leaves.append((layout.microbatch_id, leaf[: layout.total_output_rows]))
         with nvtx_phase("p3_embedding_exchange"):
-            emb_specs = self._tensor_specs(plan, pixels=False)
+            emb_specs = self._iter_specs[BridgePhase.EMBEDDING]
             emb_local = {}
             for item_id, (chunk_index, segment) in self._chunk_of_item.items():
                 emb_local[BridgeBufferKey(item_id)] = detached[chunk_index][
@@ -330,7 +343,7 @@ class MdpRuntime:
             # but no per-edge kernel pairs and no torch.cuda.synchronize
             # workaround (all_to_all_single stream-orders its receive buffer).
             self.bridge.exchange_all_to_all(
-                self.bridge.build_ledger(BridgePhase.EMBEDDING, plan, self.rank_map, emb_specs),
+                self._iter_ledgers[BridgePhase.EMBEDDING],
                 emb_local,
                 tensor_specs=emb_specs,
                 group=self.process_groups.planning_group,
@@ -421,7 +434,7 @@ class MdpRuntime:
                             ]
                         chunk_grads.append(grad_buffer[: chunk.total_output_rows])
             with nvtx_phase("p5_grad_exchange"):
-                grad_specs = self._tensor_specs(plan, pixels=False)
+                grad_specs = self._iter_specs[BridgePhase.GRADIENT]
                 grad_local = {}
                 if self.rank_view.lane_id is not None:
                     for layout in plan.layouts:
@@ -434,9 +447,7 @@ class MdpRuntime:
                                 + segment.output_rows
                             ]
                 self.bridge.exchange_all_to_all(
-                    self.bridge.build_ledger(
-                        BridgePhase.GRADIENT, plan, self.rank_map, grad_specs
-                    ),
+                    self._iter_ledgers[BridgePhase.GRADIENT],
                     grad_local,
                     tensor_specs=grad_specs,
                     group=self.process_groups.planning_group,
@@ -477,6 +488,8 @@ class MdpRuntime:
         self._assert_iteration_boundary()
         self._window = None
         self._plan = None
+        self._iter_specs = {}
+        self._iter_ledgers = {}
         self._handle = None
         self._eval_outputs = ()
         self._chunk_layouts = ()
