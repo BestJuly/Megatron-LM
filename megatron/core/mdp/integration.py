@@ -99,6 +99,7 @@ def mdp_config_from_args(args) -> MdpConfig:
         row_alignment=getattr(args, "mdp_row_alignment", 1),
         plan_check_interval=getattr(args, "mdp_plan_check_interval", 1),
         debug_plan_payload_check=getattr(args, "mdp_debug_plan_payload_check", False),
+        pixel_owner_shard=getattr(args, "mdp_pixel_owner_shard", False),
     )
 
 

@@ -41,7 +41,7 @@ from megatron.core.mdp.observability import (
 from megatron.core.mdp.plan import MdpBatchPlan, split_encoder_layout
 from megatron.core.mdp.planner import MdpPlanner, assert_consistent_plan
 from megatron.core.mdp.protocols import MdpModelAdapter
-from megatron.core.mdp.rank_mapping import MdpRankMap, MdpRankView
+from megatron.core.mdp.rank_mapping import MdpRankMap, MdpRankView, endpoint_worker_id
 from megatron.core.mdp.storage import MdpEmbeddingStorage
 from megatron.core.mdp.window import MdpIterationWindow
 
@@ -157,6 +157,10 @@ class MdpRuntime:
                 adapter=self.adapter,
                 num_vpp_chunks=self.num_vpp_chunks,
                 lane_id=self.rank_view.lane_id,
+                pixel_owner_shard=self.config.pixel_owner_shard,
+                my_worker_id=self.rank_view.my_worker_id,
+                num_workers=len(self.rank_view.worker_ids),
+                endpoint_worker_id=endpoint_worker_id(self.rank_view),
             )
         self._window = window
         local_flags = tuple(record.text_only for record in window.records())
@@ -196,12 +200,29 @@ class MdpRuntime:
                 BridgeBufferKey(item_id): tensor.to(self.params_dtype)
                 for item_id, tensor in sidecar.items()
             }
-            received_pixels = self.bridge.exchange(
-                self.bridge.build_ledger(BridgePhase.PIXEL, plan, self.rank_map, pixel_specs),
-                pixel_local,
-                tensor_specs=pixel_specs,
-                global_rank=self.rank_view.global_rank,
+            pixel_ledger = self.bridge.build_ledger(
+                BridgePhase.PIXEL, plan, self.rank_map, pixel_specs
             )
+            if self.config.pixel_owner_shard:
+                # Owners -> producers in one collective; every group member
+                # participates (with zero splits when it has nothing to move).
+                received_pixels = self.bridge.exchange_all_to_all(
+                    pixel_ledger,
+                    pixel_local,
+                    tensor_specs=pixel_specs,
+                    group=self.process_groups.planning_group,
+                    group_ranks=self.rank_view.planning_group_ranks,
+                    global_rank=self.rank_view.global_rank,
+                    dtype=self.params_dtype,
+                    device=self.device,
+                )
+            else:
+                received_pixels = self.bridge.exchange(
+                    pixel_ledger,
+                    pixel_local,
+                    tensor_specs=pixel_specs,
+                    global_rank=self.rank_view.global_rank,
+                )
             window.release_pixels()
 
         # P2: grad-enabled encoder forward per chunk (no_grad for evaluation).

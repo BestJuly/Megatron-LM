@@ -46,6 +46,7 @@ class MdpConfig:
     row_alignment: int = 1
     plan_check_interval: int = 1
     debug_plan_payload_check: bool = False
+    pixel_owner_shard: bool = False
 
 
 @dataclass(frozen=True)
@@ -136,6 +137,16 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "The plan consistency check must never be fully disabled: an undetected "
             "plan mismatch degrades from a diagnosable error into a P2P hang.",
             "1",
+        )
+    if config.pixel_owner_shard and options.tensor_parallel_size != 1:
+        _reject(
+            "pixel_owner_shard",
+            config.pixel_owner_shard,
+            "TP == 1 when pixel_owner_shard is enabled",
+            "Owner-sharded pixel reading suppresses the collate pixel branch on "
+            "non-owner workers; its interaction with the TP pixel broadcast is "
+            "untested.",
+            "False",
         )
     _validate_override_entries(config.vision_config_overrides)
 

@@ -11,7 +11,7 @@ never enters the digest.
 import hashlib
 import struct
 from dataclasses import dataclass, field
-from typing import Sequence
+from typing import Optional, Sequence
 
 from megatron.core.mdp.errors import MdpPlanError
 
@@ -43,6 +43,10 @@ class RouteSlice:
     endpoint rank receives it. Offsets are looked up in the encoder layout;
     decoder positions live only in the endpoint-local window record.
 
+    ``owner_worker_id`` is the logical worker holding the item's pixels at
+    dispatch time (the PIXEL phase source); ``None`` falls back to the
+    endpoint rank, which is the pre-owner-sharding behavior.
+
     In v1 every item has exactly one slice. When a real split lands (decoder CP),
     the route gains explicit sub-interval fields; they are not added speculatively.
     """
@@ -50,6 +54,7 @@ class RouteSlice:
     global_item_id: int
     producer_worker_id: int
     endpoint_rank: int
+    owner_worker_id: Optional[int] = None
 
 
 @dataclass(frozen=True)

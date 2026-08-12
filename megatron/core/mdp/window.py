@@ -16,6 +16,26 @@ from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
 from megatron.core.mdp.observability import nvtx_phase
 from megatron.core.mdp.protocols import CapturedMicrobatch, MdpModelAdapter, VisionDescriptor
 
+# Owner-sharded pixel reading: while ``capture`` fetches one microbatch, this
+# holds ``(microbatch_owner_worker_id, my_worker_id)`` so the model's collate
+# path (which has no microbatch context in its signature) can skip pixel
+# materialization on non-owner workers. ``None`` outside a sharded capture, so
+# the native and shard-off paths are byte-identical. Single-threaded by
+# design: this branch has no window-capture prefetch machinery.
+_PIXEL_OWNERSHIP: Optional[tuple] = None
+
+
+def pixel_capture_suppressed() -> bool:
+    """True when the in-progress capture microbatch is NOT owned by this worker.
+
+    Queried by the model collate path to skip pixel materialization + H2D for
+    microbatches whose pixels another planning-group worker owns.
+    """
+    if _PIXEL_OWNERSHIP is None:
+        return False
+    owner_worker_id, my_worker_id = _PIXEL_OWNERSHIP
+    return owner_worker_id != my_worker_id
+
 
 @dataclass(frozen=True)
 class MdpMicrobatchVisionRecord:
@@ -98,19 +118,35 @@ class MdpIterationWindow:
         adapter: MdpModelAdapter,
         num_vpp_chunks: int,
         lane_id: Optional[int],
+        pixel_owner_shard: bool = False,
+        my_worker_id: Optional[int] = None,
+        num_workers: Optional[int] = None,
+        endpoint_worker_id: int = 0,
     ) -> "MdpIterationWindow":
         """Consume one real iterator and build records, descriptors, and sidecar.
 
-        Only the owner endpoint (``lane_id is not None``) emits descriptors and
-        cuts the pixel sidecar; other group members hold replay records only.
+        Only the owner endpoint (``lane_id is not None``) emits descriptors;
         ``global_item_id`` values are assigned in ``(microbatch_id, sample_id,
         image_ordinal)`` capture order, so they are stable and unique within the
         planning group (one endpoint per group generates them).
+
+        The pixel sidecar is cut by the endpoint when ``pixel_owner_shard`` is
+        off (today's behavior). With sharding on, every worker materializes and
+        cuts pixels only for the microbatches it owns
+        (``microbatch_id % num_workers == my_worker_id``); the ownership context
+        set around each ``adapter.get_batch`` call lets the model collate path
+        skip pixel materialization on non-owners.
         """
+        global _PIXEL_OWNERSHIP
         if isinstance(data_iterators, (list, tuple)):
             iterator = data_iterators[0] if data_iterators else None
         else:
             iterator = data_iterators
+        if pixel_owner_shard and (my_worker_id is None or not num_workers):
+            raise MdpConfigurationError(
+                "MDP: pixel_owner_shard requires my_worker_id and num_workers "
+                f"(got {my_worker_id}, {num_workers})."
+            )
 
         records = []
         descriptors = []
@@ -118,14 +154,30 @@ class MdpIterationWindow:
         next_item_id = 0
         merge = adapter.spatial_merge_size
         for microbatch_id in range(num_microbatches):
-            with nvtx_phase("p1_get_batch"):
-                captured = adapter.get_batch(iterator)
+            if pixel_owner_shard:
+                owner_worker_id = microbatch_id % num_workers
+                owns_pixels = owner_worker_id == my_worker_id
+            else:
+                owner_worker_id = endpoint_worker_id
+                owns_pixels = lane_id is not None
+            try:
+                if pixel_owner_shard:
+                    _PIXEL_OWNERSHIP = (owner_worker_id, my_worker_id)
+                with nvtx_phase("p1_get_batch"):
+                    captured = adapter.get_batch(iterator)
+            finally:
+                _PIXEL_OWNERSHIP = None
             if captured is None:
                 raise MdpStateError(
                     f"MDP: data iterator violates: {num_microbatches} microbatches per "
                     f"iteration (exhausted at microbatch {microbatch_id})."
                 )
-            _validate_captured(captured, microbatch_id, merge)
+            _validate_captured(
+                captured,
+                microbatch_id,
+                merge,
+                expect_pixels=owns_pixels if pixel_owner_shard else None,
+            )
             vision_records = []
             for item in captured.vision_items:
                 t, h, w = item.grid_thw
@@ -161,8 +213,10 @@ class MdpIterationWindow:
                             payload_rows=item.payload_rows,
                             output_rows=output_rows,
                             grid_thw=item.grid_thw,
+                            owner_worker_id=owner_worker_id,
                         )
                     )
+                if owns_pixels:
                     sidecar[item_id] = captured.flat_pixel_payload[
                         item.payload_row_start : item.payload_row_start + item.payload_rows
                     ]
@@ -196,7 +250,11 @@ class MdpIterationWindow:
         return self._descriptors
 
     def payload_sidecar(self) -> Mapping[int, Tensor]:
-        """Per-item pixel tensors keyed by ``global_item_id`` (endpoint only)."""
+        """Per-item pixel tensors keyed by ``global_item_id``.
+
+        Endpoint-only without pixel sharding; the owned microbatches' items on
+        every worker with ``pixel_owner_shard``.
+        """
         return dict(self._sidecar)
 
     def release_pixels(self) -> None:
@@ -208,8 +266,19 @@ class MdpIterationWindow:
         self._sidecar.clear()
 
 
-def _validate_captured(captured: CapturedMicrobatch, microbatch_id: int, merge: int) -> None:
-    """Endpoint-local consistency checks performed before any P2P."""
+def _validate_captured(
+    captured: CapturedMicrobatch,
+    microbatch_id: int,
+    merge: int,
+    expect_pixels: Optional[bool] = None,
+) -> None:
+    """Endpoint-local consistency checks performed before any P2P.
+
+    ``expect_pixels`` is ``None`` outside owner-sharded pixel reading (pixels
+    accompany items on every rank). With sharding, an owned microbatch must
+    carry pixels for its items and a non-owned one must not (its collate pixel
+    branch is suppressed), so both wiring failures are diagnosed here.
+    """
     params = captured.decoder_packed_seq_params
     if params is not None and getattr(params, "qkv_format", None) != "thd":
         raise MdpConfigurationError(
@@ -218,7 +287,14 @@ def _validate_captured(captured: CapturedMicrobatch, microbatch_id: int, merge: 
         )
     has_pixels = captured.flat_pixel_payload is not None
     has_items = bool(captured.vision_items)
-    if has_items and not has_pixels:
+    if expect_pixels is False:
+        if has_pixels:
+            raise MdpConfigurationError(
+                f"MDP: microbatch {microbatch_id} violates: non-owned microbatches "
+                "carry no pixel payload under pixel_owner_shard (the collate pixel "
+                "branch was not suppressed)."
+            )
+    elif has_items and not has_pixels:
         raise MdpConfigurationError(
             f"MDP: microbatch {microbatch_id} violates: pixel data and grid metadata "
             "either both exist or both are absent (items without pixels)."

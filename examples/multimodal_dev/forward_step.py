@@ -307,6 +307,15 @@ def pack_or_pad_batch(
     if use_packed_sequence:
         packed_batch: Dict[str, Any] = {}
 
+        # Owner-sharded pixel reading (--mdp-pixel-owner-shard): during MDP
+        # window capture of a microbatch owned by another worker, skip pixel
+        # materialization + H2D wholesale. All text tensors and vision item
+        # metadata (grid_thw, sidecar) are still built from input_ids/grids,
+        # so every offset stays valid. False outside a sharded MDP capture.
+        from megatron.core.mdp.window import pixel_capture_suppressed
+
+        suppress_pixels = pixel_capture_suppressed()
+
         if is_src:
             assert batch is not None, "source TP rank must provide a batch"
             input_ids_list, labels_list, loss_mask_list = [], [], []
@@ -324,7 +333,8 @@ def pack_or_pad_batch(
                 loss_mask_list.append(F.pad(sample["loss_mask"], (0, target_len - seqlen), value=0))
                 seqlens_list.append(seqlen)
                 seqlens_padded_list.append(target_len)
-                pixel_values_list.append(sample["pixel_values"])
+                if not suppress_pixels:
+                    pixel_values_list.append(sample["pixel_values"])
                 image_grid_thw_list.append(sample["image_grid_thw"])
 
             cu_seqlens = list(accumulate(seqlens_list, initial=0))
@@ -364,7 +374,8 @@ def pack_or_pad_batch(
             packed_batch["labels"] = torch.concat(labels_list, dim=0).unsqueeze(0)
             packed_batch["loss_mask"] = torch.concat(loss_mask_list, dim=0).unsqueeze(0)
             packed_batch["padding_mask"] = padding_mask_thd.unsqueeze(0)
-            packed_batch["pixel_values"] = torch.concat(pixel_values_list)
+            if not suppress_pixels:
+                packed_batch["pixel_values"] = torch.concat(pixel_values_list)
             packed_batch["image_grid_thw"] = torch.concat(image_grid_thw_list)
             # cu_seqlens / cu_seqlens_padded need to reach non-source TP ranks
             # so each rank can build an identical PackedSeqParams.

@@ -147,11 +147,14 @@ class MdpPlanner:
             )
 
         # Routes: one slice per item in v1. The endpoint is single-valued.
+        # owner_worker_id names the PIXEL source; without owner sharding the
+        # window sets it to the endpoint worker, keeping today's routes.
         routes = tuple(
             RouteSlice(
                 global_item_id=descriptor.global_item_id,
                 producer_worker_id=assignment[descriptor.global_item_id],
                 endpoint_rank=view.endpoint_rank,
+                owner_worker_id=descriptor.owner_worker_id,
             )
             for descriptor in sorted(descriptors, key=lambda d: d.global_item_id)
         )
@@ -221,6 +224,12 @@ class MdpPlanner:
                 raise MdpPlanError(
                     f"MDP: microbatch_id={descriptor.microbatch_id} for item {item_id} "
                     f"violates: microbatch is part of this iteration window."
+                )
+            if descriptor.owner_worker_id not in view.worker_ids:
+                raise MdpPlanError(
+                    f"MDP: owner_worker_id={descriptor.owner_worker_id} for item "
+                    f"{item_id} violates: the pixel owner is a worker of this "
+                    f"planning group {view.worker_ids}."
                 )
             if descriptor.owner_dp_lane != view.outer_dp_rank:
                 raise MdpPlanError(

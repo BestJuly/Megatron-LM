@@ -143,7 +143,25 @@ class ModalityBridge:
             producer_rank = producer_ranks[0]
             if phase is BridgePhase.EMBEDDING:
                 src, dst = producer_rank, route.endpoint_rank
-            else:  # PIXEL and GRADIENT flow owner endpoint -> producer
+            elif phase is BridgePhase.PIXEL:
+                # Pixels flow from the worker that owns them. Routes without
+                # an owner (pre-owner-sharding plans) fall back to the
+                # endpoint, today's star dispatch.
+                if route.owner_worker_id is None:
+                    owner_rank = route.endpoint_rank
+                else:
+                    owner_ranks = rank_map.worker_ranks(
+                        plan.outer_dp_rank, route.owner_worker_id
+                    )
+                    if len(owner_ranks) != 1:
+                        raise MdpBridgeError(
+                            f"MDP: owner_worker_id={route.owner_worker_id} resolves to "
+                            f"{len(owner_ranks)} ranks; the encoder-CP physical "
+                            "expansion is not implemented in this version."
+                        )
+                    owner_rank = owner_ranks[0]
+                src, dst = owner_rank, producer_rank
+            else:  # GRADIENT flows owner endpoint -> producer
                 src, dst = route.endpoint_rank, producer_rank
             key = BridgeBufferKey(global_item_id=route.global_item_id)
             spec = tensor_specs.get(key)
@@ -260,6 +278,153 @@ class ModalityBridge:
             edges=edges,
             small_message_count=small,
         )
+        return received
+
+    def exchange_all_to_all(
+        self,
+        ledger: BridgeLedger,
+        local_tensors: Mapping[BridgeBufferKey, Tensor],
+        *,
+        tensor_specs: Mapping[BridgeBufferKey, BridgeTensorSpec],
+        group,
+        group_ranks,
+        global_rank: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Mapping[BridgeBufferKey, Tensor]:
+        """Execute this rank's part of the ledger with one ``all_to_all_single``.
+
+        Used by the PIXEL phase under owner-sharded pixel reading. Every
+        planning-group member must call this every iteration — a rank with
+        nothing to move participates with zero splits (the collective cannot be
+        skipped). The payload carries raw rows only, no headers: both sides
+        hold the identical ledger and derive the buffer layout (per-destination
+        blocks in group-rank order, ``plan_offset`` inside each block). Local
+        edges bypass the collective and copy directly, like the P2P path.
+
+        No host synchronization: ``all_to_all_single`` with ``async_op=False``
+        stream-orders subsequent reads of the receive buffer, and unpacking
+        stays on the same stream.
+        """
+        if self._in_flight:
+            raise MdpBridgeError("MDP: bridge violates: one exchange at a time per phase.")
+        self._in_flight = True
+        start = time.monotonic()
+        try:
+            received = self._exchange_all_to_all_impl(
+                ledger, local_tensors, tensor_specs, group, group_ranks, global_rank,
+                dtype, device,
+            )
+        finally:
+            self._in_flight = False
+        elapsed_ms = (time.monotonic() - start) * 1000.0
+        edges = len(
+            {
+                (e.src_global_rank, e.dst_global_rank)
+                for e in ledger.entries
+                if global_rank in (e.src_global_rank, e.dst_global_rank)
+            }
+        )
+        self._last_stats[ledger.phase] = BridgePhaseStats(
+            elapsed_ms=elapsed_ms,
+            total_bytes=ledger.total_bytes,
+            remote_bytes=ledger.remote_bytes,
+            edges=edges,
+            small_message_count=0,
+        )
+        return received
+
+    def _exchange_all_to_all_impl(
+        self,
+        ledger: BridgeLedger,
+        local_tensors: Mapping[BridgeBufferKey, Tensor],
+        tensor_specs: Mapping[BridgeBufferKey, BridgeTensorSpec],
+        group,
+        group_ranks,
+        global_rank: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Mapping[BridgeBufferKey, Tensor]:
+        group_ranks = tuple(group_ranks)
+        send_by_dst: dict = {}
+        recv_by_src: dict = {}
+        local_entries = []
+        for entry in ledger.entries:  # already in canonical order
+            if entry.dtype != dtype:
+                raise MdpBridgeError(
+                    f"MDP: all_to_all exchange violates: one dtype per phase "
+                    f"(ledger has {entry.dtype}, expected {dtype})."
+                )
+            src, dst = entry.src_global_rank, entry.dst_global_rank
+            if src == dst:
+                if src == global_rank:
+                    local_entries.append(entry)
+            elif src == global_rank:
+                send_by_dst.setdefault(dst, []).append(entry)
+            elif dst == global_rank:
+                recv_by_src.setdefault(src, []).append(entry)
+
+        input_splits = [
+            sum(e.element_count for e in send_by_dst.get(rank, ())) for rank in group_ranks
+        ]
+        output_splits = [
+            sum(e.element_count for e in recv_by_src.get(rank, ())) for rank in group_ranks
+        ]
+        send_buffer = self._allocator.acquire(
+            rows=sum(input_splits), width=0, dtype=dtype, device=device, tag="bridge_a2a_send"
+        )
+        recv_buffer = self._allocator.acquire(
+            rows=sum(output_splits), width=0, dtype=dtype, device=device, tag="bridge_a2a_recv"
+        )
+        base = 0
+        for rank, split in zip(group_ranks, input_splits):
+            for entry in send_by_dst.get(rank, ()):
+                offset = base + entry.plan_offset
+                send_buffer[offset : offset + entry.element_count].copy_(
+                    self._entry_payload(local_tensors, entry)
+                )
+            base += split
+
+        with nvtx_phase("bridge_pixel_alltoall"):
+            dist.all_to_all_single(
+                recv_buffer,
+                send_buffer,
+                output_split_sizes=output_splits,
+                input_split_sizes=input_splits,
+                group=group,
+            )
+        self._allocator.release(send_buffer)
+
+        received: dict = {}
+
+        def _unpack(entry: BridgeLedgerEntry, flat: Tensor):
+            spec = tensor_specs[entry.key]
+            width = max(1, spec.width)
+            rows = entry.element_count // width
+            out = self._allocator.acquire(
+                rows=spec.capacity_rows,
+                width=spec.width,
+                dtype=spec.dtype,
+                device=spec.device,
+                tag=f"bridge_{ledger.phase.value}_out",
+            )
+            out_valid = out[:rows] if spec.width == 0 else out[:rows, :]
+            out_valid.copy_(flat.view(out_valid.shape))
+            if entry.key in received:
+                raise MdpBridgeError(
+                    f"MDP: key {entry.key} violates: one received buffer per key."
+                )
+            received[entry.key] = out_valid
+
+        for entry in local_entries:
+            _unpack(entry, self._entry_payload(local_tensors, entry))
+        base = 0
+        for rank, split in zip(group_ranks, output_splits):
+            for entry in recv_by_src.get(rank, ()):
+                offset = base + entry.plan_offset
+                _unpack(entry, recv_buffer[offset : offset + entry.element_count])
+            base += split
+        self._allocator.release(recv_buffer)
         return received
 
     def _exchange_impl(

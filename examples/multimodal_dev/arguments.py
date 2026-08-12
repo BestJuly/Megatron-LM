@@ -147,6 +147,18 @@ def add_multimodal_args(parser):
         ),
     )
     group.add_argument(
+        "--mdp-pixel-owner-shard",
+        action="store_true",
+        default=False,
+        help=(
+            "Owner-sharded pixel reading: each planning-group worker "
+            "materializes pixels only for the microbatches it owns "
+            "(microbatch_id %% num_workers) and the PIXEL bridge phase becomes "
+            "an all_to_all_single exchange from owners to planned producers. "
+            "Requires TP=1."
+        ),
+    )
+    group.add_argument(
         "--mdp-debug-plan-payload-check",
         action="store_true",
         default=False,

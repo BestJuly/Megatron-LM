@@ -68,6 +68,11 @@ class VisionDescriptor:
     planning group; ``estimated_cost_units`` is a non-negative integer used only
     for ordering and never sizes a buffer; for spatial merge size ``m``,
     ``payload_rows == t*h*w`` and ``output_rows == t*(h/m)*(w/m)``.
+
+    ``owner_worker_id`` is the logical worker holding this item's pixels at
+    dispatch time: ``microbatch_id % num_workers`` under owner-sharded pixel
+    reading, and the endpoint's worker otherwise (both conventions resolve to
+    the endpoint worker when sharding is off, so the PIXEL routes are unchanged).
     """
 
     global_item_id: int
@@ -79,6 +84,7 @@ class VisionDescriptor:
     payload_rows: int
     output_rows: int
     grid_thw: tuple
+    owner_worker_id: int = 0
 
 
 class MdpModelAdapter(Protocol):
