@@ -8,6 +8,9 @@
 # Every experiment dimension is an environment variable:
 #
 #   MDP=0|1          enable MDP (default 0 = native in-model encoder)
+#   OVERLAP=0|1      window-capture prefetch on a background thread + side
+#                    CUDA stream (--mdp-overlap-window-capture; ignored when
+#                    MDP=0)
 #   PIXEL_SHARD=0|1  owner-sharded pixel reading + all_to_all pixel exchange
 #                    (--mdp-pixel-owner-shard; ignored when MDP=0)
 #   PIXEL_LOCALITY=0|1  planner prefers assigning items to their pixel owner
@@ -52,6 +55,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export HF_HUB_OFFLINE=1
 
 MDP=${MDP:-0}
+OVERLAP=${OVERLAP:-0}
 PIXEL_SHARD=${PIXEL_SHARD:-0}
 PIXEL_LOCALITY=${PIXEL_LOCALITY:-0}
 GRID_CACHE=${GRID_CACHE:-1}
@@ -85,6 +89,9 @@ cd "$REPO_ROOT"
 MDP_ARGS=()
 if [ "$MDP" = "1" ]; then
     MDP_ARGS=( --mdp-enable )
+    if [ "$OVERLAP" = "1" ]; then
+        MDP_ARGS+=( --mdp-overlap-window-capture )
+    fi
     if [ "$PIXEL_SHARD" = "1" ]; then
         MDP_ARGS+=( --mdp-pixel-owner-shard )
     fi

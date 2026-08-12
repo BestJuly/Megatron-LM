@@ -101,6 +101,7 @@ def mdp_config_from_args(args) -> MdpConfig:
         debug_plan_payload_check=getattr(args, "mdp_debug_plan_payload_check", False),
         pixel_owner_shard=getattr(args, "mdp_pixel_owner_shard", False),
         pixel_locality=getattr(args, "mdp_pixel_locality", False),
+        overlap_window_capture=getattr(args, "mdp_overlap_window_capture", False),
     )
 
 

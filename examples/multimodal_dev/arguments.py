@@ -147,6 +147,18 @@ def add_multimodal_args(parser):
         ),
     )
     group.add_argument(
+        "--mdp-overlap-window-capture",
+        action="store_true",
+        default=False,
+        help=(
+            "Prefetch the next iteration's data window on a background "
+            "thread and a dedicated side CUDA stream while the current "
+            "iteration runs, hiding the serial P1 window-capture cost "
+            "without inserting H2D copies into the main compute stream. "
+            "TP=1 only."
+        ),
+    )
+    group.add_argument(
         "--mdp-pixel-owner-shard",
         action="store_true",
         default=False,

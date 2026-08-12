@@ -15,6 +15,7 @@ empty ledgers, zero local encoder work, and zero encoder gradients.
 """
 
 import logging
+import threading
 import time
 from enum import Enum, auto
 from typing import Iterator, Optional, Sequence, Union
@@ -109,6 +110,16 @@ class MdpRuntime:
         self._decoder_schedule_ms = 0.0
         self._decoder_start = 0.0
         self._last_metrics: Optional[MdpIterationMetrics] = None
+        # Window-capture overlap: one in-flight prefetch keyed by the data
+        # iterator's identity, so an interleaved eval (different iterator)
+        # leaves a pending train prefetch untouched. The prefetch thread runs
+        # capture under a dedicated side stream so its H2D traffic never
+        # enters (or blocks) the main compute stream; the consumer orders
+        # itself via the recorded event.
+        self._prefetch_key = None
+        self._prefetch_thread = None
+        self._prefetch_box: Optional[dict] = None
+        self._prefetch_stream: Optional[torch.cuda.Stream] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -150,18 +161,14 @@ class MdpRuntime:
 
         # P1: window capture, descriptor broadcast, plan, pixel dispatch.
         plan_start = time.monotonic()
-        with nvtx_phase("p1_window_capture"):
-            window = MdpIterationWindow.capture(
-                data_iterators,
-                num_microbatches=num_microbatches,
-                adapter=self.adapter,
-                num_vpp_chunks=self.num_vpp_chunks,
-                lane_id=self.rank_view.lane_id,
-                pixel_owner_shard=self.config.pixel_owner_shard,
-                my_worker_id=self.rank_view.my_worker_id,
-                num_workers=len(self.rank_view.worker_ids),
-                endpoint_worker_id=endpoint_worker_id(self.rank_view),
-            )
+        window = self._take_prefetched_window(data_iterators, num_microbatches)
+        if window is None:
+            with nvtx_phase("p1_window_capture"):
+                window = self._capture_window(data_iterators, num_microbatches)
+        # The data iterator is fully consumed for this iteration; the next
+        # window can be captured concurrently with everything that follows.
+        if self.config.overlap_window_capture and not forward_only:
+            self._start_window_prefetch(data_iterators, num_microbatches)
         self._window = window
         local_flags = tuple(record.text_only for record in window.records())
         with nvtx_phase("p1_broadcast_descriptors"):
@@ -456,6 +463,111 @@ class MdpRuntime:
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+
+    def _capture_window(self, data_iterators, num_microbatches: int) -> MdpIterationWindow:
+        return MdpIterationWindow.capture(
+            data_iterators,
+            num_microbatches=num_microbatches,
+            adapter=self.adapter,
+            num_vpp_chunks=self.num_vpp_chunks,
+            lane_id=self.rank_view.lane_id,
+            pixel_owner_shard=self.config.pixel_owner_shard,
+            my_worker_id=self.rank_view.my_worker_id,
+            num_workers=len(self.rank_view.worker_ids),
+            endpoint_worker_id=endpoint_worker_id(self.rank_view),
+        )
+
+    @staticmethod
+    def _window_prefetch_key(data_iterators, num_microbatches: int):
+        if isinstance(data_iterators, (list, tuple)):
+            iterator = data_iterators[0] if data_iterators else None
+        else:
+            iterator = data_iterators
+        return (id(iterator), num_microbatches)
+
+    def _take_prefetched_window(self, data_iterators, num_microbatches: int):
+        """Return the prefetched window for this iterator, or ``None``."""
+        if self._prefetch_thread is None:
+            return None
+        if self._prefetch_key != self._window_prefetch_key(data_iterators, num_microbatches):
+            return None  # different iterator (eval); keep the pending prefetch
+        with nvtx_phase("p1_window_prefetch_join"):
+            self._prefetch_thread.join()
+        box = self._prefetch_box
+        self._prefetch_key = None
+        self._prefetch_thread = None
+        self._prefetch_box = None
+        if "error" in box:
+            raise box["error"]
+        window = box["window"]
+        # Order every subsequent main-stream op after the side-stream capture
+        # work (H2D copies of the window tensors). A stream-level wait, not a
+        # host sync: the main stream simply refuses to run ahead of the event.
+        current = torch.cuda.current_stream()
+        current.wait_event(box["event"])
+        # Belt and braces for the caching allocator: the window tensors were
+        # allocated on the side stream but are consumed (and eventually freed)
+        # from main-stream code; mark them so their blocks are not handed back
+        # to the side-stream pool while main-stream work is still pending.
+        seen = set()
+
+        def _record(value):
+            if torch.is_tensor(value) and value.is_cuda and value.data_ptr() not in seen:
+                seen.add(value.data_ptr())
+                value.record_stream(current)
+
+        for record in window.records():
+            for value in record.model_payload.values():
+                _record(value)
+            params = record.decoder_packed_seq_params
+            for name in ("cu_seqlens_q", "cu_seqlens_kv", "cu_seqlens_q_padded",
+                         "cu_seqlens_kv_padded"):
+                _record(getattr(params, name, None))
+        for tensor in window.payload_sidecar().values():
+            _record(tensor)
+        return window
+
+    def _start_window_prefetch(self, data_iterators, num_microbatches: int) -> None:
+        """Capture the next window on a background thread and a side stream.
+
+        The side stream keeps the capture's H2D traffic out of the main
+        compute stream, so the copies overlap the decoder schedule instead of
+        interleaving with (and delaying) its kernels. Concurrent capture is
+        validated for TP=1 only (see --mdp-overlap-window-capture); with TP=1
+        the capture path performs no collectives, so the thread never touches
+        NCCL. The prefetch after the final training iteration is captured but
+        never consumed; a capture failure there stays inside its box and is
+        only re-raised if a later iteration actually asks for the window.
+        """
+        if self._prefetch_thread is not None:
+            return  # one in-flight prefetch; an unconsumed one stays cached
+        if self._prefetch_stream is None:
+            self._prefetch_stream = torch.cuda.Stream(device=self.device)
+        box: dict = {}
+        stream = self._prefetch_stream
+
+        def _run():
+            try:
+                # A fresh thread defaults to cuda:0; capture moves tensors to
+                # "cuda", which must resolve to this rank's device.
+                torch.cuda.set_device(self.device)
+                with torch.cuda.stream(stream):
+                    with nvtx_phase("p1_window_capture_prefetch"):
+                        box["window"] = self._capture_window(
+                            data_iterators, num_microbatches
+                        )
+                    event = torch.cuda.Event()
+                    event.record(stream)
+                    box["event"] = event
+            except BaseException as exc:  # surfaced on consumption
+                box["error"] = exc
+
+        self._prefetch_key = self._window_prefetch_key(data_iterators, num_microbatches)
+        self._prefetch_box = box
+        self._prefetch_thread = threading.Thread(
+            target=_run, name="mdp-window-prefetch", daemon=True
+        )
+        self._prefetch_thread.start()
 
     def _require_state(self, expected: MdpRuntimeState, operation: str) -> None:
         if self._state is not expected:
