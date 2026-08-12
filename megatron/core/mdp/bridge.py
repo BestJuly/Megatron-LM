@@ -387,13 +387,18 @@ class ModalityBridge:
             rows=sum(output_splits), width=0, dtype=dtype, device=device, tag="bridge_a2a_recv"
         )
         base = 0
+        pack_dst = []
+        pack_src = []
         for rank, split in zip(group_ranks, input_splits):
             for entry in send_by_dst.get(rank, ()):
                 offset = base + entry.plan_offset
-                send_buffer[offset : offset + entry.element_count].copy_(
-                    self._entry_payload(local_tensors, entry)
-                )
+                pack_dst.append(send_buffer[offset : offset + entry.element_count])
+                pack_src.append(self._entry_payload(local_tensors, entry))
             base += split
+        if pack_dst:
+            # One multi-tensor launch instead of one copy kernel per entry;
+            # all slices share the phase dtype, so the fast path applies.
+            torch._foreach_copy_(pack_dst, pack_src)
 
         received: dict = {}
 
