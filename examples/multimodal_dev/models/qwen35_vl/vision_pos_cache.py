@@ -140,11 +140,13 @@ class GridCache:
         """cu_seqlens tensor and max frame seqlen for one grid tuple."""
         key = (grids, str(device))
         if key not in self._psp:
+            # Grid *combinations* rarely repeat (unlike single grids), so this
+            # entry is usually built fresh: do the cumsum on the host and
+            # upload from pinned staging with a non-blocking copy instead of a
+            # blocking pageable H2D against the busy compute stream.
             seqlens = [int(h) * int(w) for t, h, w in grids for _ in range(int(t))]
-            cu = torch.zeros(len(seqlens) + 1, dtype=torch.int32, device=device)
-            torch.cumsum(
-                torch.tensor(seqlens, dtype=torch.int32, device=device), 0,
-                out=cu[1:],
-            )
+            staging = torch.zeros(len(seqlens) + 1, dtype=torch.int32, pin_memory=True)
+            torch.cumsum(torch.tensor(seqlens, dtype=torch.int32), 0, out=staging[1:])
+            cu = staging.to(device, non_blocking=True)
             self._psp[key] = (cu, max(seqlens))
         return self._psp[key]

@@ -514,12 +514,17 @@ class Qwen35VLVisionEncoder(VisionModule):
         grid_thw_list = grid_thw.tolist()
 
         max_hw = max(max(int(h), int(w)) for _, h, w in grid_thw_list)
+        # The compute device, not grid_thw.device: MDP passes grid_thw as a
+        # CPU tensor (this method only needs its Python values). Stubs in
+        # tests carry no parameters; they keep following grid_thw.
+        pos_embed = getattr(self, "pos_embed", None)
+        device = pos_embed.weight.device if pos_embed is not None else grid_thw.device
         # Tests call this method unbound on stub objects without _grid_cache;
         # fall back to the original loop path when the cache is absent.
         grid_cache = getattr(self, "_grid_cache", None)
         if _GRID_CACHE_ENABLED and grid_cache is not None:
             freq_table = grid_cache.freqs(
-                self.rot_pos_emb, max_hw, grid_thw.device
+                self.rot_pos_emb, max_hw, device
             )
             device = freq_table.device
             # (row, col) coordinates depend only on the grid; cached per grid.
@@ -530,8 +535,7 @@ class Qwen35VLVisionEncoder(VisionModule):
                 ]
             )
         else:
-            freq_table = self.rot_pos_emb(max_hw, device=grid_thw.device)
-            device = freq_table.device
+            freq_table = self.rot_pos_emb(max_hw, device=device)
             # Via the class, not self: tests call this method unbound on stubs.
             pos_ids = Qwen35VLVisionEncoder._rope_pos_ids_uncached(
                 grid_thw_list, merge, device
@@ -618,6 +622,9 @@ class Qwen35VLVisionEncoder(VisionModule):
             ``PackedSeqParams`` for ``TransformerBlock``.
         """
         if not _GRID_CACHE_ENABLED:
+            # This fallback does tensor math on grid_thw; MDP may pass it on
+            # the CPU (the cached path needs only its Python values).
+            grid_thw = grid_thw.to(self.pos_embed.weight.device)
             cu_seqlens = torch.repeat_interleave(
                 grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
             ).cumsum(dim=0, dtype=torch.int32)
@@ -633,7 +640,7 @@ class Qwen35VLVisionEncoder(VisionModule):
 
         grids = tuple(tuple(int(v) for v in row) for row in grid_thw.tolist())
         cu_seqlens, max_seqlen = self._grid_cache.packed_seq(
-            grids, grid_thw.device
+            grids, self.pos_embed.weight.device
         )
 
         return PackedSeqParams(
