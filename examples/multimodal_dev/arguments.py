@@ -159,6 +159,17 @@ def add_multimodal_args(parser):
         ),
     )
     group.add_argument(
+        "--mdp-pixel-locality",
+        action="store_true",
+        default=False,
+        help=(
+            "With --mdp-pixel-owner-shard: the planner prefers assigning a "
+            "vision item to its pixel owner within the LPT slack "
+            "(--mdp-locality-slack-permille), trading load balance for less "
+            "pixel traffic."
+        ),
+    )
+    group.add_argument(
         "--mdp-debug-plan-payload-check",
         action="store_true",
         default=False,

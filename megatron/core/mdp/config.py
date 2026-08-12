@@ -47,6 +47,7 @@ class MdpConfig:
     plan_check_interval: int = 1
     debug_plan_payload_check: bool = False
     pixel_owner_shard: bool = False
+    pixel_locality: bool = False
 
 
 @dataclass(frozen=True)
@@ -146,6 +147,16 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "Owner-sharded pixel reading suppresses the collate pixel branch on "
             "non-owner workers; its interaction with the TP pixel broadcast is "
             "untested.",
+            "False",
+        )
+    if config.pixel_locality and not config.pixel_owner_shard:
+        _reject(
+            "pixel_locality",
+            config.pixel_locality,
+            "pixel_locality requires pixel_owner_shard",
+            "Owner-preferring assignment only reduces traffic when pixels are "
+            "owner-sharded; without sharding every pixel lives at the endpoint "
+            "and locality has nothing to exploit.",
             "False",
         )
     _validate_override_entries(config.vision_config_overrides)

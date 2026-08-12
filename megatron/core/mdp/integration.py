@@ -100,6 +100,7 @@ def mdp_config_from_args(args) -> MdpConfig:
         plan_check_interval=getattr(args, "mdp_plan_check_interval", 1),
         debug_plan_payload_check=getattr(args, "mdp_debug_plan_payload_check", False),
         pixel_owner_shard=getattr(args, "mdp_pixel_owner_shard", False),
+        pixel_locality=getattr(args, "mdp_pixel_locality", False),
     )
 
 
@@ -237,6 +238,7 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
             rank_view,
             locality_slack_permille=mdp_config.locality_slack_permille,
             capacity_policy=RowCapacityPolicy(mdp_config.row_alignment),
+            pixel_locality=mdp_config.pixel_locality,
         ),
         bridge=ModalityBridge(allocator),
         storage=MdpEmbeddingStorage(allocator),

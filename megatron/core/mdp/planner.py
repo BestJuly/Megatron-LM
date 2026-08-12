@@ -34,10 +34,12 @@ class MdpPlanner:
         *,
         locality_slack_permille: int,
         capacity_policy: RowCapacityPolicy,
+        pixel_locality: bool = False,
     ) -> None:
         self._rank_view = rank_view
         self._locality_slack_permille = locality_slack_permille
         self._capacity_policy = capacity_policy
+        self._pixel_locality = pixel_locality
         # The logical worker hosting the owner endpoint, derived purely from the
         # view: workers partition the group ranks in fixed-width blocks.
         ranks_per_worker = len(rank_view.planning_group_ranks) // len(rank_view.worker_ids)
@@ -70,10 +72,19 @@ class MdpPlanner:
                 for worker_id in view.worker_ids
                 if 1000 * loads[worker_id] <= 1000 * min_load + slack
             ]
+            if self._pixel_locality:
+                # Owner-sharded pixels: within the slack window, prefer the
+                # item's pixel owner (a self-edge in the PIXEL exchange). This
+                # replaces the endpoint preference, whose purpose — keeping
+                # pixel traffic local — attaches to the owner once pixels are
+                # owner-sharded.
+                preferred = descriptor.owner_worker_id
+            else:
+                preferred = self._endpoint_worker_id
             chosen = min(
                 eligible,
                 key=lambda worker_id: (
-                    0 if worker_id == self._endpoint_worker_id else 1,
+                    0 if worker_id == preferred else 1,
                     loads[worker_id],
                     worker_id,
                 ),
