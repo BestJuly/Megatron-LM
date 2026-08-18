@@ -1297,6 +1297,17 @@ def generate_state_dict(
 
         state_dict[key] = model_sd
 
+    if getattr(args, "mdp_enable", False) and args.ckpt_format == "torch_dist":
+        # MDP: the replicated vision encoder lives outside the model chunk
+        # list; contribute its weights with encoder WORLD replica metadata.
+        # No-op unless --mdp-enable is set.
+        from megatron.core.mdp import integration as mdp_integration
+        from megatron.core.mdp.checkpoint import add_encoder_state
+
+        mdp_runtime = mdp_integration.get_runtime()
+        if mdp_runtime is not None:
+            add_encoder_state(state_dict, mdp_runtime.encoder_domain.encoder_ddp)
+
     # Optimizer stuff.
     if not args.no_save_optim:
         if optimizer is not None and not optimizer.is_stub_optimizer:

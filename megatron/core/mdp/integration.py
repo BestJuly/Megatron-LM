@@ -116,13 +116,23 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
         or getattr(args, "fine_grained_activation_offloading", False)
         or getattr(args, "offload_optimizer_states", False)
     )
+    # Mirror initialize_model_parallel's order selection (initialize.py):
+    # --use-tp-pp-dp-mapping switches to 'tp-cp-ep-pp-dp', which MDP's rank
+    # mapping does not support — the snapshot must report the REAL order so
+    # validate_mdp_config's rejection can fire instead of building planning
+    # groups that no longer match the decoder replicas.
+    rank_order = (
+        "tp-cp-ep-pp-dp"
+        if getattr(args, "use_tp_pp_dp_mapping", False)
+        else SUPPORTED_RANK_ORDER
+    )
     return MdpCompatibilityOptions(
         world_size=args.world_size,
         tensor_parallel_size=args.tensor_model_parallel_size,
         pipeline_parallel_size=args.pipeline_model_parallel_size,
         context_parallel_size=args.context_parallel_size,
         expert_parallel_size=getattr(args, "expert_model_parallel_size", 1),
-        rank_order=SUPPORTED_RANK_ORDER,
+        rank_order=rank_order,
         virtual_pipeline_parallel_size=getattr(
             args, "virtual_pipeline_model_parallel_size", None
         ),
@@ -156,8 +166,8 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
 
     Called in ``setup_model_and_optimizer`` after the decoder optimizer is
     built and before the LR scheduler binds. Returns *optimizer* unchanged
-    when MDP is off. The following training-state commit replaces the return
-    value with the composite optimizer.
+    when MDP is off. The composite optimizer replaces the return value once
+    the M5 commit lands.
     """
     global _RUNTIME
     if not mdp_enabled(args) or optimizer is None:
@@ -245,7 +255,10 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
         len(rank_view.worker_ids),
         list(mdp_config.vision_config_overrides),
     )
-    return optimizer
+
+    from megatron.core.mdp.optimizer import build_mdp_composite_optimizer
+
+    return build_mdp_composite_optimizer(optimizer, encoder_domain.encoder_optimizer)
 
 
 def maybe_wrap_forward_backward(forward_backward_func: Callable, config=None) -> Callable:
