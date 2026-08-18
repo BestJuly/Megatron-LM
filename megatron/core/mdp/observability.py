@@ -34,9 +34,17 @@ class MdpIterationMetrics:
 
 
 @contextmanager
-def nvtx_phase(name: str):
-    """NVTX range for one MDP phase (visible in nsys timelines)."""
-    torch.cuda.nvtx.range_push(f"mdp.{name}")
+def nvtx_phase(name: str, prefix: str = "mdp"):
+    """NVTX range for one phase (visible in nsys timelines).
+
+    Args:
+        name: Phase name, e.g. ``p2_encoder_forward``.
+        prefix: Namespace prepended with a dot. Defaults to ``mdp`` for the
+            phases of this package; the multimodal training path passes ``mm``
+            so an MDP-off timeline carries comparable ranges from the same
+            helper instead of a second, divergent mechanism.
+    """
+    torch.cuda.nvtx.range_push(f"{prefix}.{name}")
     try:
         yield
     finally:

@@ -17,6 +17,7 @@ from typing import Optional
 import torch
 from torch import Tensor
 
+from examples.multimodal_dev.observability import nvtx_phase
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.models.gpt import GPTModel
 from megatron.core.transformer.module import MegatronModule
@@ -383,11 +384,12 @@ class MultimodalModel(MegatronModule):
         # MRoPE freqs are computed per PP stage from position_ids inside
         # GPTModel, so position_ids must be available on every stage.
         if position_ids is None:
-            position_ids = self.compute_position_ids(
-                input_ids=input_ids,
-                image_grid_thw=image_grid_thw,
-                packed_seq_params=packed_seq_params,
-            )
+            with nvtx_phase("compute_position_ids"):
+                position_ids = self.compute_position_ids(
+                    input_ids=input_ids,
+                    image_grid_thw=image_grid_thw,
+                    packed_seq_params=packed_seq_params,
+                )
 
         if self.pre_process:
             # An MDP endpoint hands the pre-encoded detached leaf in through
@@ -395,17 +397,22 @@ class MultimodalModel(MegatronModule):
             # feed the same scatter below.
             if vision_embeddings is None:
                 if self.vision_model is not None and pixel_values is not None:
-                    vision_embeddings = self.vision_model(pixel_values, image_grid_thw)
+                    with nvtx_phase("native_vision_encoder_forward"):
+                        vision_embeddings = self.vision_model(pixel_values, image_grid_thw)
 
             if decoder_input is None and self.language_model is not None:
-                text_embeddings = self.language_model.embedding(
-                    input_ids=input_ids, position_ids=None
-                )
+                with nvtx_phase("text_embedding"):
+                    text_embeddings = self.language_model.embedding(
+                        input_ids=input_ids, position_ids=None
+                    )
 
                 if vision_embeddings is not None:
-                    decoder_input = self._scatter_vision_embeddings(
-                        input_ids, text_embeddings, vision_embeddings
-                    )
+                    # MDP's equivalent of this scatter is mdp.p3_leaf_assembly
+                    # plus this same scatter on the endpoint.
+                    with nvtx_phase("scatter_vision_embeddings"):
+                        decoder_input = self._scatter_vision_embeddings(
+                            input_ids, text_embeddings, vision_embeddings
+                        )
                 else:
                     if bool((input_ids == self.image_token_id).any()):
                         raise RuntimeError(
@@ -436,7 +443,9 @@ class MultimodalModel(MegatronModule):
             padding_mask=padding_mask,
         )
 
-        with self._thd_mrope_no_cp_override(packed_seq_params):
+        with self._thd_mrope_no_cp_override(packed_seq_params), nvtx_phase(
+            "decoder_forward"
+        ):
             return self.language_model(
                 input_ids=input_ids,
                 position_ids=position_ids,
