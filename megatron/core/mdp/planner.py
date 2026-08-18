@@ -34,10 +34,12 @@ class MdpPlanner:
         *,
         locality_slack_permille: int,
         capacity_policy: RowCapacityPolicy,
+        pixel_locality: bool = False,
     ) -> None:
         self._rank_view = rank_view
         self._locality_slack_permille = locality_slack_permille
         self._capacity_policy = capacity_policy
+        self._pixel_locality = pixel_locality
         # The logical worker hosting the owner endpoint, derived purely from the
         # view: workers partition the group ranks in fixed-width blocks.
         ranks_per_worker = len(rank_view.planning_group_ranks) // len(rank_view.worker_ids)
@@ -70,10 +72,19 @@ class MdpPlanner:
                 for worker_id in view.worker_ids
                 if 1000 * loads[worker_id] <= 1000 * min_load + slack
             ]
+            if self._pixel_locality:
+                # Owner-sharded pixels: within the slack window, prefer the
+                # item's pixel owner (a self-edge in the PIXEL exchange). This
+                # replaces the endpoint preference, whose purpose — keeping
+                # pixel traffic local — attaches to the owner once pixels are
+                # owner-sharded.
+                preferred = descriptor.owner_worker_id
+            else:
+                preferred = self._endpoint_worker_id
             chosen = min(
                 eligible,
                 key=lambda worker_id: (
-                    0 if worker_id == self._endpoint_worker_id else 1,
+                    0 if worker_id == preferred else 1,
                     loads[worker_id],
                     worker_id,
                 ),
@@ -146,12 +157,14 @@ class MdpPlanner:
                 )
             )
 
-        # Routes: one slice per item in v1. The endpoint is single-valued.
+        # Routes: one slice per item in v1. The endpoint is single-valued and
+        # owner_worker_id names the owner-sharded PIXEL source.
         routes = tuple(
             RouteSlice(
                 global_item_id=descriptor.global_item_id,
                 producer_worker_id=assignment[descriptor.global_item_id],
                 endpoint_rank=view.endpoint_rank,
+                owner_worker_id=descriptor.owner_worker_id,
             )
             for descriptor in sorted(descriptors, key=lambda d: d.global_item_id)
         )
@@ -222,6 +235,12 @@ class MdpPlanner:
                     f"MDP: microbatch_id={descriptor.microbatch_id} for item {item_id} "
                     f"violates: microbatch is part of this iteration window."
                 )
+            if descriptor.owner_worker_id not in view.worker_ids:
+                raise MdpPlanError(
+                    f"MDP: owner_worker_id={descriptor.owner_worker_id} for item "
+                    f"{item_id} violates: the pixel owner is a worker of this "
+                    f"planning group {view.worker_ids}."
+                )
             if descriptor.owner_dp_lane != view.outer_dp_rank:
                 raise MdpPlanError(
                     f"MDP: owner_dp_lane={descriptor.owner_dp_lane} for item {item_id} "
@@ -277,12 +296,12 @@ def assert_consistent_plan(
     interval: int,
     debug_payload_check: bool = False,
 ) -> None:
-    """Cross-rank plan consistency check; called before any P2P post.
+    """Cross-rank plan consistency check; called before any bridge collective.
 
     All-gathers the 16-byte digest inside the planning group when
     ``iteration % interval == 0`` and raises a coordinated :class:`MdpPlanError`
     on any mismatch. ``interval`` can sample but never fully disables the check:
-    an undetected plan mismatch degrades from a diagnosable error into a P2P hang.
+    an undetected plan mismatch degrades from a diagnosable error into a collective hang.
     """
     import torch
     import torch.distributed as dist

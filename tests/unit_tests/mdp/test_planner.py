@@ -36,6 +36,7 @@ def _descriptor(item_id, cost, mb=0, sample=None, ordinal=0, grid=(1, 4, 4), lan
         payload_rows=t * h * w,
         output_rows=t * (h // 2) * (w // 2),
         grid_thw=grid,
+        owner_worker_id=0,
     )
 
 
@@ -164,6 +165,7 @@ def test_cross_microbatch_packing_in_one_producer():
                     payload_rows=99,
                     output_rows=4,
                     grid_thw=(1, 4, 4),
+                    owner_worker_id=0,
                 )
             ],
             "t\\*h\\*w",

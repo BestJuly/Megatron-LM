@@ -46,6 +46,7 @@ class MdpConfig:
     row_alignment: int = 1
     plan_check_interval: int = 1
     debug_plan_payload_check: bool = False
+    pixel_locality: bool = False
 
 
 @dataclass(frozen=True)
@@ -134,7 +135,7 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             config.plan_check_interval,
             "plan_check_interval >= 1",
             "The plan consistency check must never be fully disabled: an undetected "
-            "plan mismatch degrades from a diagnosable error into a P2P hang.",
+            "plan mismatch degrades from a diagnosable error into a collective hang.",
             "1",
         )
     _validate_override_entries(config.vision_config_overrides)
