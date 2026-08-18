@@ -128,6 +128,16 @@ class MdpRankMap:
         )
 
 
+def endpoint_worker_id(view: MdpRankView) -> int:
+    """The logical worker hosting the group's endpoint rank (worker 0 today).
+
+    Derived purely from the view, mirroring the planner's own derivation:
+    workers partition the planning-group ranks in fixed-width blocks.
+    """
+    ranks_per_worker = len(view.planning_group_ranks) // len(view.worker_ids)
+    return view.planning_group_ranks.index(view.endpoint_rank) // ranks_per_worker
+
+
 def build_rank_map(spec: MdpRankSpec) -> MdpRankMap:
     """Build the rank map from ``RankGenerator`` coordinates. Pure compute.
 

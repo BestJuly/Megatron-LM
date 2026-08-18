@@ -158,8 +158,8 @@ def test_digest_covers_the_minimal_sufficient_set():
 
 def _plan():
     routes = (
-        RouteSlice(global_item_id=0, producer_worker_id=1, endpoint_rank=0),
-        RouteSlice(global_item_id=1, producer_worker_id=0, endpoint_rank=0),
+        RouteSlice(global_item_id=0, producer_worker_id=1, endpoint_rank=0, owner_worker_id=0),
+        RouteSlice(global_item_id=1, producer_worker_id=0, endpoint_rank=0, owner_worker_id=0),
     )
     encoder_layouts = (
         EncoderThdLayout(producer_worker_id=0, segments=(_segment(1, (1, 4, 4)),)),

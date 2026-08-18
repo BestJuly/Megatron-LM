@@ -38,6 +38,7 @@ def _descriptor(item_id, mb=0, sample=0, ordinal=0, lane=0, cost=7, grid=(1, 4, 
         payload_rows=t * h * w,
         output_rows=t * (h // 2) * (w // 2),
         grid_thw=grid,
+        owner_worker_id=0,
     )
 
 

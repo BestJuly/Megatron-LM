@@ -17,8 +17,9 @@ from megatron.core.mdp.errors import MdpBridgeError, MdpConfigurationError
 from megatron.core.mdp.protocols import VisionDescriptor
 from megatron.core.mdp.rank_mapping import MdpRankMap
 
-# int64 slots per descriptor record (see API design 5.6).
-DESCRIPTOR_SLOTS = 11
+# int64 slots per descriptor record (see API design 5.6; slot 11 carries
+# owner_worker_id for owner-sharded pixel reading).
+DESCRIPTOR_SLOTS = 12
 
 
 @dataclass(frozen=True)
@@ -127,6 +128,7 @@ def descriptors_to_records(descriptors: Sequence[VisionDescriptor]) -> list:
                 d.grid_thw[0],
                 d.grid_thw[1],
                 d.grid_thw[2],
+                d.owner_worker_id,
             ]
         )
     return records
@@ -148,6 +150,7 @@ def records_to_descriptors(records) -> tuple:
             grid_t,
             grid_h,
             grid_w,
+            owner_worker_id,
         ) = (int(v) for v in row)
         descriptors.append(
             VisionDescriptor(
@@ -160,6 +163,7 @@ def records_to_descriptors(records) -> tuple:
                 payload_rows=payload_rows,
                 output_rows=output_rows,
                 grid_thw=(grid_t, grid_h, grid_w),
+                owner_worker_id=owner_worker_id,
             )
         )
     return tuple(descriptors)

@@ -43,6 +43,9 @@ class RouteSlice:
     endpoint rank receives it. Offsets are looked up in the encoder layout;
     decoder positions live only in the endpoint-local window record.
 
+    ``owner_worker_id`` is the logical worker holding the item's pixels at
+    dispatch time and is always the PIXEL phase source.
+
     In v1 every item has exactly one slice. When a real split lands (decoder CP),
     the route gains explicit sub-interval fields; they are not added speculatively.
     """
@@ -50,6 +53,7 @@ class RouteSlice:
     global_item_id: int
     producer_worker_id: int
     endpoint_rank: int
+    owner_worker_id: int
 
 
 @dataclass(frozen=True)
