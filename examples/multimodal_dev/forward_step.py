@@ -144,6 +144,89 @@ def broadcast_data_batch(data, device="cuda"):
 # -------------------------------------------------------------------
 
 
+def accumulate_flops_stats(packed_seq_params) -> None:
+    """Feed one micro-batch's real ``cu_seqlens`` into the FLOPs accumulators.
+
+    Called from the forward step -- once per micro-batch, on every rank of the
+    model-parallel group, on the main compute stream -- so the logged TFLOP/s
+    reflects the tokens actually packed instead of the BSHD closed form
+    ``micro_batch_size * seq_length`` (meaningless here: the packed multimodal
+    datasets ignore ``--seq-length`` entirely).
+    ``consume_seqlen_stats_in_iteration`` divides the world all-reduce by
+    ``TP * CP * PP``, which matches this call pattern.
+
+    Deliberately NOT called from the collate path: under
+    ``--mdp-overlap-window-capture`` the collate for iteration ``i+1`` runs on a
+    background thread and a side CUDA stream during iteration ``i``, which would
+    both mis-attribute the tokens by one iteration and enqueue the accumulation
+    off the main stream. The forward step consumes the captured window only
+    after the main stream has waited on the capture event, so it is ordered.
+
+    ``cu_seqlens_q`` is the REAL (unpadded) cumulative length vector;
+    ``cu_seqlens_q_padded`` carries the collate/CP alignment padding and is
+    intentionally not used. The reduction stays on device (no ``.item()``), so
+    no host sync is added to the hot path.
+
+    Imported lazily: ``megatron.training.training`` pulls in the whole training
+    stack, and this module is also imported by unit tests that never build it.
+    """
+    if packed_seq_params is None:
+        # BSHD path: leave the accumulator untouched so
+        # ``num_floating_point_operations`` keeps its closed-form defaults.
+        return
+    cu_seqlens = getattr(packed_seq_params, "cu_seqlens_q", None)
+    if cu_seqlens is None:
+        return
+    try:
+        from megatron.training.training import update_seqlen_stats_from_cu_seqlens
+    except ImportError:  # pragma: no cover - training stack unavailable
+        return
+    update_seqlen_stats_from_cu_seqlens(cu_seqlens)
+
+
+def accumulate_vision_flops_stats_from_grids(grid_thw) -> None:
+    """Report one micro-batch's vision work from a ``[N, 3]`` ``grid_thw``.
+
+    Used by the native (in-model encoder) path, where ``image_grid_thw`` is
+    broadcast to every PP stage. Stays on device: the two reductions are fused
+    kernels, no ``.item()``.
+    """
+    if grid_thw is None or grid_thw.numel() == 0:
+        return
+    t, h, w = grid_thw[:, 0], grid_thw[:, 1], grid_thw[:, 2]
+    frame = (h * w).to(torch.float64)
+    t = t.to(torch.float64)
+    _update_vision_stats((t * frame).sum(), (t * frame * frame).sum())
+
+
+def accumulate_vision_flops_stats_from_items(vision_items) -> None:
+    """Report one micro-batch's vision work from MDP's captured vision records.
+
+    The MDP replay record carries ``grid_thw`` as plain Python tuples on every
+    rank (only the pixel payload is owner-sharded), so the two sums are computed
+    on the host and added to the device accumulator as scalars. Byte-for-byte
+    the same quantities the native path reports for the same data.
+    """
+    rows = 0
+    attn_sq = 0
+    for item in vision_items:
+        t, h, w = (int(v) for v in item.grid_thw)
+        frame = h * w
+        rows += t * frame
+        attn_sq += t * frame * frame
+    if rows:
+        _update_vision_stats(float(rows), float(attn_sq))
+
+
+def _update_vision_stats(patch_rows, attn_squared_sum) -> None:
+    """Forward vision work to the training-loop accumulator (lazy import)."""
+    try:
+        from megatron.training.training import update_vision_stats
+    except ImportError:  # pragma: no cover - training stack unavailable
+        return
+    update_vision_stats(patch_rows, attn_squared_sum)
+
+
 def _build_packed_seq_params(seq_lengths: torch.Tensor, device: torch.device) -> PackedSeqParams:
     """Build ``PackedSeqParams`` from per-sample valid sequence lengths.
 
@@ -641,6 +724,9 @@ def mdp_forward_step(runtime, data_iterator, model):
     record = next(data_iterator)
     batch = dict(record.model_payload)
 
+    accumulate_flops_stats(record.decoder_packed_seq_params)
+    accumulate_vision_flops_stats_from_items(record.vision_items)
+
     vision_embeddings = None
     if is_pipeline_first_stage() and not record.text_only:
         vision_embeddings = runtime.storage.get_leaf(record.microbatch_id)
@@ -687,6 +773,9 @@ def forward_step(data_iterator, model):
 
     if batch is None:
         return None, None
+
+    accumulate_flops_stats(batch.get("packed_seq_params", None))
+    accumulate_vision_flops_stats_from_grids(batch.get("image_grid_thw", None))
 
     # ``pixel_values`` is the heavy vision tensor and is only consumed
     # on the first PP stage; drop it elsewhere.  ``image_grid_thw`` is
