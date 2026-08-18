@@ -139,10 +139,14 @@ class Qwen35VLMdpAdapter:
         from ``grid_thw`` (one sub-sequence per temporal frame); the decoder
         ``PackedSeqParams`` is never read here.
         """
+        # A CPU tensor, deliberately: with the grid cache enabled the encoder
+        # consumes grid_thw exclusively as Python lists (tolist), so a device
+        # tensor here cost a blocking pageable H2D on the busy compute stream
+        # (~2.4 ms/iter measured) followed by D2H readbacks inside the
+        # encoder. The encoder moves it to the device itself on the uncached
+        # (QWEN35_VL_GRID_CACHE=0) fallback paths that do tensor math on it.
         grid_thw = torch.tensor(
-            [segment.grid_thw for segment in layout.segments],
-            dtype=torch.long,
-            device=payload.device,
+            [segment.grid_thw for segment in layout.segments], dtype=torch.long
         )
         return encoder(payload, grid_thw)
 
