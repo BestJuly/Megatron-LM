@@ -207,6 +207,18 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  # MDP (modality decoupled parallelism) suite: pure-compute plan/planner/
+  # rank-map tests plus 8-GPU runtime/bridge/optimizer tests driven through
+  # torchrun. tag: [latest] only — the directory is new on this branch, so
+  # legacy CI refs don't have the path. environment: [dev] only — validated
+  # against the dev container.
+  - test_case: [tests/unit_tests/mdp/**/*.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/a2a_overlap/**/*.py]
     products:
       - environment: [lts, dev]
