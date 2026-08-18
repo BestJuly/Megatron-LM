@@ -1819,10 +1819,16 @@ def validate_args(args, defaults={}):
             token is not None for token in extra_tokens
         ), "FIM extra tokens should be specified."
 
-    assert not (args.cross_entropy_loss_fusion and args.cross_entropy_fusion_impl == 'te'), (
-        "Transformer Engine cross entropy loss fusion is disabled due to stability issues. "
-        "Use --cross-entropy-fusion-impl native, or omit --cross-entropy-loss-fusion."
-    )
+    # The TE cross-entropy stability issue this guarded is fixed in the TE
+    # version shipped in the training container (TE 2.16 + PR2932/PR3193), and
+    # the fused TE kernel is a measurable win on the multimodal MDP path, whose
+    # vocab (248320) makes the CE softmax a non-trivial share of the step.
+    # Kept as commented-out code rather than deleted so the guard is easy to
+    # restore on containers with an older TE.
+    # assert not (args.cross_entropy_loss_fusion and args.cross_entropy_fusion_impl == 'te'), (
+    #     "Transformer Engine cross entropy loss fusion is disabled due to stability issues. "
+    #     "Use --cross-entropy-fusion-impl native, or omit --cross-entropy-loss-fusion."
+    # )
 
     # Deterministic mode — env vars + config overrides + torch global state.
     # Implementation lives in ``megatron/training/determinism.py`` so the

@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterator, Optional
 import torch
 import torch.nn.functional as F
 
+from examples.multimodal_dev.observability import nvtx_phase
 from megatron.core import mpu
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
@@ -395,8 +396,8 @@ def pack_or_pad_batch(
     if use_packed_sequence:
         packed_batch: Dict[str, Any] = {}
 
-        # Owner-sharded pixel reading (--mdp-pixel-owner-shard): during MDP
-        # window capture of a microbatch owned by another worker, skip pixel
+        # Owner-sharded pixel reading: during MDP window capture of a
+        # microbatch owned by another worker, skip pixel
         # materialization + H2D wholesale. All text tensors and vision item
         # metadata (grid_thw, sidecar) are still built from input_ids/grids,
         # so every offset stays valid. False outside a sharded MDP capture.
@@ -769,7 +770,11 @@ def forward_step(data_iterator, model):
     if mdp_runtime is not None:
         return mdp_forward_step(mdp_runtime, data_iterator, model)
 
-    batch = get_batch(data_iterator)
+    # Native counterpart of mdp.p1_get_batch: the dataset fetch + THD pack
+    # + TP broadcast. MDP hoists this out of the schedule into window capture,
+    # so a like-for-like timeline comparison needs it named on both sides.
+    with nvtx_phase("get_batch"):
+        batch = get_batch(data_iterator)
 
     if batch is None:
         return None, None

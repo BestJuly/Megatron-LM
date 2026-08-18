@@ -13,6 +13,9 @@ Enable with `--mdp-enable` in a training entry point that registers an
 integration point is side-effect free and `finalize_model_grads_func` stays
 unwrapped.
 
+For an agent-oriented implementation map, invariants, extension guide, and
+verification commands, see [`knowledge.md`](knowledge.md).
+
 ## Phase machine
 
 The runtime exposes three states (`EMPTY -> DECODER_READY -> DECODER_DONE ->

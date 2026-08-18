@@ -43,6 +43,7 @@ def _nvtx(name: str):
         torch.cuda.nvtx.range_pop()
 
 from examples.multimodal_dev.models.qwen35_vl.vision_pos_cache import GridCache
+from examples.multimodal_dev.observability import backward_range_begin, backward_range_end
 from megatron.core.models.common.vision_module.vision_module import (
     VisionModule,
 )
@@ -674,6 +675,16 @@ class Qwen35VLVisionEncoder(VisionModule):
         with _nvtx("patch_embed"):
             hidden_states = self.patch_embed(pixel_values)
 
+        # Bracket the encoder's BACKWARD pass. The bracket opens on the
+        # earliest differentiable tensor (patch_embed's output -- pixels never
+        # require grad, so there is nothing earlier) and closes on the encoder
+        # output below. Backward visits those two nodes last and first
+        # respectively, so the range spans exactly the encoder backward. Both
+        # arms get it: native (inside the decoder's backward on PP stage 0) and
+        # MDP (inside mdp.p5_encoder_backward), which is what makes the two
+        # timelines comparable.
+        hidden_states, bwd_marked = backward_range_begin(hidden_states)
+
         # 2. Learned position embedding (bilinear interpolation)
         with _nvtx("pos_embed_interpolate"):
             pos_embeds = self._fast_pos_embed_interpolate(grid_thw)
@@ -701,4 +712,6 @@ class Qwen35VLVisionEncoder(VisionModule):
 
         # 5. Patch merger
         with _nvtx("patch_merger"):
-            return self.merger(hidden_states)
+            hidden_states = self.merger(hidden_states)
+
+        return backward_range_end(hidden_states, "vision_encoder_backward", bwd_marked)
