@@ -89,6 +89,70 @@ def add_multimodal_args(parser):
         ),
     )
     group.add_argument(
+        "--mdp-enable",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable MDP (modality decoupled parallelism): balance vision "
+            "items across each decoder replica's CP x PP encoder worker "
+            "pool. Off by default; when absent, training is identical to "
+            "the native path."
+        ),
+    )
+    group.add_argument(
+        "--mdp-encoder-cp",
+        type=int,
+        default=1,
+        help="MDP encoder context-parallel width (must currently be 1).",
+    )
+    group.add_argument(
+        "--mdp-encoder-max-payload-rows",
+        type=int,
+        default=None,
+        help=(
+            "Patch-row cap for one MDP encoder chunk; splitting happens "
+            "only at complete vision-item boundaries."
+        ),
+    )
+    group.add_argument(
+        "--mdp-vision-config-override",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help=(
+            "Vision TransformerConfig override entry (repeatable). Keys "
+            "are restricted to the MDP allowlist (recompute_granularity, "
+            "recompute_method, recompute_num_layers, recompute_modules)."
+        ),
+    )
+    group.add_argument(
+        "--mdp-locality-slack-permille",
+        type=int,
+        default=10,
+        help="LPT near-equal-load window in per-mille (default 10 = 1%%).",
+    )
+    group.add_argument(
+        "--mdp-row-alignment",
+        type=int,
+        default=1,
+        help="MDP row-capacity alignment (1 in production; tests may use 16).",
+    )
+    group.add_argument(
+        "--mdp-plan-check-interval",
+        type=int,
+        default=1,
+        help=(
+            "Plan-digest consistency check interval in iterations; must be "
+            ">= 1 (the check can be sampled but never fully disabled)."
+        ),
+    )
+    group.add_argument(
+        "--mdp-debug-plan-payload-check",
+        action="store_true",
+        default=False,
+        help="Additionally compare canonical plan payloads (debug only).",
+    )
+    group.add_argument(
         "--use-vanilla-collate-fn",
         action="store_true",
         default=False,
