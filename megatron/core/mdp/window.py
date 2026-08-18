@@ -7,6 +7,7 @@ one real data iterator per iteration and returns ``num_vpp_chunks`` independent
 cursors, so the replay iterators never consume additional sampler input.
 """
 
+import threading
 from dataclasses import dataclass
 from typing import Any, Iterator, Mapping, Optional, Sequence, Union
 
@@ -19,10 +20,11 @@ from megatron.core.mdp.protocols import CapturedMicrobatch, MdpModelAdapter, Vis
 # Owner-sharded pixel reading: while ``capture`` fetches one microbatch, this
 # holds ``(microbatch_owner_worker_id, my_worker_id)`` so the model's collate
 # path (which has no microbatch context in its signature) can skip pixel
-# materialization on non-owner workers. ``None`` outside MDP window capture, so
-# the native path is unchanged. Single-threaded by design at this point in the
-# history; window-capture prefetch is introduced by the later performance commit.
-_PIXEL_OWNERSHIP: Optional[tuple] = None
+# materialization on non-owner workers. Unset outside MDP capture, so the
+# native path is unchanged. Thread-local because the
+# window-capture prefetch thread may capture the next train window while the
+# main thread captures an eval window.
+_PIXEL_OWNERSHIP = threading.local()
 
 
 def pixel_capture_suppressed() -> bool:
@@ -31,9 +33,10 @@ def pixel_capture_suppressed() -> bool:
     Queried by the model collate path to skip pixel materialization + H2D for
     microbatches whose pixels another planning-group worker owns.
     """
-    if _PIXEL_OWNERSHIP is None:
+    context = getattr(_PIXEL_OWNERSHIP, "value", None)
+    if context is None:
         return False
-    owner_worker_id, my_worker_id = _PIXEL_OWNERSHIP
+    owner_worker_id, my_worker_id = context
     return owner_worker_id != my_worker_id
 
 
@@ -133,7 +136,6 @@ class MdpIterationWindow:
         set around each ``adapter.get_batch`` call lets the model collate path
         skip pixel materialization on non-owners.
         """
-        global _PIXEL_OWNERSHIP
         if isinstance(data_iterators, (list, tuple)):
             iterator = data_iterators[0] if data_iterators else None
         else:
@@ -153,11 +155,11 @@ class MdpIterationWindow:
             owner_worker_id = microbatch_id % num_workers
             owns_pixels = owner_worker_id == my_worker_id
             try:
-                _PIXEL_OWNERSHIP = (owner_worker_id, my_worker_id)
+                _PIXEL_OWNERSHIP.value = (owner_worker_id, my_worker_id)
                 with nvtx_phase("p1_get_batch"):
                     captured = adapter.get_batch(iterator)
             finally:
-                _PIXEL_OWNERSHIP = None
+                _PIXEL_OWNERSHIP.value = None
             if captured is None:
                 raise MdpStateError(
                     f"MDP: data iterator violates: {num_microbatches} microbatches per "

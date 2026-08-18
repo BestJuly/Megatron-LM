@@ -100,6 +100,7 @@ def mdp_config_from_args(args) -> MdpConfig:
         plan_check_interval=getattr(args, "mdp_plan_check_interval", 1),
         debug_plan_payload_check=getattr(args, "mdp_debug_plan_payload_check", False),
         pixel_locality=getattr(args, "mdp_pixel_locality", False),
+        overlap_window_capture=getattr(args, "mdp_overlap_window_capture", False),
     )
 
 
@@ -166,8 +167,7 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
 
     Called in ``setup_model_and_optimizer`` after the decoder optimizer is
     built and before the LR scheduler binds. Returns *optimizer* unchanged
-    when MDP is off. The composite optimizer replaces the return value once
-    the M5 commit lands.
+    when MDP is off.
     """
     global _RUNTIME
     if not mdp_enabled(args) or optimizer is None:

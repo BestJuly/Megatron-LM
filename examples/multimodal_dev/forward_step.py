@@ -93,10 +93,15 @@ def broadcast_data_batch(data, device="cuda"):
 
     # Single-member TP group: every rank is the source; ~4 broadcasts per
     # field (ndim/shape/dtype/payload) would be pure launch overhead. Keep
-    # only the device move.
+    # only the device move. Pinned sources move without the implicit
+    # per-copy device sync of pageable H2D (same bytes, same stream order).
     if torch.distributed.get_world_size(group=group) == 1:
         return {
-            key: value.to(device) if isinstance(value, torch.Tensor) else value
+            key: (
+                value.to(device, non_blocking=value.is_pinned())
+                if isinstance(value, torch.Tensor)
+                else value
+            )
             for key, value in data.items()
         }
 
@@ -316,6 +321,20 @@ def pack_or_pad_batch(
 
         suppress_pixels = pixel_capture_suppressed()
 
+        # MDP capture fast path (TP=1): build each packed field directly in
+        # one pinned buffer (no per-sample F.pad + concat churn) and move it
+        # with a non-blocking copy. Pageable H2D copies each carry an implicit
+        # device sync that serializes the window-capture (prefetch) thread;
+        # pinned + non_blocking removes the sync and the staging pass. Output
+        # bytes are identical to the generic path. torch's caching host
+        # allocator recycles the pinned blocks and event-tracks their reuse.
+        try:
+            use_pinned = (
+                bool(getattr(get_args(), "mdp_enable", False)) and tp_size == 1
+            )
+        except AssertionError:
+            use_pinned = False
+
         if is_src:
             assert batch is not None, "source TP rank must provide a batch"
             input_ids_list, labels_list, loss_mask_list = [], [], []
@@ -328,9 +347,16 @@ def pack_or_pad_batch(
                     sample["labels"].shape == sample["input_ids"].shape == sample["loss_mask"].shape
                 ), "labels, input_ids, and loss_mask must have the same shape"
                 target_len = math.ceil(seqlen / divisible_by) * divisible_by
-                input_ids_list.append(F.pad(sample["input_ids"], (0, target_len - seqlen), value=0))
-                labels_list.append(F.pad(sample["labels"], (0, target_len - seqlen), value=-100))
-                loss_mask_list.append(F.pad(sample["loss_mask"], (0, target_len - seqlen), value=0))
+                if not use_pinned:
+                    input_ids_list.append(
+                        F.pad(sample["input_ids"], (0, target_len - seqlen), value=0)
+                    )
+                    labels_list.append(
+                        F.pad(sample["labels"], (0, target_len - seqlen), value=-100)
+                    )
+                    loss_mask_list.append(
+                        F.pad(sample["loss_mask"], (0, target_len - seqlen), value=0)
+                    )
                 seqlens_list.append(seqlen)
                 seqlens_padded_list.append(target_len)
                 if not suppress_pixels:
@@ -346,12 +372,31 @@ def pack_or_pad_batch(
             # routing in megatron.core to exclude padded tokens from aux loss,
             # z-loss, and expert-bias accumulation.
             total_tokens_padded = cu_seqlens_padded[-1]
-            padding_mask_thd = torch.zeros(total_tokens_padded, dtype=torch.bool)
+            padding_mask_thd = torch.zeros(
+                total_tokens_padded, dtype=torch.bool, pin_memory=use_pinned
+            )
             for i, real_seqlen in enumerate(seqlens_list):
                 pad_start = cu_seqlens_padded[i] + real_seqlen
                 pad_end = cu_seqlens_padded[i + 1]
                 if pad_end > pad_start:
                     padding_mask_thd[pad_start:pad_end] = True
+
+            if use_pinned:
+                # Single padded buffer per field; pad regions filled with the
+                # same values F.pad used, sample slices copied in place.
+                def _packed_field(key, fill):
+                    out = torch.empty(
+                        total_tokens_padded, dtype=batch[0][key].dtype, pin_memory=True
+                    )
+                    out.fill_(fill)
+                    for i, sample in enumerate(batch):
+                        start = cu_seqlens_padded[i]
+                        out[start : start + seqlens_list[i]].copy_(sample[key])
+                    return out
+
+                input_ids_list = [_packed_field("input_ids", 0)]
+                labels_list = [_packed_field("labels", -100)]
+                loss_mask_list = [_packed_field("loss_mask", 0)]
 
             if with_vision_sidecar:
                 try:
@@ -370,28 +415,75 @@ def pack_or_pad_batch(
                     )
                 )
 
-            packed_batch["input_ids"] = torch.concat(input_ids_list, dim=0).unsqueeze(0)
-            packed_batch["labels"] = torch.concat(labels_list, dim=0).unsqueeze(0)
-            packed_batch["loss_mask"] = torch.concat(loss_mask_list, dim=0).unsqueeze(0)
+            if use_pinned:
+                # The fields already live in single pinned buffers; a concat
+                # of a one-element list would copy them into fresh pageable
+                # memory and forfeit the non-blocking upload.
+                packed_batch["input_ids"] = input_ids_list[0].unsqueeze(0)
+                packed_batch["labels"] = labels_list[0].unsqueeze(0)
+                packed_batch["loss_mask"] = loss_mask_list[0].unsqueeze(0)
+            else:
+                packed_batch["input_ids"] = torch.concat(input_ids_list, dim=0).unsqueeze(0)
+                packed_batch["labels"] = torch.concat(labels_list, dim=0).unsqueeze(0)
+                packed_batch["loss_mask"] = torch.concat(loss_mask_list, dim=0).unsqueeze(0)
             packed_batch["padding_mask"] = padding_mask_thd.unsqueeze(0)
             if not suppress_pixels:
-                packed_batch["pixel_values"] = torch.concat(pixel_values_list)
-            packed_batch["image_grid_thw"] = torch.concat(image_grid_thw_list)
+                if use_pinned and pixel_values_list:
+                    total_rows = sum(int(p.shape[0]) for p in pixel_values_list)
+                    pixels = torch.empty(
+                        (total_rows,) + tuple(pixel_values_list[0].shape[1:]),
+                        dtype=pixel_values_list[0].dtype,
+                        pin_memory=True,
+                    )
+                    torch.cat(pixel_values_list, out=pixels)
+                    packed_batch["pixel_values"] = pixels
+                else:
+                    packed_batch["pixel_values"] = torch.concat(pixel_values_list)
+            grid_thw = torch.concat(image_grid_thw_list)
+            packed_batch["image_grid_thw"] = (
+                grid_thw.pin_memory() if use_pinned else grid_thw
+            )
             # cu_seqlens / cu_seqlens_padded need to reach non-source TP ranks
             # so each rank can build an identical PackedSeqParams.
-            packed_batch["cu_seqlens"] = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
-            packed_batch["cu_seqlens_padded"] = torch.tensor(
-                cu_seqlens_padded, dtype=torch.int32, device=device
-            )
+            if use_pinned:
+                packed_batch["cu_seqlens"] = torch.tensor(
+                    cu_seqlens, dtype=torch.int32
+                ).pin_memory()
+                packed_batch["cu_seqlens_padded"] = torch.tensor(
+                    cu_seqlens_padded, dtype=torch.int32
+                ).pin_memory()
+            else:
+                packed_batch["cu_seqlens"] = torch.tensor(
+                    cu_seqlens, dtype=torch.int32, device=device
+                )
+                packed_batch["cu_seqlens_padded"] = torch.tensor(
+                    cu_seqlens_padded, dtype=torch.int32, device=device
+                )
+
+        # The vision sidecar is consumed on the CPU by the MDP adapter; with a
+        # single-member TP group there is no broadcast, so skip the GPU round
+        # trip (H2D here + D2H in the adapter) entirely.
+        sidecar_cpu = {}
+        if is_src and use_pinned:
+            for key in ("vision_item_meta", "vision_decoder_positions"):
+                if key in packed_batch:
+                    sidecar_cpu[key] = packed_batch.pop(key)
 
         packed_batch = broadcast_data_batch(packed_batch, device=device)
+        packed_batch.update(sidecar_cpu)
 
         cu_seqlens_t = packed_batch.pop("cu_seqlens")
         cu_seqlens_padded_t = packed_batch.pop("cu_seqlens_padded")
-        # Derive max_seqlen / total_tokens from the (broadcast) cu_seqlens —
-        # no extra collective needed.
-        max_seqlen_q = int((cu_seqlens_padded_t[1:] - cu_seqlens_padded_t[:-1]).max().item())
-        total_tokens = int(cu_seqlens_padded_t[-1].item())
+        if is_src and use_pinned:
+            # Known on the host already; reading them back from the device
+            # would force a sync against the in-flight non-blocking copies.
+            max_seqlen_q = max(seqlens_padded_list) if seqlens_padded_list else 0
+            total_tokens = cu_seqlens_padded[-1]
+        else:
+            # Derive max_seqlen / total_tokens from the (broadcast) cu_seqlens —
+            # no extra collective needed.
+            max_seqlen_q = int((cu_seqlens_padded_t[1:] - cu_seqlens_padded_t[:-1]).max().item())
+            total_tokens = int(cu_seqlens_padded_t[-1].item())
 
         packed_batch["packed_seq_params"] = PackedSeqParams(
             qkv_format="thd",

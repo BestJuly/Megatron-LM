@@ -207,4 +207,11 @@ def finalize_encoder_grads(encoder_ddp, *, globally_reduced_num_tokens: torch.Te
     """
     encoder_ddp.finish_grad_sync()
     denominator = torch.clamp(globally_reduced_num_tokens.float(), min=1.0)
-    encoder_ddp.scale_gradients(float(1.0 / denominator.item()))
+    # Device-side reciprocal: `.item()` here forced a full host sync between
+    # the WORLD reduce-scatter and the scale kernels. The double-precision
+    # round trip reproduces `float(1.0 / denominator.item())` bit-exactly
+    # (fp32 -> f64 is exact, one f64 divide, one rounding back to fp32), and
+    # `grad_data *= tensor` broadcasts the 0-dim fp32 scalar exactly like the
+    # Python float the kernel would otherwise receive.
+    scale = (1.0 / denominator.double()).float().reshape(())
+    encoder_ddp.scale_gradients(scale)
