@@ -47,6 +47,7 @@ class MdpConfig:
     plan_check_interval: int = 1
     debug_plan_payload_check: bool = False
     pixel_locality: bool = False
+    overlap_window_capture: bool = False
 
 
 @dataclass(frozen=True)
@@ -137,6 +138,16 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "The plan consistency check must never be fully disabled: an undetected "
             "plan mismatch degrades from a diagnosable error into a collective hang.",
             "1",
+        )
+    if config.overlap_window_capture and options.tensor_parallel_size != 1:
+        _reject(
+            "overlap_window_capture",
+            config.overlap_window_capture,
+            "tensor_parallel_size == 1",
+            "The capture path performs a TP broadcast per microbatch; running it "
+            "on the prefetch thread concurrently with the schedule's NCCL calls "
+            "is only validated without tensor parallelism.",
+            "False",
         )
     _validate_override_entries(config.vision_config_overrides)
 

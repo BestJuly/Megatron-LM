@@ -213,16 +213,27 @@ def broadcast_descriptors(
         for index, flag in enumerate(text_only_flags):
             header[1 + index] = 1 if flag else 0
     dist.broadcast(header, src=endpoint_rank, group=planning_group)
-    count = int(header[0].item())
-    flags = tuple(bool(v) for v in header[1:].tolist())
+    if is_endpoint:
+        # The endpoint knows its own header; reading it back from the device
+        # would sync against the broadcast it just posted.
+        count = len(local_descriptors)
+        flags = tuple(bool(flag) for flag in text_only_flags)
+    else:
+        count = int(header[0].item())
+        flags = tuple(bool(v) for v in header[1:].tolist())
 
     payload = torch.zeros(count, DESCRIPTOR_SLOTS, dtype=torch.int64, device=device)
     if is_endpoint and count:
-        payload.copy_(
-            torch.tensor(
-                descriptors_to_records(local_descriptors), dtype=torch.int64
-            )
+        records = torch.tensor(
+            descriptors_to_records(local_descriptors), dtype=torch.int64
         )
+        # Pinned staging: a pageable H2D here blocks until the compute
+        # stream drains; pinned + non_blocking stays stream-ordered ahead
+        # of the broadcast below without a host wait.
+        payload.copy_(records.pin_memory(), non_blocking=True)
     if count:
         dist.broadcast(payload, src=endpoint_rank, group=planning_group)
+    if is_endpoint:
+        # Wire roundtrip is lossless (unit-tested); skip the D2H readback.
+        return tuple(local_descriptors), flags
     return records_to_descriptors(payload.tolist() if count else []), flags

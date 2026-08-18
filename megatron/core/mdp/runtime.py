@@ -15,6 +15,7 @@ empty ledgers, zero local encoder work, and zero encoder gradients.
 """
 
 import logging
+import threading
 import time
 from enum import Enum, auto
 from typing import Iterator, Optional, Sequence, Union
@@ -97,6 +98,8 @@ class MdpRuntime:
         self._forward_only = False
         self._window: Optional[MdpIterationWindow] = None
         self._plan: Optional[MdpBatchPlan] = None
+        self._iter_specs: dict = {}
+        self._iter_ledgers: dict = {}
         self._handle: Optional[EncoderForwardHandle] = None
         self._eval_outputs: Sequence = ()
         self._chunk_layouts: Sequence = ()
@@ -109,6 +112,16 @@ class MdpRuntime:
         self._decoder_schedule_ms = 0.0
         self._decoder_start = 0.0
         self._last_metrics: Optional[MdpIterationMetrics] = None
+        # Window-capture overlap: one in-flight prefetch keyed by the data
+        # iterator's identity, so an interleaved eval (different iterator)
+        # leaves a pending train prefetch untouched. The prefetch thread runs
+        # capture under a dedicated side stream so its H2D traffic never
+        # enters (or blocks) the main compute stream; the consumer orders
+        # itself via the recorded event.
+        self._prefetch_key = None
+        self._prefetch_thread = None
+        self._prefetch_box: Optional[dict] = None
+        self._prefetch_stream: Optional[torch.cuda.Stream] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -142,86 +155,124 @@ class MdpRuntime:
 
         # P0: clear encoder gradients and iteration state.
         if not forward_only:
-            self.encoder_domain.encoder_ddp.zero_grad_buffer()
+            with nvtx_phase("p0_zero_grad"):
+                self.encoder_domain.encoder_ddp.zero_grad_buffer()
         self._captured_num_tokens = None
         self._token_capture_count = 0
         self._token_consumed = False
 
         # P1: window capture, descriptor broadcast, plan, pixel dispatch.
         plan_start = time.monotonic()
-        window = MdpIterationWindow.capture(
-            data_iterators,
-            num_microbatches=num_microbatches,
-            adapter=self.adapter,
-            num_vpp_chunks=self.num_vpp_chunks,
-            lane_id=self.rank_view.lane_id,
-            my_worker_id=self.rank_view.my_worker_id,
-            num_workers=len(self.rank_view.worker_ids),
-        )
+        window = self._take_prefetched_window(data_iterators, num_microbatches)
+        if window is None:
+            with nvtx_phase("p1_window_capture"):
+                window = self._capture_window(data_iterators, num_microbatches)
+        # The data iterator is fully consumed for this iteration; the next
+        # window can be captured concurrently with everything that follows.
+        if self.config.overlap_window_capture and not forward_only:
+            self._start_window_prefetch(data_iterators, num_microbatches)
         self._window = window
         local_flags = tuple(record.text_only for record in window.records())
-        descriptors, text_only_flags = broadcast_descriptors(
-            window.descriptors(),
-            planning_group=self.process_groups.planning_group,
-            endpoint_rank=self.rank_view.endpoint_rank,
-            num_microbatches=num_microbatches,
-            text_only_flags=local_flags if self.rank_view.lane_id is not None else (),
-            device=self.device,
-        )
+        with nvtx_phase("p1_broadcast_descriptors"):
+            descriptors, text_only_flags = broadcast_descriptors(
+                window.descriptors(),
+                planning_group=self.process_groups.planning_group,
+                endpoint_rank=self.rank_view.endpoint_rank,
+                num_microbatches=num_microbatches,
+                text_only_flags=local_flags if self.rank_view.lane_id is not None else (),
+                device=self.device,
+            )
         if local_flags != text_only_flags:
             raise MdpStateError(
                 f"MDP: text-only flags diverge between local records {local_flags} and "
                 f"the endpoint broadcast {text_only_flags}; group members are not "
                 "consuming identical sampler data."
             )
-        plan = self.planner.build_plan(
-            self._iteration, descriptors, list(range(num_microbatches))
-        )
-        assert_consistent_plan(
-            plan,
-            planning_group=self.process_groups.planning_group,
-            iteration=self._iteration,
-            interval=self.config.plan_check_interval,
-            debug_payload_check=self.config.debug_plan_payload_check,
-        )
+        with nvtx_phase("p1_build_plan"):
+            plan = self.planner.build_plan(
+                self._iteration, descriptors, list(range(num_microbatches))
+            )
+            assert_consistent_plan(
+                plan,
+                planning_group=self.process_groups.planning_group,
+                iteration=self._iteration,
+                interval=self.config.plan_check_interval,
+                debug_payload_check=self.config.debug_plan_payload_check,
+            )
         self._plan = plan
+        # Specs and ledgers are pure functions of the plan; derive them once
+        # per iteration instead of once per phase (EMBEDDING and GRADIENT
+        # share identical specs, and each build_ledger re-sorted the routes).
+        pixel_specs = self._tensor_specs(plan, pixels=True)
+        io_specs = self._tensor_specs(plan, pixels=False)
+        self._iter_specs = {BridgePhase.PIXEL: pixel_specs}
+        self._iter_ledgers = {}
+        for phase in (BridgePhase.PIXEL, BridgePhase.EMBEDDING, BridgePhase.GRADIENT):
+            specs = pixel_specs if phase is BridgePhase.PIXEL else io_specs
+            self._iter_specs[phase] = specs
+            self._iter_ledgers[phase] = self.bridge.build_ledger(
+                phase, plan, self.rank_map, specs
+            )
         self._plan_build_ms = (time.monotonic() - plan_start) * 1000.0
 
-        pixel_specs = self._tensor_specs(plan, pixels=True)
-        sidecar = window.payload_sidecar()
-        pixel_local = {
-            BridgeBufferKey(item_id): tensor.to(self.params_dtype)
-            for item_id, tensor in sidecar.items()
-        }
-        received_pixels = self._exchange(
-            BridgePhase.PIXEL, plan, pixel_local, pixel_specs
-        )
-        window.release_pixels()
-
-        # P2: grad-enabled encoder forward per chunk (no_grad for evaluation).
+        # The producer chunk layouts are known from the plan alone; carve the
+        # encoder payload buffers first so the PIXEL exchange can deposit
+        # every routed item directly at its final payload offset (no per-item
+        # intermediate buffer + repack pass).
         my_layout = plan.encoder_layout_for_producer(self.rank_view.my_worker_id)
         chunk_layouts = split_encoder_layout(
             my_layout, max_payload_rows=self.config.encoder_max_payload_rows
         )
         self._chunk_layouts = chunk_layouts if my_layout.segments else ()
         self._chunk_of_item = {}
+        chunk_payloads = []
+        pixel_dest = {}
+        with nvtx_phase("p2_pack_payload"):
+            for chunk_index, chunk in enumerate(self._chunk_layouts):
+                payload = self.allocator.acquire(
+                    rows=plan.capacity_policy.capacity_of(chunk.total_payload_rows),
+                    width=self.adapter.payload_width,
+                    dtype=self.params_dtype,
+                    device=self.device,
+                    tag="packed_pixels",
+                )
+                chunk_payloads.append(payload)
+                for segment in chunk.segments:
+                    pixel_dest[BridgeBufferKey(segment.global_item_id)] = payload[
+                        segment.payload_row_start : segment.payload_row_start
+                        + segment.payload_rows
+                    ]
+                    self._chunk_of_item[segment.global_item_id] = (chunk_index, segment)
+
+        with nvtx_phase("p1_pixel_dispatch"):
+            pixel_specs = self._iter_specs[BridgePhase.PIXEL]
+            sidecar = window.payload_sidecar()
+            pixel_local = {
+                BridgeBufferKey(item_id): tensor.to(self.params_dtype)
+                for item_id, tensor in sidecar.items()
+            }
+            pixel_ledger = self._iter_ledgers[BridgePhase.PIXEL]
+            # Owners -> producers in one collective; every group member
+            # participates (with zero splits when it has nothing to move).
+            self.bridge.exchange_all_to_all(
+                pixel_ledger,
+                pixel_local,
+                tensor_specs=pixel_specs,
+                group=self.process_groups.planning_group,
+                group_ranks=self.rank_view.planning_group_ranks,
+                global_rank=self.rank_view.global_rank,
+                dtype=self.params_dtype,
+                device=self.device,
+                dest_views=pixel_dest,
+            )
+            window.release_pixels()
+
+        # P2: grad-enabled encoder forward per chunk (no_grad for evaluation).
         chunk_outputs = []
         encoder = self.encoder_domain.encoder_ddp
         forward_start = time.monotonic()
         for chunk_index, chunk in enumerate(self._chunk_layouts):
-            payload = self.allocator.acquire(
-                rows=plan.capacity_policy.capacity_of(chunk.total_payload_rows),
-                width=self.adapter.payload_width,
-                dtype=self.params_dtype,
-                device=self.device,
-                tag="packed_pixels",
-            )
-            for segment in chunk.segments:
-                key = BridgeBufferKey(segment.global_item_id)
-                payload[
-                    segment.payload_row_start : segment.payload_row_start + segment.payload_rows
-                ].copy_(received_pixels[key])
-                self._chunk_of_item[segment.global_item_id] = (chunk_index, segment)
+            payload = chunk_payloads[chunk_index]
             payload_valid = payload[: chunk.total_payload_rows]
             if forward_only:
                 with torch.no_grad(), nvtx_phase("p2_encoder_forward"):
@@ -251,35 +302,52 @@ class MdpRuntime:
             self._eval_outputs = tuple(chunk_outputs)
             detached = tuple(output.detach() for output in chunk_outputs)
 
-        # P3: embedding exchange and endpoint leaf assembly.
-        emb_specs = self._tensor_specs(plan, pixels=False)
-        emb_local = {}
-        for item_id, (chunk_index, segment) in self._chunk_of_item.items():
-            emb_local[BridgeBufferKey(item_id)] = detached[chunk_index][
-                segment.output_row_start : segment.output_row_start + segment.output_rows
-            ]
-        received_embeddings = self._exchange(
-            BridgePhase.EMBEDDING, plan, emb_local, emb_specs
-        )
+        # P3: embedding exchange straight into the endpoint leaves.
+        emb_dest = {}
+        leaves = []  # (microbatch_id, valid leaf view)
         if self.rank_view.lane_id is not None:
-            for layout in plan.layouts:
-                if layout.text_only:
-                    continue
-                leaf = self.allocator.acquire(
-                    rows=plan.capacity_policy.capacity_of(layout.total_output_rows),
-                    width=self.hidden_size,
-                    dtype=self.params_dtype,
-                    device=self.device,
-                    tag="leaf",
-                )
-                for segment in layout.segments:
-                    key = BridgeBufferKey(segment.global_item_id)
-                    leaf[
-                        segment.leaf_row_start : segment.leaf_row_start + segment.output_rows
-                    ].copy_(received_embeddings[key])
-                leaf = leaf[: layout.total_output_rows]
-                leaf.requires_grad_(True)
-                self.storage.put_leaf(layout.microbatch_id, leaf)
+            with nvtx_phase("p3_leaf_assembly"):
+                for layout in plan.layouts:
+                    if layout.text_only:
+                        continue
+                    leaf = self.allocator.acquire(
+                        rows=plan.capacity_policy.capacity_of(layout.total_output_rows),
+                        width=self.hidden_size,
+                        dtype=self.params_dtype,
+                        device=self.device,
+                        tag="leaf",
+                    )
+                    for segment in layout.segments:
+                        emb_dest[BridgeBufferKey(segment.global_item_id)] = leaf[
+                            segment.leaf_row_start : segment.leaf_row_start
+                            + segment.output_rows
+                        ]
+                    leaves.append((layout.microbatch_id, leaf[: layout.total_output_rows]))
+        with nvtx_phase("p3_embedding_exchange"):
+            emb_specs = self._iter_specs[BridgePhase.EMBEDDING]
+            emb_local = {}
+            for item_id, (chunk_index, segment) in self._chunk_of_item.items():
+                emb_local[BridgeBufferKey(item_id)] = detached[chunk_index][
+                    segment.output_row_start : segment.output_row_start + segment.output_rows
+                ]
+            # One alltoall instead of batched P2P: same ledger and payload,
+            # but no per-edge kernel pairs and no torch.cuda.synchronize
+            # workaround (all_to_all_single stream-orders its receive buffer).
+            self.bridge.exchange_all_to_all(
+                self._iter_ledgers[BridgePhase.EMBEDDING],
+                emb_local,
+                tensor_specs=emb_specs,
+                group=self.process_groups.planning_group,
+                group_ranks=self.rank_view.planning_group_ranks,
+                global_rank=self.rank_view.global_rank,
+                dtype=self.params_dtype,
+                device=self.device,
+                dest_views=emb_dest,
+            )
+        # requires_grad only after every exchange copy into the leaf is done.
+        for microbatch_id, leaf_valid in leaves:
+            leaf_valid.requires_grad_(True)
+            self.storage.put_leaf(microbatch_id, leaf_valid)
         if forward_only and self._eval_outputs:
             # Evaluation releases producer outputs once the bridge completed.
             self._eval_outputs = ()
@@ -330,47 +398,65 @@ class MdpRuntime:
         else:
             # P5: gradient exchange, producer multi-tensor backward, WORLD
             # encoder-gradient reduction and 1/T_global normalization.
-            grad_specs = self._tensor_specs(plan, pixels=False)
-            grad_local = {}
-            if self.rank_view.lane_id is not None:
-                for layout in plan.layouts:
-                    if layout.text_only:
-                        continue
-                    grad = self.storage.pop_grad(layout.microbatch_id)
-                    for segment in layout.segments:
-                        grad_local[BridgeBufferKey(segment.global_item_id)] = grad[
-                            segment.leaf_row_start : segment.leaf_row_start + segment.output_rows
-                        ]
-            received_grads = self._exchange(
-                BridgePhase.GRADIENT, plan, grad_local, grad_specs
-            )
+            # Regroup buffers first: the exchange writes each routed gradient
+            # straight to its chunk offset (the wire is params_dtype; the
+            # destination copy casts to the chunk output dtype, exactly like
+            # the former two-step unpack + regroup did).
+            chunk_grads = []
+            grad_dest = {}
             if self._handle is not None:
-                chunk_grads = []
-                for chunk_index, chunk in enumerate(self._chunk_layouts):
-                    # Match the chunk output dtype: a mixed-precision wrapper
-                    # (Float16Module) returns fp32 at the module boundary even
-                    # when parameters and transport run in bf16.
-                    output_dtype = self._handle.chunk_outputs[chunk_index].dtype
-                    grad_buffer = self.allocator.acquire(
-                        rows=plan.capacity_policy.capacity_of(chunk.total_output_rows),
-                        width=self.hidden_size,
-                        dtype=output_dtype,
-                        device=self.device,
-                        tag="grad_regroup",
-                    )
-                    for segment in chunk.segments:
-                        key = BridgeBufferKey(segment.global_item_id)
-                        grad_buffer[
-                            segment.output_row_start : segment.output_row_start
-                            + segment.output_rows
-                        ].copy_(received_grads[key])
-                    chunk_grads.append(grad_buffer[: chunk.total_output_rows])
-                self._handle.backward(chunk_grads)
-                self._handle.release()
-            finalize_encoder_grads(
-                self.encoder_domain.encoder_ddp,
-                globally_reduced_num_tokens=self._captured_num_tokens,
-            )
+                with nvtx_phase("p5_grad_regroup"):
+                    for chunk_index, chunk in enumerate(self._chunk_layouts):
+                        # Match the chunk output dtype: a mixed-precision wrapper
+                        # (Float16Module) returns fp32 at the module boundary even
+                        # when parameters and transport run in bf16.
+                        output_dtype = self._handle.chunk_outputs[chunk_index].dtype
+                        grad_buffer = self.allocator.acquire(
+                            rows=plan.capacity_policy.capacity_of(chunk.total_output_rows),
+                            width=self.hidden_size,
+                            dtype=output_dtype,
+                            device=self.device,
+                            tag="grad_regroup",
+                        )
+                        for segment in chunk.segments:
+                            grad_dest[BridgeBufferKey(segment.global_item_id)] = grad_buffer[
+                                segment.output_row_start : segment.output_row_start
+                                + segment.output_rows
+                            ]
+                        chunk_grads.append(grad_buffer[: chunk.total_output_rows])
+            with nvtx_phase("p5_grad_exchange"):
+                grad_specs = self._iter_specs[BridgePhase.GRADIENT]
+                grad_local = {}
+                if self.rank_view.lane_id is not None:
+                    for layout in plan.layouts:
+                        if layout.text_only:
+                            continue
+                        grad = self.storage.pop_grad(layout.microbatch_id)
+                        for segment in layout.segments:
+                            grad_local[BridgeBufferKey(segment.global_item_id)] = grad[
+                                segment.leaf_row_start : segment.leaf_row_start
+                                + segment.output_rows
+                            ]
+                self.bridge.exchange_all_to_all(
+                    self._iter_ledgers[BridgePhase.GRADIENT],
+                    grad_local,
+                    tensor_specs=grad_specs,
+                    group=self.process_groups.planning_group,
+                    group_ranks=self.rank_view.planning_group_ranks,
+                    global_rank=self.rank_view.global_rank,
+                    dtype=self.params_dtype,
+                    device=self.device,
+                    dest_views=grad_dest,
+                )
+            if self._handle is not None:
+                with nvtx_phase("p5_encoder_backward"):
+                    self._handle.backward(chunk_grads)
+                    self._handle.release()
+            with nvtx_phase("p5_finalize_encoder_grads"):
+                finalize_encoder_grads(
+                    self.encoder_domain.encoder_ddp,
+                    globally_reduced_num_tokens=self._captured_num_tokens,
+                )
             self._token_consumed = True
 
         encoder_backward_ms = (
@@ -393,6 +479,8 @@ class MdpRuntime:
         self._assert_iteration_boundary()
         self._window = None
         self._plan = None
+        self._iter_specs = {}
+        self._iter_ledgers = {}
         self._handle = None
         self._eval_outputs = ()
         self._chunk_layouts = ()
@@ -413,18 +501,108 @@ class MdpRuntime:
     # Internals
     # ------------------------------------------------------------------
 
-    def _exchange(self, phase, plan, local_tensors, tensor_specs):
-        """Run the canonical all-to-all bridge transport for one phase."""
-        return self.bridge.exchange_all_to_all(
-            self.bridge.build_ledger(phase, plan, self.rank_map, tensor_specs),
-            local_tensors,
-            tensor_specs=tensor_specs,
-            group=self.process_groups.planning_group,
-            group_ranks=self.rank_view.planning_group_ranks,
-            global_rank=self.rank_view.global_rank,
-            dtype=self.params_dtype,
-            device=self.device,
+    def _capture_window(self, data_iterators, num_microbatches: int) -> MdpIterationWindow:
+        return MdpIterationWindow.capture(
+            data_iterators,
+            num_microbatches=num_microbatches,
+            adapter=self.adapter,
+            num_vpp_chunks=self.num_vpp_chunks,
+            lane_id=self.rank_view.lane_id,
+            my_worker_id=self.rank_view.my_worker_id,
+            num_workers=len(self.rank_view.worker_ids),
         )
+
+    @staticmethod
+    def _window_prefetch_key(data_iterators, num_microbatches: int):
+        if isinstance(data_iterators, (list, tuple)):
+            iterator = data_iterators[0] if data_iterators else None
+        else:
+            iterator = data_iterators
+        return (id(iterator), num_microbatches)
+
+    def _take_prefetched_window(self, data_iterators, num_microbatches: int):
+        """Return the prefetched window for this iterator, or ``None``."""
+        if self._prefetch_thread is None:
+            return None
+        if self._prefetch_key != self._window_prefetch_key(data_iterators, num_microbatches):
+            return None  # different iterator (eval); keep the pending prefetch
+        with nvtx_phase("p1_window_prefetch_join"):
+            self._prefetch_thread.join()
+        box = self._prefetch_box
+        self._prefetch_key = None
+        self._prefetch_thread = None
+        self._prefetch_box = None
+        if "error" in box:
+            raise box["error"]
+        window = box["window"]
+        # Order every subsequent main-stream op after the side-stream capture
+        # work (H2D copies of the window tensors). A stream-level wait, not a
+        # host sync: the main stream simply refuses to run ahead of the event.
+        current = torch.cuda.current_stream()
+        current.wait_event(box["event"])
+        # Belt and braces for the caching allocator: the window tensors were
+        # allocated on the side stream but are consumed (and eventually freed)
+        # from main-stream code; mark them so their blocks are not handed back
+        # to the side-stream pool while main-stream work is still pending.
+        seen = set()
+
+        def _record(value):
+            if torch.is_tensor(value) and value.is_cuda and value.data_ptr() not in seen:
+                seen.add(value.data_ptr())
+                value.record_stream(current)
+
+        for record in window.records():
+            for value in record.model_payload.values():
+                _record(value)
+            params = record.decoder_packed_seq_params
+            for name in ("cu_seqlens_q", "cu_seqlens_kv", "cu_seqlens_q_padded",
+                         "cu_seqlens_kv_padded"):
+                _record(getattr(params, name, None))
+        for tensor in window.payload_sidecar().values():
+            _record(tensor)
+        return window
+
+    def _start_window_prefetch(self, data_iterators, num_microbatches: int) -> None:
+        """Capture the next window on a background thread and a side stream.
+
+        The side stream keeps the capture's H2D traffic out of the main
+        compute stream, so the copies overlap the decoder schedule instead of
+        interleaving with (and delaying) its kernels. Concurrent capture is
+        validated for TP=1 only (see --mdp-overlap-window-capture); with TP=1
+        the capture path performs no collectives, so the thread never touches
+        NCCL. The prefetch after the final training iteration is captured but
+        never consumed; a capture failure there stays inside its box and is
+        only re-raised if a later iteration actually asks for the window.
+        """
+        if self._prefetch_thread is not None:
+            return  # one in-flight prefetch; an unconsumed one stays cached
+        if self._prefetch_stream is None:
+            self._prefetch_stream = torch.cuda.Stream(device=self.device)
+        box: dict = {}
+        stream = self._prefetch_stream
+
+        def _run():
+            try:
+                # A fresh thread defaults to cuda:0; capture moves tensors to
+                # "cuda", which must resolve to this rank's device.
+                torch.cuda.set_device(self.device)
+                with torch.cuda.stream(stream):
+                    with nvtx_phase("p1_window_capture_prefetch"):
+                        box["window"] = self._capture_window(
+                            data_iterators, num_microbatches
+                        )
+                    event = torch.cuda.Event()
+                    event.record(stream)
+                    box["event"] = event
+            except BaseException as exc:  # surfaced on consumption
+                box["error"] = exc
+
+        self._prefetch_key = self._window_prefetch_key(data_iterators, num_microbatches)
+        self._prefetch_box = box
+        self._prefetch_thread = threading.Thread(
+            target=_run, name="mdp-window-prefetch", daemon=True
+        )
+        self._prefetch_thread.start()
 
     def _require_state(self, expected: MdpRuntimeState, operation: str) -> None:
         if self._state is not expected:

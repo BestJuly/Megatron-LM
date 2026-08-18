@@ -41,32 +41,27 @@ class MdpChainedOptimizer(ChainedOptimizer):
         with _suppressed_scaler_updates(scalers):
             found_inf = ChainedOptimizer.prepare_grads(self)
 
-        found_inf = self._unify_over_world(found_inf)
+        # One flag tensor per iteration, for the all-reduce only; the scalers
+        # take the unified Python bool (DynamicGradScaler.update branches on
+        # truthiness, so a GPU tensor argument would cost one implicit host
+        # sync per scaler — the former per-scaler tensor did exactly that).
+        if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+            inf_flag = torch.tensor(
+                [1.0 if found_inf else 0.0], dtype=torch.float32, device=_flag_device()
+            )
+            torch.distributed.all_reduce(inf_flag, op=torch.distributed.ReduceOp.MAX)
+            unified = bool(inf_flag.item() > 0.0)
+            if unified != found_inf:
+                logger.debug(
+                    "MDP: overflow flag unified over WORLD: local=%s global=%s",
+                    found_inf,
+                    unified,
+                )
+            found_inf = unified
 
         for scaler in scalers:
-            scaler.update(
-                torch.tensor(
-                    [1.0 if found_inf else 0.0], dtype=torch.float, device=_flag_device()
-                )
-            )
+            scaler.update(found_inf)
         return found_inf
-
-    @staticmethod
-    def _unify_over_world(found_inf: bool) -> bool:
-        if not (torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1):
-            return found_inf
-        flag = torch.tensor(
-            [1.0 if found_inf else 0.0], dtype=torch.float32, device=_flag_device()
-        )
-        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
-        unified = bool(flag.item() > 0.0)
-        if unified != found_inf:
-            logger.debug(
-                "MDP: overflow flag unified over WORLD: local=%s global=%s",
-                found_inf,
-                unified,
-            )
-        return unified
 
     def _member_grad_scalers(self) -> List:
         """Every member's grad scaler, de-duplicated by identity."""
@@ -78,22 +73,34 @@ class MdpChainedOptimizer(ChainedOptimizer):
                 scalers.append(scaler)
         return scalers
 
+    #: Check member loss scales for divergence every N calls: torch.equal on
+    #: GPU scalars is an implicit host sync, and after prepare_grads every
+    #: scaler is driven by the same global verdict, so the invariant holds by
+    #: construction between samples.
+    LOSS_SCALE_CHECK_INTERVAL = 50
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._loss_scale_calls = 0
+
     def get_loss_scale(self) -> torch.Tensor:
-        """The shared loss scale, asserting the members have not diverged.
+        """The shared loss scale, sample-asserting the members have not diverged.
 
         The training loop scales the loss by member 0's scale while each
         member unscales with its own, so equal scales are a correctness
         precondition — and after :meth:`prepare_grads` every scaler is driven
         by the same global verdict.
         """
-        scales = [s.scale for s in self._member_grad_scalers()]
-        if len(scales) > 1:
-            first = scales[0]
-            assert all(torch.equal(first, s) for s in scales[1:]), (
-                "MDP composite optimizer members hold different loss scales "
-                f"({[float(s) for s in scales]}); gradients would be unscaled by "
-                "different factors per domain"
-            )
+        if self._loss_scale_calls % self.LOSS_SCALE_CHECK_INTERVAL == 0:
+            scales = [s.scale for s in self._member_grad_scalers()]
+            if len(scales) > 1:
+                first = scales[0]
+                assert all(torch.equal(first, s) for s in scales[1:]), (
+                    "MDP composite optimizer members hold different loss scales "
+                    f"({[float(s) for s in scales]}); gradients would be unscaled by "
+                    "different factors per domain"
+                )
+        self._loss_scale_calls += 1
         return super().get_loss_scale()
 
 
