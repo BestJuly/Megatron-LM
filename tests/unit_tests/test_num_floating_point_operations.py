@@ -20,8 +20,12 @@ import torch
 import megatron.training.training as training_module
 from megatron.training.training import (
     consume_seqlen_stats_in_iteration,
+    consume_vision_stats_in_iteration,
     num_floating_point_operations,
+    reset_seqlen_stats_in_iteration,
+    reset_vision_stats_in_iteration,
     update_seqlen_stats_from_cu_seqlens,
+    update_vision_stats,
 )
 
 
@@ -531,6 +535,25 @@ class TestAccumulator:
         # the closed-form defaults.
         assert consume_seqlen_stats_in_iteration() == (None, None)
 
+    def test_reset_discards_without_reducing(self):
+        """``reset_seqlen_stats_in_iteration`` drops evaluation's contribution.
+
+        Evaluation runs after ``training_log`` has already drained the
+        accumulator, so whatever it accumulates would otherwise be added to the
+        next training iteration's FLOPs.
+        """
+        update_seqlen_stats_from_cu_seqlens(torch.tensor([0, 100, 200], dtype=torch.int32))
+        reset_seqlen_stats_in_iteration()
+        assert training_module._seqlen_stats_active is False
+        assert consume_seqlen_stats_in_iteration() == (None, None)
+        # A later training update still works on the reused tensor.
+        update_seqlen_stats_from_cu_seqlens(torch.tensor([0, 7], dtype=torch.int32))
+        assert consume_seqlen_stats_in_iteration() == (7, 49)
+
+    def test_reset_before_any_update_is_noop(self):
+        reset_seqlen_stats_in_iteration()
+        assert consume_seqlen_stats_in_iteration() == (None, None)
+
     def test_no_updates_returns_none(self):
         """BSHD path: never calling update must NOT issue a collective. The
         flag stays ``False`` and consume returns ``(None, None)``."""
@@ -1038,3 +1061,105 @@ class TestDSv4HybridMatchesStandard:
         std_flops = num_floating_point_operations(standard, batch_size)
         hyb_flops = num_floating_point_operations(hybrid, batch_size)
         assert hyb_flops == std_flops
+
+
+def _add_vision_args(args, *, num_layers=27):
+    """The ``args.vision_*`` metadata the multimodal entry point installs."""
+    args.count_vision_model_flops = True
+    args.vision_num_layers = num_layers
+    args.vision_hidden_size = 1152
+    args.vision_ffn_hidden_size = 4304
+    args.vision_num_attention_heads = 16
+    args.vision_kv_channels = 72
+    args.vision_in_channels = 3
+    args.vision_patch_size = 16
+    args.vision_temporal_patch_size = 2
+    args.vision_spatial_merge_size = 2
+    args.vision_out_hidden_size = 2048
+    return args
+
+
+class TestVisionEncoderFlops:
+    """The vision-encoder term added for the multimodal (ViT + LLM) path."""
+
+    def setup_method(self):
+        _reset_seqlen_accumulator()
+        reset_vision_stats_in_iteration()
+
+    def teardown_method(self):
+        _reset_seqlen_accumulator()
+        reset_vision_stats_in_iteration()
+
+    def test_text_model_is_bit_identical(self):
+        """No ``count_vision_model_flops`` -> the metric must not move at all."""
+        args = _make_gpt_args()
+        baseline = num_floating_point_operations(args, 8)
+        with_stats = num_floating_point_operations(
+            args, 8, vision_patch_rows_in_batch=12345, vision_attn_squared_sum_in_batch=678
+        )
+        assert baseline == with_stats
+
+    def test_no_vision_work_reported_is_language_only(self):
+        """A multimodal model on a text-only iteration counts the LLM only."""
+        args = _add_vision_args(_make_gpt_args())
+        assert num_floating_point_operations(args, 8) == num_floating_point_operations(
+            args, 8, vision_patch_rows_in_batch=None
+        )
+
+    def test_vision_term_matches_closed_form(self):
+        args = _add_vision_args(_make_gpt_args())
+        # One item, grid (t=1, h=8, w=8): 64 patch rows, one attention chunk.
+        rows, attn_sq = 64, 64**2
+        language_only = num_floating_point_operations(args, 8)
+        total = num_floating_point_operations(
+            args,
+            8,
+            vision_patch_rows_in_batch=rows,
+            vision_attn_squared_sum_in_batch=attn_sq,
+        )
+
+        h, m = args.vision_hidden_size, args.vision_spatial_merge_size
+        p = args.vision_kv_channels * args.vision_num_attention_heads / h
+        patch_in = args.vision_in_channels * args.vision_temporal_patch_size * (
+            args.vision_patch_size**2
+        )
+        merge_dim = h * m * m
+        expected = 3 * (
+            2 * rows * patch_in * h
+            + args.vision_num_layers
+            * (
+                4 * rows * h * p * (2 * h)
+                + 4 * attn_sq * h * p
+                + 4 * rows * h * args.vision_ffn_hidden_size
+            )
+            + 2
+            * (rows / (m * m))
+            * (merge_dim * merge_dim + merge_dim * args.vision_out_hidden_size)
+        )
+        assert total - language_only == pytest.approx(expected, rel=1e-12)
+
+    def test_vision_term_scales_linearly_in_rows(self):
+        """Token-linear terms double with rows; the L^2 term is separate."""
+        args = _add_vision_args(_make_gpt_args())
+        base = num_floating_point_operations(args, 8)
+        one = num_floating_point_operations(
+            args, 8, vision_patch_rows_in_batch=64, vision_attn_squared_sum_in_batch=0
+        )
+        two = num_floating_point_operations(
+            args, 8, vision_patch_rows_in_batch=128, vision_attn_squared_sum_in_batch=0
+        )
+        assert (two - base) == pytest.approx(2 * (one - base), rel=1e-12)
+
+    def test_accumulator_roundtrip(self):
+        """``update_vision_stats`` accumulates and drains like its seqlen twin."""
+        assert consume_vision_stats_in_iteration() == (None, None)
+        update_vision_stats(64, 64**2)
+        update_vision_stats(16, 16**2)
+        assert consume_vision_stats_in_iteration() == (80, 64**2 + 16**2)
+        # Draining resets: a second consume reports "no vision work".
+        assert consume_vision_stats_in_iteration() == (None, None)
+
+    def test_reset_discards_eval_contribution(self):
+        update_vision_stats(64, 4096)
+        reset_vision_stats_in_iteration()
+        assert consume_vision_stats_in_iteration() == (None, None)

@@ -139,7 +139,24 @@ def post_language_config(language_config, args):
     pass
 
 def set_vision_flops_metadata(args, language_config, vision_config):
-    """(Optional) Set vision FLOPs metadata on args."""
+    """(Optional) Set vision FLOPs metadata on args.
+
+    ``num_floating_point_operations`` adds a vision-encoder term when
+    ``count_vision_model_flops`` is set, so an arch that skips this hook
+    reports language-model FLOPs only. All of the fields below are
+    required once the flag is on:
+
+        args.vision_num_layers, vision_hidden_size, vision_ffn_hidden_size,
+        vision_num_attention_heads, vision_kv_channels, vision_in_channels,
+        vision_patch_size, vision_temporal_patch_size,
+        vision_spatial_merge_size, vision_out_hidden_size
+
+    The term assumes a ViT shaped like Qwen3.5-VL's: Conv3d patch embed
+    (kernel == stride), MHA (no GQA), bidirectional attention over
+    per-frame chunks, a non-gated MLP, and a two-layer patch merger. An
+    arch that differs structurally needs its own branch there rather than
+    just these fields.
+    """
     args.count_vision_model_flops = True
     args.vision_flops_variant = "llava_next"
     # ... set dimension fields for FLOPs calculation
