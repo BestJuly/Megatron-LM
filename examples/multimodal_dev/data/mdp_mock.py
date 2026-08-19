@@ -22,6 +22,7 @@ from typing import Optional, Sequence
 import torch
 from torch.utils.data import Dataset
 
+from examples.multimodal_dev.data.mdp_scenarios import build_scenarios
 from examples.multimodal_dev.models.qwen35_vl.configuration import (
     QWEN35_VL_IMAGE_TOKEN_ID,
     QWEN35_VL_VISION_START_TOKEN_ID,
@@ -35,18 +36,14 @@ def item_sentinel(sample_id: int, image_ordinal: int) -> int:
 
 # Per-sample scenarios, cycled by sample index. Grids are (t, h, w) in patch
 # units; h and w must be divisible by the spatial merge size.
-_SCENARIOS: Sequence = (
-    # one still image
-    (((1, 8, 8),), (16, 16)),
-    # two images with interleaved text, different resolutions
-    (((1, 4, 8), (1, 6, 6)), (8, 12, 8)),
-    # text-only
-    ((), (48,)),
-    # multi-frame video item plus a small image
-    (((3, 4, 4), (1, 4, 6)), (10, 6, 10)),
-    # three images, mixed grids
-    (((1, 4, 4), (2, 4, 4), (1, 8, 4)), (6, 4, 4, 6)),
-)
+#
+# The pool is the randomized one from ``mdp_scenarios``: 64 deterministic
+# scenarios with sequence lengths in [1000, 2000] and ~67 distinct grids. The
+# heterogeneity is the point -- variable lengths and grids are what exercise
+# THD packing, planner load balancing, and the encoder's grid-keyed caches, so
+# a run against this pool measures something. Pass ``scenarios=`` to
+# ``MdpThdMockDataset`` to override.
+_SCENARIOS: Sequence = build_scenarios()
 
 
 class MdpThdMockDataset(Dataset):
