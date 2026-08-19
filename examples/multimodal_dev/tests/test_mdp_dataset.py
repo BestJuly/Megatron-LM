@@ -62,7 +62,12 @@ def test_scenarios_cover_required_cases():
 
 def test_sidecar_metadata_and_sentinels():
     dataset = MdpThdMockDataset(num_samples=32)
-    indices = [0, 1, 2, 3]  # includes text-only sample 2
+    # Three multimodal samples plus a text-only one, located in the scenario
+    # pool rather than assumed at a fixed index.
+    text_only = next(i for i, (grids, _) in enumerate(dataset.scenarios) if not grids)
+    multimodal = [i for i, (grids, _) in enumerate(dataset.scenarios) if grids][:3]
+    indices = sorted(multimodal + [text_only])
+    text_only_position = indices.index(text_only)
     batch = _batch(indices, dataset)
     packed = pack_or_pad_batch(
         [dict(s) for s in batch], use_packed_sequence=True, with_vision_sidecar=True
@@ -77,7 +82,9 @@ def test_sidecar_metadata_and_sentinels():
     # Ordered by (sample_index, image_ordinal).
     order = [(int(r[0]), int(r[1])) for r in meta]
     assert order == sorted(order)
-    assert 2 not in {s for s, _ in order}, "text-only sample must contribute no items"
+    assert text_only_position not in {
+        s for s, _ in order
+    }, "text-only sample must contribute no items"
 
     position_cursor = 0
     for row in meta:
@@ -124,15 +131,19 @@ def test_true_and_padded_cu_seqlens_differ_under_alignment():
 
 
 def test_sidecar_positions_respect_interleaved_text():
-    # Scenario 1 has two images with text between them: the two position
-    # blocks must be non-adjacent.
-    batch = _batch([1])
+    # A multi-image scenario carries text between its images: consecutive
+    # position blocks must be non-adjacent.
+    dataset = MdpThdMockDataset(num_samples=8)
+    index, (grids, _) = next(
+        (i, s) for i, s in enumerate(dataset.scenarios) if len(s[0]) >= 2
+    )
+    batch = _batch([index], dataset)
     packed = pack_or_pad_batch(
         [dict(s) for s in batch], use_packed_sequence=True, with_vision_sidecar=True
     )
     meta = packed["vision_item_meta"].cpu()
     positions = packed["vision_decoder_positions"].cpu()
-    assert meta.shape[0] == 2
+    assert meta.shape[0] == len(grids)
     t0, h0, w0 = (int(v) for v in meta[0][2:5])
     first_rows = t0 * (h0 // MERGE) * (w0 // MERGE)
     first_end = int(positions[first_rows - 1])
@@ -141,7 +152,9 @@ def test_sidecar_positions_respect_interleaved_text():
 
 
 def test_text_only_batch_produces_empty_sidecar():
-    batch = _batch([2])  # text-only scenario
+    dataset = MdpThdMockDataset(num_samples=8)
+    text_only = next(i for i, (grids, _) in enumerate(dataset.scenarios) if not grids)
+    batch = _batch([text_only], dataset)
     packed = pack_or_pad_batch(
         [dict(s) for s in batch], use_packed_sequence=True, with_vision_sidecar=True
     )
