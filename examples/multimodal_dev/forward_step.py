@@ -20,6 +20,7 @@ from megatron.core.parallel_state import (
     is_pipeline_first_stage,
     is_pipeline_last_stage,
 )
+from megatron.core.utils import get_attr_wrapped_model
 from megatron.training import get_args
 
 # -------------------------------------------------------------------
@@ -217,6 +218,29 @@ def accumulate_vision_flops_stats_from_items(vision_items) -> None:
         attn_sq += t * frame * frame
     if rows:
         _update_vision_stats(float(rows), float(attn_sq))
+
+
+def _accumulate_workload_stats(
+    model, packed_seq_params, *, vision_items=None, image_grid_thw=None
+) -> None:
+    """Report one micro-batch's decoder and vision work exactly once per rank.
+
+    With virtual pipeline parallelism, every model chunk on a physical rank
+    invokes the forward step for the same micro-batch. The global consumer
+    de-duplicates replicated statistics by ``TP * CP * PP``, so letting every
+    virtual chunk report would overcount by the VPP size. Chunk zero is the
+    canonical reporter; non-VPP models expose ``vp_stage=None`` and retain the
+    original behavior.
+    """
+    vp_stage = get_attr_wrapped_model(model, "vp_stage")
+    if vp_stage not in (None, 0):
+        return
+
+    accumulate_flops_stats(packed_seq_params)
+    if vision_items is not None:
+        accumulate_vision_flops_stats_from_items(vision_items)
+    else:
+        accumulate_vision_flops_stats_from_grids(image_grid_thw)
 
 
 def _update_vision_stats(patch_rows, attn_squared_sum) -> None:
@@ -725,8 +749,11 @@ def mdp_forward_step(runtime, data_iterator, model):
     record = next(data_iterator)
     batch = dict(record.model_payload)
 
-    accumulate_flops_stats(record.decoder_packed_seq_params)
-    accumulate_vision_flops_stats_from_items(record.vision_items)
+    _accumulate_workload_stats(
+        model,
+        record.decoder_packed_seq_params,
+        vision_items=record.vision_items,
+    )
 
     vision_embeddings = None
     if is_pipeline_first_stage() and not record.text_only:
@@ -779,8 +806,11 @@ def forward_step(data_iterator, model):
     if batch is None:
         return None, None
 
-    accumulate_flops_stats(batch.get("packed_seq_params", None))
-    accumulate_vision_flops_stats_from_grids(batch.get("image_grid_thw", None))
+    _accumulate_workload_stats(
+        model,
+        batch.get("packed_seq_params", None),
+        image_grid_thw=batch.get("image_grid_thw", None),
+    )
 
     # ``pixel_values`` is the heavy vision tensor and is only consumed
     # on the first PP stage; drop it elsewhere.  ``image_grid_thw`` is
