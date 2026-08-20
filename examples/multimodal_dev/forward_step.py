@@ -739,12 +739,13 @@ def loss_func(loss_mask, output_tensor):
 # -------------------------------------------------------------------
 
 
-def mdp_forward_step(runtime, data_iterator, model):
+def mdp_forward_step(runtime, data_iterator, model, return_schedule_plan: bool = False):
     """Forward step over an MDP replay record.
 
     The iterator yields immutable ``MdpMicrobatchRecord`` objects captured in
     P1. Pixels never reach the decoder: the first PP stage receives the
-    pre-encoded detached leaf from endpoint storage instead.
+    pre-encoded detached leaf from endpoint storage instead.  The EP-overlap
+    path builds a decoder-only schedule plan from that same leaf.
     """
     record = next(data_iterator)
     batch = dict(record.model_payload)
@@ -764,7 +765,7 @@ def mdp_forward_step(runtime, data_iterator, model):
                 "leaf in endpoint storage; P3 embedding routing did not complete"
             )
 
-    output_tensor = model(
+    model_inputs = dict(
         input_ids=batch["input_ids"],
         position_ids=batch.get("position_ids"),
         attention_mask=batch.get("attention_mask", None),
@@ -776,6 +777,13 @@ def mdp_forward_step(runtime, data_iterator, model):
         packed_seq_params=record.decoder_packed_seq_params,
         vision_embeddings=vision_embeddings,
     )
+    if return_schedule_plan:
+        assert get_args().overlap_moe_expert_parallel_comm, (
+            "overlap_moe_expert_parallel_comm must be enabled to return a schedule plan"
+        )
+        output_tensor = model.build_schedule_plan(**model_inputs)
+    else:
+        output_tensor = model(**model_inputs)
 
     loss_mask = batch.get("loss_mask", None)
     if loss_mask is None:
@@ -789,13 +797,20 @@ def mdp_forward_step(runtime, data_iterator, model):
     return output_tensor, partial(loss_func, loss_mask)
 
 
-def forward_step(data_iterator, model):
-    """Forward step for multimodal_dev training."""
+def forward_step(data_iterator, model, return_schedule_plan: bool = False):
+    """Forward step for multimodal_dev training.
+
+    ``return_schedule_plan`` is requested only by MCore's native decoder EP
+    communication-overlap scheduler.  The default path remains an eager model
+    forward.
+    """
     from megatron.core.mdp import integration as mdp_integration
 
     mdp_runtime = mdp_integration.get_runtime()
     if mdp_runtime is not None:
-        return mdp_forward_step(mdp_runtime, data_iterator, model)
+        return mdp_forward_step(
+            mdp_runtime, data_iterator, model, return_schedule_plan=return_schedule_plan
+        )
 
     # Native counterpart of mdp.p1_get_batch: the dataset fetch + THD pack
     # + TP broadcast. MDP hoists this out of the schedule into window capture,
@@ -831,6 +846,33 @@ def forward_step(data_iterator, model):
         and pixel_values.dtype == torch.float32
     ):
         pixel_values = pixel_values.bfloat16()
+
+    if return_schedule_plan:
+        assert get_args().overlap_moe_expert_parallel_comm, (
+            "overlap_moe_expert_parallel_comm must be enabled to return a schedule plan"
+        )
+        output_tensor = model.build_schedule_plan(
+            input_ids=batch["input_ids"],
+            position_ids=batch.get("position_ids"),
+            attention_mask=batch.get("attention_mask", None),
+            labels=batch.get("labels", None),
+            loss_mask=batch.get("loss_mask", None),
+            padding_mask=batch.get("padding_mask", None),
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            packed_seq_params=batch.get("packed_seq_params", None),
+        )
+
+        loss_mask = batch.get("loss_mask", None)
+        if loss_mask is None:
+            loss_mask = torch.ones_like(batch["input_ids"], dtype=torch.float)
+        if is_last:
+            from examples.multimodal_dev.models.base import MultimodalModel
+
+            loss_mask = MultimodalModel.cp_split_loss_mask(
+                loss_mask, batch.get("packed_seq_params", None)
+            )
+        return output_tensor, partial(loss_func, loss_mask)
 
     # We don't provide position_ids, now. Let model handle it itself.
     output_tensor = model(
