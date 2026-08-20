@@ -64,19 +64,20 @@ def _cu_seqlens_search_steps(num_seqs: int) -> int:
     return max(steps, 1)
 
 
-# Elements in one [BLOCK_T, BLOCK_HALF] tile. The kernel is memory bound, and on
-# GB300 every tile from 256 elements upwards reaches the same bandwidth, so the
-# smallest saturating tile is used: it leaves the most programs in the grid.
-_MROPE_THD_TILE_ELEMENTS = 256
+# Elements in one [BLOCK_T, BLOCK_HALF] tile. Both mRoPE kernels are memory
+# bound, and on GB300 every tile from 256 elements upwards reaches the same
+# bandwidth, so the smallest saturating tile is used: it leaves the most
+# programs in the grid.
+_MROPE_TILE_ELEMENTS = 256
 # Upper bound on the token tile height, for very narrow rotary dimensions.
-_MROPE_THD_MAX_BLOCK_T = 16
+_MROPE_MAX_BLOCK_T = 16
 # Tile elements per warp. Fewer warps than this leaves the load pipeline idle,
 # more warps makes the tail dominate; measured flat within 1% at this ratio.
-_MROPE_THD_ELEMENTS_PER_WARP = 128
-_MROPE_THD_MAX_WARPS = 8
+_MROPE_ELEMENTS_PER_WARP = 128
+_MROPE_MAX_WARPS = 8
 # Programs per SM the grid should reach before the head dimension stops being
 # split. Measured on GB300 (152 SMs): throughput plateaus around here.
-_MROPE_THD_PROGRAMS_PER_SM = 32
+_MROPE_PROGRAMS_PER_SM = 32
 
 
 @functools.lru_cache(maxsize=None)
@@ -84,33 +85,38 @@ def _multi_processor_count(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
-def _fused_mrope_thd_launch_shape(
-    tokens: int, heads: int, block_half: int, device: torch.device
+def _fused_mrope_launch_shape(
+    rows: int, heads: int, block_half: int, device: torch.device, grid_repeats: int = 1
 ) -> tuple[int, int, int]:
-    """Pick ``(BLOCK_T, BLOCK_H, num_warps)`` for the THD mRoPE kernel.
+    """Pick ``(BLOCK_T, BLOCK_H, num_warps)`` for either mRoPE kernel.
 
-    A program owns ``BLOCK_T`` tokens and ``BLOCK_H`` heads, so the grid holds
-    ``ceil(tokens / BLOCK_T) * (heads / BLOCK_H)`` programs. The token tile is
-    fixed at the smallest size that saturates the load pipeline, and the
-    remaining parallelism knob is the head group: keeping all heads in one
-    program evaluates sin/cos once per token, but a short packed batch needs the
-    heads split back out to fill the device. ``BLOCK_H`` must divide ``heads``
-    so the grid covers every head exactly.
+    A program owns ``BLOCK_T`` rows of the tiled dimension -- packed tokens for
+    the THD kernel, sequence positions for the SBHD one -- and ``BLOCK_H``
+    heads, so the grid holds ``ceil(rows / BLOCK_T) * grid_repeats *
+    (heads / BLOCK_H)`` programs. ``grid_repeats`` counts the grid dimensions
+    the row tile is replicated over and is the batch for SBHD, 1 for THD, where
+    the batch is already folded into the token count.
+
+    The row tile is fixed at the smallest size that saturates the load
+    pipeline, and the remaining parallelism knob is the head group: keeping all
+    heads in one program evaluates sin/cos once per row, but a short batch needs
+    the heads split back out to fill the device. ``BLOCK_H`` must divide
+    ``heads`` so the grid covers every head exactly.
     """
-    block_t = max(1, min(_MROPE_THD_TILE_ELEMENTS // block_half, _MROPE_THD_MAX_BLOCK_T))
-    token_programs = -(-tokens // block_t)
+    block_t = max(1, min(_MROPE_TILE_ELEMENTS // block_half, _MROPE_MAX_BLOCK_T))
+    row_programs = -(-rows // block_t) * grid_repeats
 
     device_index = device.index if device.index is not None else torch.cuda.current_device()
-    target_programs = _multi_processor_count(device_index) * _MROPE_THD_PROGRAMS_PER_SM
+    target_programs = _multi_processor_count(device_index) * _MROPE_PROGRAMS_PER_SM
 
     block_h = heads
     while (
-        block_h > 1 and block_h % 2 == 0 and token_programs * (heads // block_h) < target_programs
+        block_h > 1 and block_h % 2 == 0 and row_programs * (heads // block_h) < target_programs
     ):
         block_h //= 2
 
     num_warps = _largest_power_of_2_at_most(
-        max(1, min(block_t * block_half // _MROPE_THD_ELEMENTS_PER_WARP, _MROPE_THD_MAX_WARPS))
+        max(1, min(block_t * block_half // _MROPE_ELEMENTS_PER_WARP, _MROPE_MAX_WARPS))
     )
     return block_t, block_h, num_warps
 
@@ -453,6 +459,7 @@ def _fused_mrope_kernel(
     o_s_batch,
     o_s_head,
     o_s_dim,
+    num_seq,
     HALF_ROTARY_DIM: tl.constexpr,
     PASS_DIM: tl.constexpr,
     SEC_T: tl.constexpr,
@@ -462,63 +469,87 @@ def _fused_mrope_kernel(
     ROTARY_INTERLEAVED: tl.constexpr,
     INVERSE: tl.constexpr,
     FP32_COMPUTE: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_H: tl.constexpr,
     BLOCK_HALF: tl.constexpr,
     BLOCK_PASS: tl.constexpr,
 ):
-    seq_idx = tl.program_id(0)
+    """Apply raw three-axis mRoPE to an SBHD ``[seq, batch, heads, head_dim]`` tensor.
+
+    One program owns ``BLOCK_T`` sequence positions of one batch element and
+    walks ``BLOCK_H`` heads internally, so sin/cos is evaluated once per
+    position per head group instead of once per ``(position, head)`` pair, and
+    every access is a ``[BLOCK_T, BLOCK_HALF]`` tile rather than a single
+    ``head_dim`` row. ``BLOCK_H`` divides the head count, so the grid covers
+    every head exactly.
+    """
+    seq_idx = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
+    seq_mask = seq_idx < num_seq
+    # Clamp so out-of-range lanes never gather outside ``FREQS`` or ``T``.
+    safe_seq_idx = tl.where(seq_mask, seq_idx, 0)
     batch_idx = tl.program_id(1)
-    head_idx = tl.program_id(2)
 
     k = tl.arange(0, BLOCK_HALF)
-    mask = k < HALF_ROTARY_DIM
-
+    tile_mask = seq_mask[:, None] & (k < HALF_ROTARY_DIM)[None, :]
     axis = _mrope_axis(k, SEC_T, SEC_H, SEC_W, INTERLEAVED_MROPE)
 
     # Pick the arithmetic dtype once: fp32 when fp32 accumulation is requested, otherwise the
     # output dtype so intermediates round exactly like PyTorch's pointwise RoPE.
     compute_ty = tl.float32 if FP32_COMPUTE else OUT.dtype.element_ty
 
-    freqs_offset = axis * f_s_axis + batch_idx * f_s_batch + seq_idx * f_s_seq + k * f_s_dim
-    freqs = tl.load(FREQS + freqs_offset, mask=mask, other=0.0)
+    freqs_offset = (
+        axis[None, :] * f_s_axis
+        + batch_idx * f_s_batch
+        + safe_seq_idx[:, None].to(tl.int64) * f_s_seq
+        + k[None, :] * f_s_dim
+    )
+    freqs = tl.load(FREQS + freqs_offset, mask=tile_mask, other=0.0)
     cos_v = tl.cos(freqs).to(compute_ty)
     sin_v = tl.sin(freqs).to(compute_ty)
     if INVERSE:
         sin_v = -sin_v
 
-    t_base = T + seq_idx * t_s_seq + batch_idx * t_s_batch + head_idx * t_s_head
-    out_base = OUT + seq_idx * o_s_seq + batch_idx * o_s_batch + head_idx * o_s_head
-
     if ROTARY_INTERLEAVED:
-        lo_offset = (2 * k) * t_s_dim
-        hi_offset = (2 * k + 1) * t_s_dim
-        out_lo_offset = (2 * k) * o_s_dim
-        out_hi_offset = (2 * k + 1) * o_s_dim
+        lo_offset = (2 * k)[None, :] * t_s_dim
+        hi_offset = (2 * k + 1)[None, :] * t_s_dim
+        out_lo_offset = (2 * k)[None, :] * o_s_dim
+        out_hi_offset = (2 * k + 1)[None, :] * o_s_dim
     else:
-        lo_offset = k * t_s_dim
-        hi_offset = (k + HALF_ROTARY_DIM) * t_s_dim
-        out_lo_offset = k * o_s_dim
-        out_hi_offset = (k + HALF_ROTARY_DIM) * o_s_dim
+        lo_offset = k[None, :] * t_s_dim
+        hi_offset = (k + HALF_ROTARY_DIM)[None, :] * t_s_dim
+        out_lo_offset = k[None, :] * o_s_dim
+        out_hi_offset = (k + HALF_ROTARY_DIM)[None, :] * o_s_dim
 
-    t_lo = tl.load(t_base + lo_offset, mask=mask, other=0.0).to(compute_ty)
-    t_hi = tl.load(t_base + hi_offset, mask=mask, other=0.0).to(compute_ty)
+    # 64-bit row offsets: a long-context batch can exceed 2**31 elements.
+    t_row_base = T + safe_seq_idx[:, None].to(tl.int64) * t_s_seq + batch_idx * t_s_batch
+    out_row_base = OUT + safe_seq_idx[:, None].to(tl.int64) * o_s_seq + batch_idx * o_s_batch
 
-    lo_cos = (t_lo * cos_v).to(compute_ty)
-    hi_sin = (t_hi * sin_v).to(compute_ty)
-    hi_cos = (t_hi * cos_v).to(compute_ty)
-    lo_sin = (t_lo * sin_v).to(compute_ty)
+    head_begin = tl.program_id(2) * BLOCK_H
+    for head_offset in range(BLOCK_H):
+        head_idx = head_begin + head_offset
+        t_base = t_row_base + head_idx * t_s_head
+        out_base = out_row_base + head_idx * o_s_head
 
-    out_lo = (lo_cos - hi_sin).to(OUT.dtype.element_ty)
-    out_hi = (hi_cos + lo_sin).to(OUT.dtype.element_ty)
+        t_lo = tl.load(t_base + lo_offset, mask=tile_mask, other=0.0).to(compute_ty)
+        t_hi = tl.load(t_base + hi_offset, mask=tile_mask, other=0.0).to(compute_ty)
 
-    tl.store(out_base + out_lo_offset, out_lo, mask=mask)
-    tl.store(out_base + out_hi_offset, out_hi, mask=mask)
+        lo_cos = (t_lo * cos_v).to(compute_ty)
+        hi_sin = (t_hi * sin_v).to(compute_ty)
+        hi_cos = (t_hi * cos_v).to(compute_ty)
+        lo_sin = (t_lo * sin_v).to(compute_ty)
 
-    if PASS_DIM > 0:
-        pass_idx = tl.arange(0, BLOCK_PASS)
-        pass_mask = pass_idx < PASS_DIM
-        src_dim = 2 * HALF_ROTARY_DIM + pass_idx
-        pass_values = tl.load(t_base + src_dim * t_s_dim, mask=pass_mask, other=0.0)
-        tl.store(out_base + src_dim * o_s_dim, pass_values, mask=pass_mask)
+        out_lo = (lo_cos - hi_sin).to(OUT.dtype.element_ty)
+        out_hi = (hi_cos + lo_sin).to(OUT.dtype.element_ty)
+
+        tl.store(out_base + out_lo_offset, out_lo, mask=tile_mask)
+        tl.store(out_base + out_hi_offset, out_hi, mask=tile_mask)
+
+        if PASS_DIM > 0:
+            pass_idx = tl.arange(0, BLOCK_PASS)
+            pass_mask = seq_mask[:, None] & (pass_idx < PASS_DIM)[None, :]
+            src_dim = (2 * HALF_ROTARY_DIM + pass_idx)[None, :]
+            pass_values = tl.load(t_base + src_dim * t_s_dim, mask=pass_mask, other=0.0)
+            tl.store(out_base + src_dim * o_s_dim, pass_values, mask=pass_mask)
 
 
 @triton.jit
@@ -730,7 +761,17 @@ def _launch_fused_mrope(
     pass_dim = head_dim - (2 * half_rotary_dim)
     block_pass = _smallest_power_of_2_at_least(max(pass_dim, 1))
 
-    grid = (seq, batch, heads)
+    if seq == 0 or batch == 0 or heads == 0:
+        return out
+
+    block_t, block_h, num_warps = _fused_mrope_launch_shape(
+        seq, heads, block_half, t.device, grid_repeats=batch
+    )
+    # A head group that does not divide the head count would leave the trailing
+    # heads outside the grid, and therefore unwritten, rather than fail loudly.
+    assert heads % block_h == 0, f"head group {block_h} does not divide head count {heads}"
+
+    grid = (triton.cdiv(seq, block_t), batch, heads // block_h)
     _fused_mrope_kernel[grid](
         t,
         freqs,
@@ -747,6 +788,7 @@ def _launch_fused_mrope(
         out.stride(1),
         out.stride(2),
         out.stride(3),
+        seq,
         HALF_ROTARY_DIM=half_rotary_dim,
         PASS_DIM=pass_dim,
         SEC_T=sec_t,
@@ -756,9 +798,11 @@ def _launch_fused_mrope(
         ROTARY_INTERLEAVED=rotary_interleaved,
         INVERSE=inverse,
         FP32_COMPUTE=fp32_compute,
+        BLOCK_T=block_t,
+        BLOCK_H=block_h,
         BLOCK_HALF=block_half,
         BLOCK_PASS=block_pass,
-        num_warps=4,
+        num_warps=num_warps,
     )
     return out
 
@@ -793,7 +837,7 @@ def _launch_fused_mrope_thd(
     pass_dim = head_dim - (2 * half_rotary_dim)
     block_pass = _smallest_power_of_2_at_least(max(pass_dim, 1))
     num_seqs = cu_seqlens.numel() - 1
-    block_t, block_h, num_warps = _fused_mrope_thd_launch_shape(tokens, heads, block_half, t.device)
+    block_t, block_h, num_warps = _fused_mrope_launch_shape(tokens, heads, block_half, t.device)
     # A head group that does not divide the head count would leave the trailing
     # heads outside the grid, and therefore unwritten, rather than fail loudly.
     assert heads % block_h == 0, f"head group {block_h} does not divide head count {heads}"

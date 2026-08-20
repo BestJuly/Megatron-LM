@@ -13,9 +13,11 @@ change touches the arithmetic, so two properties are checked here:
 * forward and backward still match an unfused PyTorch mRoPE, including under
   context parallelism.
 
-The context-parallel case additionally runs on two ranks. Launch it with::
+The context-parallel case additionally runs on real ranks. Launch it with::
 
     torchrun --nproc_per_node=2 -m pytest \
+        tests/unit_tests/fusions/test_fused_mrope_thd_kernel.py
+    torchrun --nproc_per_node=4 -m pytest \
         tests/unit_tests/fusions/test_fused_mrope_thd_kernel.py
 """
 
@@ -477,22 +479,32 @@ def _context_parallel_shard(tensor, cu_seqlens_cpu, cp_size, cp_rank):
 
 
 @pytest.mark.skipif(
-    int(os.environ.get("WORLD_SIZE", "1")) != 2,
-    reason="context-parallel THD mRoPE check needs torchrun --nproc_per_node=2",
+    int(os.environ.get("WORLD_SIZE", "1")) not in (2, 4),
+    reason="context-parallel THD mRoPE check needs torchrun --nproc_per_node=2 or 4",
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_thd_kernel_context_parallel_two_ranks(dtype):
+def test_thd_kernel_context_parallel_ranks(dtype):
     """Each CP rank rotates its shard exactly as the unsharded reference does.
 
-    Both ranks build the same global packed batch, then each one runs the fused
+    Every rank builds the same global packed batch, then each one runs the fused
     kernel on its own shard with its own ``cp_rank``. The result must equal the
     corresponding shard of the unfused reference computed over the whole batch,
     for the forward pass and for the gradient.
+
+    The whole world is one context-parallel group, so the test covers
+    ``cp_size=2`` under ``--nproc_per_node=2`` and ``cp_size=4`` under
+    ``--nproc_per_node=4``. ``cp_size > 2`` matters because the balanced THD
+    split gives each rank two non-adjacent chunks whose frequency rows are
+    ``cp_size``-dependent; the single-process tests exercise that mapping
+    against the legacy kernel, and this one exercises it against a reference
+    computed over the unsharded batch.
     """
     from megatron.core import parallel_state
     from tests.unit_tests.test_utilities import Utils
 
-    Utils.initialize_model_parallel(context_parallel_size=2)
+    Utils.initialize_model_parallel(
+        context_parallel_size=int(os.environ.get("WORLD_SIZE", "1"))
+    )
     try:
         cp_group = parallel_state.get_context_parallel_group()
         cp_size = torch.distributed.get_world_size(cp_group)
@@ -500,6 +512,7 @@ def test_thd_kernel_context_parallel_two_ranks(dtype):
 
         # Sub-sequence lengths are multiples of 2 * cp_size so the balanced split
         # is exact, which is what the packed multimodal data loader guarantees.
+        # 8 divides all three, so the same lengths work for cp_size 2 and 4.
         seqlens = [64, 32, 96]
         heads, head_dim, half_rotary_dim = 8, 128, 36
         interleaved_mrope = True
