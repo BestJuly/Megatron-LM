@@ -328,6 +328,23 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
         )
 
 
+def greedy_max_real_sequences(options: "MdpCompatibilityOptions") -> Optional[int]:
+    """Real sequences a greedy bin may hold, or ``None`` for no cap.
+
+    ``thd_max_packed_sequences`` is the *final* static THD capacity. Under
+    ``--thd-static-packing`` the padding tail is represented as an ordinary
+    dummy sequence appended to ``cu_seqlens``, so one slot must be reserved for
+    it -- exactly what ``_get_scheduler_max_real_num_seqs`` does for
+    ``dp_balanced``. Without the reservation a bin filled to the cap overflows
+    the ``thd_max_packed_sequences + 1`` entry budget and dies inside
+    ``_pad_cu_seqlens``.
+    """
+    cap = options.thd_max_packed_sequences
+    if cap is None:
+        return None
+    return int(cap) - 1 if options.thd_static_packing else int(cap)
+
+
 def _validate_packing(config: MdpConfig, options: MdpCompatibilityOptions) -> None:
     """Reject packing configurations MDP cannot honor.
 
@@ -370,12 +387,17 @@ def _validate_packing(config: MdpConfig, options: MdpCompatibilityOptions) -> No
             "A bin filled to the budget must still split legally across CP/SP ranks; "
             "discovering this inside TransformerEngine gives a far worse error.",
         )
-    if options.thd_max_packed_sequences is not None and options.thd_max_packed_sequences < 1:
+    minimum = 2 if options.thd_static_packing else 1
+    if (
+        options.thd_max_packed_sequences is not None
+        and options.thd_max_packed_sequences < minimum
+    ):
         _reject(
             "thd_max_packed_sequences",
             options.thd_max_packed_sequences,
-            "thd_max_packed_sequences >= 1",
-            "It caps the real sequences per greedy bin.",
+            f"thd_max_packed_sequences >= {minimum}",
+            "It caps the real sequences per greedy bin; under --thd-static-packing "
+            "one slot is reserved for the padding tail's dummy sequence.",
             "8",
         )
 

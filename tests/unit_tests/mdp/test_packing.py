@@ -6,11 +6,7 @@ import pytest
 import torch
 
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
-from megatron.core.mdp.packing import (
-    GreedySampleStream,
-    decoder_sample_length,
-    greedy_bin_sizes,
-)
+from megatron.core.mdp.packing import GreedySampleStream, decoder_sample_length
 
 
 def _sample(length, tag=0):
@@ -28,48 +24,37 @@ def _bin_lengths(bins):
 
 
 # ---------------------------------------------------------------------------
-# greedy_bin_sizes
+# GreedySampleStream
 # ---------------------------------------------------------------------------
 
 
+def _stream(lengths, *, mbs, budget, cap=None, align=1):
+    return GreedySampleStream(
+        _microbatches(lengths, mbs),
+        token_budget=budget,
+        max_num_seqs=cap,
+        align=align,
+        length_of=decoder_sample_length,
+    )
+
+
 def test_bins_respect_the_token_budget():
-    lengths = [400, 400, 400, 100, 900]
-    sizes = greedy_bin_sizes(lengths, token_budget=1000, max_num_seqs=None, num_bins=2)
-    # 400+400 fits, +400 would be 1200 -> close. Second bin: 400+100+900 = 1400 -> 400+100.
-    assert sizes == [2, 2]
-
-
-def test_bins_respect_the_sequence_cap():
-    lengths = [10] * 20
-    sizes = greedy_bin_sizes(lengths, token_budget=1000, max_num_seqs=4, num_bins=3)
-    assert sizes == [4, 4, 4]
-
-
-def test_exactly_num_bins_are_produced():
-    lengths = [100] * 50
-    sizes = greedy_bin_sizes(lengths, token_budget=250, max_num_seqs=8, num_bins=5)
-    assert len(sizes) == 5
-    assert all(size == 2 for size in sizes)
+    stream = _stream([400, 400, 400, 100, 900], mbs=5, budget=1000)
+    # 400+400 fits; +400 would be 1200 -> close. Then 400+100, +900 -> close.
+    assert _bin_lengths([next(stream), next(stream)]) == [[400, 400], [400, 100]]
 
 
 def test_no_bin_exceeds_the_budget():
     lengths = [137, 998, 5, 640, 640, 1, 512, 512, 511]
-    sizes = greedy_bin_sizes(lengths, token_budget=1024, max_num_seqs=8, num_bins=3)
-    cursor = 0
-    for size in sizes:
-        assert sum(lengths[cursor : cursor + size]) <= 1024
-        cursor += size
-    assert cursor <= len(lengths)
+    stream = _stream(lengths, mbs=3, budget=1024, cap=8)
+    for _ in range(3):
+        assert sum(decoder_sample_length(s) for s in next(stream)) <= 1024
 
 
-def test_exhausted_stream_is_a_named_error():
-    with pytest.raises(MdpStateError, match="non-empty bins per iteration"):
-        greedy_bin_sizes([10, 10], token_budget=1000, max_num_seqs=None, num_bins=3)
-
-
-# ---------------------------------------------------------------------------
-# GreedySampleStream
-# ---------------------------------------------------------------------------
+def test_exactly_num_bins_are_produced():
+    stream = _stream([100] * 50, mbs=10, budget=250, cap=8)
+    bins = [next(stream) for _ in range(5)]
+    assert [len(b) for b in bins] == [2] * 5
 
 
 def test_stream_drains_microbatch_lists_sample_by_sample():

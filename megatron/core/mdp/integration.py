@@ -29,6 +29,7 @@ from megatron.core.mdp.config import (
     SUPPORTED_RANK_ORDER,
     MdpCompatibilityOptions,
     MdpConfig,
+    greedy_max_real_sequences,
     thd_row_alignment,
     validate_mdp_config,
 )
@@ -239,6 +240,7 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
         if mdp_config.greedy_packing
         else None
     )
+    greedy_max_num_seqs = greedy_max_real_sequences(compat)
     _RUNTIME = MdpRuntime(
         config=mdp_config,
         rank_map=rank_map,
@@ -259,7 +261,7 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
         params_dtype=params_dtype,
         num_vpp_chunks=len(model),
         greedy_token_budget=greedy_token_budget,
-        greedy_max_num_seqs=getattr(args, "thd_max_packed_sequences", None),
+        greedy_max_num_seqs=greedy_max_num_seqs,
         greedy_row_alignment=thd_row_alignment(compat),
     )
     logger.info(

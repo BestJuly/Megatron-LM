@@ -46,39 +46,6 @@ def decoder_sample_length(sample: Any) -> int:
         ) from exc
 
 
-def greedy_bin_sizes(
-    lengths: List[int], *, token_budget: int, max_num_seqs: Optional[int], num_bins: int
-) -> List[int]:
-    """Number of samples taken into each of ``num_bins`` in-order greedy bins.
-
-    Pure function over a length vector, so the grouping rule is testable without
-    a dataset. ``lengths`` must already be aligned (see
-    :class:`GreedySampleStream`). Raises when ``lengths`` cannot fill
-    ``num_bins`` bins.
-    """
-    sizes = []
-    cursor = 0
-    for _ in range(num_bins):
-        taken = 0
-        total = 0
-        while cursor + taken < len(lengths):
-            length = lengths[cursor + taken]
-            if taken and total + length > token_budget:
-                break
-            if max_num_seqs is not None and taken >= max_num_seqs:
-                break
-            total += length
-            taken += 1
-        if taken == 0:
-            raise MdpStateError(
-                f"MDP: greedy packing violates: {num_bins} non-empty bins per iteration "
-                f"(the sample stream ran out after {len(sizes)})."
-            )
-        sizes.append(taken)
-        cursor += taken
-    return sizes
-
-
 class GreedySampleStream:
     """Wrap a microbatch-list iterator so ``next()`` returns one greedy bin.
 
