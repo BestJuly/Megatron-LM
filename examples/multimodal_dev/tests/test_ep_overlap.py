@@ -18,6 +18,7 @@ class _FakeLanguageModel(torch.nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.embedding_calls = 0
+        self.forward_inputs = None
         self.plan_inputs = None
         self.plan = object()
 
@@ -26,6 +27,10 @@ class _FakeLanguageModel(torch.nn.Module):
         seq_length = input_ids.shape[1]
         batch_size = input_ids.shape[0]
         return torch.zeros(seq_length, batch_size, self.hidden_size)
+
+    def forward(self, **kwargs):
+        self.forward_inputs = kwargs
+        return kwargs["decoder_input"]
 
     def build_schedule_plan(self, **kwargs):
         self.plan_inputs = kwargs
@@ -97,6 +102,45 @@ def test_schedule_plan_keeps_native_vision_preprocessing_outside_decoder_plan():
     assert torch.equal(
         model.language_model.plan_inputs["decoder_input"][[0, 2], 0], pixel_values + 1
     )
+
+
+def test_schedule_plan_input_preparation_matches_eager_forward():
+    model_inputs = dict(
+        input_ids=torch.tensor([[7, 3, 7]]),
+        position_ids=None,
+        attention_mask=None,
+        labels=torch.tensor([[3, 7, 4]]),
+        loss_mask=torch.ones(1, 3),
+        padding_mask=torch.tensor([[False, True, False]]),
+        pixel_values=torch.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]]),
+        image_grid_thw=torch.tensor([[1, 1, 2]]),
+        packed_seq_params=None,
+    )
+
+    eager_model = _make_model()
+    eager_model(**model_inputs)
+
+    scheduled_model = _make_model()
+    plan = scheduled_model.build_schedule_plan(**model_inputs)
+
+    assert plan is scheduled_model.language_model.plan
+    assert eager_model.vision_model.calls == scheduled_model.vision_model.calls == 1
+    for name in (
+        "input_ids",
+        "position_ids",
+        "attention_mask",
+        "decoder_input",
+        "labels",
+        "loss_mask",
+        "padding_mask",
+        "packed_seq_params",
+    ):
+        eager_value = eager_model.language_model.forward_inputs[name]
+        scheduled_value = scheduled_model.language_model.plan_inputs[name]
+        if eager_value is None:
+            assert scheduled_value is None
+        else:
+            torch.testing.assert_close(scheduled_value, eager_value)
 
 
 def test_schedule_plan_non_preprocess_chunk_skips_embedding_and_vision():

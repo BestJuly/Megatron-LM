@@ -847,35 +847,7 @@ def forward_step(data_iterator, model, return_schedule_plan: bool = False):
     ):
         pixel_values = pixel_values.bfloat16()
 
-    if return_schedule_plan:
-        assert get_args().overlap_moe_expert_parallel_comm, (
-            "overlap_moe_expert_parallel_comm must be enabled to return a schedule plan"
-        )
-        output_tensor = model.build_schedule_plan(
-            input_ids=batch["input_ids"],
-            position_ids=batch.get("position_ids"),
-            attention_mask=batch.get("attention_mask", None),
-            labels=batch.get("labels", None),
-            loss_mask=batch.get("loss_mask", None),
-            padding_mask=batch.get("padding_mask", None),
-            pixel_values=pixel_values,
-            image_grid_thw=image_grid_thw,
-            packed_seq_params=batch.get("packed_seq_params", None),
-        )
-
-        loss_mask = batch.get("loss_mask", None)
-        if loss_mask is None:
-            loss_mask = torch.ones_like(batch["input_ids"], dtype=torch.float)
-        if is_last:
-            from examples.multimodal_dev.models.base import MultimodalModel
-
-            loss_mask = MultimodalModel.cp_split_loss_mask(
-                loss_mask, batch.get("packed_seq_params", None)
-            )
-        return output_tensor, partial(loss_func, loss_mask)
-
-    # We don't provide position_ids, now. Let model handle it itself.
-    output_tensor = model(
+    model_inputs = dict(
         input_ids=batch["input_ids"],
         position_ids=batch.get("position_ids"),
         attention_mask=batch.get("attention_mask", None),
@@ -886,6 +858,13 @@ def forward_step(data_iterator, model, return_schedule_plan: bool = False):
         image_grid_thw=image_grid_thw,
         packed_seq_params=batch.get("packed_seq_params", None),
     )
+    if return_schedule_plan:
+        assert get_args().overlap_moe_expert_parallel_comm, (
+            "overlap_moe_expert_parallel_comm must be enabled to return a schedule plan"
+        )
+        output_tensor = model.build_schedule_plan(**model_inputs)
+    else:
+        output_tensor = model(**model_inputs)
 
     loss_mask = batch.get("loss_mask", None)
     if loss_mask is None:
