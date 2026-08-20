@@ -523,28 +523,44 @@ class MdpRuntime:
     def _greedy_stream(self, data_iterators):
         """The greedy sample stream for this data iterator, created on first use."""
         iterator = self._first_iterator(data_iterators)
-        stream = self._greedy_streams.get(id(iterator))
-        if stream is None:
-            stream = GreedySampleStream(
-                iterator,
-                token_budget=self._greedy_token_budget,
-                max_num_seqs=self._greedy_max_num_seqs,
-                align=self._greedy_row_alignment,
-                length_of=decoder_sample_length,
+        entry = self._greedy_streams.get(id(iterator))
+        if entry is None:
+            entry = (
+                GreedySampleStream(
+                    iterator,
+                    token_budget=self._greedy_token_budget,
+                    max_num_seqs=self._greedy_max_num_seqs,
+                    align=self._greedy_row_alignment,
+                    length_of=decoder_sample_length,
+                ),
+                # Evaluation runs forward_only; recorded so its consumption is
+                # kept out of consumed_train_samples.
+                self._forward_only,
             )
-            self._greedy_streams[id(iterator)] = stream
-        return stream
+            self._greedy_streams[id(iterator)] = entry
+        return entry[0]
 
     def consumed_samples(self) -> Optional[int]:
-        """Real samples drained by greedy packing so far, or ``None`` when off.
+        """Real samples drained by greedy *training* packing, or ``None`` when off.
 
-        Sums every stream (train and eval) this rank owns. ``training.py`` reads
-        the delta per iteration because the closed form
-        ``dp x mbs x num_microbatches`` is wrong under greedy packing.
+        ``training.py`` reads the delta per iteration because the closed form
+        ``dp x mbs x num_microbatches`` is wrong under greedy packing. Evaluation
+        streams are excluded: they consume their own samples, and folding them in
+        would charge an eval pass to the next training iteration.
+
+        Under ``--mdp-overlap-window-capture`` the count is shifted by one
+        iteration -- the prefetch thread drains iteration i+1's samples during
+        iteration i, and the final prefetch is captured but never consumed.
+        Per-iteration values are therefore approximate with overlap on; the
+        running total is not.
         """
         if not self.config.greedy_packing:
             return None
-        return sum(stream.consumed_samples for stream in self._greedy_streams.values())
+        return sum(
+            stream.consumed_samples
+            for stream, forward_only in self._greedy_streams.values()
+            if not forward_only
+        )
 
     def _capture_window(self, data_iterators, num_microbatches: int) -> MdpIterationWindow:
         if not self.config.greedy_packing:

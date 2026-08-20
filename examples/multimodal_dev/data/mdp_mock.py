@@ -184,7 +184,7 @@ class MdpThdMockDataset(Dataset):
 GREEDY_SAMPLE_SAFETY = 1.5
 
 
-def _greedy_sample_scale(args, length_config):
+def _greedy_sample_scale(args, scenarios):
     """Scale factor for the synthetic dataset length under greedy packing.
 
     Megatron sizes the dataset as ``train_iters * global_batch_size`` samples.
@@ -201,8 +201,7 @@ def _greedy_sample_scale(args, length_config):
         return 1.0
     budget = int(args.max_seqlen_per_dp_cp_rank) * int(args.context_parallel_size)
     cap = getattr(args, "thd_max_packed_sequences", None)
-    pool = build_scenarios(length_config=length_config)
-    mean_len = sum(scenario_totals(s)[0] for s in pool) / len(pool)
+    mean_len = sum(scenario_totals(s)[0] for s in scenarios) / len(scenarios)
     samples_per_bin = budget / mean_len
     if cap:
         samples_per_bin = min(samples_per_bin, float(cap))
@@ -219,12 +218,15 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         from megatron.training.datasets.utils import load_json_arg
 
         length_config = load_json_arg(length_config)
+    # Built once and shared: the pool is a deterministic function of the length
+    # config, and drawing it re-samples a million lognormal lengths.
+    scenarios = build_scenarios(length_config=length_config)
     kwargs = dict(
         vocab_size=getattr(args, "padded_vocab_size", 1024),
         image_token_id=getattr(args, "image_token_id", QWEN35_VL_IMAGE_TOKEN_ID),
-        length_config=length_config,
+        scenarios=scenarios,
     )
-    scale = _greedy_sample_scale(args, length_config)
+    scale = _greedy_sample_scale(args, scenarios)
     return tuple(
         MdpThdMockDataset(num_samples=math.ceil(n * scale), seed=1234 + split, **kwargs)
         for split, n in enumerate(train_val_test_num_samples)
