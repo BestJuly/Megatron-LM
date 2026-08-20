@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Checkpoint facade tests: torch_dist weight-only round trip of the encoder
-state with WORLD replica metadata.
+"""Checkpoint facade tests: torch_dist round trip of the encoder state with
+WORLD replica metadata.
 
 Run with::
 
@@ -18,7 +18,8 @@ from megatron.core import dist_checkpointing
 from megatron.core.mdp.checkpoint import (
     ENCODER_STATE_KEY,
     add_encoder_state,
-    assert_weight_only_checkpoint,
+    assert_supported_checkpoint_config,
+    load_encoder_state,
 )
 from megatron.core.mdp.errors import MdpCheckpointError
 
@@ -36,56 +37,41 @@ if _DISTRIBUTED:
         Utils.destroy_model_parallel()
 
 
-def test_weight_only_contract_is_enforced():
-    good = SimpleNamespace(
+def test_exact_resume_flags_are_accepted():
+    """Optimizer, LR-scheduler and RNG state round-trip, so the native
+    `--no-*-optim`/`--no-*-rng` flags must no longer be demanded."""
+    exact_resume = SimpleNamespace(
         save="/tmp/x",
         load="/tmp/x",
-        no_save_optim=True,
-        no_save_rng=True,
-        no_load_optim=True,
-        no_load_rng=True,
+        no_save_optim=False,
+        no_save_rng=False,
+        no_load_optim=False,
+        no_load_rng=False,
         ckpt_fully_parallel_save=False,
         ckpt_fully_parallel_load=False,
     )
-    assert_weight_only_checkpoint(good)
-    for missing in ("no_save_optim", "no_save_rng"):
-        args = SimpleNamespace(
-            save="/tmp/x",
-            load=None,
-            no_save_optim=True,
-            no_save_rng=True,
-            ckpt_fully_parallel_save=False,
-        )
-        setattr(args, missing, False)
-        with pytest.raises(MdpCheckpointError, match=missing.replace("_", "-")):
-            assert_weight_only_checkpoint(args)
+    assert_supported_checkpoint_config(exact_resume)
+    no_ckpt = SimpleNamespace(save=None, load=None)
+    assert_supported_checkpoint_config(no_ckpt)
+
+
+def test_fully_parallel_modes_are_rejected():
     # Megatron defaults ckpt_fully_parallel_save=True: it must be rejected
     # when saving (the fully-parallel path shards over one DP-CP group for
     # every child, which is wrong for the encoder's WORLD replica domain).
-    fully_parallel = SimpleNamespace(
-        save="/tmp/x",
-        load=None,
-        no_save_optim=True,
-        no_save_rng=True,
-        ckpt_fully_parallel_save=True,
-    )
+    fully_parallel_save = SimpleNamespace(save="/tmp/x", load=None, ckpt_fully_parallel_save=True)
     with pytest.raises(MdpCheckpointError, match="fully-parallel-save"):
-        assert_weight_only_checkpoint(fully_parallel)
-    no_ckpt = SimpleNamespace(save=None, load=None)
-    assert_weight_only_checkpoint(no_ckpt)
+        assert_supported_checkpoint_config(fully_parallel_save)
+    fully_parallel_load = SimpleNamespace(save=None, load="/tmp/x", ckpt_fully_parallel_load=True)
+    with pytest.raises(MdpCheckpointError, match="fully-parallel-load"):
+        assert_supported_checkpoint_config(fully_parallel_load)
 
 
 def test_unsupported_checkpoint_execution_modes_rejected():
     # Design doc section 12: asynchronous, non-persistent, and constant-
     # structure caching modes must fail at startup when a save/load is
     # requested; checkpoint-free runs are unaffected.
-    base = dict(
-        save="/tmp/x",
-        load=None,
-        no_save_optim=True,
-        no_save_rng=True,
-        ckpt_fully_parallel_save=False,
-    )
+    base = dict(save="/tmp/x", load=None, ckpt_fully_parallel_save=False)
     for field, match in (
         ("async_save", "async-save"),
         ("ckpt_assume_constant_structure", "constant-structure"),
@@ -93,15 +79,15 @@ def test_unsupported_checkpoint_execution_modes_rejected():
         args = SimpleNamespace(**base)
         setattr(args, field, True)
         with pytest.raises(MdpCheckpointError, match=match):
-            assert_weight_only_checkpoint(args)
+            assert_supported_checkpoint_config(args)
     args = SimpleNamespace(**base, non_persistent_ckpt_type="global")
     with pytest.raises(MdpCheckpointError, match="non-persistent"):
-        assert_weight_only_checkpoint(args)
+        assert_supported_checkpoint_config(args)
     # The same flags are ignored when no checkpoint is requested.
     quiet = SimpleNamespace(
         save=None, load=None, async_save=True, ckpt_assume_constant_structure=True
     )
-    assert_weight_only_checkpoint(quiet)
+    assert_supported_checkpoint_config(quiet)
 
 
 def test_add_encoder_state_rejects_duplicates():
@@ -113,6 +99,29 @@ def test_add_encoder_state_rejects_duplicates():
     assert state[ENCODER_STATE_KEY] == {"marker": "vision_model."}
     with pytest.raises(MdpCheckpointError, match="exactly once"):
         add_encoder_state(state, _FakeDdp())
+
+
+def test_load_encoder_state_strips_both_prefix_levels():
+    class _FakeDdp:
+        def __init__(self):
+            self.loaded = None
+            self.strict = None
+
+        def load_state_dict(self, state_dict, strict=True):
+            self.loaded = state_dict
+            self.strict = strict
+
+    encoder = _FakeDdp()
+    load_encoder_state(
+        {ENCODER_STATE_KEY: {"vision_model.module.proj.weight": "w"}}, encoder, strict=False
+    )
+    assert encoder.loaded == {"proj.weight": "w"}
+    assert encoder.strict is False
+
+    with pytest.raises(MdpCheckpointError, match=ENCODER_STATE_KEY):
+        load_encoder_state({"model": {}}, _FakeDdp())
+    with pytest.raises(MdpCheckpointError, match="drifted apart"):
+        load_encoder_state({ENCODER_STATE_KEY: {"proj.weight": "w"}}, _FakeDdp())
 
 
 @pytest.mark.skipif(not _DISTRIBUTED, reason="needs torchrun world")
@@ -183,15 +192,9 @@ def test_encoder_state_round_trips_strictly(tmp_path_factory):
     dist_checkpointing.save(state[ENCODER_STATE_KEY], directory)
     torch.distributed.barrier()
 
-    load_skeleton = add_encoder_state({}, target)[ENCODER_STATE_KEY]
-    loaded = dist_checkpointing.load(load_skeleton, directory)
-    # The DDP wrapper contributes a "module." level under the logical prefix;
-    # DDP.load_state_dict delegates to the inner module, so strip both.
-    prefix = "vision_model.module."
-    assert all(key.startswith(prefix) for key in loaded)
-    target.load_state_dict(
-        {key[len(prefix) :]: value for key, value in loaded.items()}, strict=True
-    )
+    load_skeleton = add_encoder_state({}, target)
+    loaded = dist_checkpointing.load(load_skeleton[ENCODER_STATE_KEY], directory)
+    load_encoder_state({ENCODER_STATE_KEY: loaded}, target, strict=True)
 
     with torch.no_grad():
         for source_param, target_param in zip(

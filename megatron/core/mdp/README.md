@@ -51,7 +51,7 @@ schedule model list.
 | `window.py` / `activation.py` | Iteration window with VPP replay cursors; forward handle, chunking, encoder THD params |
 | `runtime.py` / `schedule.py` | Phase machine; schedule and finalizer wrappers |
 | `encoder.py` / `optimizer.py` | Encoder DDP over WORLD + ZeRO-1; composite optimizer with WORLD overflow union |
-| `checkpoint.py` | Weight-only torch_dist facade (`vision_model.*` with WORLD replica metadata) |
+| `checkpoint.py` | torch_dist facade: `vision_model.*` save and load with WORLD replica metadata |
 | `integration.py` / `observability.py` | Training-loop seams; iteration metrics and NVTX markers |
 
 ## Support matrix (v1)
@@ -61,14 +61,16 @@ Supported: Qwen3.5-VL (one vision encoder), `TP=1`, decoder `CP=1`,
 `calculate_per_token_loss=True`, bf16 main path (fp16 covered by
 overflow-union tests), THD packed sequences on both sides, native MCore vision
 recompute (`None`/`selective`/`full`) via the override channel, text-only
-microbatches, synchronous global `torch_dist` weight-only checkpoints,
+microbatches, synchronous global `torch_dist` checkpoints with exact resume
+(model, optimizer, LR-scheduler and RNG state at the same world size),
 `alignment_rows=1` (tests exercise 16).
 
 Rejected at startup: FSDP/HSDP, FP8/MXFP8, full-iteration CUDA graphs, CPU
 activation offload, comm overlap (`overlap_grad_reduce`,
 `overlap_param_gather`, delayed reduction), multiple distributed-optimizer
 instances, `calculate_per_token_loss=False`, non-`torch_dist` checkpoint
-formats, non-weight-only save/load, invalid rank mappings.
+formats, fully-parallel / asynchronous / non-persistent / constant-structure
+checkpoint modes, invalid rank mappings.
 
 Registered extension hooks (each exercised by a test at a non-degenerate
 value): logical workers + `worker_ranks()` for encoder CP, single-valued

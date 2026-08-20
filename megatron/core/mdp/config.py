@@ -298,7 +298,7 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "checkpoint_mode",
             options.checkpoint_mode,
             f"checkpoint_mode == '{SUPPORTED_CHECKPOINT_MODE}'",
-            "Only the synchronous global torch_dist weight-only checkpoint is "
+            "Only the synchronous global torch_dist checkpoint is "
             "supported; fully-parallel, local, asynchronous, non-persistent, and "
             "constant-structure caching modes are rejected.",
             SUPPORTED_CHECKPOINT_MODE,
