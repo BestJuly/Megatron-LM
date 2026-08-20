@@ -17,12 +17,13 @@ dispatch, producer THD packing, endpoint reassembly, and gradient reverse
 routing can be verified element by element.
 """
 
+import math
 from typing import Optional, Sequence
 
 import torch
 from torch.utils.data import Dataset
 
-from examples.multimodal_dev.data.mdp_scenarios import build_scenarios
+from examples.multimodal_dev.data.mdp_scenarios import build_scenarios, scenario_totals
 from examples.multimodal_dev.models.qwen35_vl.configuration import (
     QWEN35_VL_IMAGE_TOKEN_ID,
     QWEN35_VL_VISION_START_TOKEN_ID,
@@ -63,6 +64,10 @@ class MdpThdMockDataset(Dataset):
             ``(grids, text_chunk_lengths)`` with ``len(text_chunks) ==
             len(grids) + 1`` (text before/between/after vision blocks; the
             text-only scenario uses one chunk).
+        length_config: Optional ``--mdp-mock-dataset-config-json`` payload
+            controlling the per-sample *total* token length distribution
+            (same schema as ``--varlen-mock-dataset-config-json``). Ignored
+            when ``scenarios`` is given.
     """
 
     def __init__(
@@ -76,6 +81,7 @@ class MdpThdMockDataset(Dataset):
         spatial_merge_size: int = 2,
         seed: int = 1234,
         scenarios: Optional[Sequence] = None,
+        length_config: Optional[dict] = None,
     ):
         self.num_samples = num_samples
         self.vocab_size = vocab_size
@@ -85,7 +91,14 @@ class MdpThdMockDataset(Dataset):
         self.temporal_patch_size = temporal_patch_size
         self.spatial_merge_size = spatial_merge_size
         self.seed = seed
-        self.scenarios = tuple(scenarios) if scenarios is not None else _SCENARIOS
+        if scenarios is not None:
+            self.scenarios = tuple(scenarios)
+        elif length_config is not None:
+            # Rebuilt independently on every rank; build_scenarios is seeded
+            # from the fixed GENERATOR_SEED so the pools stay identical.
+            self.scenarios = build_scenarios(length_config=length_config)
+        else:
+            self.scenarios = _SCENARIOS
         self.pixel_dim = 3 * temporal_patch_size * patch_size * patch_size
         for grids, text_chunks in self.scenarios:
             expected_chunks = len(grids) + 1 if grids else 1
@@ -165,16 +178,54 @@ class MdpThdMockDataset(Dataset):
         }
 
 
+#: Extra margin on top of the computed greedy sample requirement. The mean
+#: sample length only predicts the *average* bin occupancy; individual bins run
+#: short or long, and the shortfall compounds across iterations.
+GREEDY_SAMPLE_SAFETY = 1.5
+
+
+def _greedy_sample_scale(args, length_config):
+    """Scale factor for the synthetic dataset length under greedy packing.
+
+    Megatron sizes the dataset as ``train_iters * global_batch_size`` samples.
+    Under ``--mdp-greedy-packing`` that is a *bin* count, not a sample count:
+    each bin swallows roughly ``token_budget / mean_sample_len`` samples instead
+    of exactly ``micro_batch_size``. Whenever the mean sample is shorter than
+    ``token_budget / micro_batch_size`` the stream runs dry mid-run. The mock
+    dataset is a pure function of the sample index, so enlarging it costs
+    nothing and changes no sample's content.
+
+    Returns 1.0 when greedy packing is off, so the default path is unchanged.
+    """
+    if not getattr(args, "mdp_greedy_packing", False):
+        return 1.0
+    budget = int(args.max_seqlen_per_dp_cp_rank) * int(args.context_parallel_size)
+    cap = getattr(args, "thd_max_packed_sequences", None)
+    pool = build_scenarios(length_config=length_config)
+    mean_len = sum(scenario_totals(s)[0] for s in pool) / len(pool)
+    samples_per_bin = budget / mean_len
+    if cap:
+        samples_per_bin = min(samples_per_bin, float(cap))
+    return max(1.0, samples_per_bin / int(args.micro_batch_size)) * GREEDY_SAMPLE_SAFETY
+
+
 def train_valid_test_datasets_provider(train_val_test_num_samples):
     """Provide MDP mock train / val / test datasets."""
     from megatron.training import get_args
 
     args = get_args()
+    length_config = getattr(args, "mdp_mock_dataset_config_json", None)
+    if length_config is not None:
+        from megatron.training.datasets.utils import load_json_arg
+
+        length_config = load_json_arg(length_config)
     kwargs = dict(
         vocab_size=getattr(args, "padded_vocab_size", 1024),
         image_token_id=getattr(args, "image_token_id", QWEN35_VL_IMAGE_TOKEN_ID),
+        length_config=length_config,
     )
+    scale = _greedy_sample_scale(args, length_config)
     return tuple(
-        MdpThdMockDataset(num_samples=n, seed=1234 + split, **kwargs)
+        MdpThdMockDataset(num_samples=math.ceil(n * scale), seed=1234 + split, **kwargs)
         for split, n in enumerate(train_val_test_num_samples)
     )

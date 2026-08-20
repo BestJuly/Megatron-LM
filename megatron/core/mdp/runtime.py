@@ -34,6 +34,7 @@ from megatron.core.mdp.config import MdpConfig
 from megatron.core.mdp.encoder import EncoderDomain, finalize_encoder_grads
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
 from megatron.core.mdp.groups import MdpProcessGroups, broadcast_descriptors
+from megatron.core.mdp.packing import GreedySampleStream, decoder_sample_length
 from megatron.core.mdp.observability import (
     MdpIterationMetrics,
     nvtx_phase,
@@ -77,6 +78,9 @@ class MdpRuntime:
         params_dtype: torch.dtype,
         num_vpp_chunks: int = 1,
         device: Optional[torch.device] = None,
+        greedy_token_budget: Optional[int] = None,
+        greedy_max_num_seqs: Optional[int] = None,
+        greedy_row_alignment: int = 1,
     ) -> None:
         self.config = config
         self.rank_map = rank_map
@@ -122,6 +126,15 @@ class MdpRuntime:
         self._prefetch_thread = None
         self._prefetch_box: Optional[dict] = None
         self._prefetch_stream: Optional[torch.cuda.Stream] = None
+        # Greedy token-budget packing (--mdp-greedy-packing). One
+        # GreedySampleStream per underlying data iterator, so train and eval keep
+        # independent sample buffers: an eval window must never consume (or be
+        # consumed by) the training stream's leftovers. Keyed by iterator
+        # identity, which the training loop keeps stable for the whole run.
+        self._greedy_token_budget = greedy_token_budget
+        self._greedy_max_num_seqs = greedy_max_num_seqs
+        self._greedy_row_alignment = greedy_row_alignment
+        self._greedy_streams: dict = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -501,7 +514,62 @@ class MdpRuntime:
     # Internals
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _first_iterator(data_iterators):
+        if isinstance(data_iterators, (list, tuple)):
+            return data_iterators[0] if data_iterators else None
+        return data_iterators
+
+    def _greedy_stream(self, data_iterators):
+        """The greedy sample stream for this data iterator, created on first use."""
+        iterator = self._first_iterator(data_iterators)
+        stream = self._greedy_streams.get(id(iterator))
+        if stream is None:
+            stream = GreedySampleStream(
+                iterator,
+                token_budget=self._greedy_token_budget,
+                max_num_seqs=self._greedy_max_num_seqs,
+                align=self._greedy_row_alignment,
+                length_of=decoder_sample_length,
+            )
+            self._greedy_streams[id(iterator)] = stream
+        return stream
+
+    def consumed_samples(self) -> Optional[int]:
+        """Real samples drained by greedy packing so far, or ``None`` when off.
+
+        Sums every stream (train and eval) this rank owns. ``training.py`` reads
+        the delta per iteration because the closed form
+        ``dp x mbs x num_microbatches`` is wrong under greedy packing.
+        """
+        if not self.config.greedy_packing:
+            return None
+        return sum(stream.consumed_samples for stream in self._greedy_streams.values())
+
     def _capture_window(self, data_iterators, num_microbatches: int) -> MdpIterationWindow:
+        if not self.config.greedy_packing:
+            return self._capture(data_iterators, num_microbatches)
+        stream = self._greedy_stream(data_iterators)
+        try:
+            return self._capture(stream, num_microbatches)
+        except MdpStateError as error:
+            if not stream.exhausted:
+                raise
+            # Greedy fills a fixed number of bins to a token budget, so an
+            # iteration eats roughly token_budget/mean_sample_len samples per
+            # bin, not micro_batch_size. Megatron provisions the sampler as
+            # train_iters x global_batch_size *samples*, which under-counts
+            # whenever the mean sample is shorter than the per-bin share.
+            raise MdpStateError(
+                f"{error} Under --mdp-greedy-packing the sample stream must be "
+                "provisioned by tokens, not by samples: each bin consumes about "
+                f"{self._greedy_token_budget} tokens' worth of samples, so raise "
+                "--train-samples / the dataset size (roughly by "
+                "token_budget / (mean_sample_len x micro_batch_size)), or lower "
+                "--max-seqlen-per-dp-cp-rank."
+            ) from error
+
+    def _capture(self, data_iterators, num_microbatches: int) -> MdpIterationWindow:
         return MdpIterationWindow.capture(
             data_iterators,
             num_microbatches=num_microbatches,
