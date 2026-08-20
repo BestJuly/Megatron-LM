@@ -293,6 +293,84 @@ def extend_thd_padding_before_cp_slice(
     return cu_seqlens_padded, max_seqlen, global_target_len
 
 
+def build_static_thd_metadata(
+    cu_seqlens: Tensor,
+    cu_seqlens_padded: Tensor,
+    *,
+    target_len: int,
+    max_num_seqs: int,
+    tail_padding_policy: Literal["append_dummy_seq", "extend_last"],
+    cp_size: int = 1,
+    cp_partition_mode: str = "zigzag",
+) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
+    """Pad already-packed *global* THD metadata to a fixed shape.
+
+    For collators that pack outside ``--sequence-packing-scheduler`` and pad the
+    token-like tensors themselves (see ``thd_static_packing``). Operates on the
+    global, pre-CP-slice metadata, which is where ``extend_last`` must be
+    applied.
+
+    Args:
+        cu_seqlens: Valid-token boundaries, ``num_samples + 1`` entries.
+        cu_seqlens_padded: Physical boundaries, ``num_samples + 1`` entries.
+        target_len: Global physical row count every batch is padded to
+            (``max_seqlen_per_dp_cp_rank * cp_size``).
+        max_num_seqs: ``thd_max_packed_sequences``; both tensors are padded to
+            ``max_num_seqs + 1`` entries.
+        tail_padding_policy: ``extend_last`` keeps the valid coordinates
+            untouched (CP=1 only); ``append_dummy_seq`` represents the tail as an
+            ordinary extra sequence, which also lands in ``cu_seqlens``.
+        cp_size: Context-parallel world size.
+        cp_partition_mode: ``zigzag`` or ``contiguous``.
+
+    Returns:
+        ``(cu_seqlens, cu_seqlens_padded, real_cu_seqlens)``. ``real_cu_seqlens``
+        is the pre-tail valid vector and is not ``None`` only when
+        ``append_dummy_seq`` polluted ``cu_seqlens`` -- FLOPs accounting must use
+        it instead, or the tail is counted as real tokens.
+    """
+    actual_len = int(cu_seqlens_padded[-1].item())
+    assert actual_len <= target_len, (
+        f"Packed THD length ({actual_len}) exceeds the static target ({target_len}). "
+        "Increase --max-seqlen-per-dp-cp-rank, or reduce the number of samples per "
+        "microbatch so the pack fits."
+    )
+
+    real_cu_seqlens = None
+    if actual_len < target_len:
+        if tail_padding_policy == "extend_last":
+            assert cp_size == 1, (
+                "thd_tail_padding_policy='extend_last' needs the global metadata "
+                "extended before CP slicing, which this collator does not do; use "
+                "'append_dummy_seq' with context parallelism."
+            )
+            cu_seqlens_padded = _extend_last_padded_sequence(cu_seqlens_padded, target_len)
+        else:
+            dummy_seq_len = target_len - actual_len
+            if cp_size > 1 and cp_partition_mode == "zigzag":
+                assert dummy_seq_len % (2 * cp_size) == 0, (
+                    f"THD dummy padding length ({dummy_seq_len}) must be divisible by "
+                    f"2 * context_parallel_size ({2 * cp_size}) for zigzag partitioning."
+                )
+            real_cu_seqlens = cu_seqlens
+            if torch.equal(cu_seqlens, cu_seqlens_padded):
+                cu_seqlens = _append_dummy_seq(cu_seqlens, target_len)
+            else:
+                # Gaps already exist between real sequences; the dummy's valid and
+                # physical lengths are both exactly the new tail length.
+                cu_seqlens = _append_dummy_seq(
+                    cu_seqlens, int(cu_seqlens[-1].item()) + dummy_seq_len
+                )
+            cu_seqlens_padded = _append_dummy_seq(cu_seqlens_padded, target_len)
+
+    target_entries = max_num_seqs + 1
+    return (
+        _pad_cu_seqlens(cu_seqlens, target_entries),
+        _pad_cu_seqlens(cu_seqlens_padded, target_entries),
+        real_cu_seqlens,
+    )
+
+
 def _resolve_thd_padding_lengths(
     tokens: Optional[Tensor],
     labels: Optional[Tensor],

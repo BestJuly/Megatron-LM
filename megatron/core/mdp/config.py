@@ -48,6 +48,7 @@ class MdpConfig:
     debug_plan_payload_check: bool = False
     pixel_locality: bool = False
     overlap_window_capture: bool = False
+    greedy_packing: bool = False
 
 
 @dataclass(frozen=True)
@@ -76,6 +77,27 @@ class MdpCompatibilityOptions:
     checkpoint_mode: str
     save_requested: bool
     load_requested: bool
+    sequence_parallel: bool = False
+    sequence_packing_scheduler: Optional[str] = None
+    thd_static_packing: bool = False
+    max_seqlen_per_dp_cp_rank: Optional[int] = None
+    thd_max_packed_sequences: Optional[int] = None
+
+
+def thd_row_alignment(options: "MdpCompatibilityOptions") -> int:
+    """Row alignment the MDP collator pads each packed sample to.
+
+    Mirrors ``pack_or_pad_batch``'s ``divisible_by`` (zigzag CP wants an even
+    per-rank split; SP additionally splits across TP). The greedy token budget
+    must be a multiple of this, or a full bin cannot be partitioned legally.
+    """
+    if options.context_parallel_size > 1:
+        return (
+            options.tensor_parallel_size * options.context_parallel_size * 2
+            if options.sequence_parallel
+            else options.context_parallel_size * 2
+        )
+    return options.tensor_parallel_size if options.sequence_parallel else 1
 
 
 def _reject(option: str, value: Any, condition: str, why: str, suggestion: str = "") -> None:
@@ -150,6 +172,7 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "False",
         )
     _validate_override_entries(config.vision_config_overrides)
+    _validate_packing(config, options)
 
     # --- parallel dimensions and rank mapping preconditions ---
     if options.rank_order != SUPPORTED_RANK_ORDER:
@@ -302,6 +325,58 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "supported; fully-parallel, local, asynchronous, non-persistent, and "
             "constant-structure caching modes are rejected.",
             SUPPORTED_CHECKPOINT_MODE,
+        )
+
+
+def _validate_packing(config: MdpConfig, options: MdpCompatibilityOptions) -> None:
+    """Reject packing configurations MDP cannot honor.
+
+    ``--sequence-packing-scheduler`` is rejected outright, not merely untested:
+    ``training.py`` wraps the data iterator whenever it is set, and
+    ``DpBalancedScheduler.run`` then asserts on GPT-only sample keys, deletes
+    every key outside those six (dropping ``pixel_values`` / ``image_grid_thw``),
+    and reroutes samples across DP with an all-to-all that has no notion of
+    variable-size pixel payloads. Without this rejection the run dies deep inside
+    an assert about a missing ``tokens`` key.
+    """
+    if options.sequence_packing_scheduler is not None:
+        _reject(
+            "sequence_packing_scheduler",
+            options.sequence_packing_scheduler,
+            "sequence_packing_scheduler is None",
+            "MCore's packing schedulers assert on GPT-only sample keys, drop the "
+            "pixel payload, and reroute samples across DP without pixel awareness. "
+            "MDP owns its packing (--mdp-greedy-packing).",
+            "None",
+        )
+    if not config.greedy_packing:
+        return
+    if options.max_seqlen_per_dp_cp_rank is None:
+        _reject(
+            "max_seqlen_per_dp_cp_rank",
+            options.max_seqlen_per_dp_cp_rank,
+            "max_seqlen_per_dp_cp_rank is set when --mdp-greedy-packing is on",
+            "The greedy token budget is max_seqlen_per_dp_cp_rank x "
+            "context_parallel_size; there is no default for it.",
+        )
+    alignment = thd_row_alignment(options)
+    budget = options.max_seqlen_per_dp_cp_rank * options.context_parallel_size
+    if budget % alignment != 0:
+        _reject(
+            "max_seqlen_per_dp_cp_rank",
+            options.max_seqlen_per_dp_cp_rank,
+            f"the greedy token budget ({budget}) is divisible by the collator row "
+            f"alignment ({alignment})",
+            "A bin filled to the budget must still split legally across CP/SP ranks; "
+            "discovering this inside TransformerEngine gives a far worse error.",
+        )
+    if options.thd_max_packed_sequences is not None and options.thd_max_packed_sequences < 1:
+        _reject(
+            "thd_max_packed_sequences",
+            options.thd_max_packed_sequences,
+            "thd_max_packed_sequences >= 1",
+            "It caps the real sequences per greedy bin.",
+            "8",
         )
 
 

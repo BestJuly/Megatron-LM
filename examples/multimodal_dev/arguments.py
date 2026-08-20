@@ -169,6 +169,40 @@ def add_multimodal_args(parser):
         ),
     )
     group.add_argument(
+        "--mdp-greedy-packing",
+        action="store_true",
+        default=False,
+        help=(
+            "Fill each decoder microbatch to a token budget "
+            "(--max-seqlen-per-dp-cp-rank x CP) by consuming as many samples as "
+            "it takes, instead of a fixed --micro-batch-size count. "
+            "IMPORTANT: this REINTERPRETS --micro-batch-size and "
+            "--global-batch-size. They no longer describe what goes into a "
+            "microbatch; they only set the number of bins per iteration "
+            "(N = GBS / (MBS x DP)). The sample count per iteration then floats, "
+            "so --global-batch-size means 'N x token budget' and loss curves are "
+            "not iteration-by-iteration comparable against a fixed-GBS run. "
+            "Requires --max-seqlen-per-dp-cp-rank. Independent of "
+            "--thd-static-packing."
+        ),
+    )
+    group.add_argument(
+        "--mdp-mock-dataset-config-json",
+        type=str,
+        default=None,
+        help=(
+            "Sequence-length distribution for the MDP mock dataset, as JSON or "
+            "a path to a JSON file. Same schema as "
+            "--varlen-mock-dataset-config-json, e.g. "
+            '\'{"mode":"distribution","type":"lognormal","min_seq_len":512,'
+            '"max_seq_len":4096,"mean_seq_len":2048,"lognormal_sigma":1.1}\'. '
+            "A dedicated flag because --varlen-mock-dataset-config-json is only "
+            "honored under --use-varlen-dataset, which auto-sets the packing "
+            "scheduler MDP must not have. Unset keeps the built-in "
+            "[1000, 2000] uniform range."
+        ),
+    )
+    group.add_argument(
         "--mdp-debug-plan-payload-check",
         action="store_true",
         default=False,

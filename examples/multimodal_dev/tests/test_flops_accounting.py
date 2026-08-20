@@ -23,7 +23,9 @@ class _Wrapper:
 def test_workload_stats_report_once_per_physical_rank(monkeypatch, vp_stage, expected_calls):
     """Only the canonical VPP chunk reports a physical rank's micro-batch."""
     calls = []
-    monkeypatch.setattr(forward_step, "accumulate_flops_stats", lambda _: calls.append("decoder"))
+    monkeypatch.setattr(
+        forward_step, "accumulate_flops_stats", lambda *_, **__: calls.append("decoder")
+    )
     monkeypatch.setattr(
         forward_step,
         "accumulate_vision_flops_stats_from_items",
@@ -44,7 +46,9 @@ def test_workload_stats_native_path_uses_grid_metadata(monkeypatch):
     """The native path keeps reporting grid-based vision statistics."""
     calls = []
     grid = object()
-    monkeypatch.setattr(forward_step, "accumulate_flops_stats", lambda _: calls.append("decoder"))
+    monkeypatch.setattr(
+        forward_step, "accumulate_flops_stats", lambda *_, **__: calls.append("decoder")
+    )
     monkeypatch.setattr(
         forward_step,
         "accumulate_vision_flops_stats_from_grids",
