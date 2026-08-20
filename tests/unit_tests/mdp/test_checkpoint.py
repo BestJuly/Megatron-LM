@@ -103,9 +103,15 @@ def test_add_encoder_state_rejects_duplicates():
 
 def test_load_encoder_state_strips_both_prefix_levels():
     class _FakeDdp:
-        def __init__(self):
+        def __init__(self, keys=("proj.weight",)):
             self.loaded = None
             self.strict = None
+            self._keys = keys
+
+        def state_dict(self):
+            # `load_encoder_state` compares the checkpoint's keys against the
+            # module's own before delegating, so the double must expose them.
+            return {key: None for key in self._keys}
 
         def load_state_dict(self, state_dict, strict=True):
             self.loaded = state_dict
@@ -124,21 +130,109 @@ def test_load_encoder_state_strips_both_prefix_levels():
         load_encoder_state({ENCODER_STATE_KEY: {"proj.weight": "w"}}, _FakeDdp())
 
 
+class _RealDdp(torch.nn.Module):
+    """Stand-in with the same ``load_state_dict`` contract as the encoder DDP.
+
+    ``_BaseDataParallel.load_state_dict`` forwards to the wrapped module and
+    returns ``None``, so a caller cannot learn which keys were missing from its
+    return value -- which is why the guard below checks the keys up front.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.module = torch.nn.Linear(4, 4, bias=False)
+
+    def state_dict(self, *args, **kwargs):
+        return self.module.state_dict(*args, **kwargs)
+
+    def load_state_dict(self, state_dict, strict=True):
+        self.module.load_state_dict(state_dict, strict=strict)
+
+
+def test_load_encoder_state_rejects_missing_keys_even_when_not_strict():
+    """A relaxed load must not leave the encoder randomly initialized.
+
+    ``strict`` reaches :func:`load_encoder_state` from ``load_checkpoint``'s own
+    parameter, and ``torch.nn.Module.load_state_dict(strict=False)`` reports
+    missing keys instead of raising. The encoder is fully replicated and is
+    always written whole, so a key that is absent here means the state did not
+    round-trip -- there is no "empty stage" case to tolerate, unlike a decoder
+    chunk. Silently skipping it would resume training from the random
+    initialization, which is exactly the failure ``load_encoder_state`` exists
+    to prevent.
+    """
+    encoder = _RealDdp()
+    complete = {
+        "vision_model.module." + key: value for key, value in encoder.module.state_dict().items()
+    }
+    load_encoder_state({ENCODER_STATE_KEY: complete}, encoder, strict=False)
+
+    with pytest.raises(MdpCheckpointError, match="missing"):
+        load_encoder_state({ENCODER_STATE_KEY: {}}, _RealDdp(), strict=False)
+    with pytest.raises(MdpCheckpointError, match="missing"):
+        load_encoder_state({ENCODER_STATE_KEY: {}}, _RealDdp(), strict=True)
+
+
+class _ExtraStateLinear(torch.nn.Linear):
+    """A layer with TransformerEngine's extra-state contract.
+
+    Overriding ``get_extra_state``/``set_extra_state`` is what makes
+    ``torch.nn.Module`` publish an ``_extra_state`` key in ``state_dict()`` and,
+    under ``strict=True``, demand it back on load -- the same contract TE's
+    layers carry.
+    """
+
+    def get_extra_state(self):
+        return {"fp8_meta": None}
+
+    def set_extra_state(self, state):
+        pass
+
+
+def test_load_encoder_state_tolerates_absent_te_extra_state():
+    """TE's ``_extra_state`` entries hold no weights and may be absent.
+
+    A real TE encoder publishes ``..._extra_state`` keys in ``state_dict()``
+    that the sharded state dict does not always carry, so the weight check must
+    exempt them -- and so must the delegated load, which would otherwise reject
+    the very same keys one line later. ``megatron.training.checkpointing``'s
+    ``load_model_state_dict`` gives every decoder chunk that tolerance already;
+    the encoder must not be stricter than the decoder it trains beside.
+
+    The double deliberately does *not* override ``load_state_dict``:
+    ``_BaseDataParallel.load_state_dict`` forwards ``strict`` verbatim, so a
+    double that dropped it would hide the mismatch this test exists to pin down.
+    """
+
+    class _ExtraStateDdp(_RealDdp):
+        def __init__(self):
+            super().__init__()
+            self.module = _ExtraStateLinear(4, 4, bias=False)
+
+    encoder = _ExtraStateDdp()
+    assert "_extra_state" in encoder.state_dict()
+    weights = {"vision_model.module.weight": torch.full((4, 4), 3.0)}
+
+    load_encoder_state({ENCODER_STATE_KEY: weights}, encoder, strict=True)
+    assert torch.equal(encoder.module.weight, torch.full((4, 4), 3.0))
+
+    # The weight guard still fires for the same module: exempting extra state
+    # must not have relaxed the check that keeps the encoder off its random
+    # initialization.
+    with pytest.raises(MdpCheckpointError, match="missing"):
+        load_encoder_state({ENCODER_STATE_KEY: {}}, _ExtraStateDdp(), strict=True)
+
+
 @pytest.mark.skipif(not _DISTRIBUTED, reason="needs torchrun world")
 def test_encoder_state_round_trips_strictly(tmp_path_factory):
-    from megatron.core.distributed import (
-        DistributedDataParallel,
-        DistributedDataParallelConfig,
-    )
-    from megatron.core.mdp.groups import MdpGroupRegistry, install_mdp_process_groups
+    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
     from megatron.core.mdp.encoder import build_encoder_pg_collection
+    from megatron.core.mdp.groups import MdpGroupRegistry, install_mdp_process_groups
     from megatron.core.mdp.rank_mapping import MdpRankSpec, build_rank_map
     from megatron.core.transformer.transformer_config import TransformerConfig
 
     world = torch.distributed.get_world_size()
-    rank_map = build_rank_map(
-        MdpRankSpec(world_size=world, tp=1, pp=2, cp=1, ep=1, encoder_cp=1)
-    )
+    rank_map = build_rank_map(MdpRankSpec(world_size=world, tp=1, pp=2, cp=1, ep=1, encoder_cp=1))
     groups = install_mdp_process_groups(rank_map, group_registry=MdpGroupRegistry())
     encoder_pgs = build_encoder_pg_collection(rank_map, encoder_cp=1, process_groups=groups)
 

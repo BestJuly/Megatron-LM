@@ -72,6 +72,26 @@ instances, `calculate_per_token_loss=False`, non-`torch_dist` checkpoint
 formats, fully-parallel / asynchronous / non-persistent / constant-structure
 checkpoint modes, invalid rank mappings.
 
+### Checkpoint support matrix
+
+Every "supported" row below was measured on 4x GB300 with the tiny MDP proxy
+(4 decoder layers, 8 experts top-2, 2 vision layers, seq 1024, GBS 8, seed
+1234), `--ckpt-format torch_dist --no-ckpt-fully-parallel-save`. Deltas are
+against the trajectory the checkpoint was taken from; the run-to-run floor for
+this shape is ~8.6e-2 in grad norm.
+
+| Scenario | Status | Evidence |
+|---|---|---|
+| MDP -> MDP, identical parallel layout, full resume (model + optimizer + LR scheduler + RNG) | **Supported** | Resumed iterations reproduce the reference at d=0.000E+00 except one iteration at 4.6e-3, inside the floor |
+| Cross-PP restart, weights only (`--no-load-optim`) | **Supported** | PP=2 save -> PP=4 load: the first resumed iteration matches the PP=2 source exactly in loss *and* grad norm; later iterations drift as expected without optimizer state |
+| Cross-PP restart **with** optimizer state, saved with `--dist-ckpt-optim-fully-reshardable` | **Supported** | Same save/load pair tracks the source to 1e-3 grad norm and 1.2e-4 loss -- two orders tighter than weight-only, and tighter than the floor |
+| Cross-PP restart with optimizer state, checkpoint saved with the defaults | **Rejected, by design** | Upstream raises before training starts (`distrib_optim_sharding_type == 'dp_reshardable'`). The flag is a **save-time** decision; a checkpoint already written without it can only be restarted weight-only. Note the upstream message names `--ckpt-fully-parallel-save`, which is a different flag and is itself rejected under MDP |
+| Checkpoint missing encoder weights (e.g. a non-strict `--dist-ckpt-strictness` dropped them) | **Rejected, loudly** | `load_encoder_state` raises `MdpCheckpointError` instead of resuming from the random initialization |
+| TransformerEngine `_extra_state` drift between the checkpoint and the running TE | **Tolerated** | The delegated load retries non-strictly, matching what `load_model_state_dict` gives every decoder chunk |
+| Cross-TP / cross-EP / cross-CP restart, and changing the world size | **Untested** | Only the pipeline dimension was moved; no claim either way |
+| native (non-MDP) checkpoint -> MDP, or MDP -> native | **Not supported** | Decoder keys line up, but the encoder is saved through its DDP wrapper and carries an extra `module.` level (`vision_model.module.<param>` vs `vision_model.<param>`) |
+| Fully-parallel save/load, asynchronous, non-persistent, constant-structure caching, non-`torch_dist` formats | **Rejected at startup** | `assert_supported_checkpoint_config` and `validate_mdp_config` |
+
 Registered extension hooks (each exercised by a test at a non-degenerate
 value): logical workers + `worker_ranks()` for encoder CP, single-valued
 endpoints + multi-slice routes for decoder CP, the vision config override

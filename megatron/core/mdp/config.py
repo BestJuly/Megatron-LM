@@ -25,12 +25,7 @@ SUPPORTED_CHECKPOINT_MODE = "torch_dist"
 # Keys that may be overridden on the vision TransformerConfig. Field semantics and
 # cross-field validation are delegated entirely to MCore's own __post_init__.
 VISION_CONFIG_OVERRIDE_ALLOWLIST: frozenset = frozenset(
-    {
-        "recompute_granularity",
-        "recompute_method",
-        "recompute_num_layers",
-        "recompute_modules",
-    }
+    {"recompute_granularity", "recompute_method", "recompute_num_layers", "recompute_modules"}
 )
 
 
@@ -268,8 +263,7 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "overlap_grad_reduce",
             options.overlap_grad_reduce,
             "overlap_grad_reduce == False",
-            "Encoder communication must not overlap the decoder schedule or the "
-            "optimizer step.",
+            "Encoder communication must not overlap the decoder schedule or the " "optimizer step.",
             "False",
         )
     if options.overlap_param_gather:
@@ -277,8 +271,7 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "overlap_param_gather",
             options.overlap_param_gather,
             "overlap_param_gather == False",
-            "Encoder communication must not overlap the decoder schedule or the "
-            "optimizer step.",
+            "Encoder communication must not overlap the decoder schedule or the " "optimizer step.",
             "False",
         )
     if options.delay_grad_reduce:

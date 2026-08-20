@@ -80,9 +80,7 @@ class MdpChainedOptimizer(ChainedOptimizer):
             unified = bool(inf_flag.item() > 0.0)
             if unified != found_inf:
                 logger.debug(
-                    "MDP: overflow flag unified over WORLD: local=%s global=%s",
-                    found_inf,
-                    unified,
+                    "MDP: overflow flag unified over WORLD: local=%s global=%s", found_inf, unified
                 )
             found_inf = unified
 

@@ -39,6 +39,13 @@ ENCODER_STATE_PREFIX = "vision_model."
 #: child — so both levels come off before the state is handed back.
 _DDP_CHILD_PREFIX = "module."
 
+#: TransformerEngine's per-module opaque state. It appears in ``state_dict()``
+#: but not necessarily in the sharded state dict, and holds no weights. This
+#: mirrors the producing side's ``extra_state_suffix`` default in
+#: :func:`megatron.core.transformer.utils.make_sharded_tensors_for_checkpoint`;
+#: keep the two in step if core ever renames it.
+_EXTRA_STATE_SUFFIX = "_extra_state"
+
 
 def encoder_sharded_state_dict(encoder_ddp) -> Mapping:
     """The encoder's sharded model-weight state with WORLD replica metadata.
@@ -48,8 +55,7 @@ def encoder_sharded_state_dict(encoder_ddp) -> Mapping:
     every PP stage claim a distinct (wrong) replica coordinate.
     """
     return encoder_ddp.sharded_state_dict(
-        prefix=ENCODER_STATE_PREFIX,
-        metadata={"dp_cp_group": torch.distributed.group.WORLD},
+        prefix=ENCODER_STATE_PREFIX, metadata={"dp_cp_group": torch.distributed.group.WORLD}
     )
 
 
@@ -88,7 +94,42 @@ def load_encoder_state(state_dict: Mapping, encoder_ddp, *, strict: bool = True)
                 "encoder save and load skeletons have drifted apart."
             )
         inner[key[len(prefix) :]] = value
-    encoder_ddp.load_state_dict(inner, strict=strict)
+
+    # ``strict`` arrives from ``load_checkpoint``'s own parameter, and
+    # ``load_state_dict(strict=False)`` merely reports missing keys -- and
+    # ``_BaseDataParallel.load_state_dict`` drops even that report, returning
+    # ``None``. The encoder is replicated and always written whole, so there is
+    # no "empty stage" case to tolerate here the way there is for a decoder
+    # chunk: an absent key means the state did not round-trip, and skipping it
+    # would resume from the random initialization. Check before delegating.
+    #
+    # TransformerEngine's ``_extra_state`` entries are exempt: they are present
+    # in ``state_dict()`` but the sharded state dict legitimately omits the ones
+    # whose modules contribute no persistent extra state, and they carry no
+    # weights, so their absence cannot leave a randomly initialized encoder.
+    expected = {key for key in encoder_ddp.state_dict() if not key.endswith(_EXTRA_STATE_SUFFIX)}
+    missing = sorted(expected - set(inner))
+    if missing:
+        raise MdpCheckpointError(
+            f"MDP: the checkpoint is missing {len(missing)} encoder tensor(s), "
+            f"first {missing[:5]}; the encoder would stay randomly initialized. "
+            "A non-strict --dist-ckpt-strictness drops the keys the checkpoint "
+            "cannot supply, which is how they get here."
+        )
+
+    # The check above already enforces the property that matters, so a strict
+    # failure below can only come from an ``_extra_state`` or unexpected-key
+    # mismatch -- never from an absent weight. Retry non-strictly for those, the
+    # way ``load_model_state_dict`` does for every decoder chunk in
+    # ``megatron.training.checkpointing``: TransformerEngine changes which
+    # ``_extra_state`` entries it publishes between versions, and the encoder
+    # must not be stricter about that than the decoder it trains beside.
+    try:
+        encoder_ddp.load_state_dict(inner, strict=strict)
+    except RuntimeError:
+        if not strict:
+            raise
+        encoder_ddp.load_state_dict(inner, strict=False)
 
 
 def assert_supported_checkpoint_config(args) -> None:
@@ -111,8 +152,7 @@ def assert_supported_checkpoint_config(args) -> None:
             problems.append("no --async-save (asynchronous save is unsupported)")
         if getattr(args, "non_persistent_ckpt_type", None) is not None:
             problems.append(
-                "no --non-persistent-ckpt-type (non-persistent checkpoints are "
-                "unsupported)"
+                "no --non-persistent-ckpt-type (non-persistent checkpoints are " "unsupported)"
             )
         if getattr(args, "ckpt_assume_constant_structure", False):
             problems.append(
