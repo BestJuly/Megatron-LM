@@ -1115,9 +1115,7 @@ class _HybridEPManager(_DispatchManager):
         # Used for padding the output for each expert
         self.pad_multiple = None
 
-        if hybrid_ep_dispatch is None and not getattr(config, 'fake_process_group', False):
-            # Under fake_process_group, dispatch()/combine() never call the real HybridEP
-            # kernel, so the package doesn't need to be importable for memory-only simulation.
+        if hybrid_ep_dispatch is None:
             raise ImportError(
                 "HybridEP is not installed. Please install HybridEP package from "
                 "https://github.com/deepseek-ai/DeepEP/tree/hybrid-ep."
@@ -1211,51 +1209,26 @@ class _HybridEPManager(_DispatchManager):
             hidden_states = torch.cat(
                 [hidden_states, hidden_states.new_zeros((pad_rows, hidden_states.shape[-1]))], dim=0
             )
-        if getattr(self.config, 'fake_process_group', False):
-            # Single real GPU standing in for `self.group.size()` simulated ranks: there is no
-            # real peer to exchange tokens with, so skip the actual HybridEP a2a kernel and
-            # synthesize buffers of the size the real dispatch would have produced. This assumes
-            # balanced routing (true for the mock/force-balanced data fake-PG memory runs use),
-            # matching the same "no drops, no imbalance" assumption the real dropless path
-            # (self.num_permuted_tokens is None) resolves via a CPU sync on real tokens_per_expert.
-            num_permuted_tokens = (
-                self.num_permuted_tokens
-                if self.num_permuted_tokens is not None
-                else hidden_states.shape[0] * self.config.moe_router_topk
+        dispatched_hidden, self.dispatched_probs, _, tokens_per_expert, self.handle = (
+            hybrid_ep_dispatch(
+                x=hidden_states,
+                routing_map=self.routing_map,
+                probs=self.token_probs,
+                group=self.group,
+                num_local_experts=self.num_local_experts,
+                num_sms_dispatch_api=self.config.moe_flex_dispatcher_num_sms,
+                num_sms_combine_api=self.config.moe_flex_dispatcher_num_sms,
+                num_blocks_permute=self.config.moe_hybridep_num_blocks_permute,
+                num_blocks_unpermute=self.config.moe_hybridep_num_blocks_unpermute,
+                num_permuted_tokens=self.num_permuted_tokens,
+                pad_multiple=self.pad_multiple,
+                fused=self.config.moe_permute_fusion_into_hybridep,
+                num_sms_preprocessing_api=self.config.moe_hybridep_num_sms_preprocessing,
             )
-            dispatched_hidden = hidden_states.new_zeros((num_permuted_tokens, hidden_states.shape[-1]))
-            self.dispatched_probs = self.token_probs.new_zeros((num_permuted_tokens,))
-            tokens_per_expert = torch.full(
-                (self.num_local_experts,),
-                num_permuted_tokens // max(self.num_local_experts, 1),
-                dtype=torch.int64,
-                device=hidden_states.device,
-            )
-            self.handle = None
-            self.num_permuted_tokens = num_permuted_tokens
-        else:
-            dispatched_hidden, self.dispatched_probs, _, tokens_per_expert, self.handle = (
-                hybrid_ep_dispatch(
-                    x=hidden_states,
-                    routing_map=self.routing_map,
-                    probs=self.token_probs,
-                    group=self.group,
-                    num_local_experts=self.num_local_experts,
-                    num_sms_dispatch_api=self.config.moe_flex_dispatcher_num_sms,
-                    num_sms_combine_api=self.config.moe_flex_dispatcher_num_sms,
-                    num_blocks_permute=self.config.moe_hybridep_num_blocks_permute,
-                    num_blocks_unpermute=self.config.moe_hybridep_num_blocks_unpermute,
-                    num_permuted_tokens=self.num_permuted_tokens,
-                    pad_multiple=self.pad_multiple,
-                    fused=self.config.moe_permute_fusion_into_hybridep,
-                    num_sms_preprocessing_api=self.config.moe_hybridep_num_sms_preprocessing,
-                )
-            )
-        if self.moe_expert_rank_capacity_factor is not None and self.handle is not None:
+        )
+        if self.moe_expert_rank_capacity_factor is not None:
             # Static-budget path only: handle[-1] is HybridEP overflow_flag when tokens were
             # dropped because permuted count exceeded num_permuted_tokens from setup_metadata.
-            # self.handle is None under fake_process_group (no real dispatch call ran, so there
-            # is no overflow signal to read -- the synthetic path never drops tokens).
             over_budget = self.handle[-1] != 0
             self.over_budget |= over_budget
         # When capacity factor is None, skip overflow tracking (no token drops). Actual
@@ -1275,24 +1248,13 @@ class _HybridEPManager(_DispatchManager):
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
     ) -> torch.Tensor:
-        if getattr(self.config, 'fake_process_group', False):
-            # Mirror dispatch()'s short-circuit: synthesize the post-combine shape (permuted
-            # rows collapsed back down to per-rank token count) instead of calling the real
-            # combine kernel, which has no real peers to exchange with under fake-PG.
-            restored_num_tokens = (
-                self._padded_num_tokens
-                if self._padded_num_tokens is not None
-                else self._original_num_tokens
-            )
-            hidden_states = hidden_states.new_zeros((restored_num_tokens, hidden_states.shape[-1]))
-        else:
-            hidden_states = hybrid_ep_combine(
-                x=hidden_states,
-                handle=self.handle,
-                num_permuted_tokens=self.num_permuted_tokens,
-                pad_multiple=self.pad_multiple,
-                fused=self.config.moe_permute_fusion_into_hybridep,
-            )
+        hidden_states = hybrid_ep_combine(
+            x=hidden_states,
+            handle=self.handle,
+            num_permuted_tokens=self.num_permuted_tokens,
+            pad_multiple=self.pad_multiple,
+            fused=self.config.moe_permute_fusion_into_hybridep,
+        )
         if (
             self._padded_num_tokens is not None
             and self._original_num_tokens is not None
