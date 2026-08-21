@@ -28,6 +28,7 @@ import sys
 from itertools import accumulate
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -651,6 +652,126 @@ def test_thd_batch_size_2_with_vision():
             f"seg {k} does not start at 0 — positions leaked from "
             f"previous segment: first col = {thd_slice[:, 0]}"
         )
+
+
+def _packed_seq_params_to_cuda(psp):
+    return PackedSeqParams(
+        cu_seqlens_q=psp.cu_seqlens_q.cuda(),
+        cu_seqlens_kv=psp.cu_seqlens_kv.cuda(),
+        cu_seqlens_q_padded=psp.cu_seqlens_q_padded.cuda(),
+        cu_seqlens_kv_padded=psp.cu_seqlens_kv_padded.cuda(),
+        max_seqlen_q=psp.max_seqlen_q,
+        max_seqlen_kv=psp.max_seqlen_kv,
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("divisible_by", [1, 4])
+def test_thd_cuda_fused_matches_cpu_reference(divisible_by):
+    """The Triton image/text path is bit-identical to the CPU fallback."""
+    packed, psp, grids, _, _ = _pack_samples(
+        _sample_bank(), divisible_by=divisible_by
+    )
+    kwargs = dict(
+        spatial_merge_size=SPATIAL_MERGE_SIZE,
+        image_token_id=IMAGE_TOKEN_ID,
+        video_token_id=VIDEO_TOKEN_ID,
+        vision_start_token_id=VISION_START_TOKEN_ID,
+    )
+    reference_position_ids, reference_deltas = get_rope_index(
+        input_ids=packed,
+        image_grid_thw=grids,
+        packed_seq_params=psp,
+        **kwargs,
+    )
+    fused_position_ids, fused_deltas = get_rope_index(
+        input_ids=packed.cuda(),
+        image_grid_thw=grids.cuda(),
+        packed_seq_params=_packed_seq_params_to_cuda(psp),
+        **kwargs,
+    )
+
+    assert torch.equal(fused_position_ids.cpu(), reference_position_ids)
+    assert torch.equal(fused_deltas.cpu(), reference_deltas)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_thd_cuda_fused_text_only_and_static_padding_tail():
+    """Text-only segments and a physical dummy tail stay graph-shape safe."""
+    samples = [
+        _build_sample(prefix_text_len=6, grids=[], suffix_text_len=0),
+        _build_sample(prefix_text_len=11, grids=[], suffix_text_len=0),
+    ]
+    packed, psp, _, _, _ = _pack_samples(samples, divisible_by=4)
+    tail_len = 32
+    original_tokens = packed.shape[1]
+    packed = F.pad(packed, (0, tail_len), value=0)
+    cu_seqlens = torch.cat(
+        [psp.cu_seqlens_q, psp.cu_seqlens_q[-1:]]
+    )
+    cu_seqlens_padded = torch.cat(
+        [
+            psp.cu_seqlens_q_padded,
+            torch.tensor([original_tokens + tail_len], dtype=torch.int32),
+        ]
+    )
+    psp = PackedSeqParams(
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens_padded,
+        max_seqlen_q=tail_len,
+        max_seqlen_kv=tail_len,
+    )
+    kwargs = dict(
+        spatial_merge_size=SPATIAL_MERGE_SIZE,
+        image_token_id=IMAGE_TOKEN_ID,
+        video_token_id=VIDEO_TOKEN_ID,
+        vision_start_token_id=VISION_START_TOKEN_ID,
+        image_grid_thw=None,
+    )
+    reference_position_ids, reference_deltas = get_rope_index(
+        input_ids=packed, packed_seq_params=psp, **kwargs
+    )
+    fused_position_ids, fused_deltas = get_rope_index(
+        input_ids=packed.cuda(),
+        packed_seq_params=_packed_seq_params_to_cuda(psp),
+        **kwargs,
+    )
+
+    assert torch.equal(fused_position_ids.cpu(), reference_position_ids)
+    assert torch.equal(fused_deltas.cpu(), reference_deltas)
+    assert torch.all(fused_position_ids[..., original_tokens:] == 1)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_thd_cuda_fused_is_cuda_graph_capturable():
+    """The fused path has no host scalar extraction during capture/replay."""
+    packed, psp, grids, _, _ = _pack_samples(_two_image_samples(), divisible_by=4)
+    packed = packed.cuda()
+    grids = grids.cuda()
+    psp = _packed_seq_params_to_cuda(psp)
+    kwargs = dict(
+        spatial_merge_size=SPATIAL_MERGE_SIZE,
+        image_token_id=IMAGE_TOKEN_ID,
+        video_token_id=VIDEO_TOKEN_ID,
+        vision_start_token_id=VISION_START_TOKEN_ID,
+        input_ids=packed,
+        image_grid_thw=grids,
+        packed_seq_params=psp,
+    )
+    get_rope_index(**kwargs)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_position_ids, graph_deltas = get_rope_index(**kwargs)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    reference_position_ids, reference_deltas = get_rope_index(**kwargs)
+    assert torch.equal(graph_position_ids, reference_position_ids)
+    assert torch.equal(graph_deltas, reference_deltas)
 
 
 def test_vision_rope_wrapper_forwards_max_seqlen_to_thd(monkeypatch):
