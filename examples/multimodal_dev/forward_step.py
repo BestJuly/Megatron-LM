@@ -12,7 +12,11 @@ import torch.nn.functional as F
 
 from examples.multimodal_dev.observability import nvtx_phase
 from megatron.core import mpu
-from megatron.core.packed_seq_params import PackedSeqParams, build_static_thd_metadata
+from megatron.core.packed_seq_params import (
+    PackedSeqParams,
+    build_static_thd_metadata,
+    thd_collate_row_alignment,
+)
 from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
@@ -423,10 +427,11 @@ def pack_or_pad_batch(
     except AssertionError:
         has_sp = False
 
-    if cp_size > 1:
-        divisible_by = (tp_size * cp_size * 2) if has_sp else (cp_size * 2)
-    else:
-        divisible_by = tp_size if has_sp else 1
+    divisible_by = thd_collate_row_alignment(
+        context_parallel_size=cp_size,
+        tensor_model_parallel_size=tp_size,
+        sequence_parallel=has_sp,
+    )
     if pad_to_multiple is not None:
         divisible_by = max(divisible_by, pad_to_multiple)
 
@@ -447,6 +452,16 @@ def pack_or_pad_batch(
         except AssertionError:
             static_args = None
         if static_args is not None and getattr(static_args, "thd_static_packing", False):
+            # pad_between_seqs below is derived from the row alignment, and the
+            # CUDA-graph path re-derives the same value from the config alone
+            # (packed_seq_params.thd_static_pad_between_seqs). An extra
+            # pad_to_multiple would introduce gaps the config cannot see, so the
+            # two would silently disagree.
+            assert pad_to_multiple is None, (
+                "thd_static_packing is incompatible with an explicit pad_to_multiple: "
+                "the CUDA-graph path derives pad_between_seqs from the CP/SP row "
+                "alignment alone and cannot see it."
+            )
             static_target_T = int(static_args.max_seqlen_per_dp_cp_rank) * cp_size
             static_max_num_seqs = int(static_args.thd_max_packed_sequences)
             # append_dummy_seq, matching what --sequence-packing-scheduler

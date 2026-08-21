@@ -19,7 +19,10 @@ from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import (
+    PackedSeqParams,
+    thd_static_pad_between_seqs,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup, make_weakref
 from megatron.core.transformer.enums import (
@@ -1386,12 +1389,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             cu_seqlens_kv_padded=kwargs.pop('cu_seqlens_kv_padded'),
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
-            # CUDA graph inputs do not carry this Python bool. Sequence-packing
-            # metadata may contain valid/physical gaps, so use the conservative
-            # graph-static value instead of asking TE to infer it with a CUDA
-            # tensor comparison during capture. This restricts TE backend
-            # selection for THD to cuDNN fused attention.
-            pad_between_seqs=True,
+            # CUDA graph inputs do not carry this Python bool, and inferring it
+            # from the cu_seqlens tensors would synchronize during capture, so it
+            # comes from the config instead - batch-independent by construction.
+            # Defaults to the conservative True; --thd-static-packing narrows it,
+            # which matters because True costs FlashAttention eligibility.
+            pad_between_seqs=thd_static_pad_between_seqs(self.config),
         )
         kwargs['packed_seq_params'] = packed_seq_params
 

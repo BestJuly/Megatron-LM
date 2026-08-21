@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
+from megatron.core.packed_seq_params import thd_shapes_are_static
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
@@ -3447,9 +3448,7 @@ class TransformerConfig(ModelParallelConfig):
                 self.attention_backend == AttnBackend.flash
             ), "Batch invariant mode only supports FlashAttention"
 
-        if self.cuda_graph_impl != "none" and (
-            self.sequence_packing_scheduler is not None or self.dynamic_context_parallel
-        ):
+        if self.cuda_graph_impl != "none" and thd_shapes_are_static(self):
             if self.thd_max_packed_sequences is None:
                 raise ValueError("THD CUDA Graph requires --thd-max-packed-sequences to be set.")
             assert (
@@ -3462,6 +3461,15 @@ class TransformerConfig(ModelParallelConfig):
                 "THD CUDA Graph requires --pad-packed-seq-alignment='max' "
                 "or --pad-packed-seq-alignment equal to max_seqlen_per_dp_cp_rank "
                 f"({self.max_seqlen_per_dp_cp_rank}), got {self.pad_packed_seq_alignment}."
+            )
+
+        # THD packing constrains the MoE dispatcher regardless of *who* produced
+        # the pack, so this keys off the shape contract rather than on
+        # sequence_packing_scheduler alone.
+        if thd_shapes_are_static(self) and self.num_moe_experts is not None:
+            assert self.moe_token_dispatcher_type in ("alltoall", "flex"), (
+                f"sequence packing only supports moe_token_dispatcher_type in "
+                f"('alltoall', 'flex'), got '{self.moe_token_dispatcher_type}'"
             )
 
         if self.thd_static_packing and self.thd_max_packed_sequences is None:
@@ -3503,12 +3511,6 @@ class TransformerConfig(ModelParallelConfig):
 
             # Needed for passing variable sequences between pp stages.
             self.variable_seq_lengths = True
-
-            if self.num_moe_experts is not None:
-                assert self.moe_token_dispatcher_type in ("alltoall", "flex"), (
-                    f"sequence_packing only supports moe_token_dispatcher_type in "
-                    f"('alltoall', 'flex'), got '{self.moe_token_dispatcher_type}'"
-                )
 
             supported_schedulers = ['dp_balanced', 'default_dynamic_cp']
             if (

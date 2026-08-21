@@ -158,6 +158,42 @@ class MultimodalModel(MegatronModule):
             mtp_block_spec=mtp_block_spec,
         )
 
+    # ------------------------------------------------------------------
+    # Attributes surfaced for per-layer CUDA graph capture.
+    #
+    # ``TECudaGraphHelper._discover_layers`` resolves the graphable layers with
+    # ``get_attr_wrapped_model(chunk, 'decoder')``, which only unwraps through
+    # ``.module`` (DDP -> Float16Module -> this class). It then reads ``decoder``,
+    # ``mtp``, ``rotary_pos_emb``, and ``position_embedding_type`` off the object it
+    # stopped at. Without these forwards the helper raises, catches its own
+    # RuntimeError, and silently captures zero layers. Same pattern as
+    # ``shared_embedding_or_output_weight`` below.
+    # ------------------------------------------------------------------
+
+    @property
+    def decoder(self):
+        """The language model's transformer block."""
+        return self.language_model.decoder
+
+    @property
+    def mtp(self):
+        """The language model's MTP block.
+
+        Raises ``AttributeError`` when MTP is off, so ``hasattr(chunk, 'mtp')``
+        keeps reporting False exactly as it does for a bare ``GPTModel``.
+        """
+        return self.language_model.mtp
+
+    @property
+    def rotary_pos_emb(self):
+        """The language model's rotary embedding module."""
+        return self.language_model.rotary_pos_emb
+
+    @property
+    def position_embedding_type(self):
+        """The language model's position embedding type."""
+        return self.language_model.position_embedding_type
+
     def shared_embedding_or_output_weight(self):
         """Surface the wrapped language model's shared embedding / output
         weight to the PP grad-finalize step (mirrors the LLaVA wrapper).
