@@ -243,18 +243,40 @@ def test_static_packing_off_is_byte_identical(static_args):
 
 
 class TestFlopsAccounting:
-    def test_extend_last_reports_only_real_tokens(self, static_args):
+    def test_the_emitted_override_reports_only_real_tokens(self, static_args):
+        """The accumulator must see the real tokens, never the static pad.
+
+        Under static packing the tail is an ``append_dummy_seq`` sequence, so it
+        lands in ``cu_seqlens_q`` itself; the collator emits the pre-tail vector
+        separately and ``accumulate_flops_stats`` prefers it.
+        """
         static_args()
         lengths = [5, 13, 7]
         batch = [_make_sample(L, base=i * 1000) for i, L in enumerate(lengths)]
         packed = fs.pack_or_pad_batch(batch, use_packed_sequence=True, device="cuda")
 
-        # extend_last leaves cu_seqlens_q compact, so no override is emitted and
-        # the accumulator sees exactly the real tokens.
-        assert "flops_cu_seqlens" not in packed
+        override = packed["flops_cu_seqlens"]
+        assert (override[1:] - override[:-1]).sum().item() == sum(lengths)
+
+        # Without the override the pad would be counted as real work.
         cu = packed["packed_seq_params"].cu_seqlens_q
-        seqlens = (cu[1:] - cu[:-1]).tolist()
-        assert sum(seqlens) == sum(lengths)
+        assert (cu[1:] - cu[:-1]).clamp(min=0).sum().item() == MAX_SEQLEN
+
+    def test_the_accumulator_prefers_the_override(self, static_args, monkeypatch):
+        # accumulate_flops_stats imports this lazily from the training module.
+        import megatron.training.training as training
+
+        seen = []
+        monkeypatch.setattr(
+            training, "update_seqlen_stats_from_cu_seqlens", lambda cu: seen.append(cu)
+        )
+        static_args()
+        batch = [_make_sample(L, base=i * 1000) for i, L in enumerate([5, 13, 7])]
+        packed = fs.pack_or_pad_batch(batch, use_packed_sequence=True, device="cuda")
+        fs.accumulate_flops_stats(
+            packed["packed_seq_params"], real_cu_seqlens=packed["flops_cu_seqlens"]
+        )
+        assert seen and torch.equal(seen[0], packed["flops_cu_seqlens"])
 
     def test_dummy_tail_would_pollute_without_the_override(self):
         """The override exists because the dummy tail lands in cu_seqlens_q."""
