@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """MDP installation seams for the Megatron training loop.
 
@@ -151,6 +151,9 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
         overlap_grad_reduce=getattr(args, "overlap_grad_reduce", False),
         overlap_param_gather=getattr(args, "overlap_param_gather", False),
         delay_grad_reduce=bool(getattr(args, "delay_grad_reduce", False)),
+        overlap_moe_expert_parallel_comm=bool(
+            getattr(args, "overlap_moe_expert_parallel_comm", False)
+        ),
         checkpoint_mode=getattr(args, "ckpt_format", "torch_dist"),
         save_requested=getattr(args, "save", None) is not None,
         load_requested=getattr(args, "load", None) is not None,

@@ -942,9 +942,6 @@ def build_mtp_layer_callables(layer):
         assert (
             node.chunk_state.context is None
         ), f"multi token prediction + cross attention is not yet supported."
-        assert (
-            node.chunk_state.packed_seq_params is None
-        ), f"multi token prediction + sequence packing is not yet supported."
 
         if layer.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
