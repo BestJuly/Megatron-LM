@@ -2340,6 +2340,20 @@ def load_checkpoint(
                 if 'model%d' % i not in state_dict:
                     continue
                 load_model_state_dict(ddp_model[i], state_dict['model%d' % i], strict)
+
+        if getattr(args, "mdp_enable", False) and args.ckpt_format == "torch_dist":
+            # MDP: the replicated vision encoder lives outside the model chunk
+            # list, so the loop above never reaches it. `generate_state_dict`
+            # already put its tensors in the load skeleton; copy them in.
+            # No-op unless --mdp-enable is set.
+            from megatron.core.mdp import integration as mdp_integration
+            from megatron.core.mdp.checkpoint import load_encoder_state
+
+            mdp_runtime = mdp_integration.get_runtime()
+            if mdp_runtime is not None:
+                load_encoder_state(
+                    state_dict, mdp_runtime.encoder_domain.encoder_ddp, strict=strict
+                )
     # Fix up query/key/value matrix ordering if needed.
     checkpoint_version = get_checkpoint_version()
     print_rank_0(f' checkpoint version {checkpoint_version}')
