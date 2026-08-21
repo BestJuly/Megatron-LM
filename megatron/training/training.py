@@ -391,6 +391,41 @@ def print_datetime(string, override_timestamp=None):
     print_rank_0(f'[{string}] datetime: {time_str} ')
 
 
+def _mdp_greedy_consumed_samples(args):
+    """Real samples this iteration under ``--mdp-greedy-packing``, summed over DP.
+
+    Returns ``None`` when MDP greedy packing is off, so the caller keeps the
+    closed-form ``dp * mbs * num_microbatches``. Under greedy packing that form
+    is wrong: each rank fills a fixed number of bins to a token budget and
+    consumes however many samples that takes, which differs per iteration and
+    per rank.
+
+    The MDP runtime keeps a cumulative per-rank counter; this returns the delta
+    since the previous call, all-reduced over the data-parallel group. One small
+    D2H per iteration on the logging path, next to the existing host-side
+    ``consumed_train_samples`` arithmetic.
+    """
+    if not getattr(args, "mdp_enable", False) or not getattr(args, "mdp_greedy_packing", False):
+        return None
+    from megatron.core.mdp import integration as mdp_integration
+
+    runtime = mdp_integration.get_runtime()
+    if runtime is None:
+        return None
+    consumed = runtime.consumed_samples()
+    if consumed is None:
+        return None
+    previous = getattr(args, "_mdp_prev_consumed_samples", 0)
+    args._mdp_prev_consumed_samples = consumed
+    delta = torch.tensor(
+        [consumed - previous],
+        dtype=torch.long,
+        device=torch.cuda.current_device() if torch.cuda.is_available() else 'cpu',
+    )
+    torch.distributed.all_reduce(delta, group=mpu.get_data_parallel_group())
+    return int(delta.item())
+
+
 def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
     """Add ``sum(L_i)`` and ``sum(L_i ** 2)`` from one micro-batch's REAL ``cu_seqlens``.
 
@@ -4641,6 +4676,14 @@ def train(
         else:
             batch_size = _dp_world_size() * args.micro_batch_size * get_num_microbatches()
             iteration_sequences = batch_size
+            mdp_consumed = _mdp_greedy_consumed_samples(args)
+            if mdp_consumed is not None:
+                # --mdp-greedy-packing fills a fixed number of bins to a token
+                # budget, so the number of samples consumed floats per iteration
+                # AND per DP rank. The closed form above is simply wrong then;
+                # report the real all-reduced count instead. Same hook shape as
+                # rl_utils.get_iteration_sequence_count above.
+                iteration_sequences = mdp_consumed
 
         # Update consumed samples (always means sequences now)
         args.consumed_train_samples += iteration_sequences
