@@ -293,6 +293,162 @@ def extend_thd_padding_before_cp_slice(
     return cu_seqlens_padded, max_seqlen, global_target_len
 
 
+def thd_shapes_are_static(config) -> bool:
+    """Whether the incoming THD batches have fixed shapes.
+
+    The THD CUDA-graph machinery -- static ``hidden_states``, static
+    ``cu_seqlens_*``, static ``padding_mask``, and the tensor <-> PackedSeqParams
+    bridge -- needs exactly one thing from the data path: that ``T`` and the
+    ``cu_seqlens`` entry count do not vary per microbatch. It does not care
+    *who* guarantees that.
+
+    Three producers do:
+
+    - ``--sequence-packing-scheduler`` (``dp_balanced`` / ``default_dynamic_cp``);
+    - ``--dynamic-context-parallel``;
+    - ``--thd-static-packing``, for collators that pack outside the scheduler
+      (MDP's greedy packer).
+
+    Deliberately **not** derived from ``pad_packed_seq_alignment is not None``:
+    that would silently change behavior for existing GPT ``--sft`` runs that set
+    an alignment without a scheduler. An explicit opt-in cannot.
+    """
+    return bool(
+        getattr(config, 'sequence_packing_scheduler', None) is not None
+        or getattr(config, 'dynamic_context_parallel', False)
+        or getattr(config, 'thd_static_packing', False)
+    )
+
+
+def thd_collate_row_alignment(
+    *, context_parallel_size: int, tensor_model_parallel_size: int, sequence_parallel: bool
+) -> int:
+    """Row alignment a THD collator must pad each packed sample to.
+
+    Zigzag context parallelism needs an even per-rank split, and sequence
+    parallelism additionally splits the packed rows across TP. Single source of
+    truth for the rule: the collator pads with it, MDP validates the greedy token
+    budget against it, and ``thd_static_pad_between_seqs`` derives from it.
+    """
+    if context_parallel_size > 1:
+        return (
+            tensor_model_parallel_size * context_parallel_size * 2
+            if sequence_parallel
+            else context_parallel_size * 2
+        )
+    return tensor_model_parallel_size if sequence_parallel else 1
+
+
+def thd_static_pad_between_seqs(config) -> bool:
+    """Batch-independent ``pad_between_seqs`` for a fixed-shape THD data path.
+
+    ``pad_between_seqs`` cannot be a graph input (it is a capture-time Python
+    branch) and cannot be inferred from the cu_seqlens tensors during capture (a
+    device comparison would synchronize), so the CUDA-graph path needs a value
+    that is correct for *every* replay batch. Answering "True, always" is safe
+    but expensive: TE disables FlashAttention for THD whenever padding may exist
+    between sequences, and when cuDNN fused attention does not support the head
+    configuration either, the fallback is the unfused O(T^2) backend.
+
+    Under ``thd_static_packing`` the answer is knowable without looking at any
+    batch. A collator setting that flag pads each sample to
+    ``thd_collate_row_alignment``, so gaps between sequences exist exactly when
+    that alignment exceeds 1. **That is the contract the flag asserts**; a
+    collator that leaves gaps at alignment 1 must not set it.
+
+    Without ``thd_static_packing`` (the ``--sequence-packing-scheduler`` path,
+    which does pad each sub-sample) the conservative ``True`` is retained.
+    """
+    if not getattr(config, 'thd_static_packing', False):
+        return True
+    return (
+        thd_collate_row_alignment(
+            context_parallel_size=config.context_parallel_size,
+            tensor_model_parallel_size=config.tensor_model_parallel_size,
+            sequence_parallel=config.sequence_parallel,
+        )
+        > 1
+    )
+
+
+def build_static_thd_metadata(
+    cu_seqlens: Tensor,
+    cu_seqlens_padded: Tensor,
+    *,
+    target_len: int,
+    max_num_seqs: int,
+    tail_padding_policy: Literal["append_dummy_seq", "extend_last"],
+    cp_size: int = 1,
+    cp_partition_mode: str = "zigzag",
+) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
+    """Pad already-packed *global* THD metadata to a fixed shape.
+
+    For collators that pack outside ``--sequence-packing-scheduler`` and pad the
+    token-like tensors themselves (see ``thd_static_packing``). Operates on the
+    global, pre-CP-slice metadata, which is where ``extend_last`` must be
+    applied.
+
+    Args:
+        cu_seqlens: Valid-token boundaries, ``num_samples + 1`` entries.
+        cu_seqlens_padded: Physical boundaries, ``num_samples + 1`` entries.
+        target_len: Global physical row count every batch is padded to
+            (``max_seqlen_per_dp_cp_rank * cp_size``).
+        max_num_seqs: ``thd_max_packed_sequences``; both tensors are padded to
+            ``max_num_seqs + 1`` entries.
+        tail_padding_policy: ``extend_last`` keeps the valid coordinates
+            untouched (CP=1 only); ``append_dummy_seq`` represents the tail as an
+            ordinary extra sequence, which also lands in ``cu_seqlens``.
+        cp_size: Context-parallel world size.
+        cp_partition_mode: ``zigzag`` or ``contiguous``.
+
+    Returns:
+        ``(cu_seqlens, cu_seqlens_padded, real_cu_seqlens)``. ``real_cu_seqlens``
+        is the pre-tail valid vector and is not ``None`` only when
+        ``append_dummy_seq`` polluted ``cu_seqlens`` -- FLOPs accounting must use
+        it instead, or the tail is counted as real tokens.
+    """
+    actual_len = int(cu_seqlens_padded[-1].item())
+    assert actual_len <= target_len, (
+        f"Packed THD length ({actual_len}) exceeds the static target ({target_len}). "
+        "Increase --max-seqlen-per-dp-cp-rank, or reduce the number of samples per "
+        "microbatch so the pack fits."
+    )
+
+    real_cu_seqlens = None
+    if actual_len < target_len:
+        if tail_padding_policy == "extend_last":
+            assert cp_size == 1, (
+                "thd_tail_padding_policy='extend_last' needs the global metadata "
+                "extended before CP slicing, which this collator does not do; use "
+                "'append_dummy_seq' with context parallelism."
+            )
+            cu_seqlens_padded = _extend_last_padded_sequence(cu_seqlens_padded, target_len)
+        else:
+            dummy_seq_len = target_len - actual_len
+            if cp_size > 1 and cp_partition_mode == "zigzag":
+                assert dummy_seq_len % (2 * cp_size) == 0, (
+                    f"THD dummy padding length ({dummy_seq_len}) must be divisible by "
+                    f"2 * context_parallel_size ({2 * cp_size}) for zigzag partitioning."
+                )
+            real_cu_seqlens = cu_seqlens
+            if torch.equal(cu_seqlens, cu_seqlens_padded):
+                cu_seqlens = _append_dummy_seq(cu_seqlens, target_len)
+            else:
+                # Gaps already exist between real sequences; the dummy's valid and
+                # physical lengths are both exactly the new tail length.
+                cu_seqlens = _append_dummy_seq(
+                    cu_seqlens, int(cu_seqlens[-1].item()) + dummy_seq_len
+                )
+            cu_seqlens_padded = _append_dummy_seq(cu_seqlens_padded, target_len)
+
+    target_entries = max_num_seqs + 1
+    return (
+        _pad_cu_seqlens(cu_seqlens, target_entries),
+        _pad_cu_seqlens(cu_seqlens_padded, target_entries),
+        real_cu_seqlens,
+    )
+
+
 def _resolve_thd_padding_lengths(
     tokens: Optional[Tensor],
     labels: Optional[Tensor],

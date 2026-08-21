@@ -1769,6 +1769,7 @@ class TECudaGraphHelper:
         self.callables_per_chunk_is_mtp = []
         self.flattened_callables = []
         self.flattened_callables_is_mtp = []
+        chunks_missing_decoder = 0
         for chunk_number, model_chunk in enumerate(self.model):
             try:
                 chunk_with_decoder = get_attr_wrapped_model(
@@ -1776,6 +1777,7 @@ class TECudaGraphHelper:
                 )
             except RuntimeError:
                 num_graphable_layers = 0
+                chunks_missing_decoder += 1
                 log_on_each_pipeline_stage(
                     logger=logger,
                     tp_group=self.tp_group,
@@ -1835,6 +1837,29 @@ class TECudaGraphHelper:
             msg=f'Rank {torch.distributed.get_rank()}: '
             f'{len(self.flattened_callables)} graphable layers.',
         )
+
+        # The per-chunk attribute-lookup failure above is only a DEBUG log, so a
+        # model whose decoder `get_attr_wrapped_model(chunk, 'decoder')` cannot
+        # reach captures zero layers and looks like a successful no-op run. When
+        # *every* chunk failed that lookup it is a wiring bug, not a property of
+        # the model: `get_attr_wrapped_model` unwraps only through `.module`, so a
+        # wrapper holding its decoder elsewhere (a multimodal model whose decoder
+        # is `self.language_model.decoder`, say) needs a forwarding property.
+        #
+        # Deliberately keyed on the lookup failing rather than on
+        # `flattened_callables` being empty: a model whose layers are all
+        # non-graphable is a legitimate zero-layer case that must stay silent.
+        if self.model and chunks_missing_decoder == len(self.model):
+            raise RuntimeError(
+                f"CUDA graphs are enabled (cuda_graph_impl="
+                f"{self.config.cuda_graph_impl!r}) but none of the "
+                f"{len(self.model)} model chunks exposes a 'decoder' attribute "
+                "reachable through get_attr_wrapped_model, so capture would be a "
+                "silent no-op. get_attr_wrapped_model unwraps only through "
+                "'.module'; if the decoder lives under another attribute, add a "
+                "forwarding property for 'decoder' (and 'mtp' / 'rotary_pos_emb' / "
+                "'position_embedding_type') on the wrapper."
+            )
 
     def capture_finished(self):
         """

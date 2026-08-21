@@ -18,6 +18,7 @@ from megatron.core.activations import squared_relu
 from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
 from megatron.core.model_parallel_config import _parse_pad_packed_seq_alignment
+from megatron.core.packed_seq_params import thd_shapes_are_static
 from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.quantization.utils import (
     kitchen_quantization_recipe_config,
@@ -1597,9 +1598,7 @@ def validate_args(args, defaults={}):
                     f'got {args.pad_packed_seq_alignment}.'
                 )
 
-    if args.cuda_graph_impl != "none" and (
-        args.sequence_packing_scheduler is not None or args.dynamic_context_parallel
-    ):
+    if args.cuda_graph_impl != "none" and thd_shapes_are_static(args):
         if getattr(args, 'pad_packed_seq_alignment', None) is None:
             raise ValueError('THD CUDA Graph requires --pad-packed-seq-alignment to be set.')
         if (

@@ -29,6 +29,8 @@ from megatron.core.mdp.config import (
     SUPPORTED_RANK_ORDER,
     MdpCompatibilityOptions,
     MdpConfig,
+    greedy_max_real_sequences,
+    thd_row_alignment,
     validate_mdp_config,
 )
 from megatron.core.mdp.encoder import (
@@ -101,6 +103,7 @@ def mdp_config_from_args(args) -> MdpConfig:
         debug_plan_payload_check=getattr(args, "mdp_debug_plan_payload_check", False),
         pixel_locality=getattr(args, "mdp_pixel_locality", False),
         overlap_window_capture=getattr(args, "mdp_overlap_window_capture", False),
+        greedy_packing=getattr(args, "mdp_greedy_packing", False),
     )
 
 
@@ -111,7 +114,10 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
         or getattr(args, "use_custom_fsdp", False)
         or getattr(args, "use_megatron_fsdp", False)
     )
-    cuda_graph = getattr(args, "cuda_graph_impl", "none") not in (None, "none")
+    # Snapshot the implementation itself, not just "any graph enabled": it decides
+    # whether the graph owns the whole iteration (rejected) or individual decoder
+    # layers (supported).
+    cuda_graph_impl = getattr(args, "cuda_graph_impl", "none") or "none"
     offload = bool(
         getattr(args, "cpu_offloading", False)
         or getattr(args, "fine_grained_activation_offloading", False)
@@ -146,7 +152,7 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
         bf16=bool(args.bf16),
         fsdp_enabled=fsdp,
         fp8_enabled=getattr(args, "fp8", None) is not None,
-        cuda_graph_enabled=cuda_graph,
+        cuda_graph_impl=cuda_graph_impl,
         activation_offload_enabled=offload,
         overlap_grad_reduce=getattr(args, "overlap_grad_reduce", False),
         overlap_param_gather=getattr(args, "overlap_param_gather", False),
@@ -154,6 +160,11 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
         checkpoint_mode=getattr(args, "ckpt_format", "torch_dist"),
         save_requested=getattr(args, "save", None) is not None,
         load_requested=getattr(args, "load", None) is not None,
+        sequence_parallel=bool(getattr(args, "sequence_parallel", False)),
+        sequence_packing_scheduler=getattr(args, "sequence_packing_scheduler", None),
+        thd_static_packing=bool(getattr(args, "thd_static_packing", False)),
+        max_seqlen_per_dp_cp_rank=getattr(args, "max_seqlen_per_dp_cp_rank", None),
+        thd_max_packed_sequences=getattr(args, "thd_max_packed_sequences", None),
     )
 
 
@@ -226,6 +237,13 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
     else:
         params_dtype = torch.float32
     allocator = DirectBufferAllocator()
+    compat = compatibility_options_from_args(args)
+    greedy_token_budget = (
+        args.max_seqlen_per_dp_cp_rank * args.context_parallel_size
+        if mdp_config.greedy_packing
+        else None
+    )
+    greedy_max_num_seqs = greedy_max_real_sequences(compat)
     _RUNTIME = MdpRuntime(
         config=mdp_config,
         rank_map=rank_map,
@@ -245,6 +263,9 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
         hidden_size=args.hidden_size,
         params_dtype=params_dtype,
         num_vpp_chunks=len(model),
+        greedy_token_budget=greedy_token_budget,
+        greedy_max_num_seqs=greedy_max_num_seqs,
+        greedy_row_alignment=thd_row_alignment(compat),
     )
     logger.info(
         "MDP: runtime installed (outer_dp_rank=%d, worker_id=%s, endpoint=%d, "

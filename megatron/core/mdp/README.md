@@ -27,7 +27,7 @@ EMPTY`) driving seven phases:
 | P1 | `begin_iteration` | Capture the iteration window, broadcast fixed-width descriptors from the PP0 endpoint, run deterministic LPT to logical workers, check the plan digest across the group, exchange pixels |
 | P2 | `begin_iteration` | Grad-enabled chunked encoder forward on encoder THD (`no_grad` for evaluation); outputs retained as a list in the forward handle |
 | P3 | `begin_iteration` | Exchange detached embeddings; endpoint assembles one detached leaf per vision-bearing microbatch |
-| P4 | native schedule | Replay iterators feed the unmodified decoder schedule; the wrapped `finalize_model_grads_func` captures the in-place-reduced global token count |
+| P4 | native schedule | Replay iterators feed the unmodified decoder schedule (per-layer CUDA graphs, if enabled, live entirely inside it); the wrapped `finalize_model_grads_func` captures the in-place-reduced global token count |
 | P5 | `end_iteration` | Exchange leaf gradients back, one multi-tensor backward per producer (native MCore recompute replays here), WORLD sum-reduce with prescale 1, scale by `1/clamp(T_global, 1)` |
 | P6 | composite optimizer | WORLD MAX overflow union before any scaler update, combined-norm shared clipping, one atomic step for `[decoder_dense, decoder_expert?, encoder]` |
 
@@ -49,6 +49,7 @@ schedule model list.
 | `allocator.py` / `storage.py` | Single allocation point for MDP buffers; endpoint leaf storage |
 | `bridge.py` | One ledger + transport for pixels/embeddings/gradients |
 | `window.py` / `activation.py` | Iteration window with VPP replay cursors; forward handle, chunking, encoder THD params |
+| `packing.py` | Greedy token-budget bin filling and the cross-iteration sample buffer |
 | `runtime.py` / `schedule.py` | Phase machine; schedule and finalizer wrappers |
 | `encoder.py` / `optimizer.py` | Encoder DDP over WORLD + ZeRO-1; composite optimizer with WORLD overflow union |
 | `checkpoint.py` | Weight-only torch_dist facade (`vision_model.*` with WORLD replica metadata) |
@@ -64,8 +65,7 @@ recompute (`None`/`selective`/`full`) via the override channel, text-only
 microbatches, synchronous global `torch_dist` weight-only checkpoints,
 `alignment_rows=1` (tests exercise 16).
 
-Rejected at startup: FSDP/HSDP, FP8/MXFP8, full-iteration CUDA graphs, CPU
-activation offload, comm overlap (`overlap_grad_reduce`,
+Rejected at startup: FSDP/HSDP, FP8/MXFP8, CPU activation offload, comm overlap (`overlap_grad_reduce`,
 `overlap_param_gather`, delayed reduction), multiple distributed-optimizer
 instances, `calculate_per_token_loss=False`, non-`torch_dist` checkpoint
 formats, non-weight-only save/load, invalid rank mappings.

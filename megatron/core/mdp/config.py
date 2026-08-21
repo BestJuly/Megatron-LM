@@ -22,6 +22,18 @@ SUPPORTED_RANK_ORDER = "tp-cp-ep-dp-pp"
 # The only checkpoint format supported by the MDP checkpoint facade.
 SUPPORTED_CHECKPOINT_MODE = "torch_dist"
 
+# CUDA graph implementations MDP accepts. "local" and "transformer_engine" are the
+# per-layer ("partial") implementations: they graph individual decoder submodules and
+# leave the schedule, the encoder, and every MDP collective in eager mode. MDP's P4
+# runs the unmodified decoder schedule, so the decoder layers a per-layer graph owns
+# are never touched by the bridge.
+SUPPORTED_CUDA_GRAPH_IMPLS: frozenset = frozenset({"none", "local", "transformer_engine"})
+
+# The one implementation that is structurally incompatible with the phase machine: a
+# single graph over the whole forward-backward path would swallow P4 together with the
+# Python-level control flow P1-P3/P5 depend on.
+REJECTED_CUDA_GRAPH_IMPL = "full_iteration"
+
 # Keys that may be overridden on the vision TransformerConfig. Field semantics and
 # cross-field validation are delegated entirely to MCore's own __post_init__.
 VISION_CONFIG_OVERRIDE_ALLOWLIST: frozenset = frozenset(
@@ -48,6 +60,7 @@ class MdpConfig:
     debug_plan_payload_check: bool = False
     pixel_locality: bool = False
     overlap_window_capture: bool = False
+    greedy_packing: bool = False
 
 
 @dataclass(frozen=True)
@@ -68,7 +81,7 @@ class MdpCompatibilityOptions:
     bf16: bool
     fsdp_enabled: bool
     fp8_enabled: bool
-    cuda_graph_enabled: bool
+    cuda_graph_impl: str
     activation_offload_enabled: bool
     overlap_grad_reduce: bool
     overlap_param_gather: bool
@@ -76,6 +89,27 @@ class MdpCompatibilityOptions:
     checkpoint_mode: str
     save_requested: bool
     load_requested: bool
+    sequence_parallel: bool = False
+    sequence_packing_scheduler: Optional[str] = None
+    thd_static_packing: bool = False
+    max_seqlen_per_dp_cp_rank: Optional[int] = None
+    thd_max_packed_sequences: Optional[int] = None
+
+
+def thd_row_alignment(options: "MdpCompatibilityOptions") -> int:
+    """Row alignment the MDP collator pads each packed sample to.
+
+    Mirrors ``pack_or_pad_batch``'s ``divisible_by`` (zigzag CP wants an even
+    per-rank split; SP additionally splits across TP). The greedy token budget
+    must be a multiple of this, or a full bin cannot be partitioned legally.
+    """
+    from megatron.core.packed_seq_params import thd_collate_row_alignment
+
+    return thd_collate_row_alignment(
+        context_parallel_size=options.context_parallel_size,
+        tensor_model_parallel_size=options.tensor_parallel_size,
+        sequence_parallel=options.sequence_parallel,
+    )
 
 
 def _reject(option: str, value: Any, condition: str, why: str, suggestion: str = "") -> None:
@@ -150,6 +184,7 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "False",
         )
     _validate_override_entries(config.vision_config_overrides)
+    _validate_packing(config, options)
 
     # --- parallel dimensions and rank mapping preconditions ---
     if options.rank_order != SUPPORTED_RANK_ORDER:
@@ -247,14 +282,7 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "config override channel is reserved for a future FP8 recipe.",
             "False",
         )
-    if options.cuda_graph_enabled:
-        _reject(
-            "cuda_graph_enabled",
-            options.cuda_graph_enabled,
-            "full-iteration CUDA graphs disabled",
-            "MDP buffers are not captured graph-safe in this version.",
-            "False",
-        )
+    _validate_cuda_graph_options(config, options)
     if options.activation_offload_enabled:
         _reject(
             "activation_offload_enabled",
@@ -302,6 +330,145 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "supported; fully-parallel, local, asynchronous, non-persistent, and "
             "constant-structure caching modes are rejected.",
             SUPPORTED_CHECKPOINT_MODE,
+        )
+
+
+def _validate_cuda_graph_options(
+    config: MdpConfig, options: MdpCompatibilityOptions
+) -> None:
+    """Accept per-layer CUDA graphs; keep full-iteration graphs rejected.
+
+    Per-layer graphs own individual decoder submodules. P4 replays the captured
+    microbatches through the *unmodified* decoder schedule, and the bridge only ever
+    touches the decoder's embedding leaves (P3) and their gradients (P5) - never the
+    transformer layers - so a per-layer graph and the phase machine do not interact.
+    A full-iteration graph would instead capture P4 itself.
+    """
+    impl = options.cuda_graph_impl or "none"
+    if impl == REJECTED_CUDA_GRAPH_IMPL:
+        _reject(
+            "cuda_graph_impl",
+            impl,
+            f"cuda_graph_impl != '{REJECTED_CUDA_GRAPH_IMPL}'",
+            "A full-iteration graph captures the decoder schedule itself, so the "
+            "Python-level phase machine around it (pixel/embedding/gradient exchange, "
+            "per-iteration plan, dynamic vision item counts) cannot run. Per-layer "
+            "graphs are supported instead.",
+            "transformer_engine",
+        )
+    if impl not in SUPPORTED_CUDA_GRAPH_IMPLS:
+        _reject(
+            "cuda_graph_impl",
+            impl,
+            f"cuda_graph_impl in {sorted(SUPPORTED_CUDA_GRAPH_IMPLS)}",
+            "MDP validates against the known CUDA graph implementations only.",
+            "none",
+        )
+    if impl == "none":
+        return
+
+    if config.overlap_window_capture:
+        _reject(
+            "overlap_window_capture",
+            config.overlap_window_capture,
+            "overlap_window_capture == False when per-layer CUDA graphs are enabled",
+            "Window prefetch runs H2D copies and allocations from a background thread "
+            "on a side CUDA stream while graph capture is in flight, which "
+            "cudaStreamCaptureModeGlobal treats as an unsafe concurrent action. The "
+            "prefetch started in iteration N is still running when the capture step "
+            "runs, so the conflict is timing-dependent rather than reproducible.",
+            "False",
+        )
+
+    if not options.thd_static_packing:
+        _reject(
+            "thd_static_packing",
+            options.thd_static_packing,
+            "thd_static_packing == True when per-layer CUDA graphs are enabled",
+            "MDP requires a THD-packed decoder (window.py asserts qkv_format == 'thd'), "
+            "and a CUDA graph replays into fixed-size static input buffers: "
+            "[max_seqlen_per_dp_cp_rank, 1, H] hidden_states plus cu_seqlens of "
+            "thd_max_packed_sequences + 1 entries. Only --thd-static-packing makes MDP's "
+            "collator emit that shape; without it every microbatch has a different "
+            "packed token count and replay fails on the first mismatch. "
+            "--sequence-packing-scheduler, which produces the same contract for the "
+            "decoder-only path, is not usable under MDP (see validate_mdp_config).",
+            "--thd-static-packing --pad-packed-seq-alignment max "
+            "--max-seqlen-per-dp-cp-rank <N> --thd-max-packed-sequences <K>",
+        )
+
+
+def greedy_max_real_sequences(options: "MdpCompatibilityOptions") -> Optional[int]:
+    """Real sequences a greedy bin may hold, or ``None`` for no cap.
+
+    ``thd_max_packed_sequences`` is the *final* static THD capacity. Under
+    ``--thd-static-packing`` the padding tail is represented as an ordinary
+    dummy sequence appended to ``cu_seqlens``, so one slot must be reserved for
+    it -- exactly what ``_get_scheduler_max_real_num_seqs`` does for
+    ``dp_balanced``. Without the reservation a bin filled to the cap overflows
+    the ``thd_max_packed_sequences + 1`` entry budget and dies inside
+    ``_pad_cu_seqlens``.
+    """
+    cap = options.thd_max_packed_sequences
+    if cap is None:
+        return None
+    return int(cap) - 1 if options.thd_static_packing else int(cap)
+
+
+def _validate_packing(config: MdpConfig, options: MdpCompatibilityOptions) -> None:
+    """Reject packing configurations MDP cannot honor.
+
+    ``--sequence-packing-scheduler`` is rejected outright, not merely untested:
+    ``training.py`` wraps the data iterator whenever it is set, and
+    ``DpBalancedScheduler.run`` then asserts on GPT-only sample keys, deletes
+    every key outside those six (dropping ``pixel_values`` / ``image_grid_thw``),
+    and reroutes samples across DP with an all-to-all that has no notion of
+    variable-size pixel payloads. Without this rejection the run dies deep inside
+    an assert about a missing ``tokens`` key.
+    """
+    if options.sequence_packing_scheduler is not None:
+        _reject(
+            "sequence_packing_scheduler",
+            options.sequence_packing_scheduler,
+            "sequence_packing_scheduler is None",
+            "MCore's packing schedulers assert on GPT-only sample keys, drop the "
+            "pixel payload, and reroute samples across DP without pixel awareness. "
+            "MDP owns its packing (--mdp-greedy-packing).",
+            "None",
+        )
+    if not config.greedy_packing:
+        return
+    if options.max_seqlen_per_dp_cp_rank is None:
+        _reject(
+            "max_seqlen_per_dp_cp_rank",
+            options.max_seqlen_per_dp_cp_rank,
+            "max_seqlen_per_dp_cp_rank is set when --mdp-greedy-packing is on",
+            "The greedy token budget is max_seqlen_per_dp_cp_rank x "
+            "context_parallel_size; there is no default for it.",
+        )
+    alignment = thd_row_alignment(options)
+    budget = options.max_seqlen_per_dp_cp_rank * options.context_parallel_size
+    if budget % alignment != 0:
+        _reject(
+            "max_seqlen_per_dp_cp_rank",
+            options.max_seqlen_per_dp_cp_rank,
+            f"the greedy token budget ({budget}) is divisible by the collator row "
+            f"alignment ({alignment})",
+            "A bin filled to the budget must still split legally across CP/SP ranks; "
+            "discovering this inside TransformerEngine gives a far worse error.",
+        )
+    minimum = 2 if options.thd_static_packing else 1
+    if (
+        options.thd_max_packed_sequences is not None
+        and options.thd_max_packed_sequences < minimum
+    ):
+        _reject(
+            "thd_max_packed_sequences",
+            options.thd_max_packed_sequences,
+            f"thd_max_packed_sequences >= {minimum}",
+            "It caps the real sequences per greedy bin; under --thd-static-packing "
+            "one slot is reserved for the padding tail's dummy sequence.",
+            "8",
         )
 
 

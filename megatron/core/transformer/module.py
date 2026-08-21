@@ -225,11 +225,16 @@ class GraphableMegatronModule(MegatronModule):
         self.cuda_graphs[cg_index].backward_dw()
 
     def _is_thd_cuda_graph(self):
-        """Check if THD format with CUDA Graph is being used."""
-        return (
-            getattr(self.config, 'sequence_packing_scheduler', None) is not None
-            and self.config.cuda_graph_impl != "none"
-        )
+        """Check if THD format with CUDA Graph is being used.
+
+        The question is "does the incoming THD batch have fixed shapes", not
+        "is MCore's packing scheduler configured" -- those coincided only while
+        the scheduler was the sole fixed-shape producer. See
+        ``thd_shapes_are_static``.
+        """
+        from megatron.core.packed_seq_params import thd_shapes_are_static
+
+        return thd_shapes_are_static(self.config) and self.config.cuda_graph_impl != "none"
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """

@@ -12,7 +12,11 @@ import torch.nn.functional as F
 
 from examples.multimodal_dev.observability import nvtx_phase
 from megatron.core import mpu
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import (
+    PackedSeqParams,
+    build_static_thd_metadata,
+    thd_collate_row_alignment,
+)
 from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
@@ -146,7 +150,7 @@ def broadcast_data_batch(data, device="cuda"):
 # -------------------------------------------------------------------
 
 
-def accumulate_flops_stats(packed_seq_params) -> None:
+def accumulate_flops_stats(packed_seq_params, real_cu_seqlens=None) -> None:
     """Feed one micro-batch's real ``cu_seqlens`` into the FLOPs accumulators.
 
     Called from the forward step -- once per micro-batch, on every rank of the
@@ -169,6 +173,15 @@ def accumulate_flops_stats(packed_seq_params) -> None:
     intentionally not used. The reduction stays on device (no ``.item()``), so
     no host sync is added to the hot path.
 
+    ``real_cu_seqlens`` overrides ``cu_seqlens_q``. Under ``--thd-static-packing``
+    with the ``append_dummy_seq`` tail policy (forced at CP>1), the static pad is
+    represented as an ordinary extra sequence and therefore lands in
+    ``cu_seqlens_q`` itself. Accumulating that would overstate ``sum(L)`` and
+    ``sum(L^2)`` by the padding fraction -- exactly the shape of a false speedup,
+    since it appears only on the padded side. The collator emits the pre-tail
+    vector as ``flops_cu_seqlens`` in that case. ``extend_last`` (CP=1) leaves
+    ``cu_seqlens_q`` untouched and needs no override.
+
     Imported lazily: ``megatron.training.training`` pulls in the whole training
     stack, and this module is also imported by unit tests that never build it.
     """
@@ -176,7 +189,11 @@ def accumulate_flops_stats(packed_seq_params) -> None:
         # BSHD path: leave the accumulator untouched so
         # ``num_floating_point_operations`` keeps its closed-form defaults.
         return
-    cu_seqlens = getattr(packed_seq_params, "cu_seqlens_q", None)
+    cu_seqlens = (
+        real_cu_seqlens
+        if real_cu_seqlens is not None
+        else getattr(packed_seq_params, "cu_seqlens_q", None)
+    )
     if cu_seqlens is None:
         return
     try:
@@ -221,7 +238,7 @@ def accumulate_vision_flops_stats_from_items(vision_items) -> None:
 
 
 def _accumulate_workload_stats(
-    model, packed_seq_params, *, vision_items=None, image_grid_thw=None
+    model, packed_seq_params, *, vision_items=None, image_grid_thw=None, real_cu_seqlens=None
 ) -> None:
     """Report one micro-batch's decoder and vision work exactly once per rank.
 
@@ -236,7 +253,7 @@ def _accumulate_workload_stats(
     if vp_stage not in (None, 0):
         return
 
-    accumulate_flops_stats(packed_seq_params)
+    accumulate_flops_stats(packed_seq_params, real_cu_seqlens=real_cu_seqlens)
     if vision_items is not None:
         accumulate_vision_flops_stats_from_items(vision_items)
     else:
@@ -410,15 +427,57 @@ def pack_or_pad_batch(
     except AssertionError:
         has_sp = False
 
-    if cp_size > 1:
-        divisible_by = (tp_size * cp_size * 2) if has_sp else (cp_size * 2)
-    else:
-        divisible_by = tp_size if has_sp else 1
+    divisible_by = thd_collate_row_alignment(
+        context_parallel_size=cp_size,
+        tensor_model_parallel_size=tp_size,
+        sequence_parallel=has_sp,
+    )
     if pad_to_multiple is not None:
         divisible_by = max(divisible_by, pad_to_multiple)
 
     if use_packed_sequence:
         packed_batch: Dict[str, Any] = {}
+
+        # --thd-static-packing: emit a fixed-shape THD batch. Every microbatch
+        # becomes exactly `max_seqlen_per_dp_cp_rank * cp_size` rows with
+        # cu_seqlens* of `thd_max_packed_sequences + 1` entries, which is the
+        # contract MCore's THD CUDA-graph machinery expects from a packing
+        # scheduler. This collator works in GLOBAL (pre-CP-slice) coordinates:
+        # CP slicing happens later in models/base.py.
+        static_target_T = None
+        static_max_num_seqs = None
+        static_tail_policy = "extend_last"
+        try:
+            static_args = get_args()
+        except AssertionError:
+            static_args = None
+        if static_args is not None and getattr(static_args, "thd_static_packing", False):
+            # pad_between_seqs below is derived from the row alignment, and the
+            # CUDA-graph path re-derives the same value from the config alone
+            # (packed_seq_params.thd_static_pad_between_seqs). An extra
+            # pad_to_multiple would introduce gaps the config cannot see, so the
+            # two would silently disagree.
+            assert pad_to_multiple is None, (
+                "thd_static_packing is incompatible with an explicit pad_to_multiple: "
+                "the CUDA-graph path derives pad_between_seqs from the CP/SP row "
+                "alignment alone and cannot see it."
+            )
+            static_target_T = int(static_args.max_seqlen_per_dp_cp_rank) * cp_size
+            static_max_num_seqs = int(static_args.thd_max_packed_sequences)
+            # append_dummy_seq, matching what --sequence-packing-scheduler
+            # produces. `extend_last` is *not* usable here even at CP=1: it
+            # leaves cu_seqlens_q ending at the real token count while the
+            # tensors are padded to target_T, and TE then returns a shorter
+            # attention output than the padded input (observed as a view
+            # mismatch in Attention._apply_output_gate).
+            #
+            # The cost is that the pad tail becomes an ordinary sequence in
+            # cu_seqlens_q, which would inflate the FLOPs accumulator; the
+            # pre-tail vector is therefore emitted separately (see
+            # accumulate_flops_stats).
+            static_tail_policy = (
+                getattr(static_args, "thd_tail_padding_policy", None) or "append_dummy_seq"
+            )
 
         # Owner-sharded pixel reading: during MDP window capture of a
         # microbatch owned by another worker, skip pixel
@@ -480,21 +539,35 @@ def pack_or_pad_batch(
             # routing in megatron.core to exclude padded tokens from aux loss,
             # z-loss, and expert-bias accumulation.
             total_tokens_padded = cu_seqlens_padded[-1]
+            # Physical row count of the emitted tensors. Under static packing it
+            # is the fixed target, so the tail beyond the pack is padding too.
+            physical_T = total_tokens_padded
+            if static_target_T is not None:
+                assert total_tokens_padded <= static_target_T, (
+                    f"Packed THD length ({total_tokens_padded}) exceeds the static "
+                    f"target ({static_target_T}). Increase "
+                    "--max-seqlen-per-dp-cp-rank, or lower the number of samples per "
+                    "microbatch (--micro-batch-size, or the greedy token budget)."
+                )
+                physical_T = static_target_T
             padding_mask_thd = torch.zeros(
-                total_tokens_padded, dtype=torch.bool, pin_memory=use_pinned
+                physical_T, dtype=torch.bool, pin_memory=use_pinned
             )
             for i, real_seqlen in enumerate(seqlens_list):
                 pad_start = cu_seqlens_padded[i] + real_seqlen
                 pad_end = cu_seqlens_padded[i + 1]
                 if pad_end > pad_start:
                     padding_mask_thd[pad_start:pad_end] = True
+            if physical_T > total_tokens_padded:
+                padding_mask_thd[total_tokens_padded:] = True
 
             if use_pinned:
                 # Single padded buffer per field; pad regions filled with the
-                # same values F.pad used, sample slices copied in place.
+                # same values F.pad used, sample slices copied in place. Sized to
+                # physical_T so static packing costs no second copy.
                 def _packed_field(key, fill):
                     out = torch.empty(
-                        total_tokens_padded, dtype=batch[0][key].dtype, pin_memory=True
+                        physical_T, dtype=batch[0][key].dtype, pin_memory=True
                     )
                     out.fill_(fill)
                     for i, sample in enumerate(batch):
@@ -531,9 +604,16 @@ def pack_or_pad_batch(
                 packed_batch["labels"] = labels_list[0].unsqueeze(0)
                 packed_batch["loss_mask"] = loss_mask_list[0].unsqueeze(0)
             else:
-                packed_batch["input_ids"] = torch.concat(input_ids_list, dim=0).unsqueeze(0)
-                packed_batch["labels"] = torch.concat(labels_list, dim=0).unsqueeze(0)
-                packed_batch["loss_mask"] = torch.concat(loss_mask_list, dim=0).unsqueeze(0)
+                def _concat_field(pieces, fill):
+                    packed = torch.concat(pieces, dim=0)
+                    tail = physical_T - packed.shape[0]
+                    if tail:
+                        packed = F.pad(packed, (0, tail), value=fill)
+                    return packed.unsqueeze(0)
+
+                packed_batch["input_ids"] = _concat_field(input_ids_list, 0)
+                packed_batch["labels"] = _concat_field(labels_list, -100)
+                packed_batch["loss_mask"] = _concat_field(loss_mask_list, 0)
             packed_batch["padding_mask"] = padding_mask_thd.unsqueeze(0)
             if not suppress_pixels:
                 if use_pinned and pixel_values_list:
@@ -593,6 +673,35 @@ def pack_or_pad_batch(
             max_seqlen_q = int((cu_seqlens_padded_t[1:] - cu_seqlens_padded_t[:-1]).max().item())
             total_tokens = int(cu_seqlens_padded_t[-1].item())
 
+        pad_between_seqs = None
+        if static_target_T is not None:
+            cu_seqlens_t, cu_seqlens_padded_t, real_cu_seqlens_t = build_static_thd_metadata(
+                cu_seqlens_t,
+                cu_seqlens_padded_t,
+                target_len=static_target_T,
+                max_num_seqs=static_max_num_seqs,
+                tail_padding_policy=static_tail_policy,
+                cp_size=cp_size,
+            )
+            # max_seqlen must be the padded static value: the tail belongs to a
+            # sequence now, and a stale (shorter) max silently produces wrong
+            # attention rather than a crash.
+            max_seqlen_q = static_target_T
+            total_tokens = static_target_T
+            # Must be batch-independent (that is the point of static shapes), so
+            # derive it from the alignment rather than from this batch's
+            # vectors: with divisible_by == 1 no sample is ever padded, so
+            # cu_seqlens and cu_seqlens_padded coincide and there is provably no
+            # gap between sequences. Saying True there is not free -- it makes
+            # FlashAttention ineligible and, when the fused cuDNN backend is not
+            # selected either, drops TE onto its unfused O(T^2) attention, which
+            # OOMs at these lengths.
+            pad_between_seqs = divisible_by > 1
+            if real_cu_seqlens_t is not None:
+                # append_dummy_seq put the tail into cu_seqlens_q itself, which
+                # would inflate sum(L) and sum(L^2) in the FLOPs accumulator.
+                packed_batch["flops_cu_seqlens"] = real_cu_seqlens_t
+
         packed_batch["packed_seq_params"] = PackedSeqParams(
             qkv_format="thd",
             cu_seqlens_q=cu_seqlens_t,
@@ -602,6 +711,7 @@ def pack_or_pad_batch(
             max_seqlen_q=max_seqlen_q,
             max_seqlen_kv=max_seqlen_q,
             total_tokens=total_tokens,
+            pad_between_seqs=pad_between_seqs,
         )
         return packed_batch
 
@@ -753,6 +863,7 @@ def mdp_forward_step(runtime, data_iterator, model):
         model,
         record.decoder_packed_seq_params,
         vision_items=record.vision_items,
+        real_cu_seqlens=batch.get("flops_cu_seqlens"),
     )
 
     vision_embeddings = None
@@ -810,6 +921,7 @@ def forward_step(data_iterator, model):
         model,
         batch.get("packed_seq_params", None),
         image_grid_thw=batch.get("image_grid_thw", None),
+        real_cu_seqlens=batch.get("flops_cu_seqlens"),
     )
 
     # ``pixel_values`` is the heavy vision tensor and is only consumed
