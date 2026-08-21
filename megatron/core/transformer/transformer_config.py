@@ -941,6 +941,14 @@ class TransformerConfig(ModelParallelConfig):
     moe_permute_fusion_into_hybridep: bool = False
     """Fuse token rearrangement ops during token dispatching for HybridEP."""
 
+    fake_process_group: bool = False
+    """Set when the job was launched with --fake-process-group (single-GPU multi-rank memory
+    simulation). Threaded into MoEConfig so the flex dispatcher's HybridEP manager can skip its
+    real cross-GPU communication kernel (which bypasses torch.distributed and therefore cannot
+    be intercepted by the fake process group's FakeStore backend) and instead synthesize
+    correctly-shaped/sized buffers, so memory profiling still captures a faithful footprint
+    without attempting real inter-rank communication against ranks that don't physically exist."""
+
     moe_hybridep_pad_variable_tokens: bool = False
     """Dynamically pad uneven local token counts to the HybridEP group maximum before dispatch.
 

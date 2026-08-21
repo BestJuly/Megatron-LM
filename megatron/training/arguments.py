@@ -1924,9 +1924,19 @@ def validate_args(args, defaults={}):
                 ), '--distrib-optim-fully-reshardable-mem-efficient requires -enable-gloo-process-groups'
 
     if args.fake_process_group:
-        assert (
-            args.moe_token_dispatcher_type != "flex"
-        ), "Fake process group is not supported with flex token dispatcher."
+        # The flex dispatcher's deepep/deepepv2/ncclep backends call vendor-specific fused
+        # communication kernels directly (not torch.distributed collectives), which the fake
+        # process group's FakeStore backend cannot intercept -- running them under fake-PG would
+        # try to communicate with peer ranks that don't physically exist. The "hybridep" backend
+        # is the exception: MoEFlexTokenDispatcher's HybridEP manager checks
+        # config.fake_process_group itself and skips its real communication kernel in favor of a
+        # shape-preserving synthetic dispatch/combine, so memory profiling stays possible.
+        assert args.moe_token_dispatcher_type != "flex" or (
+            args.moe_flex_dispatcher_backend == "hybridep"
+        ), (
+            "Fake process group is not supported with the flex token dispatcher's "
+            f"'{args.moe_flex_dispatcher_backend}' backend (only 'hybridep' has fake-PG support)."
+        )
         # Disable nan check for fake process group
         args.check_for_nan_in_loss_and_grad = False
         warn_rank_0('check_for_nan_in_loss_and_grad is set to False for fake process group.')
