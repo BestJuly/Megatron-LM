@@ -49,6 +49,7 @@ schedule model list.
 | `allocator.py` / `storage.py` | Single allocation point for MDP buffers; endpoint leaf storage |
 | `bridge.py` | One ledger + transport for pixels/embeddings/gradients |
 | `window.py` / `activation.py` | Iteration window with VPP replay cursors; forward handle, chunking, encoder THD params |
+| `packing.py` | Greedy token-budget bin filling and the cross-iteration sample buffer |
 | `runtime.py` / `schedule.py` | Phase machine; schedule and finalizer wrappers |
 | `encoder.py` / `optimizer.py` | Encoder DDP over WORLD + ZeRO-1; composite optimizer with WORLD overflow union |
 | `checkpoint.py` | Weight-only torch_dist facade (`vision_model.*` with WORLD replica metadata) |
