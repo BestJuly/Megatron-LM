@@ -22,6 +22,18 @@ SUPPORTED_RANK_ORDER = "tp-cp-ep-dp-pp"
 # The only checkpoint format supported by the MDP checkpoint facade.
 SUPPORTED_CHECKPOINT_MODE = "torch_dist"
 
+# CUDA graph implementations MDP accepts. "local" and "transformer_engine" are the
+# per-layer ("partial") implementations: they graph individual decoder submodules and
+# leave the schedule, the encoder, and every MDP collective in eager mode. MDP's P4
+# runs the unmodified decoder schedule, so the decoder layers a per-layer graph owns
+# are never touched by the bridge.
+SUPPORTED_CUDA_GRAPH_IMPLS: frozenset = frozenset({"none", "local", "transformer_engine"})
+
+# The one implementation that is structurally incompatible with the phase machine: a
+# single graph over the whole forward-backward path would swallow P4 together with the
+# Python-level control flow P1-P3/P5 depend on.
+REJECTED_CUDA_GRAPH_IMPL = "full_iteration"
+
 # Keys that may be overridden on the vision TransformerConfig. Field semantics and
 # cross-field validation are delegated entirely to MCore's own __post_init__.
 VISION_CONFIG_OVERRIDE_ALLOWLIST: frozenset = frozenset(
@@ -69,7 +81,7 @@ class MdpCompatibilityOptions:
     bf16: bool
     fsdp_enabled: bool
     fp8_enabled: bool
-    cuda_graph_enabled: bool
+    cuda_graph_impl: str
     activation_offload_enabled: bool
     overlap_grad_reduce: bool
     overlap_param_gather: bool
@@ -91,13 +103,13 @@ def thd_row_alignment(options: "MdpCompatibilityOptions") -> int:
     per-rank split; SP additionally splits across TP). The greedy token budget
     must be a multiple of this, or a full bin cannot be partitioned legally.
     """
-    if options.context_parallel_size > 1:
-        return (
-            options.tensor_parallel_size * options.context_parallel_size * 2
-            if options.sequence_parallel
-            else options.context_parallel_size * 2
-        )
-    return options.tensor_parallel_size if options.sequence_parallel else 1
+    from megatron.core.packed_seq_params import thd_collate_row_alignment
+
+    return thd_collate_row_alignment(
+        context_parallel_size=options.context_parallel_size,
+        tensor_model_parallel_size=options.tensor_parallel_size,
+        sequence_parallel=options.sequence_parallel,
+    )
 
 
 def _reject(option: str, value: Any, condition: str, why: str, suggestion: str = "") -> None:
@@ -270,14 +282,7 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "config override channel is reserved for a future FP8 recipe.",
             "False",
         )
-    if options.cuda_graph_enabled:
-        _reject(
-            "cuda_graph_enabled",
-            options.cuda_graph_enabled,
-            "full-iteration CUDA graphs disabled",
-            "MDP buffers are not captured graph-safe in this version.",
-            "False",
-        )
+    _validate_cuda_graph_options(config, options)
     if options.activation_offload_enabled:
         _reject(
             "activation_offload_enabled",
@@ -325,6 +330,71 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "supported; fully-parallel, local, asynchronous, non-persistent, and "
             "constant-structure caching modes are rejected.",
             SUPPORTED_CHECKPOINT_MODE,
+        )
+
+
+def _validate_cuda_graph_options(
+    config: MdpConfig, options: MdpCompatibilityOptions
+) -> None:
+    """Accept per-layer CUDA graphs; keep full-iteration graphs rejected.
+
+    Per-layer graphs own individual decoder submodules. P4 replays the captured
+    microbatches through the *unmodified* decoder schedule, and the bridge only ever
+    touches the decoder's embedding leaves (P3) and their gradients (P5) - never the
+    transformer layers - so a per-layer graph and the phase machine do not interact.
+    A full-iteration graph would instead capture P4 itself.
+    """
+    impl = options.cuda_graph_impl or "none"
+    if impl == REJECTED_CUDA_GRAPH_IMPL:
+        _reject(
+            "cuda_graph_impl",
+            impl,
+            f"cuda_graph_impl != '{REJECTED_CUDA_GRAPH_IMPL}'",
+            "A full-iteration graph captures the decoder schedule itself, so the "
+            "Python-level phase machine around it (pixel/embedding/gradient exchange, "
+            "per-iteration plan, dynamic vision item counts) cannot run. Per-layer "
+            "graphs are supported instead.",
+            "transformer_engine",
+        )
+    if impl not in SUPPORTED_CUDA_GRAPH_IMPLS:
+        _reject(
+            "cuda_graph_impl",
+            impl,
+            f"cuda_graph_impl in {sorted(SUPPORTED_CUDA_GRAPH_IMPLS)}",
+            "MDP validates against the known CUDA graph implementations only.",
+            "none",
+        )
+    if impl == "none":
+        return
+
+    if config.overlap_window_capture:
+        _reject(
+            "overlap_window_capture",
+            config.overlap_window_capture,
+            "overlap_window_capture == False when per-layer CUDA graphs are enabled",
+            "Window prefetch runs H2D copies and allocations from a background thread "
+            "on a side CUDA stream while graph capture is in flight, which "
+            "cudaStreamCaptureModeGlobal treats as an unsafe concurrent action. The "
+            "prefetch started in iteration N is still running when the capture step "
+            "runs, so the conflict is timing-dependent rather than reproducible.",
+            "False",
+        )
+
+    if not options.thd_static_packing:
+        _reject(
+            "thd_static_packing",
+            options.thd_static_packing,
+            "thd_static_packing == True when per-layer CUDA graphs are enabled",
+            "MDP requires a THD-packed decoder (window.py asserts qkv_format == 'thd'), "
+            "and a CUDA graph replays into fixed-size static input buffers: "
+            "[max_seqlen_per_dp_cp_rank, 1, H] hidden_states plus cu_seqlens of "
+            "thd_max_packed_sequences + 1 entries. Only --thd-static-packing makes MDP's "
+            "collator emit that shape; without it every microbatch has a different "
+            "packed token count and replay fails on the first mismatch. "
+            "--sequence-packing-scheduler, which produces the same contract for the "
+            "decoder-only path, is not usable under MDP (see validate_mdp_config).",
+            "--thd-static-packing --pad-packed-seq-alignment max "
+            "--max-seqlen-per-dp-cp-rank <N> --thd-max-packed-sequences <K>",
         )
 
 

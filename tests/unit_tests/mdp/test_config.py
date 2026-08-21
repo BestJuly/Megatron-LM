@@ -11,6 +11,7 @@ from megatron.core.mdp.config import (
     VISION_CONFIG_OVERRIDE_ALLOWLIST,
     MdpCompatibilityOptions,
     MdpConfig,
+    SUPPORTED_CUDA_GRAPH_IMPLS,
     apply_vision_config_overrides,
     greedy_max_real_sequences,
     validate_mdp_config,
@@ -34,7 +35,7 @@ def _options(**overrides):
         bf16=True,
         fsdp_enabled=False,
         fp8_enabled=False,
-        cuda_graph_enabled=False,
+        cuda_graph_impl="none",
         activation_offload_enabled=False,
         overlap_grad_reduce=False,
         overlap_param_gather=False,
@@ -103,7 +104,7 @@ def test_invalid_mdp_config_fields_rejected(config_kwargs, match):
         (dict(bf16=False), "fp16/bf16"),
         (dict(fsdp_enabled=True), "fsdp"),
         (dict(fp8_enabled=True), "fp8"),
-        (dict(cuda_graph_enabled=True), "cuda_graph"),
+        (dict(cuda_graph_impl="full_iteration"), "cuda_graph_impl"),
         (dict(activation_offload_enabled=True), "activation_offload"),
         (dict(overlap_grad_reduce=True), "overlap_grad_reduce"),
         (dict(overlap_param_gather=True), "overlap_param_gather"),
@@ -332,4 +333,70 @@ def test_static_packing_needs_room_for_a_real_sequence_and_the_dummy():
                 thd_max_packed_sequences=1,
                 thd_static_packing=True,
             ),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Per-layer CUDA graphs
+# ---------------------------------------------------------------------------
+
+
+def _graph_options(**overrides):
+    """Options that satisfy every per-layer CUDA-graph precondition."""
+    base = dict(
+        cuda_graph_impl="transformer_engine",
+        thd_static_packing=True,
+        max_seqlen_per_dp_cp_rank=8192,
+        thd_max_packed_sequences=16,
+    )
+    base.update(overrides)
+    return _options(**base)
+
+
+@pytest.mark.parametrize("impl", sorted(SUPPORTED_CUDA_GRAPH_IMPLS))
+def test_per_layer_cuda_graphs_are_accepted(impl):
+    validate_mdp_config(MdpConfig(enable=True), _graph_options(cuda_graph_impl=impl))
+
+
+def test_full_iteration_graphs_stay_rejected():
+    # Regression guard: a full-iteration graph captures the decoder schedule
+    # itself, so the Python-level phase machine around it cannot run.
+    with pytest.raises(MdpConfigurationError, match="full_iteration"):
+        validate_mdp_config(
+            MdpConfig(enable=True), _graph_options(cuda_graph_impl="full_iteration")
+        )
+
+
+def test_unknown_cuda_graph_impl_is_rejected():
+    with pytest.raises(MdpConfigurationError, match="cuda_graph_impl"):
+        validate_mdp_config(MdpConfig(enable=True), _graph_options(cuda_graph_impl="nonsense"))
+
+
+def test_per_layer_graphs_require_static_thd_shapes():
+    # Without --thd-static-packing every microbatch has a different packed token
+    # count and replay fails on the first mismatch.
+    with pytest.raises(MdpConfigurationError, match="thd_static_packing"):
+        validate_mdp_config(MdpConfig(enable=True), _graph_options(thd_static_packing=False))
+
+
+def test_per_layer_graphs_reject_overlap_window_capture():
+    with pytest.raises(MdpConfigurationError, match="overlap_window_capture"):
+        validate_mdp_config(
+            MdpConfig(enable=True, overlap_window_capture=True), _graph_options()
+        )
+
+
+def test_graph_gate_is_inert_without_graphs():
+    # thd_static_packing is not required when graphs are off.
+    validate_mdp_config(
+        MdpConfig(enable=True, overlap_window_capture=True), _options(cuda_graph_impl="none")
+    )
+
+
+def test_mcore_scheduler_still_rejected_with_graphs():
+    # The scheduler would satisfy the *shape* contract but not MDP's data
+    # contract, so the packing rejection must win.
+    with pytest.raises(MdpConfigurationError, match="sequence_packing_scheduler"):
+        validate_mdp_config(
+            MdpConfig(enable=True), _graph_options(sequence_packing_scheduler="dp_balanced")
         )

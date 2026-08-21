@@ -266,6 +266,35 @@ Primary flags:
 - `--mdp-greedy-packing`
 - `--mdp-mock-dataset-config-json`
 
+CUDA graphs:
+
+- `--cuda-graph-impl local|transformer_engine` -- per-layer ("partial") graphs,
+  **accepted**. Requires `--thd-static-packing`; rejected together with
+  `--mdp-overlap-window-capture`.
+- `--cuda-graph-impl full_iteration` -- **rejected**: one graph over the whole
+  forward-backward path swallows P4 along with the Python control flow P1-P3/P5
+  depend on.
+- Whether the THD CUDA-graph machinery engages is decided by one shared
+  predicate, `packed_seq_params.thd_shapes_are_static(config)`: true for
+  `sequence_packing_scheduler`, `dynamic_context_parallel`, **or**
+  `thd_static_packing`. Before this it asked "is MCore's packing scheduler
+  configured", which coincided with "are the shapes fixed" only while the
+  scheduler was the sole fixed-shape producer. Four call sites share it:
+  `module.py:_is_thd_cuda_graph`, `transformer_config.py`'s
+  `thd_max_packed_sequences` / `pad_packed_seq_alignment` gate, the same gate in
+  `arguments.py`, and the MoE dispatcher restriction.
+  `cuda_graphs.py:_needs_full_local_padding_mask` follows via
+  `_is_thd_cuda_graph`. `_get_thd_varlen_max_num_microbatches` deliberately does
+  **not**: it stays `dp_balanced`-specific, and MDP falls through to "runtime"
+  because greedy variant A keeps `num_microbatches` static.
+- `MultimodalModel` forwards `decoder` / `mtp` / `rotary_pos_emb` /
+  `position_embedding_type` to `self.language_model`.
+  `TECudaGraphHelper._discover_layers` resolves layers with
+  `get_attr_wrapped_model(chunk, 'decoder')`, which unwraps only through
+  `.module`; without the forwards it raised, swallowed its own error at DEBUG,
+  and captured **zero** layers while reporting success. Core now raises when
+  *every* chunk fails that lookup.
+
 Packing flags MDP consumes from the core config (all optional, all off by
 default):
 
