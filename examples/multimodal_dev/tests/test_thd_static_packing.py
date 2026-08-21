@@ -170,7 +170,12 @@ class TestStaticShapes:
             assert getattr(psp, name).numel() == MAX_PACKED + 1, name
         assert psp.max_seqlen_q == MAX_SEQLEN
         assert psp.max_seqlen_kv == MAX_SEQLEN
-        assert psp.pad_between_seqs is True
+        # Derived from the collator's row alignment, not hardcoded: at TP=CP=1 no
+        # sample is ever padded, so cu_seqlens and cu_seqlens_padded coincide and
+        # there is provably no gap. Claiming True here is not free -- TE disables
+        # FlashAttention for THD whenever padding may exist between sequences.
+        assert psp.pad_between_seqs is False
+        assert torch.equal(psp.cu_seqlens_q, psp.cu_seqlens_q_padded)
 
     def test_shapes_do_not_depend_on_the_batch(self, static_args, mdp_enable, sample_device):
         static_args(mdp_enable=mdp_enable)
