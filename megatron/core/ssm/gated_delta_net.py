@@ -993,13 +993,22 @@ class GatedDeltaNet(MegatronModule):
         else:
             cu_seqlens = cu_seqlens_actual
 
-        total_cu = cu_seqlens[-1].cpu().item()
-        if total_cu != total_seq_len:
-            raise ValueError(
-                f"GDN: {name}[-1]={total_cu} does not match "
-                f"total_sequence_length={total_seq_len}. "
-                f"({cu_seqlens_padded=}, {cu_seqlens_actual=})."
-            )
+        # `.cpu().item()` is a device-to-host sync, which CUDA graph capture
+        # forbids outright unless the destination is pinned memory. Static
+        # THD packing (a prerequisite for per-layer CUDA graphs) guarantees
+        # this invariant by construction, and cuda_graph_warmup_steps runs
+        # real eager iterations before capture starts, so the check has
+        # already run at least once on this exact shape. Skip the redundant
+        # sync while a graph is being captured or replayed; keep it for
+        # ordinary eager execution where it still catches real bugs.
+        if not torch.cuda.is_current_stream_capturing():
+            total_cu = cu_seqlens[-1].cpu().item()
+            if total_cu != total_seq_len:
+                raise ValueError(
+                    f"GDN: {name}[-1]={total_cu} does not match "
+                    f"total_sequence_length={total_seq_len}. "
+                    f"({cu_seqlens_padded=}, {cu_seqlens_actual=})."
+                )
 
         seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
         if (seq_lengths % cp_size != 0).any():
