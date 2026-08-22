@@ -402,10 +402,14 @@ class GatedDeltaNet(MegatronModule):
                 "cu_seqlens_kv",
                 cp_size=self.cp_size,
             )
-            assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
-                "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
-                f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
-            )
+            # torch.equal syncs (returns a Python bool); forbidden during
+            # CUDA graph capture/replay. See the comment in
+            # _resolve_cu_seqlens for why skipping it here is safe.
+            if not torch.cuda.is_current_stream_capturing():
+                assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
+                    "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
+                    f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
+                )
             num_packed_seqs = cu_seqlens_q.shape[0] - 1
             assert num_packed_seqs > 0, (
                 "Number of packed sequences must be greater than 0, "
@@ -993,14 +997,15 @@ class GatedDeltaNet(MegatronModule):
         else:
             cu_seqlens = cu_seqlens_actual
 
-        # `.cpu().item()` is a device-to-host sync, which CUDA graph capture
-        # forbids outright unless the destination is pinned memory. Static
-        # THD packing (a prerequisite for per-layer CUDA graphs) guarantees
-        # this invariant by construction, and cuda_graph_warmup_steps runs
-        # real eager iterations before capture starts, so the check has
-        # already run at least once on this exact shape. Skip the redundant
-        # sync while a graph is being captured or replayed; keep it for
-        # ordinary eager execution where it still catches real bugs.
+        # Both checks below force a device-to-host sync (`.cpu().item()`, and
+        # `.any()` on a CUDA tensor implicitly calls `__bool__`), which CUDA
+        # graph capture forbids outright. Static THD packing (a prerequisite
+        # for per-layer CUDA graphs) guarantees these invariants by
+        # construction, and cuda_graph_warmup_steps runs real eager
+        # iterations before capture starts, so both checks have already run
+        # on this exact shape at least once. Skip them while a graph is
+        # being captured or replayed; keep them for ordinary eager execution
+        # where they still catch real bugs.
         if not torch.cuda.is_current_stream_capturing():
             total_cu = cu_seqlens[-1].cpu().item()
             if total_cu != total_seq_len:
@@ -1010,12 +1015,12 @@ class GatedDeltaNet(MegatronModule):
                     f"({cu_seqlens_padded=}, {cu_seqlens_actual=})."
                 )
 
-        seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-        if (seq_lengths % cp_size != 0).any():
-            raise ValueError(
-                f"All per-sequence lengths in cu_seqlens must be divisible by cp_size={cp_size}, "
-                f"but got lengths: {seq_lengths.tolist()}"
-            )
+            seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+            if (seq_lengths % cp_size != 0).any():
+                raise ValueError(
+                    f"All per-sequence lengths in cu_seqlens must be divisible by cp_size={cp_size}, "
+                    f"but got lengths: {seq_lengths.tolist()}"
+                )
 
         return cu_seqlens
 
