@@ -613,6 +613,12 @@ class GatedDeltaNet(MegatronModule):
             # deterministic_mode path) has no such parameter and asserts
             # cu_seqlens is None outright, so this is only threaded on the fla path.
             gdr_extra_kwargs["cu_seqlens_cpu"] = self._cu_seqlens_cpu_mirror(cu_seqlens_q)
+            # ... but the CPU mirror only removes the D2H sync; the resulting
+            # chunk_indices would still be host-built (an H2D copy) and frozen
+            # at capture time. Supply a device-built, fixed-shape table instead.
+            static_ci = self._static_chunk_indices(cu_seqlens_q)
+            if static_ci is not None:
+                gdr_extra_kwargs["chunk_indices"] = static_ci
         core_attn_out, _ = self.gated_delta_rule(
             query,
             key,
@@ -772,6 +778,11 @@ class GatedDeltaNet(MegatronModule):
                     # CPU-only arithmetic, no D2H sync, capture-safe.
                     _conv_cu_seqlens_cpu = _conv_cu_seqlens_cpu.clone()
                     _conv_cu_seqlens_cpu[-1] += _pad_n
+            _conv_chunk_indices = (
+                self._static_chunk_indices(_conv_cu_seqlens)
+                if _conv_cu_seqlens is not None
+                else None
+            )
             qkv, _ = causal_conv1d(
                 x=_conv_input,  # FLA conv1d accepts [b, s, d] format input
                 weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
@@ -779,6 +790,7 @@ class GatedDeltaNet(MegatronModule):
                 activation=self.activation,
                 initial_state=None,
                 cu_seqlens_cpu=_conv_cu_seqlens_cpu,
+                chunk_indices=_conv_chunk_indices,
                 output_final_state=False,
                 cu_seqlens=_conv_cu_seqlens,
                 cp_context=_conv_cp_context,
@@ -1043,6 +1055,61 @@ class GatedDeltaNet(MegatronModule):
                 )
 
         return cu_seqlens
+
+    def _static_chunk_indices(self, cu_seqlens: torch.Tensor, chunk_size: int = 64):
+        """Device-side, fixed-shape ``chunk_indices`` for ``fla``'s varlen kernels.
+
+        ``fla``'s chunked varlen kernels need a ``[NT, 2]`` table mapping each
+        chunk slot to ``(sequence index, chunk index within that sequence)``.
+        ``fla`` builds it on the host from the *contents* of ``cu_seqlens``
+        (``prepare_chunk_indices``), which is fatal for CUDA graphs twice over:
+
+        1. the build itself is a host<->device round trip that capture forbids;
+        2. even if it were capture-safe, ``NT`` and the table contents would be
+           frozen at capture time, while the static ``cu_seqlens`` buffer is
+           refilled with a *different* packing on every replay - so the graph
+           would silently compute the wrong chunk decomposition.
+
+        This builds the same table entirely with device ops and at a fixed
+        ``NT_max`` upper bound, so the shape (and therefore the Triton grid) is
+        a capture-time constant while the *values* are recomputed by the
+        replayed kernels from whatever ``cu_seqlens`` holds.
+
+        Slots past the real chunk count are pointed at sequence 0 with an
+        intra-chunk index beyond any possible sequence length, so every masked
+        load/store in ``fla``'s kernels (all gated on ``o_t < T``) turns them
+        into no-ops.
+
+        Returns ``None`` when the static THD bound is unknown, in which case the
+        caller lets ``fla`` build the table itself (eager-only path).
+        """
+        max_num_seqs = getattr(self.config, 'thd_max_packed_sequences', None)
+        max_seqlen = getattr(self.config, 'max_seqlen_per_dp_cp_rank', None)
+        if max_num_seqs is None or max_seqlen is None:
+            return None
+
+        total_t = int(max_seqlen) * int(self.config.context_parallel_size)
+        # Each sequence wastes at most one partial chunk, so the total chunk
+        # count never exceeds ceil(total_t / chunk_size) + num_sequences.
+        nt_max = (total_t + chunk_size - 1) // chunk_size + int(max_num_seqs)
+
+        lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        n_seq = lens.shape[0]
+        n_chunks = (lens + (chunk_size - 1)).div(chunk_size, rounding_mode='floor').to(torch.int64)
+        # offsets[i] = first chunk slot owned by sequence i; offsets[-1] = total.
+        offsets = F.pad(n_chunks.cumsum(0), (1, 0))
+        slot = torch.arange(nt_max, device=cu_seqlens.device, dtype=torch.int64)
+        # searchsorted over offsets[1:] maps a slot to its owning sequence; slots
+        # past the last boundary come back as n_seq, which flags them unused.
+        seg_id = torch.searchsorted(offsets[1:].contiguous(), slot, right=True)
+        valid = seg_id < n_seq
+        seg_id = seg_id.clamp(max=n_seq - 1)
+        intra = slot - offsets[seg_id]
+        zero = torch.zeros((), device=cu_seqlens.device, dtype=torch.int64)
+        beyond = torch.full((), nt_max, device=cu_seqlens.device, dtype=torch.int64)
+        seg_id = torch.where(valid, seg_id, zero)
+        intra = torch.where(valid, intra, beyond)
+        return torch.stack([seg_id, intra], 1).to(cu_seqlens)
 
     def _cu_seqlens_cpu_mirror(self, cu_seqlens: torch.Tensor) -> torch.Tensor:
         """Return a CPU mirror of ``cu_seqlens``, without syncing during capture.
