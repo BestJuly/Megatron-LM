@@ -286,6 +286,10 @@ class GatedDeltaNet(MegatronModule):
         # both values.
         self._chunkwise_cp_context_cache = {}
 
+        # Identity-keyed CPU mirror cache for static (CUDA-graph-capturable)
+        # cu_seqlens buffers - see _cu_seqlens_cpu_mirror below.
+        self._cu_seqlens_cpu_cache = {}
+
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -601,6 +605,14 @@ class GatedDeltaNet(MegatronModule):
             nvtx_range_pop(suffix="pre_gated_delta_rule")
 
         nvtx_range_push(suffix="gated_delta_rule")
+        gdr_extra_kwargs = {}
+        if not self.config.deterministic_mode and cu_seqlens_q is not None:
+            # fla's chunk_gated_delta_rule internally calls prepare_chunk_indices,
+            # which D2H-syncs on cu_seqlens unless given a CPU mirror - forbidden
+            # during CUDA graph capture. torch_chunk_gated_delta_rule (the
+            # deterministic_mode path) has no such parameter and asserts
+            # cu_seqlens is None outright, so this is only threaded on the fla path.
+            gdr_extra_kwargs["cu_seqlens_cpu"] = self._cu_seqlens_cpu_mirror(cu_seqlens_q)
         core_attn_out, _ = self.gated_delta_rule(
             query,
             key,
@@ -612,6 +624,7 @@ class GatedDeltaNet(MegatronModule):
             use_qk_l2norm_in_kernel=False,
             cu_seqlens=cu_seqlens_q,
             cp_context=chunkwise_cp_context,
+            **gdr_extra_kwargs,
         )
         nvtx_range_pop(suffix="gated_delta_rule")
 
@@ -733,6 +746,9 @@ class GatedDeltaNet(MegatronModule):
             _pad_n = 0
             _conv_input = qkv.contiguous()
             _conv_cu_seqlens = cu_seqlens_q
+            _conv_cu_seqlens_cpu = (
+                self._cu_seqlens_cpu_mirror(cu_seqlens_q) if cu_seqlens_q is not None else None
+            )
             _conv_cp_context = chunkwise_cp_context
             if self.config.gdn_conv_pad_alignment is not None:
                 if packed_seq_params is None or cu_seqlens_q is None:
@@ -753,12 +769,16 @@ class GatedDeltaNet(MegatronModule):
                 if cu_seqlens_q is not None:
                     _conv_cu_seqlens = cu_seqlens_q.clone()
                     _conv_cu_seqlens[-1] += _pad_n
+                    # CPU-only arithmetic, no D2H sync, capture-safe.
+                    _conv_cu_seqlens_cpu = _conv_cu_seqlens_cpu.clone()
+                    _conv_cu_seqlens_cpu[-1] += _pad_n
             qkv, _ = causal_conv1d(
                 x=_conv_input,  # FLA conv1d accepts [b, s, d] format input
                 weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
                 bias=conv1d_bias,
                 activation=self.activation,
                 initial_state=None,
+                cu_seqlens_cpu=_conv_cu_seqlens_cpu,
                 output_final_state=False,
                 cu_seqlens=_conv_cu_seqlens,
                 cp_context=_conv_cp_context,
@@ -1023,6 +1043,35 @@ class GatedDeltaNet(MegatronModule):
                 )
 
         return cu_seqlens
+
+    def _cu_seqlens_cpu_mirror(self, cu_seqlens: torch.Tensor) -> torch.Tensor:
+        """Return a CPU mirror of ``cu_seqlens``, without syncing during capture.
+
+        ``fla``'s chunked kernels (``chunk_gated_delta_rule``, ``causal_conv1d``)
+        internally call ``prepare_chunk_indices``, which does a ``.tolist()`` on
+        the CUDA ``cu_seqlens`` tensor if no CPU-side mirror is supplied - a D2H
+        sync that CUDA-graph capture forbids. When our packing is static (the
+        same ``cu_seqlens`` tensor object is reused on every replay, as required
+        for THD CUDA-graph capture), the CPU values are identical every time, so
+        we can compute the ``.cpu()`` once outside capture (during warmup) and
+        replay the cached mirror by tensor identity thereafter - mirroring the
+        pattern ``fla``'s own ``@tensor_cache`` decorator uses internally.
+        """
+        key = id(cu_seqlens)
+        cached = self._cu_seqlens_cpu_cache.get(key)
+        if cached is not None:
+            return cached
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "GDN: no cached CPU mirror for this cu_seqlens tensor during CUDA "
+                "graph capture. The warmup iterations must run this exact "
+                "cu_seqlens tensor object (by identity) at least once before "
+                "capture begins, so the CPU mirror can be computed off the "
+                "capturing stream."
+            )
+        cpu_mirror = cu_seqlens.cpu()
+        self._cu_seqlens_cpu_cache[key] = cpu_mirror
+        return cpu_mirror
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None, tp_group=None):
         """Provide a sharded state dictionary for distributed checkpointing."""
