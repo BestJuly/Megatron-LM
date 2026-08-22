@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """MDP installation seams for the Megatron training loop.
 
@@ -78,8 +78,7 @@ def mdp_config_from_args(args) -> MdpConfig:
         key, _, raw = entry.partition("=")
         if not _:
             raise MdpConfigurationError(
-                f"MDP: --mdp-vision-config-override entry {entry!r} violates: "
-                "KEY=VALUE format."
+                f"MDP: --mdp-vision-config-override entry {entry!r} violates: " "KEY=VALUE format."
             )
         value: object = raw
         if raw in ("None", "null"):
@@ -123,9 +122,7 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
     # validate_mdp_config's rejection can fire instead of building planning
     # groups that no longer match the decoder replicas.
     rank_order = (
-        "tp-cp-ep-pp-dp"
-        if getattr(args, "use_tp_pp_dp_mapping", False)
-        else SUPPORTED_RANK_ORDER
+        "tp-cp-ep-pp-dp" if getattr(args, "use_tp_pp_dp_mapping", False) else SUPPORTED_RANK_ORDER
     )
     return MdpCompatibilityOptions(
         world_size=args.world_size,
@@ -134,14 +131,10 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
         context_parallel_size=args.context_parallel_size,
         expert_parallel_size=getattr(args, "expert_model_parallel_size", 1),
         rank_order=rank_order,
-        virtual_pipeline_parallel_size=getattr(
-            args, "virtual_pipeline_model_parallel_size", None
-        ),
+        virtual_pipeline_parallel_size=getattr(args, "virtual_pipeline_model_parallel_size", None),
         calculate_per_token_loss=getattr(args, "calculate_per_token_loss", False),
         use_distributed_optimizer=getattr(args, "use_distributed_optimizer", False),
-        distributed_optimizer_instances=getattr(
-            args, "num_distributed_optimizer_instances", 1
-        ),
+        distributed_optimizer_instances=getattr(args, "num_distributed_optimizer_instances", 1),
         fp16=bool(args.fp16),
         bf16=bool(args.bf16),
         fsdp_enabled=fsdp,
@@ -150,6 +143,9 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
         activation_offload_enabled=offload,
         overlap_grad_reduce=getattr(args, "overlap_grad_reduce", False),
         overlap_param_gather=getattr(args, "overlap_param_gather", False),
+        overlap_param_gather_with_optimizer_step=bool(
+            getattr(args, "overlap_param_gather_with_optimizer_step", False)
+        ),
         delay_grad_reduce=bool(getattr(args, "delay_grad_reduce", False)),
         checkpoint_mode=getattr(args, "ckpt_format", "torch_dist"),
         save_requested=getattr(args, "save", None) is not None,
@@ -193,9 +189,7 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
         )
     )
     rank_view = rank_map.view(torch.distributed.get_rank())
-    process_groups = install_mdp_process_groups(
-        rank_map, group_registry=MdpGroupRegistry()
-    )
+    process_groups = install_mdp_process_groups(rank_map, group_registry=MdpGroupRegistry())
     encoder_pgs = build_encoder_pg_collection(
         rank_map, encoder_cp=mdp_config.encoder_cp, process_groups=process_groups
     )
