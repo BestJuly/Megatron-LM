@@ -33,6 +33,8 @@ VISION_CONFIG_OVERRIDE_ALLOWLIST: frozenset = frozenset(
     }
 )
 
+ENCODER_RECOMPUTE_MODES: frozenset = frozenset({"none", "all"})
+
 
 @dataclass(frozen=True)
 class MdpConfig:
@@ -41,6 +43,7 @@ class MdpConfig:
     enable: bool = False
     encoder_cp: int = 1
     encoder_max_payload_rows: Optional[int] = None
+    encoder_recompute: str = "none"
     vision_config_overrides: tuple = ()
     locality_slack_permille: int = 10
     row_alignment: int = 1
@@ -113,6 +116,25 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "None or a positive integer",
             "The chunk cap is measured in patch rows.",
             "None",
+        )
+    if config.encoder_recompute not in ENCODER_RECOMPUTE_MODES:
+        _reject(
+            "encoder_recompute",
+            config.encoder_recompute,
+            f"one of {sorted(ENCODER_RECOMPUTE_MODES)}",
+            "The complete-encoder replay path has only an off mode and the "
+            "Design-Doc all-recompute mode.",
+            "none",
+        )
+    if config.encoder_recompute == "all" and config.vision_config_overrides:
+        _reject(
+            "vision_config_overrides",
+            config.vision_config_overrides,
+            "empty when encoder_recompute == 'all'",
+            "Complete-encoder replay and nested TransformerConfig checkpointing "
+            "would replay the vision Transformer twice in P5 and make the mode's "
+            "memory/compute contract ambiguous.",
+            "()",
         )
     if not (0 <= config.locality_slack_permille < 1000):
         _reject(

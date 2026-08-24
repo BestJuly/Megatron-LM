@@ -115,6 +115,18 @@ def add_multimodal_args(parser):
         ),
     )
     group.add_argument(
+        "--mdp-encoder-recompute",
+        choices=("none", "all"),
+        default="none",
+        help=(
+            "MDP vision-encoder recompute mode. 'none' retains the P2 autograd "
+            "graph; 'all' follows the MDP design: P2 runs the complete encoder "
+            "under no_grad and P5 restores RNG and replays patch embedding, "
+            "Transformer blocks, and patch merger before backward. 'all' is "
+            "mutually exclusive with --mdp-vision-config-override."
+        ),
+    )
+    group.add_argument(
         "--mdp-vision-config-override",
         action="append",
         nargs="+",

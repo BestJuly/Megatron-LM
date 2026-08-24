@@ -60,6 +60,7 @@ def test_disabled_mdp_skips_all_checks():
     [
         (dict(encoder_cp=2), "encoder_cp"),
         (dict(encoder_max_payload_rows=0), "encoder_max_payload_rows"),
+        (dict(encoder_recompute="partial"), "encoder_recompute"),
         (dict(locality_slack_permille=1000), "locality_slack_permille"),
         (dict(locality_slack_permille=-1), "locality_slack_permille"),
         (dict(row_alignment=0), "row_alignment"),
@@ -144,6 +145,24 @@ def test_fp16_configuration_accepted_for_overflow_tests():
 )
 def test_native_decoder_ddp_overlap_is_supported(option_kwargs):
     validate_mdp_config(MdpConfig(enable=True), _options(**option_kwargs))
+
+
+def test_all_encoder_recompute_rejects_nested_transformer_recompute():
+    with pytest.raises(MdpConfigurationError, match="nested TransformerConfig"):
+        validate_mdp_config(
+            MdpConfig(
+                enable=True,
+                encoder_recompute="all",
+                vision_config_overrides=(("recompute_granularity", "full"),),
+            ),
+            _options(),
+        )
+
+
+def test_all_encoder_recompute_without_overrides_is_valid():
+    validate_mdp_config(
+        MdpConfig(enable=True, encoder_recompute="all"), _options()
+    )
 
 
 def test_error_messages_carry_option_value_and_suggestion():
@@ -297,6 +316,15 @@ def test_vision_recompute_modules_are_always_parsed_as_a_list(entries, expected)
         _fake_args(mdp_enable=True, mdp_vision_config_override=entries)
     )
     assert config.vision_config_overrides == expected
+
+
+def test_all_encoder_recompute_is_parsed_from_args():
+    from megatron.core.mdp.integration import mdp_config_from_args
+
+    config = mdp_config_from_args(
+        _fake_args(mdp_enable=True, mdp_encoder_recompute="all")
+    )
+    assert config.encoder_recompute == "all"
 
 
 @pytest.mark.parametrize("recompute_num_layers", [0, -1])

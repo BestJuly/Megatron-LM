@@ -100,10 +100,10 @@ The iteration phases are:
 |---|---|---|
 | P0 | `MdpRuntime.begin_iteration` | Reset iteration state and encoder gradients. |
 | P1 | `window.py`, `groups.py`, `planner.py`, `bridge.py` | Capture the full iteration, shard pixel reads, broadcast descriptors, build/check the plan, and route pixels. |
-| P2 | `runtime.py`, `activation.py`, model adapter | Pack producer chunks and run the vision encoder with autograd during training. |
+| P2 | `runtime.py`, `activation.py`, model adapter | Pack producer chunks. Default training runs the encoder with autograd; complete-encoder recompute runs it under `no_grad` and saves pixels/layouts/output metadata/RNG recipes. |
 | P3 | `bridge.py`, `storage.py` | Route detached vision embeddings to decoder endpoints and create endpoint leaves. |
 | P4 | Native Megatron schedule | Replay captured microbatches through the unchanged decoder schedule, finish any native decoder gradient-reduce overlap, and capture global token count. |
-| P5 | `runtime.py`, `activation.py`, `encoder.py` | Route leaf gradients back, run encoder backward, reduce WORLD gradients, and normalize them. |
+| P5 | `runtime.py`, `activation.py`, `encoder.py` | Route leaf gradients back; run retained-graph backward or replay complete encoder chunks with restored RNG before backward; reduce WORLD gradients and normalize them. |
 | P6 | `optimizer.py` | Union overflow state, compute a combined norm, clip consistently, and step decoder plus encoder optimizers. |
 
 Evaluation runs P0-P4, skips autograd/backward, releases retained state, and
@@ -126,7 +126,7 @@ returns to `EMPTY`.
 | `storage.py` | Endpoint embedding leaves and lifecycle checks. |
 | `bridge.py` | Canonical ledger and `all_to_all_single` transport for all three payload phases. |
 | `window.py` | Whole-iteration capture, microbatch replay cursors, pixel ownership context. |
-| `activation.py` | Encoder forward handle, chunk output retention, multi-tensor backward. |
+| `activation.py` | Retained-graph and complete-replay encoder handles, RNG recipes, chunk backward. |
 | `encoder.py` | Encoder process groups, DDP/ZeRO-1 domain, gradient finalization. |
 | `runtime.py` | P0-P5 orchestration, prefetch handoff, per-iteration state and metrics. |
 | `schedule.py` | Native schedule and `finalize_model_grads_func` wrappers. |
@@ -255,6 +255,7 @@ Primary flags:
 - `--mdp-enable`
 - `--mdp-encoder-cp` (currently must be 1)
 - `--mdp-encoder-max-payload-rows`
+- `--mdp-encoder-recompute none|all`
 - `--mdp-vision-config-override KEY=VALUE`
 - `--mdp-locality-slack-permille`
 - `--mdp-pixel-locality`
@@ -263,12 +264,25 @@ Primary flags:
 - `--mdp-overlap-window-capture`
 - `--mdp-debug-plan-payload-check`
 
-Vision activation recompute uses repeatable overrides. For example,
+Two mutually exclusive vision activation-recompute mechanisms are supported.
+The default `--mdp-encoder-recompute none` retains the P2 graph and may use
+repeatable TransformerConfig overrides. For example,
 `recompute_modules=mlp` and `recompute_modules=core_attn,mlp` are parsed as
 module lists for selective recompute. Full recompute additionally requires
 `recompute_method=uniform|block` and a positive `recompute_num_layers`; zero
 and negative chunk sizes are rejected during configuration instead of reaching
 the layer checkpoint loop.
+
+`--mdp-encoder-recompute all` follows the original MDP design: P2 runs patch
+embedding, positions/RoPE, all Transformer layers, and the patch merger under
+`no_grad`; the producer retains valid packed pixels, immutable chunk layouts,
+P2 output metadata, and CPU/CUDA/model-parallel RNG state per chunk. In P5 it
+forks the ambient RNG, restores each chunk's P2 state, replays the complete
+encoder with gradients enabled, immediately backpropagates the routed output
+gradient, and finally restores the P5-entry RNG. Chunk-at-a-time replay makes
+`encoder_max_payload_rows` bound the rebuilt graph. This mode rejects vision
+config overrides because nesting Transformer checkpointing would replay the
+Transformer twice in P5.
 
 There is deliberately no pixel-sharding flag. Pixel owner sharding is part of
 the MDP definition in this baseline.

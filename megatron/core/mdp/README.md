@@ -25,10 +25,10 @@ EMPTY`) driving seven phases:
 |---|---|---|
 | P0 | `begin_iteration` | Zero encoder grads, reset iteration state |
 | P1 | `begin_iteration` | Capture the iteration window, broadcast fixed-width descriptors from the PP0 endpoint, run deterministic LPT to logical workers, check the plan digest across the group, exchange pixels |
-| P2 | `begin_iteration` | Grad-enabled chunked encoder forward on encoder THD (`no_grad` for evaluation); outputs retained as a list in the forward handle |
+| P2 | `begin_iteration` | Chunked encoder forward on encoder THD. Default training retains graph-connected outputs; `--mdp-encoder-recompute all` runs under `no_grad` and retains pixels/layouts/RNG recipes; evaluation retains neither graph nor recipe |
 | P3 | `begin_iteration` | Exchange detached embeddings; endpoint assembles one detached leaf per vision-bearing microbatch |
 | P4 | native schedule | Replay iterators feed the unmodified decoder schedule; the wrapped `finalize_model_grads_func` captures the in-place-reduced global token count |
-| P5 | `end_iteration` | Exchange leaf gradients back, one multi-tensor backward per producer (native MCore recompute replays here), WORLD sum-reduce with prescale 1, scale by `1/clamp(T_global, 1)` |
+| P5 | `end_iteration` | Exchange leaf gradients back; default mode runs one multi-tensor backward (native MCore Transformer recompute replays here), while `all` restores RNG and replays complete encoder chunks one by one before backward; WORLD sum-reduce with prescale 1, scale by `1/clamp(T_global, 1)` |
 | P6 | composite optimizer | WORLD MAX overflow union before any scaler update, combined-norm shared clipping, one atomic step for `[decoder_dense, decoder_expert?, encoder]` |
 
 Key contracts: encoder and decoder THD packings are fully separate (linked
@@ -59,8 +59,10 @@ schedule model list.
 Supported: Qwen3.5-VL (one vision encoder), `TP=1`, decoder `CP=1`,
 `encoder_cp=1`, native PP/VPP/EP, fully replicated encoder with WORLD ZeRO-1,
 `calculate_per_token_loss=True`, bf16 main path (fp16 covered by
-overflow-union tests), THD packed sequences on both sides, native MCore vision
-recompute (`None`/`selective`/`full`) via the override channel, text-only
+overflow-union tests), THD packed sequences on both sides, either native MCore
+vision Transformer recompute (`None`/`selective`/`full`) via the override
+channel or Design-Doc complete-encoder recompute (`--mdp-encoder-recompute
+all`), text-only
 microbatches, synchronous global `torch_dist` weight-only checkpoints,
 `alignment_rows=1` (tests exercise 16), and native decoder DDP
 `overlap_grad_reduce`/`overlap_param_gather`. Decoder overlap remains owned by
@@ -72,6 +74,10 @@ activation offload, delayed gradient reduction,
 `overlap_param_gather_with_optimizer_step`, multiple distributed-optimizer
 instances, `calculate_per_token_loss=False`, non-`torch_dist` checkpoint formats,
 non-weight-only save/load, invalid rank mappings.
+
+Complete-encoder replay is deliberately exclusive with vision
+`TransformerConfig` recompute overrides. Nesting the two would add a third
+vision forward in P5 and obscure both the memory and compute contract.
 
 Registered extension hooks (each exercised by a test at a non-degenerate
 value): logical workers + `worker_ranks()` for encoder CP, single-valued

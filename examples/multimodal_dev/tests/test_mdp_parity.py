@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """G1/G2 parity: the MDP phase machine must reproduce the native pixel path.
 
@@ -244,7 +244,7 @@ def _captured_microbatch(pixel_values, slots):
     )
 
 
-def _build_runtime(vision_config, microbatches):
+def _build_runtime(vision_config, microbatches, *, mdp_config=None):
     world = torch.distributed.get_world_size()
     rank_map = build_rank_map(
         MdpRankSpec(world_size=world, tp=1, pp=1, cp=1, ep=1, encoder_cp=1)
@@ -269,7 +269,7 @@ def _build_runtime(vision_config, microbatches):
         pg_collection=encoder_pgs,
     )
     allocator = DirectBufferAllocator()
-    config = MdpConfig(enable=True)
+    config = mdp_config or MdpConfig(enable=True)
     runtime = MdpRuntime(
         config=config,
         rank_map=rank_map,
@@ -312,7 +312,14 @@ def _run_native(vision_config, batch):
     return model, total_loss
 
 
-def _run_mdp(vision_config, batch, *, native_model, corrupt_leaf_grad=False):
+def _run_mdp(
+    vision_config,
+    batch,
+    *,
+    native_model,
+    corrupt_leaf_grad=False,
+    mdp_config=None,
+):
     input_ids, labels, loss_mask, position_ids, pixel_values, _grid, slots = batch
     model = _build_language_model(with_encoder=False, vision_config=vision_config)
     # Identical language weights by construction (same seeds); assert one.
@@ -321,7 +328,9 @@ def _run_mdp(vision_config, batch, *, native_model, corrupt_leaf_grad=False):
     assert torch.equal(native_emb, mdp_emb)
 
     runtime, encoder_ddp = _build_runtime(
-        vision_config, [_captured_microbatch(pixel_values, slots)]
+        vision_config,
+        [_captured_microbatch(pixel_values, slots)],
+        mdp_config=mdp_config,
     )
     # Transplant the native encoder weights so both paths run the same model.
     encoder_ddp.module.load_state_dict(native_model.vision_model.state_dict())
@@ -502,6 +511,58 @@ def test_g1_recompute_modes_match_reference(overrides):
     )
     for name, param in mode_ddp.module.named_parameters():
         assert torch.equal(param.main_grad.float(), reference_grads[name]), name
+
+
+def test_g1_all_encoder_recompute_matches_reference():
+    """The Design-Doc P2-no-grad/P5-full-replay path must preserve stochastic
+    encoder outputs and the ambient RNG stream bitwise.
+
+    ``_run_mdp`` already asserts the P5 RNG fork. Using dropout and forcing two
+    encoder chunks ensures that neither a missing RNG restore nor a
+    single-recipe-for-all-chunks implementation can pass. Encoder gradients
+    use the same BF16-ULP tolerance as native-vs-MDP parity: the retained-graph
+    reference performs one multi-tensor backward, while complete replay must
+    backward and release one chunk at a time, so weight-gradient accumulation
+    order is intentionally different.
+    """
+    batch = _make_batch()
+    native_model, _ = _seeded(_run_native, _vision_config(dropout=0.0), batch)
+
+    reference_config = _vision_config(dropout=0.1)
+    reference_mdp_config = MdpConfig(enable=True, encoder_max_payload_rows=64)
+    _, reference_loss, reference_ddp = _run_mdp(
+        reference_config,
+        batch,
+        native_model=native_model,
+        mdp_config=reference_mdp_config,
+    )
+    reference_grads = {
+        name: param.main_grad.float().clone()
+        for name, param in reference_ddp.module.named_parameters()
+    }
+
+    _, mode_loss, mode_ddp = _run_mdp(
+        _vision_config(dropout=0.1),
+        batch,
+        native_model=native_model,
+        mdp_config=MdpConfig(
+            enable=True,
+            encoder_max_payload_rows=64,
+            encoder_recompute="all",
+        ),
+    )
+    assert torch.equal(reference_loss, mode_loss), (
+        float(reference_loss),
+        float(mode_loss),
+    )
+    for name, param in mode_ddp.module.named_parameters():
+        grad = param.main_grad.float()
+        reference = reference_grads[name]
+        atol = max(1e-5, 2e-3 * float(reference.abs().max()))
+        assert torch.allclose(grad, reference, rtol=8e-3, atol=atol), (
+            name,
+            float((grad - reference).abs().max()),
+        )
 
 
 def test_g1_one_step_update_parity():

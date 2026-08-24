@@ -103,6 +103,7 @@ def mdp_config_from_args(args) -> MdpConfig:
         enable=mdp_enabled(args),
         encoder_cp=getattr(args, "mdp_encoder_cp", 1),
         encoder_max_payload_rows=getattr(args, "mdp_encoder_max_payload_rows", None),
+        encoder_recompute=getattr(args, "mdp_encoder_recompute", "none"),
         vision_config_overrides=tuple(overrides),
         locality_slack_permille=getattr(args, "mdp_locality_slack_permille", 10),
         row_alignment=getattr(args, "mdp_row_alignment", 1),
@@ -260,11 +261,12 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
     )
     logger.info(
         "MDP: runtime installed (outer_dp_rank=%d, worker_id=%s, endpoint=%d, "
-        "workers=%d, overrides=%s)",
+        "workers=%d, encoder_recompute=%s, overrides=%s)",
         rank_view.outer_dp_rank,
         rank_view.my_worker_id,
         rank_view.endpoint_rank,
         len(rank_view.worker_ids),
+        mdp_config.encoder_recompute,
         list(mdp_config.vision_config_overrides),
     )
 
