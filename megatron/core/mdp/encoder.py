@@ -118,11 +118,24 @@ def build_encoder_domain(
         )
 
     encoder_ddp_config = build_encoder_ddp_config(ddp_config)
+    for field_name in (
+        "overlap_grad_reduce",
+        "overlap_param_gather",
+        "align_param_gather",
+    ):
+        if getattr(encoder_ddp_config, field_name, False):
+            raise MdpConfigurationError(
+                f"MDP: projected encoder DDP config has {field_name}=True; "
+                "decoder schedule-driven communication options must not enter "
+                "the encoder P5/P6 domain."
+            )
+
     effective_config = apply_vision_config_overrides(
         model_config, mdp_config.vision_config_overrides
     )
     logger.info(
-        "MDP: effective vision config overrides: %s", list(mdp_config.vision_config_overrides)
+        "MDP: effective vision config overrides: %s",
+        list(mdp_config.vision_config_overrides),
     )
     encoder = adapter.build_encoder(effective_config, pg_collection=encoder_pgs)
     if wrap_mixed_precision and (
@@ -196,8 +209,7 @@ def assert_parameter_disjointness(
         decoder_ids.update(id(p) for p in chunk.parameters())
     if all_trainable_parameters is not None:
         missing = [
-            id(p)
-            for p in all_trainable_parameters
+            id(p) for p in all_trainable_parameters
             if id(p) not in encoder_ids and id(p) not in decoder_ids
         ]
         if missing:

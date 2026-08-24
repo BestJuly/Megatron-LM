@@ -25,7 +25,12 @@ SUPPORTED_CHECKPOINT_MODE = "torch_dist"
 # Keys that may be overridden on the vision TransformerConfig. Field semantics and
 # cross-field validation are delegated entirely to MCore's own __post_init__.
 VISION_CONFIG_OVERRIDE_ALLOWLIST: frozenset = frozenset(
-    {"recompute_granularity", "recompute_method", "recompute_num_layers", "recompute_modules"}
+    {
+        "recompute_granularity",
+        "recompute_method",
+        "recompute_num_layers",
+        "recompute_modules",
+    }
 )
 
 
