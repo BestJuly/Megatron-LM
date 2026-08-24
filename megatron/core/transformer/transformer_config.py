@@ -2133,14 +2133,15 @@ class TransformerConfig(ModelParallelConfig):
 
             if (
                 self.recompute_granularity != "selective"
-                and self.recompute_num_layers is None
                 and not ep_overlap_full_recompute
+                and (
+                    self.recompute_num_layers is None
+                    or self.recompute_num_layers < 1
+                )
             ):
                 raise ValueError(
                     f"When using recompute_granularity: {self.recompute_granularity} "
-                    "recompute_num_layers must be between "
-                    "1 and num_layers_per_pipeline_rank: "
-                    f"{self.num_layers // self.pipeline_model_parallel_size}"
+                    "recompute_num_layers must be a positive integer."
                 )
             elif (
                 self.recompute_granularity == "selective" and self.recompute_num_layers is not None

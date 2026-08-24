@@ -272,3 +272,43 @@ def test_snapshot_reports_optimizer_step_param_gather_overlap():
     assert options.overlap_param_gather_with_optimizer_step
     with pytest.raises(MdpConfigurationError, match="overlap_param_gather_with_optimizer_step"):
         validate_mdp_config(MdpConfig(enable=True), options)
+
+@pytest.mark.parametrize(
+    "entries, expected",
+    [
+        (["recompute_modules=mlp"], (("recompute_modules", ["mlp"]),)),
+        (
+            [["recompute_granularity=selective", "recompute_modules=mlp"]],
+            (
+                ("recompute_granularity", "selective"),
+                ("recompute_modules", ["mlp"]),
+            ),
+        ),
+        (
+            ["recompute_modules=core_attn, mlp"],
+            (("recompute_modules", ["core_attn", "mlp"]),),
+        ),
+    ],
+)
+def test_vision_recompute_modules_are_always_parsed_as_a_list(entries, expected):
+    from megatron.core.mdp.integration import mdp_config_from_args
+
+    config = mdp_config_from_args(
+        _fake_args(mdp_enable=True, mdp_vision_config_override=entries)
+    )
+    assert config.vision_config_overrides == expected
+
+
+@pytest.mark.parametrize("recompute_num_layers", [0, -1])
+def test_full_recompute_num_layers_must_be_positive(recompute_num_layers):
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        TransformerConfig(
+            num_layers=4,
+            hidden_size=64,
+            num_attention_heads=4,
+            recompute_granularity="full",
+            recompute_method="uniform",
+            recompute_num_layers=recompute_num_layers,
+        )

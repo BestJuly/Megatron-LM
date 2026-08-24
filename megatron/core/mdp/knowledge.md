@@ -263,6 +263,13 @@ Primary flags:
 - `--mdp-overlap-window-capture`
 - `--mdp-debug-plan-payload-check`
 
+Vision activation recompute uses repeatable overrides. For example,
+`recompute_modules=mlp` and `recompute_modules=core_attn,mlp` are parsed as
+module lists for selective recompute. Full recompute additionally requires
+`recompute_method=uniform|block` and a positive `recompute_num_layers`; zero
+and negative chunk sizes are rejected during configuration instead of reaching
+the layer checkpoint loop.
+
 There is deliberately no pixel-sharding flag. Pixel owner sharding is part of
 the MDP definition in this baseline.
 

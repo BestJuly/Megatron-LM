@@ -74,21 +74,30 @@ def mdp_enabled(args) -> bool:
 def mdp_config_from_args(args) -> MdpConfig:
     """Build the frozen MdpConfig from the entry point's ``--mdp-*`` flags."""
     overrides = []
-    for entry in getattr(args, "mdp_vision_config_override", []) or []:
+    override_groups = getattr(args, "mdp_vision_config_override", []) or []
+    entries = (
+        entry
+        for group in override_groups
+        for entry in (group if isinstance(group, (list, tuple)) else (group,))
+    )
+    for entry in entries:
         key, _, raw = entry.partition("=")
         if not _:
             raise MdpConfigurationError(
                 f"MDP: --mdp-vision-config-override entry {entry!r} violates: "
                 "KEY=VALUE format."
             )
+        key = key.strip()
         value: object = raw
-        if raw in ("None", "null"):
+        if key == "recompute_modules":
+            value = [part.strip() for part in raw.split(",") if part.strip()]
+        elif raw in ("None", "null"):
             value = None
         elif raw.lstrip("-").isdigit():
             value = int(raw)
         elif "," in raw:
-            value = [part for part in raw.split(",") if part]
-        overrides.append((key.strip(), value))
+            value = [part.strip() for part in raw.split(",") if part.strip()]
+        overrides.append((key, value))
     overrides.sort(key=lambda item: item[0])
     return MdpConfig(
         enable=mdp_enabled(args),

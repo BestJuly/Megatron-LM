@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Extra CLI arguments for multimodal_dev standalone training."""
 
@@ -117,12 +117,14 @@ def add_multimodal_args(parser):
     group.add_argument(
         "--mdp-vision-config-override",
         action="append",
+        nargs="+",
         default=[],
         metavar="KEY=VALUE",
         help=(
-            "Vision TransformerConfig override entry (repeatable). Keys "
+            "Vision TransformerConfig override entries (groupable and repeatable). Keys "
             "are restricted to the MDP allowlist (recompute_granularity, "
-            "recompute_method, recompute_num_layers, recompute_modules)."
+            "recompute_method, recompute_num_layers, recompute_modules). "
+            "Use a comma-separated value for recompute_modules."
         ),
     )
     group.add_argument(
