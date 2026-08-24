@@ -414,6 +414,9 @@ fi
     --moe-permute-fusion \
     --vision-num-layers "$VISION_NUM_LAYERS" \
     --log-interval 1 \
+    --log-throughput \
+    --log-device-memory-used \
+    --log-memory-interval 5 \
     --eval-interval 100000 \
     --eval-iters 2 \
     --seed "$SEED" \
