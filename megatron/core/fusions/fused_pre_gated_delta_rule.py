@@ -1685,11 +1685,21 @@ def _resolve_packed_seq_idx(
         return None
 
     if seq_idx is None:
-        seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-        seq_idx = torch.repeat_interleave(
-            torch.arange(seq_lengths.numel(), device=cu_seqlens.device, dtype=torch.int32),
-            seq_lengths,
-        )
+        # Build the token -> sequence-id map with device-only ops at a shape
+        # fixed by total_tokens. The obvious formulation,
+        #     repeat_interleave(arange(n_seq), cu_seqlens[1:] - cu_seqlens[:-1])
+        # produces an output whose *length* is read from device data, so it
+        # forces a D2H sync and is rejected outright during CUDA graph capture
+        # ("operation not permitted when stream is capturing"). searchsorted
+        # gives the same answer -- the number of sequence ends at or below a
+        # token index is that token's sequence id -- with a static shape, so
+        # the values are recomputed on every replay from whatever cu_seqlens
+        # holds. Trailing zero-length sequences (THD padding) are handled
+        # identically by both formulations.
+        positions = torch.arange(total_tokens, device=cu_seqlens.device)
+        seq_idx = torch.searchsorted(
+            cu_seqlens[1:].contiguous(), positions, right=True
+        ).to(torch.int32)
         seq_idx = seq_idx.unsqueeze(0)
     elif seq_idx.dim() == 1:
         seq_idx = seq_idx.unsqueeze(0)
