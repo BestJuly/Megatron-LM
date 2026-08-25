@@ -327,6 +327,18 @@ case "$CE_FUSION" in
     *) echo "ERROR: CE_FUSION must be te|native|off, got '$CE_FUSION'" >&2; exit 1 ;;
 esac
 
+# Memory snapshot (MEMSNAP=1). Records the caching-allocator trace on every
+# rank in --profile-ranks and dumps one pickle per rank, for memory_viz /
+# mem-profile. Independent of NSYS.
+MEMSNAP_ARGS=()
+if [ "${MEMSNAP:-0}" = "1" ]; then
+    MEMSNAP_OUT="${MEMSNAP_OUT:?MEMSNAP=1 requires MEMSNAP_OUT=<snapshot pickle path>}"
+    MEMSNAP_RANKS=$(seq -s' ' 0 $((NPROC * NNODES - 1)))
+    MEMSNAP_ARGS=( --record-memory-history
+                   --memory-snapshot-path "$MEMSNAP_OUT"
+                   --profile-ranks $MEMSNAP_RANKS )
+fi
+
 PROF_ARGS=()
 TORCHRUN=( torchrun
            --nnodes "$NNODES"
@@ -433,4 +445,5 @@ fi
     "${PRECISION_AWARE_OPT_ARGS[@]}" \
     "${FORCE_LOAD_BALANCING_ARGS[@]}" \
     "${MANUAL_GC_ARGS[@]}" \
+    "${MEMSNAP_ARGS[@]}" \
     $EXTRA
