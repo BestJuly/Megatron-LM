@@ -3553,14 +3553,30 @@ def training_log(
 
     # Dump memory snapshot and print metrics to stdout.
     if iteration % args.log_interval == 0 or is_first_iteration:
-        if args.record_memory_history and (
-            is_last_rank() or torch.distributed.get_backend() == 'fake'
-        ):
-            snapshot = torch.cuda.memory._snapshot()
-            from pickle import dump
+        if args.record_memory_history:
+            # Dump on exactly the ranks that recorded. start_memory_history_recording
+            # gates torch.cuda.memory._record_memory_history on --profile-ranks, so
+            # gating the dump on is_last_rank() instead meant that setting
+            # --profile-ranks to anything not containing the last rank recorded
+            # history nowhere it was written out, and wrote out a snapshot with no
+            # history on the last rank. Rank-suffix the filename when more than one
+            # rank dumps, matching the OOM observer's existing convention.
+            profile_ranks = getattr(args, 'profile_ranks', None) or []
+            is_fake = torch.distributed.get_backend() == 'fake'
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            should_dump = (
+                rank in profile_ranks if profile_ranks else (is_last_rank() or is_fake)
+            )
+            if should_dump:
+                snapshot = torch.cuda.memory._snapshot()
+                from pickle import dump
 
-            with open(args.memory_snapshot_path, 'wb') as f:
-                dump(snapshot, f)
+                path = args.memory_snapshot_path
+                if len(profile_ranks) > 1:
+                    base, ext = os.path.splitext(path)
+                    path = f"{base}_rank-{rank}{ext}"
+                with open(path, 'wb') as f:
+                    dump(snapshot, f)
 
         elapsed_time = timers('interval-time').elapsed(barrier=True, reset=should_reset)
         elapsed_time_per_iteration = elapsed_time / total_iterations
