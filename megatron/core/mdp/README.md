@@ -62,13 +62,16 @@ Supported: Qwen3.5-VL (one vision encoder), `TP=1`, decoder `CP=1`,
 overflow-union tests), THD packed sequences on both sides, native MCore vision
 recompute (`None`/`selective`/`full`) via the override channel, text-only
 microbatches, synchronous global `torch_dist` weight-only checkpoints,
-`alignment_rows=1` (tests exercise 16).
+`alignment_rows=1` (tests exercise 16), and native decoder DDP
+`overlap_grad_reduce`/`overlap_param_gather`. Decoder overlap remains owned by
+the native PP/VPP schedule; the separate encoder DDP domain stays synchronous
+in P5/P6.
 
 Rejected at startup: FSDP/HSDP, FP8/MXFP8, full-iteration CUDA graphs, CPU
-activation offload, comm overlap (`overlap_grad_reduce`,
-`overlap_param_gather`, delayed reduction), multiple distributed-optimizer
-instances, `calculate_per_token_loss=False`, non-`torch_dist` checkpoint
-formats, non-weight-only save/load, invalid rank mappings.
+activation offload, delayed gradient reduction,
+`overlap_param_gather_with_optimizer_step`, multiple distributed-optimizer
+instances, `calculate_per_token_loss=False`, non-`torch_dist` checkpoint formats,
+non-weight-only save/load, invalid rank mappings.
 
 Registered extension hooks (each exercised by a test at a non-degenerate
 value): logical workers + `worker_ranks()` for encoder CP, single-valued
