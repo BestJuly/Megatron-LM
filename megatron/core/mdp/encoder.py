@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """MDP encoder domain: replicated encoder DDP over WORLD, ZeRO-1, and gradient
 finalization.
@@ -10,12 +10,12 @@ domain. The encoder never enters the decoder schedule model list.
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Sequence
 
 import torch
 
-from megatron.core.distributed import DistributedDataParallel
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.mdp.config import MdpConfig, apply_vision_config_overrides
 from megatron.core.mdp.errors import MdpConfigurationError
 from megatron.core.mdp.groups import MdpProcessGroups
@@ -33,6 +33,23 @@ class EncoderDomain:
     encoder_ddp: Any
     encoder_optimizer: Any
     effective_config: Any
+
+
+def build_encoder_ddp_config(
+    decoder_ddp_config: DistributedDataParallelConfig,
+) -> DistributedDataParallelConfig:
+    """Copy the decoder DDP policy while keeping encoder communication synchronous.
+
+    Decoder gradient-reduce and parameter-gather overlap is owned by the native
+    decoder schedule. The encoder has a separate backward/finalization lifecycle in
+    P5/P6, so it must not inherit those schedule-driven hooks.
+    """
+    return replace(
+        decoder_ddp_config,
+        overlap_grad_reduce=False,
+        overlap_param_gather=False,
+        align_param_gather=False,
+    )
 
 
 def build_encoder_pg_collection(
@@ -94,18 +111,24 @@ def build_encoder_domain(
     DDP over the encoder process groups; DistributedOptimizer from the DDP
     buffers.
     """
-    for field_name in ("overlap_grad_reduce", "overlap_param_gather"):
-        if getattr(ddp_config, field_name, False):
-            raise MdpConfigurationError(
-                f"MDP: {field_name}=True violates: encoder gradients only exist after "
-                "P5, so an overlapped reduction would fire against an empty buffer "
-                "during decoder backward. validate_mdp_config rejects this upstream."
-            )
     if getattr(ddp_config, "num_distributed_optimizer_instances", 1) != 1:
         raise MdpConfigurationError(
             "MDP: num_distributed_optimizer_instances != 1 violates: the encoder "
             "shards its optimizer state over WORLD."
         )
+
+    encoder_ddp_config = build_encoder_ddp_config(ddp_config)
+    for field_name in (
+        "overlap_grad_reduce",
+        "overlap_param_gather",
+        "align_param_gather",
+    ):
+        if getattr(encoder_ddp_config, field_name, False):
+            raise MdpConfigurationError(
+                f"MDP: projected encoder DDP config has {field_name}=True; "
+                "decoder schedule-driven communication options must not enter "
+                "the encoder P5/P6 domain."
+            )
 
     effective_config = apply_vision_config_overrides(
         model_config, mdp_config.vision_config_overrides
@@ -126,7 +149,7 @@ def build_encoder_domain(
 
     encoder_ddp = DistributedDataParallel(
         config=effective_config,
-        ddp_config=ddp_config,
+        ddp_config=encoder_ddp_config,
         module=encoder,
         pg_collection=encoder_pgs,
     )
