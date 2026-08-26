@@ -168,12 +168,15 @@ class EncoderAllRecomputeHandle:
     layouts, P2 output metadata, and the RNG state observed before each chunk.
     P5 replays and backpropagates one chunk at a time so
     ``encoder_max_payload_rows`` bounds the rebuilt graph as well as forward
-    workspace.
+    workspace. It does not bound the pixels retained across P4 or the complete
+    set of routed output gradients materialized before replay. Processed pixel
+    and gradient references are dropped after each chunk backward, reducing
+    their remaining lifetime but not the initial P5 peak.
     """
 
     iteration: int
     producer_worker_id: int
-    chunk_payloads: tuple[Tensor, ...]
+    chunk_payloads: list[Tensor | None]
     chunk_layouts: tuple[EncoderThdLayout, ...]
     output_metadata: tuple[EncoderOutputMetadata, ...]
     chunk_rng_states: tuple[tuple, ...]
@@ -214,12 +217,12 @@ class EncoderAllRecomputeHandle:
 
     def backward(
         self,
-        chunk_grads: Sequence[Tensor],
+        chunk_grads: list[Tensor | None],
         *,
         encoder: torch.nn.Module,
         encode: Callable[[torch.nn.Module, Tensor, EncoderThdLayout], Tensor],
     ) -> None:
-        """Replay each complete encoder chunk and immediately backpropagate it."""
+        """Replay each chunk, backpropagate it, and consume its pixels and gradient."""
         if self._backward_done:
             raise MdpStateError(
                 "MDP: all-recompute handle violates: exactly one backward."
@@ -232,6 +235,10 @@ class EncoderAllRecomputeHandle:
         for index, (grad, metadata) in enumerate(
             zip(chunk_grads, self.output_metadata)
         ):
+            if grad is None:
+                raise MdpStateError(
+                    f"MDP: all-recompute chunk {index} gradient was already consumed."
+                )
             if grad.shape != metadata.shape or grad.dtype != metadata.dtype:
                 raise MdpStateError(
                     f"MDP: all-recompute chunk {index} gradient violates: shape and "
@@ -250,15 +257,20 @@ class EncoderAllRecomputeHandle:
         # states are restored independently because a backward kernel is allowed
         # to consume RNG between consecutive replayed forwards.
         with _fork_rng():
-            for index, (payload, layout, grad, rng_state, metadata) in enumerate(
+            for index, (layout, rng_state, metadata) in enumerate(
                 zip(
-                    self.chunk_payloads,
                     self.chunk_layouts,
-                    chunk_grads,
                     self.chunk_rng_states,
                     self.output_metadata,
                 )
             ):
+                payload = self.chunk_payloads[index]
+                grad = chunk_grads[index]
+                if payload is None or grad is None:
+                    raise MdpStateError(
+                        f"MDP: all-recompute chunk {index} replay inputs were "
+                        "already consumed."
+                    )
                 _set_all_rng_states(*rng_state)
                 with torch.enable_grad():
                     output = encode(encoder, payload, layout)
@@ -280,6 +292,9 @@ class EncoderAllRecomputeHandle:
                     )
                 torch.autograd.backward(output, grad)
                 del output
+                self.chunk_payloads[index] = None
+                chunk_grads[index] = None
+                del payload, grad
         self._backward_done = True
 
     def release(self) -> None:
@@ -288,7 +303,7 @@ class EncoderAllRecomputeHandle:
             raise MdpStateError(
                 "MDP: all-recompute handle violates: release only after backward."
             )
-        self.chunk_payloads = ()
+        self.chunk_payloads = []
         self.chunk_layouts = ()
         self.output_metadata = ()
         self.chunk_rng_states = ()

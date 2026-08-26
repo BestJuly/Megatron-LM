@@ -12,6 +12,7 @@ from megatron.core.mdp.config import (
     MdpCompatibilityOptions,
     MdpConfig,
     apply_vision_config_overrides,
+    validate_effective_vision_config,
     validate_mdp_config,
 )
 from megatron.core.mdp.errors import MdpConfigurationError
@@ -211,6 +212,19 @@ def test_apply_overrides_empty_returns_base():
     assert apply_vision_config_overrides(base, ()) is base
 
 
+@pytest.mark.parametrize("recompute_granularity", ["full", "selective"])
+def test_all_encoder_recompute_rejects_effective_vision_recompute(
+    recompute_granularity,
+):
+    with pytest.raises(
+        MdpConfigurationError, match="effective vision recompute_granularity"
+    ):
+        validate_effective_vision_config(
+            MdpConfig(enable=True, encoder_recompute="all"),
+            _FakeTransformerConfig(recompute_granularity=recompute_granularity),
+        )
+
+
 def test_apply_overrides_delegates_field_validation_to_post_init():
     with pytest.raises(ValueError, match="bad recompute_granularity"):
         apply_vision_config_overrides(
@@ -325,18 +339,3 @@ def test_all_encoder_recompute_is_parsed_from_args():
         _fake_args(mdp_enable=True, mdp_encoder_recompute="all")
     )
     assert config.encoder_recompute == "all"
-
-
-@pytest.mark.parametrize("recompute_num_layers", [0, -1])
-def test_full_recompute_num_layers_must_be_positive(recompute_num_layers):
-    from megatron.core.transformer.transformer_config import TransformerConfig
-
-    with pytest.raises(ValueError, match="must be a positive integer"):
-        TransformerConfig(
-            num_layers=4,
-            hidden_size=64,
-            num_attention_heads=4,
-            recompute_granularity="full",
-            recompute_method="uniform",
-            recompute_num_layers=recompute_num_layers,
-        )

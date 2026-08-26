@@ -79,6 +79,19 @@ Complete-encoder replay is deliberately exclusive with vision
 `TransformerConfig` recompute overrides. Nesting the two would add a third
 vision forward in P5 and obscure both the memory and compute contract.
 
+`encoder_max_payload_rows` caps one rebuilt activation graph, not the complete
+P5 footprint. Producers retain all packed pixels across P4, and P5 materializes
+all routed chunk-output gradients before replay begins, so the initial peak is
+all pixels plus all output gradients plus one chunk's activation graph.
+Processed pixel and gradient references are dropped after each chunk backward;
+smaller chunks reduce the graph term but add serial replay/backward launches.
+
+Complete replay adds one full encoder forward, approximately doubling encoder
+forward FLOPs while leaving encoder backward at one execution. Prefer native
+`selective` or `full` Transformer recompute when its memory savings are enough;
+use complete replay when saving patch embedding, position/RoPE, and patch-merger
+activations justifies the extra complete forward.
+
 Registered extension hooks (each exercised by a test at a non-degenerate
 value): logical workers + `worker_ranks()` for encoder CP, single-valued
 endpoints + multi-slice routes for decoder CP, the vision config override

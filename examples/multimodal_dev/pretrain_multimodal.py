@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Standalone entry point for multimodal_dev model training (FSDP + EP).
 
@@ -196,9 +196,11 @@ def _setup_mdp(args):
         )
     if getattr(args, "recompute_vision", False):
         raise RuntimeError(
-            "--recompute-vision is the native-path switch; with --mdp-enable use "
-            "--mdp-vision-config-override recompute_granularity=full (and friends) "
-            "so the vision config flows through the MDP override channel"
+            "--recompute-vision is the native-path switch; with --mdp-enable choose "
+            "either native Transformer recompute through "
+            "--mdp-vision-config-override recompute_granularity=full (and friends), "
+            "or complete-encoder replay through --mdp-encoder-recompute all. The two "
+            "MDP recompute modes are mutually exclusive"
         )
     mdp_integration.validate_from_args(args)
     from megatron.core.mdp.checkpoint import assert_weight_only_checkpoint

@@ -373,3 +373,19 @@ def apply_vision_config_overrides(
     if not overrides:
         return base_config
     return dataclasses.replace(base_config, **dict(overrides))
+
+
+def validate_effective_vision_config(
+    config: MdpConfig, effective_config: "TransformerConfig"
+) -> None:
+    """Reject unsupported combinations visible only after adapter resolution."""
+    recompute_granularity = getattr(effective_config, "recompute_granularity", None)
+    if config.encoder_recompute == "all" and recompute_granularity is not None:
+        _reject(
+            "effective vision recompute_granularity",
+            recompute_granularity,
+            "None when encoder_recompute == 'all'",
+            "Complete-encoder replay cannot wrap native Transformer recompute; "
+            "otherwise the vision Transformer is replayed twice in P5.",
+            "None",
+        )

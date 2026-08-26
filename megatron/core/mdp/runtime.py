@@ -309,10 +309,10 @@ class MdpRuntime:
                 self._handle = EncoderAllRecomputeHandle(
                     iteration=self._iteration,
                     producer_worker_id=self.rank_view.my_worker_id,
-                    chunk_payloads=tuple(
+                    chunk_payloads=[
                         payload[: chunk.total_payload_rows]
                         for payload, chunk in zip(chunk_payloads, self._chunk_layouts)
-                    ),
+                    ],
                     chunk_layouts=tuple(self._chunk_layouts),
                     output_metadata=tuple(
                         EncoderOutputMetadata.from_tensor(output)
@@ -430,10 +430,11 @@ class MdpRuntime:
         else:
             # P5: gradient exchange, producer multi-tensor backward, WORLD
             # encoder-gradient reduction and 1/T_global normalization.
-            # Regroup buffers first: the exchange writes each routed gradient
-            # straight to its chunk offset (the wire is params_dtype; the
-            # destination copy casts to the chunk output dtype, exactly like
-            # the former two-step unpack + regroup did).
+            # Regroup every chunk before the one gradient exchange: the
+            # collective writes each routed gradient straight to its chunk
+            # offset (the wire is params_dtype; the destination copy casts to
+            # the chunk output dtype). Therefore encoder_max_payload_rows bounds
+            # one replay graph, not the full set of P5 gradient buffers.
             chunk_grads = []
             grad_dest = {}
             if self._handle is not None:
@@ -456,6 +457,8 @@ class MdpRuntime:
                                 + segment.output_rows
                             ]
                         chunk_grads.append(grad_buffer[: chunk.total_output_rows])
+                    # The chunk and destination views own the storage from here.
+                    del grad_buffer
             with nvtx_phase("p5_grad_exchange"):
                 grad_specs = self._iter_specs[BridgePhase.GRADIENT]
                 grad_local = {}
@@ -480,6 +483,9 @@ class MdpRuntime:
                     device=self.device,
                     dest_views=grad_dest,
                 )
+                # The chunk views remain in chunk_grads; segment views are no
+                # longer needed after the collective has populated them.
+                grad_dest.clear()
             if self._handle is not None:
                 with nvtx_phase("p5_encoder_backward"):
                     if isinstance(self._handle, EncoderAllRecomputeHandle):

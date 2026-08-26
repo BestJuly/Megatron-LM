@@ -155,8 +155,8 @@ def test_all_recompute_handle_replays_and_releases(monkeypatch):
     layout = _layout()
     chunks = split_encoder_layout(layout, max_payload_rows=80)
     assert len(chunks) == 2
-    payloads = tuple(torch.randn(chunk.total_payload_rows, 4) for chunk in chunks)
-    grads = tuple(torch.randn(chunk.total_output_rows, 4) for chunk in chunks)
+    payloads = [torch.randn(chunk.total_payload_rows, 4) for chunk in chunks]
+    grads = [torch.randn(chunk.total_output_rows, 4) for chunk in chunks]
 
     reference = torch.nn.Linear(4, 4, bias=False)
     replay = torch.nn.Linear(4, 4, bias=False)
@@ -200,5 +200,7 @@ def test_all_recompute_handle_replays_and_releases(monkeypatch):
         handle.release()
     handle.backward(grads, encoder=replay, encode=encode)
     assert torch.equal(replay.weight.grad, reference.weight.grad)
+    assert handle.chunk_payloads == [None, None]
+    assert grads == [None, None]
     handle.release()
     assert handle.consumed

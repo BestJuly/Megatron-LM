@@ -16,7 +16,11 @@ from typing import Any, Sequence
 import torch
 
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.mdp.config import MdpConfig, apply_vision_config_overrides
+from megatron.core.mdp.config import (
+    MdpConfig,
+    apply_vision_config_overrides,
+    validate_effective_vision_config,
+)
 from megatron.core.mdp.errors import MdpConfigurationError
 from megatron.core.mdp.groups import MdpProcessGroups
 from megatron.core.mdp.protocols import MdpModelAdapter
@@ -133,6 +137,7 @@ def build_encoder_domain(
     effective_config = apply_vision_config_overrides(
         model_config, mdp_config.vision_config_overrides
     )
+    validate_effective_vision_config(mdp_config, effective_config)
     logger.info(
         "MDP: effective vision config overrides: %s",
         list(mdp_config.vision_config_overrides),

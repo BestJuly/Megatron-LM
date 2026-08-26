@@ -268,10 +268,9 @@ Two mutually exclusive vision activation-recompute mechanisms are supported.
 The default `--mdp-encoder-recompute none` retains the P2 graph and may use
 repeatable TransformerConfig overrides. For example,
 `recompute_modules=mlp` and `recompute_modules=core_attn,mlp` are parsed as
-module lists for selective recompute. Full recompute additionally requires
-`recompute_method=uniform|block` and a positive `recompute_num_layers`; zero
-and negative chunk sizes are rejected during configuration instead of reaching
-the layer checkpoint loop.
+module lists for selective recompute. Full recompute uses MCore's native
+`TransformerConfig` validation for `recompute_method` and
+`recompute_num_layers`.
 
 `--mdp-encoder-recompute all` follows the original MDP design: P2 runs patch
 embedding, positions/RoPE, all Transformer layers, and the patch merger under
@@ -280,8 +279,23 @@ P2 output metadata, and CPU/CUDA/model-parallel RNG state per chunk. In P5 it
 forks the ambient RNG, restores each chunk's P2 state, replays the complete
 encoder with gradients enabled, immediately backpropagates the routed output
 gradient, and finally restores the P5-entry RNG. Chunk-at-a-time replay makes
-`encoder_max_payload_rows` bound the rebuilt graph. This mode rejects vision
-config overrides because nesting Transformer checkpointing would replay the
+`encoder_max_payload_rows` bound the rebuilt graph, but not all live state:
+every producer's packed pixels survive across P4, and P5 materializes all
+routed chunk-output gradients before the first replay. The initial P5 peak is
+therefore all retained pixels plus all routed gradients plus one chunk's
+activation graph. Consumed pixel and gradient references are dropped after
+each chunk backward, so their live storage decreases through P5, but this does
+not reduce that initial peak. Smaller chunks reduce only the rebuilt-graph
+term and add more serial replay/backward launches.
+
+Complete replay adds one full encoder forward: encoder forward FLOPs are
+approximately doubled, while encoder backward still runs once. Prefer native
+`selective` or `full` Transformer recompute when checkpointing Transformer
+activations saves enough memory; use `all` when the additional patch
+embedding, position/RoPE, and patch-merger activation savings justify replaying
+the complete encoder. This mode rejects native vision recompute on the
+effective vision config, whether it came from the override channel or directly
+from an adapter, because nesting the mechanisms would replay the vision
 Transformer twice in P5.
 
 There is deliberately no pixel-sharding flag. Pixel owner sharding is part of
