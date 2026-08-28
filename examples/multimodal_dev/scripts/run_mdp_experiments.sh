@@ -52,6 +52,17 @@
 #                    off    no fusion args at all
 #                    The TE path needs the assert in megatron/training/
 #                    arguments.py (~1822) commented out; it is, on this branch.
+#   MODEL_VARIANT=35b_a3b_light|397b_a17b_light  decoder width (default
+#                    35b_a3b_light). --model-variant only drives the vision
+#                    encoder shape in this training path (pretrain_multimodal.py
+#                    builds the language TransformerConfig straight from CLI
+#                    args, not from configuration.py's _VARIANT_CONFIGS table),
+#                    so this also switches the hidden_size/ffn_hidden_size/
+#                    num_attention_heads/moe_ffn_hidden_size/
+#                    moe_shared_expert_intermediate_size/linear_num_value_heads
+#                    CLI values below to match. NUM_LAYERS/NUM_EXPERTS/
+#                    MOE_TOPK/VISION_NUM_LAYERS/MTP_NUM_LAYERS stay independent
+#                    env overrides either way.
 #   EXTRA="..."      extra args appended verbatim
 #
 # Shape overrides: PP TP EP CP MBS GBS SEQ_LEN NUM_LAYERS NUM_EXPERTS
@@ -105,6 +116,33 @@ MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 MASTER_PORT=${MASTER_PORT:-29500}
 ENTRY=${ENTRY:-$REPO_ROOT/examples/multimodal_dev/pretrain_multimodal.py}
 EXTRA=${EXTRA:-}
+MODEL_VARIANT=${MODEL_VARIANT:-35b_a3b_light}
+
+# --model-variant only drives the vision encoder shape in this training
+# path -- the language decoder shape below is plain CLI args, so it has to
+# switch on MODEL_VARIANT too (see MODEL_VARIANT doc above).
+case "$MODEL_VARIANT" in
+    35b_a3b_light)
+        HIDDEN_SIZE=2048
+        FFN_HIDDEN_SIZE=4096
+        NUM_ATTENTION_HEADS=16
+        MOE_FFN_HIDDEN_SIZE=512
+        MOE_SHARED_EXPERT_INTERMEDIATE_SIZE=512
+        LINEAR_NUM_VALUE_HEADS=32
+        ;;
+    397b_a17b_light)
+        HIDDEN_SIZE=4096
+        FFN_HIDDEN_SIZE=10240
+        NUM_ATTENTION_HEADS=32
+        MOE_FFN_HIDDEN_SIZE=1024
+        MOE_SHARED_EXPERT_INTERMEDIATE_SIZE=1024
+        LINEAR_NUM_VALUE_HEADS=64
+        ;;
+    *)
+        echo "ERROR: MODEL_VARIANT must be 35b_a3b_light|397b_a17b_light, got '$MODEL_VARIANT'" >&2
+        exit 1
+        ;;
+esac
 
 export QWEN35_VL_GRID_CACHE=$GRID_CACHE
 # The scenario-pool wrapper (see ENTRY docs above) locates the repo via WT.
@@ -131,7 +169,7 @@ if [ "$GDN" = "1" ]; then
                --linear-key-head-dim 128
                --linear-value-head-dim 128
                --linear-num-key-heads 16
-               --linear-num-value-heads 32 )
+               --linear-num-value-heads "$LINEAR_NUM_VALUE_HEADS" )
 fi
 
 # MTP_NUM_LAYERS=0 omits the MTP args entirely (Megatron treats the arg's
@@ -190,7 +228,7 @@ fi
 
 "${LAUNCH[@]}" "$ENTRY" \
     --model-arch qwen35_vl \
-    --model-variant 35b_a3b_light \
+    --model-variant "$MODEL_VARIANT" \
     --dataset-provider mdp_mock \
     --use-vanilla-collate-fn \
     --use-packed-sequence \
@@ -216,9 +254,9 @@ fi
     --enable-experimental \
     --use-flash-attn \
     --num-layers "$NUM_LAYERS" \
-    --hidden-size 2048 \
-    --ffn-hidden-size 4096 \
-    --num-attention-heads 16 \
+    --hidden-size "$HIDDEN_SIZE" \
+    --ffn-hidden-size "$FFN_HIDDEN_SIZE" \
+    --num-attention-heads "$NUM_ATTENTION_HEADS" \
     --group-query-attention --num-query-groups 2 \
     --kv-channels 256 \
     --max-position-embeddings 262144 \
@@ -233,8 +271,8 @@ fi
     --make-vocab-size-divisible-by 485 \
     --untie-embeddings-and-output-weights \
     --num-experts "$NUM_EXPERTS" \
-    --moe-ffn-hidden-size 512 \
-    --moe-shared-expert-intermediate-size 512 \
+    --moe-ffn-hidden-size "$MOE_FFN_HIDDEN_SIZE" \
+    --moe-shared-expert-intermediate-size "$MOE_SHARED_EXPERT_INTERMEDIATE_SIZE" \
     --moe-shared-expert-gate \
     --moe-router-load-balancing-type aux_loss \
     --moe-router-topk "$MOE_TOPK" \
