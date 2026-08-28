@@ -82,6 +82,7 @@ _VISION_VARIANT_CONFIGS = {
     "9b":         {**_VISION_LARGE,  "out_hidden_size": 4096},
     "27b":        {**_VISION_LARGE,  "out_hidden_size": 5120},
     "35b_a3b":    {**_VISION_LARGE,  "out_hidden_size": 2048},
+    "35b_a3b_light": {**_VISION_LARGE, "out_hidden_size": 2048},
     "122b_a10b":  {**_VISION_LARGE,  "out_hidden_size": 3072},
     "397b_a17b":  {**_VISION_LARGE,  "out_hidden_size": 4096},
     "397b_a17b_light": {**_VISION_LARGE, "out_hidden_size": 4096},
