@@ -4,7 +4,9 @@
 
 Provides TransformerConfig builders for the vision encoder and all language
 decoder variants.  Both the standalone ``multimodal_dev`` training path and the
-MIMO path import from here — this is the single source of truth.
+MIMO path import the vision config from here; the language variants below are
+not read by ``run_qwen35_vl.sh`` / ``run_mdp_experiments.sh``, which keep
+their own MODEL_VARIANT CLI-arg tables.
 
 Supported language variants (HuggingFace Qwen3.5 series):
     ``0.8b``          Dense 0.8B
@@ -16,6 +18,7 @@ Supported language variants (HuggingFace Qwen3.5 series):
     ``122b_a10b``     MoE 122B-A10B (256 experts, top-8)
     ``397b_a17b``     MoE 397B-A17B (512 experts, top-10)
     ``35b_a3b_light`` Reduced 35B-A3B for testing
+    ``397b_a17b_light`` Reduced 397B-A17B (8 layers, 32 experts) for testing
     ``proxy``         Reduced proxy based on 397B for single-node testing
 """
 
@@ -66,8 +69,12 @@ _VISION_LARGE = {
     "kv_channels": 72, "ffn_hidden_size": 4304,
 }
 
-# Per-variant vision config.  ``out_hidden_size`` equals the language model's
-# hidden_size and controls the merger projection output dimension.
+# Per-variant vision config. ``out_hidden_size`` is documentation only:
+# get_qwen35_vl_vision_config() below does not read it -- callers (model.py,
+# mdp_adapter.py, factory.py) always derive the real merger output dim
+# directly from the language TransformerConfig's hidden_size instead. Kept
+# here (== the language variant's hidden_size) so the table stays a complete
+# per-variant reference, not because it drives any behavior.
 _VISION_VARIANT_CONFIGS = {
     "0.8b":       {**_VISION_SMALL,  "out_hidden_size": 1024},
     "2b":         {**_VISION_MEDIUM, "out_hidden_size": 2048},
@@ -77,6 +84,7 @@ _VISION_VARIANT_CONFIGS = {
     "35b_a3b":    {**_VISION_LARGE,  "out_hidden_size": 2048},
     "122b_a10b":  {**_VISION_LARGE,  "out_hidden_size": 3072},
     "397b_a17b":  {**_VISION_LARGE,  "out_hidden_size": 4096},
+    "397b_a17b_light": {**_VISION_LARGE, "out_hidden_size": 4096},
 }
 
 # Fallback for proxy/unknown variants (large ViT, generic out_hidden_size).
@@ -259,6 +267,19 @@ _VARIANT_CONFIGS = {
         "moe_ffn_hidden_size": 1024,
         "moe_shared_expert_intermediate_size": 1024,
     },
+    "397b_a17b_light": {
+        "num_layers": 8,
+        "hidden_size": 4096,
+        "ffn_hidden_size": 10240,
+        "num_attention_heads": 32,
+        "num_query_groups": 2,
+        "kv_channels": 256,
+        "linear_num_value_heads": 64,
+        "num_moe_experts": 32,
+        "moe_router_topk": 10,
+        "moe_ffn_hidden_size": 1024,
+        "moe_shared_expert_intermediate_size": 1024,
+    },
     "proxy": {
         "num_layers": 4,
         "hidden_size": 4096,
@@ -287,7 +308,7 @@ def get_qwen35_vl_language_config(
     Args:
         variant: One of ``0.8b``, ``2b``, ``4b``, ``9b``, ``27b``,
             ``35b_a3b``, ``122b_a10b``, ``397b_a17b``,
-            ``35b_a3b_light``, ``proxy``.
+            ``35b_a3b_light``, ``397b_a17b_light``, ``proxy``.
         **overrides: Override any TransformerConfig field.
 
     Returns:
