@@ -21,7 +21,9 @@ Startup validates the following before model allocation:
 - the memory dimension is divisible by the positive number of hash heads;
 - the versioned tokenizer-map artifact matches the configured tokenizer vocabulary, pad ID,
   selected layers, maximum order, and hash seed;
-- CP is one and packed sequences, VPP, activation recomputation, CUDA graphs, and FSDP are off.
+- CP is one and packed sequences, VPP, activation recomputation, and CUDA graphs are off;
+- Torch FSDP2 is off. Megatron FSDP is allowed only with `optim_grads_params`, Adam,
+  `fsdp_dtensor` checkpoints, and non-meta model initialization.
 
 EP is legal without MoE experts when Engram is enabled. If MoE and Engram coexist they share the
 same EP dimension and `ProcessGroupCollection.ep`. DeepEP is not a dependency or backend.
@@ -106,9 +108,52 @@ Sparse table weights have `allreduce=False`, so DDP synchronizes matching shards
 not across EP owners. The weights are replicated over TP in this milestone. With SP, their and all
 dense Engram parameter gradients are summed across TP by the existing sequence-parallel finalizer.
 All other Engram parameters use normal dense DP synchronization. The opt-in training verifier logs
-per-rank ordered token checksums plus global sparse-table and FP64 full-model checksums before and
-after every optimizer step, in addition to gradient, update, and peak-memory evidence. Normal
-training does not compute these diagnostics.
+global sparse-table and FP64 full-model checksums before and after every optimizer step, in
+addition to gradient, update, and peak-memory evidence. It also writes lightweight per-rank
+table/model/master/Adam residency records at construction, the first step, and the last step.
+Normal training does not compute these diagnostics.
+
+With DistributedOptimizer, a small table parameter can fall wholly inside one rank's contiguous
+DP optimizer shard. Other ranks still expose the BF16 model table through DDP but legitimately own
+no FP32 master value or Adam state for that table. Verification treats such ranks as identity
+contributors to the WORLD reductions, requires at least one optimizer-owned table shard globally,
+and applies the finite-gradient/change checks to every shard that is actually owned.
+
+## Megatron FSDP composition
+
+Engram composes its manual EP ownership with Megatron FSDP as a two-level row partition:
+
+```text
+global table rows
+  -> uneven contiguous EP owner slice
+  -> MFSDP shard of that slice over expert-DP
+```
+
+The table weight's `allreduce=False` marker is the MCore contract for the second level. The
+MFSDP adapter builds an expert device mesh whenever the wrapped module contains such a parameter,
+even when `num_moe_experts` is unset, and its bucketing code routes the parameter through that
+mesh without depending on a `.experts.` name. Because Engram is a child of `TransformerLayer`,
+the default ZeRO-3 FSDP unit already encloses the lookup table and its dense projections. Before
+a selected layer runs, MFSDP gathers one complete EP-owner slice over expert-DP; Engram then
+routes hash requests over EP exactly as in the non-FSDP path. Backward reduce-scatters the owner
+slice over expert-DP. Dense Engram parameters remain on the ordinary dense-DP mesh.
+
+A sharded run must include:
+
+```text
+--use-megatron-fsdp
+--use-distributed-optimizer
+--data-parallel-sharding-strategy optim_grads_params
+--optimizer adam
+--ckpt-format fsdp_dtensor
+```
+
+`tests/functional_tests/test_cases/engram/engram_proxy_ep4_mfsdp_1node` is the functional
+acceptance configuration. The toolkit recipe
+`configs/dev/training/engram_hybridep_mfsdp_8gpu.yaml` adds a real eight-rank MoE coexistence
+run: EP4 owns the global rows, expert-DP2 shards every owner slice, and MoE dispatches through
+HybridEP. Meta-device construction remains rejected because Engram's table and routing buffers
+currently materialize directly on CPU/CUDA.
 
 ## TP, SP, and PP data flow
 
@@ -125,6 +170,16 @@ Layers use their
 global 1-based `layer_number`; therefore selected layers on middle and last stages work without
 stage-specific layer specs or saved per-forward state.
 
+The prefetch boundary also covers the Qwen3.5-VL development data path. It accepts either an
+already-collated mapping containing `tokens`/`input_ids`, or a fixed-length list of multimodal
+sample mappings containing tensor `input_ids`. After the vanilla multimodal collator has assembled
+the model batch, the forward step replaces its token tensor with the prefetched tensor and checks
+shape and elementwise identity first. Engram therefore hashes exactly the token IDs consumed by
+the language decoder without advancing the underlying iterator twice. Empty, malformed, or
+variable-length raw sample lists fail before the pipeline schedule; packed language sequences
+remain outside this milestone. The vision encoder may still use its own internal THD packing,
+because those visual patch sequences are not Engram's language-token input.
+
 ## Optimizer policy
 
 Only sparse table weights carry `is_engram_embedding=True`. A `ParamKey` override selects those
@@ -134,7 +189,15 @@ decay (default zero). Value/key projections, gates, norms, and convolution remai
 selected optimizer and ordinary LR/weight-decay policy. The standard non-distributed optimizer path
 splits mixed model/Engram policies into chained optimizer instances. Mixed optimizer types over
 expert-parallel parameters are rejected with DistributedOptimizer, and mixed optimizer types are
-rejected with Megatron FSDP, because those paths cannot safely split their shared gradient buffers.
+rejected with Megatron FSDP, because those paths cannot safely split their shared gradient
+buffers. Megatron FSDP therefore requires the model optimizer itself to be Adam; the
+table-specific learning-rate and weight-decay override still forms a separate Adam parameter
+group. MFSDP replacement DTensors preserve both the authoritative `allreduce=False` expert-DP
+ownership marker and `is_engram_embedding=True`, including parameters rematerialized from meta
+initialization, so table ownership and the optimizer override survive parameter replacement.
+Each table also receives an independent MFSDP bucket. Its EP-owned rows are therefore sliced
+directly across expert-DP instead of being flattened beside unrelated MoE expert weights, which
+could skew the entire table payload onto one expert-DP rank.
 
 ## Distributed checkpointing
 
@@ -156,6 +219,14 @@ parameter: 2 bytes for the model value plus 12 bytes for the FP32 master value a
 moments. They report this payload for every global table and each Engram module at EP8 and EP4;
 fixed-size Adam step scalars are excluded because they do not scale with a table's row shard.
 
+Megatron FSDP checkpoints use `fsdp_dtensor`. Engram table model and optimizer keys receive an
+EP-rank suffix during DCP planning so potentially uneven owner slices cannot collide under one
+global key; expert-DP ranks retain the same key and contribute their DTensor shards. The suffix is
+only a checkpoint-planning name and the local module keys remain unchanged on load. Same-topology
+MFSDP save/resume is covered by the EP4/expert-DP2 functional configuration. Changing EP size
+directly while loading an Engram `fsdp_dtensor` checkpoint is deferred; use the existing
+`torch_dist` Engram checkpoint path when EP-size resharding is required.
+
 ## Profiling evidence
 
 When `--nvtx-ranges` is enabled, Engram emits ranges for hashing, owner mapping, request-count
@@ -173,12 +244,19 @@ also write per-rank JSONL records after model/DDP construction, optimizer constr
 optimizer step, and the final steady-state step. The records contain exact BF16 table, FP32 master
 parameter, and named Adam-state tensor bytes plus CUDA allocated/reserved/peak counters and the
 TP/PP/EP/dense-DP/expert-DP group coordinates. This separates EP row ownership from any further
-distributed-optimizer sharding over expert-DP.
+distributed-optimizer sharding over expert-DP. Under MFSDP, the BF16 count comes directly from
+each table's resident model-weight-buffer intersection and the remaining tensors come from their
+optimizer-owned local shards; DTensor logical shapes are never counted as resident storage.
+`--engram-verify-training` writes the same lightweight JSONL residency records without enabling
+allocator history or pickle snapshots.
 
 ## Supported and deferred combinations
 
-The first milestone supports BF16 GPT training with standard residuals or native mHC, EP, TP, PP,
-SP, MoE coexistence, native all-to-all, and torch distributed checkpoints. CP greater than one,
-packed THD inputs, VPP, activation recomputation, CUDA graphs, FSDP, inference serving, offload,
-DeepEP, communication overlap, request deduplication, FP8 table storage, and fused Engram kernels
-are intentionally deferred and rejected during startup.
+The milestone supports BF16 GPT training with standard residuals or native mHC, EP, TP, PP, SP,
+MoE coexistence (including a MoE flex/HybridEP dispatcher), native Engram all-to-all, torch
+distributed checkpoints, and Megatron FSDP ZeRO-3 over expert-DP with same-topology
+`fsdp_dtensor` save/resume. CP greater than one, packed THD inputs,
+VPP, activation recomputation, CUDA graphs, Torch FSDP2, Megatron FSDP meta initialization,
+non-Adam Megatron FSDP, cross-EP-size `fsdp_dtensor` resharding, inference serving, offload, DeepEP,
+communication overlap, request deduplication, FP8 table storage, and fused Engram kernels are
+intentionally deferred and rejected during startup where applicable.

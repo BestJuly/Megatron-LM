@@ -501,10 +501,15 @@ Wheneveer FSDP is composed with other model parallelisms, FSDP sharding is alway
 
 Megatron-FSDP uses `torch.distributed.DeviceMesh` to describe and configure communications across devices in data-parallel group(s). Because heterogeneous models that have mixed layers, such as [Hybrid Mamba-Transformer](https://arxiv.org/abs/2504.03624) or [Mixture-of-Experts (MoE)](https://arxiv.org/abs/1701.06538) models, require different parallelism configurations, multiple `DeviceMesh`(s) may be required for specific layers that require distinct distributed topologies for optimal memory efficiency and performance.
 
-Currently, Megatron-FSDP supports two `DeviceMesh`(s), one for dense / non-expert `Module`(s) and another for Megatron-Core MoE sparse / expert `Module`(s). (Expert modules and parameters in Megatron-Core are automatically detected.)
+Currently, Megatron-FSDP supports two `DeviceMesh`(s), one for dense / non-expert parameters
+and another for expert-parallel parameters. MCore's authoritative parameter-level marker is
+`allreduce=False`; `num_moe_experts` also requests the expert mesh before wrapping a MoE model.
+This lets non-MoE EP owners such as Engram use expert-DP FSDP without relying on a `.experts.`
+module path.
 
 - Dense modules typically have a `DeviceMesh` with data parallel, tensor parallel, and context parallel dimensions, where the data parallel dimension is used for FSDP. Typically, both data-parallel and context-parallel ranks are used for sharding in FSDP.
-- Mixture-of-experts modules typically have a `DeviceMesh` with data parallel, tensor parallel, and expert parallel dimensions, where the data parallel dimension is used for FSDP.
+- Expert-parallel parameters typically have a `DeviceMesh` with expert data parallel, expert
+  tensor parallel, and expert parallel dimensions, where expert-DP is used for FSDP.
 
 For more information about Mixture-of-Experts in Megatron-Core, refer to the [Megatron-Core User Guide - MoE](https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/features/moe.html).
 

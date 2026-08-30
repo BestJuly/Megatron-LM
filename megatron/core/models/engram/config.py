@@ -16,6 +16,16 @@ TOKENIZER_MAP_FORMAT = "megatron-engram-token-map"
 TOKENIZER_MAP_VERSION = 1
 
 
+def _uses_packed_sequences(args: Any) -> bool:
+    """Return whether the selected data path actually emits packed/THD inputs."""
+    return bool(
+        getattr(args, "use_packed_sequence", False)
+        or getattr(args, "use_varlen_dataset", False)
+        or getattr(args, "sequence_packing_scheduler", None) is not None
+        or (getattr(args, "sft", False) and not getattr(args, "use_vanilla_collate_fn", False))
+    )
+
+
 def is_prime(value: int) -> bool:
     """Return whether ``value`` is prime using deterministic trial division."""
     if value < 2:
@@ -116,14 +126,14 @@ class EngramConfig:
         config.validate_startup(
             transformer_config,
             expected_tokenizer_vocab_size=args.padded_vocab_size,
-            packed_sequences=bool(
-                getattr(args, "sft", False)
-                or getattr(args, "use_varlen_dataset", False)
-                or getattr(args, "sequence_packing_scheduler", None) is not None
+            packed_sequences=_uses_packed_sequences(args),
+            use_torch_fsdp2=bool(getattr(args, "use_torch_fsdp2", False)),
+            use_megatron_fsdp=bool(getattr(args, "use_megatron_fsdp", False)),
+            data_parallel_sharding_strategy=getattr(
+                args, "data_parallel_sharding_strategy", "optim_grads_params"
             ),
-            use_fsdp=bool(
-                getattr(args, "use_torch_fsdp2", False) or getattr(args, "use_megatron_fsdp", False)
-            ),
+            init_model_with_meta_device=bool(getattr(args, "init_model_with_meta_device", False)),
+            optimizer=getattr(args, "optimizer", "adam"),
         )
         return config
 
@@ -276,7 +286,11 @@ class EngramConfig:
         transformer_config: Any,
         expected_tokenizer_vocab_size: int,
         packed_sequences: bool = False,
-        use_fsdp: bool = False,
+        use_torch_fsdp2: bool = False,
+        use_megatron_fsdp: bool = False,
+        data_parallel_sharding_strategy: str = "optim_grads_params",
+        init_model_with_meta_device: bool = False,
+        optimizer: str = "adam",
     ) -> None:
         """Validate layer placement, tokenizer compatibility, and supported parallel features."""
         if any(layer_id > transformer_config.num_layers for layer_id in self.layer_ids):
@@ -308,5 +322,20 @@ class EngramConfig:
             raise ValueError("Engram does not yet support activation recomputation.")
         if transformer_config.cuda_graph_impl != "none":
             raise ValueError("Engram does not yet support CUDA graphs.")
-        if use_fsdp:
-            raise ValueError("Engram does not yet support FSDP.")
+        if use_torch_fsdp2:
+            raise ValueError("Engram does not support Torch FSDP2; use Megatron FSDP instead.")
+        if use_megatron_fsdp:
+            if data_parallel_sharding_strategy != "optim_grads_params":
+                raise ValueError(
+                    "Engram Megatron FSDP requires data_parallel_sharding_strategy="
+                    "optim_grads_params so table parameters are fully sharded over expert-DP."
+                )
+            if init_model_with_meta_device:
+                raise ValueError(
+                    "Engram Megatron FSDP does not yet support meta-device initialization."
+                )
+            if optimizer != "adam":
+                raise ValueError(
+                    "Engram Megatron FSDP requires the Adam model optimizer because Megatron "
+                    "FSDP cannot mix optimizer types in shared parameter buffers."
+                )

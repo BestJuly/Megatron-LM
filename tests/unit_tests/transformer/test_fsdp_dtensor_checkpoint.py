@@ -45,7 +45,34 @@ from megatron.core.tensor_parallel.layers import (
 from megatron.core.transformer.fsdp_dtensor_checkpoint import (
     flatten_state_dict,
     get_expert_index_from_key,
+    handle_engram_in_state_dict,
 )
+
+
+# ============================================================================
+# Test Engram EP checkpoint key rewriting
+# ============================================================================
+def test_engram_checkpoint_keys_are_unique_per_ep_owner():
+    table_key = "decoder.layers.0.engram.embedding.tables.0.weight"
+    dense_key = "decoder.layers.0.self_attention.linear_qkv.weight"
+    model_state = {table_key: object(), dense_key: object()}
+    optimizer_state = {
+        "state": {table_key: {"exp_avg": object()}, dense_key: {}},
+        "param_to_group_meta": {table_key: {"lr_mult": 5.0}, dense_key: {}},
+    }
+
+    rewritten_model, rewritten_optimizer = handle_engram_in_state_dict(
+        model_state, optimizer_state, ep_rank=3
+    )
+
+    rewritten_table_key = f"{table_key}.engram_ep_rank_3"
+    assert rewritten_table_key in rewritten_model
+    assert rewritten_table_key in rewritten_optimizer["state"]
+    assert rewritten_table_key in rewritten_optimizer["param_to_group_meta"]
+    assert dense_key in rewritten_model
+    assert dense_key in rewritten_optimizer["state"]
+    assert table_key in model_state
+    assert table_key in optimizer_state["state"]
 
 
 # ============================================================================

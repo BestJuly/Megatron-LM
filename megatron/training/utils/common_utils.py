@@ -564,6 +564,46 @@ class PipelineTokenPrefetchIterator:
         return self._pipeline_tokens.popleft()
 
 
+def _extract_pipeline_tokens(batch: Any) -> torch.Tensor:
+    """Extract fixed-shape token IDs from text or vanilla multimodal batches."""
+    if isinstance(batch, dict):
+        for key in ("tokens", "input_ids"):
+            tokens = batch.get(key)
+            if isinstance(tokens, torch.Tensor):
+                return tokens
+        raise RuntimeError(
+            "Engram data batches must contain token IDs under 'tokens' or 'input_ids'."
+        )
+
+    if isinstance(batch, (list, tuple)):
+        rows = []
+        for sample in batch:
+            if not isinstance(sample, dict) or not isinstance(
+                sample.get("input_ids"), torch.Tensor
+            ):
+                raise RuntimeError("Engram multimodal samples must contain tensor 'input_ids'.")
+            input_ids = sample["input_ids"]
+            if input_ids.ndim != 1:
+                raise ValueError(
+                    "Engram multimodal sample input_ids must be one-dimensional, "
+                    f"got {tuple(input_ids.shape)}."
+                )
+            rows.append(input_ids)
+        if not rows:
+            raise RuntimeError("Engram multimodal batches must not be empty.")
+        try:
+            return torch.stack(rows, dim=0)
+        except RuntimeError as exc:
+            raise ValueError(
+                "Engram multimodal batches require fixed-length input_ids before pipeline "
+                "prefetch."
+            ) from exc
+
+    raise RuntimeError(
+        "Engram data batches must be a token dict or a list of multimodal sample dicts."
+    )
+
+
 def prepare_tokens_for_pipeline(
     data_iterator,
     num_microbatches: int,
@@ -598,9 +638,9 @@ def prepare_tokens_for_pipeline(
                 raise RuntimeError("The first pipeline stage TP source must own Engram data.")
             batch = next(data_iterator)
             prefetched_batches.append(batch)
-            if "tokens" not in batch:
-                raise RuntimeError("Engram data batches must contain token IDs.")
-            tokens = batch["tokens"].to(device=device, dtype=torch.int64, non_blocking=True)
+            tokens = _extract_pipeline_tokens(batch).to(
+                device=device, dtype=torch.int64, non_blocking=True
+            )
             if tuple(tokens.shape) != expected_shape:
                 raise ValueError(
                     f"Engram expected token shape {expected_shape}, got {tuple(tokens.shape)}."

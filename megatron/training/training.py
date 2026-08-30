@@ -2734,46 +2734,137 @@ def dummy_train_step(data_iterator):
             )
 
 
-def _model_parameter_checksum(model):
-    """Return FP64 sum and square-sum checksums for all local model parameters."""
-    first_parameter = next(unwrap_model(model[0]).parameters())
-    checksum = torch.zeros(2, dtype=torch.float64, device=first_parameter.device)
-    for model_chunk in model:
-        for parameter in unwrap_model(model_chunk).parameters():
-            value = parameter.detach()
-            checksum[0] += value.sum(dtype=torch.float64)
-            checksum[1] += value.float().square().sum(dtype=torch.float64)
+def _local_tensor(tensor):
+    """Return the resident tensor for a regular Tensor or DTensor."""
+    return tensor.to_local() if hasattr(tensor, "to_local") else tensor
+
+
+def _is_engram_table_parameter(name, parameter):
+    """Identify Engram tables, retaining a name fallback for older checkpoints."""
+    return getattr(parameter, "is_engram_embedding", False) or (
+        "engram" in name and ".embedding.tables." in name
+    )
+
+
+def _iter_engram_table_parameters(model):
+    """Yield Engram parameters and their exact rank-resident compute tensors."""
+    for model_chunk_id, model_chunk in enumerate(model):
+        param_and_grad_buffer = getattr(model_chunk, "param_and_grad_buffer", None)
+        if param_and_grad_buffer is not None and hasattr(
+            param_and_grad_buffer, "optimizer_named_parameters"
+        ):
+            for name, parameter in param_and_grad_buffer.optimizer_named_parameters:
+                if not _is_engram_table_parameter(name, parameter):
+                    continue
+                orig_parameter = parameter.orig_param
+                group_id = param_and_grad_buffer.param_to_param_group[orig_parameter]
+                parameter_group = param_and_grad_buffer.parameter_groups[group_id]
+                model_weight_buffer = parameter_group.model_weight_buffer
+                if model_weight_buffer is None:
+                    model_tensor = _local_tensor(orig_parameter)
+                else:
+                    item_id = model_weight_buffer.param_idx[orig_parameter]
+                    model_tensor = model_weight_buffer.get_item(item_id)
+                yield {
+                    "name": f"model_chunk{model_chunk_id}.{name}",
+                    "shape": list(orig_parameter.shape),
+                    "parameter": parameter,
+                    "model_tensor": model_tensor,
+                }
+            continue
+
+        for name, parameter in unwrap_model(model_chunk).named_parameters():
+            if _is_engram_table_parameter(name, parameter):
+                yield {
+                    "name": f"model_chunk{model_chunk_id}.{name}",
+                    "shape": list(parameter.shape),
+                    "parameter": parameter,
+                    "model_tensor": parameter,
+                }
+
+
+def _find_optimizer_parameter(optimizer, model_parameter):
+    """Find the optimizer-owned resident shard for a model parameter."""
+    if optimizer is None:
+        return None, None
+    optimizer_parts = getattr(optimizer, "chained_optimizers", [optimizer])
+    for optimizer_part in optimizer_parts:
+        inner_optimizer = optimizer_part.optimizer
+        group_map = getattr(optimizer_part, "model_param_group_index_map", {})
+        if model_parameter in group_map:
+            group_index, group_order = group_map[model_parameter]
+            parameter = inner_optimizer.param_groups[group_index]["params"][group_order]
+            return parameter, inner_optimizer
+        for param_group in inner_optimizer.param_groups:
+            for parameter in param_group["params"]:
+                if parameter is model_parameter:
+                    return parameter, inner_optimizer
+    return None, None
+
+
+def _model_parameter_checksum(model, optimizer):
+    """Return checksums for optimizer-owned local shards, or model tensors as a fallback."""
+    local_parameters = []
+    if optimizer is not None:
+        optimizer_parts = getattr(optimizer, "chained_optimizers", [optimizer])
+        for optimizer_part in optimizer_parts:
+            for param_group in optimizer_part.optimizer.param_groups:
+                local_parameters.extend(
+                    _local_tensor(parameter) for parameter in param_group["params"]
+                )
+    if not local_parameters:
+        local_parameters = [
+            _local_tensor(parameter)
+            for model_chunk in model
+            for parameter in unwrap_model(model_chunk).parameters()
+        ]
+    checksum = torch.zeros(2, dtype=torch.float64, device=local_parameters[0].device)
+    for parameter in local_parameters:
+        value = parameter.detach()
+        checksum[0] += value.sum(dtype=torch.float64)
+        checksum[1] += value.float().square().sum(dtype=torch.float64)
     return checksum
 
 
-def _capture_engram_table_training_state(model):
+def _capture_engram_table_training_state(model, optimizer):
     """Capture scalar evidence before an Engram optimizer step."""
     snapshots = []
-    for model_chunk in model:
-        for name, parameter in unwrap_model(model_chunk).named_parameters():
-            if not getattr(parameter, 'is_engram_embedding', False):
-                continue
-            gradient = getattr(parameter, 'main_grad', None)
+    table_count = 0
+    for table in _iter_engram_table_parameters(model):
+        table_count += 1
+        parameter, _ = _find_optimizer_parameter(optimizer, table["parameter"])
+        if parameter is None:
+            continue
+        value = _local_tensor(parameter).detach().float()
+        gradient = getattr(parameter, "decoupled_grad", None)
+        if gradient is None:
+            gradient = parameter.grad
+        if gradient is None:
+            model_parameter = table["parameter"]
+            gradient = getattr(model_parameter, "main_grad", None)
             if gradient is None:
-                gradient = parameter.grad
-            grad_square_sum = (
-                torch.zeros((), dtype=torch.float32, device=parameter.device)
-                if gradient is None
-                else gradient.detach().float().square().sum()
-            )
-            value = parameter.detach().float()
-            checksum = torch.stack((value.sum(), value.square().sum()))
-            snapshots.append((name, parameter, grad_square_sum, checksum))
-    if not snapshots:
+                gradient = model_parameter.grad
+        gradient = None if gradient is None else _local_tensor(gradient)
+        grad_square_sum = (
+            torch.zeros((), dtype=torch.float32, device=value.device)
+            if gradient is None
+            else gradient.detach().float().square().sum()
+        )
+        checksum = torch.stack((value.sum(), value.square().sum()))
+        snapshots.append((table["name"], parameter, grad_square_sum, checksum))
+    if table_count == 0:
         raise RuntimeError("Engram training verification found no sparse table parameters.")
-    return snapshots, _model_parameter_checksum(model)
+    return snapshots, _model_parameter_checksum(model, optimizer)
 
 
 def _report_engram_memory_state(model, optimizer, phase):
     """Write exact rank-local Engram model and optimizer tensor bytes for profiling runs."""
     args = get_args()
     if (
-        not getattr(args, "record_memory_history", False)
+        not (
+            getattr(args, "record_memory_history", False)
+            or getattr(args, "engram_verify_training", False)
+        )
         or getattr(args, "engram_vocab_sizes", None) is None
     ):
         return
@@ -2790,45 +2881,32 @@ def _report_engram_memory_state(model, optimizer, phase):
         for name in group_names
     }
 
-    optimizer_parts = []
-    if optimizer is not None:
-        optimizer_parts = getattr(optimizer, "chained_optimizers", [optimizer])
-
     table_records = []
-    for model_chunk_id, model_chunk in enumerate(model):
-        for name, parameter in unwrap_model(model_chunk).named_parameters():
-            if not getattr(parameter, "is_engram_embedding", False):
-                continue
-
-            record = {
-                "name": f"model_chunk{model_chunk_id}.{name}",
-                "shape": list(parameter.shape),
-                "model_numel": parameter.numel(),
-                "model_bytes": parameter.numel() * parameter.element_size(),
-                "main_numel": 0,
-                "main_bytes": 0,
-                "optimizer_state_numel": {},
-                "optimizer_state_bytes": {},
-            }
-            for optimizer_part in optimizer_parts:
-                group_map = getattr(optimizer_part, "model_param_group_index_map", {})
-                if parameter not in group_map:
-                    continue
-                group_index, group_order = group_map[parameter]
-                inner_optimizer = optimizer_part.optimizer
-                main_parameter = inner_optimizer.param_groups[group_index]["params"][group_order]
-                record["main_numel"] = main_parameter.numel()
-                record["main_bytes"] = main_parameter.numel() * main_parameter.element_size()
-                for state_name, state_value in inner_optimizer.state.get(
-                    main_parameter, {}
-                ).items():
-                    if isinstance(state_value, torch.Tensor):
-                        record["optimizer_state_numel"][state_name] = state_value.numel()
-                        record["optimizer_state_bytes"][state_name] = (
-                            state_value.numel() * state_value.element_size()
-                        )
-                break
-            table_records.append(record)
+    for table in _iter_engram_table_parameters(model):
+        model_tensor = _local_tensor(table["model_tensor"])
+        record = {
+            "name": table["name"],
+            "shape": table["shape"],
+            "model_numel": model_tensor.numel(),
+            "model_bytes": model_tensor.numel() * model_tensor.element_size(),
+            "main_numel": 0,
+            "main_bytes": 0,
+            "optimizer_state_numel": {},
+            "optimizer_state_bytes": {},
+        }
+        main_parameter, inner_optimizer = _find_optimizer_parameter(optimizer, table["parameter"])
+        if main_parameter is not None:
+            main_tensor = _local_tensor(main_parameter)
+            record["main_numel"] = main_tensor.numel()
+            record["main_bytes"] = main_tensor.numel() * main_tensor.element_size()
+            for state_name, state_value in inner_optimizer.state.get(main_parameter, {}).items():
+                if isinstance(state_value, torch.Tensor):
+                    state_tensor = _local_tensor(state_value)
+                    record["optimizer_state_numel"][state_name] = state_tensor.numel()
+                    record["optimizer_state_bytes"][state_name] = (
+                        state_tensor.numel() * state_tensor.element_size()
+                    )
+        table_records.append(record)
 
     state_names = sorted(
         {state_name for record in table_records for state_name in record["optimizer_state_bytes"]}
@@ -2888,16 +2966,21 @@ def _report_engram_memory_state(model, optimizer, phase):
     torch.cuda.reset_peak_memory_stats()
 
 
-def _verify_engram_table_training_state(training_state, model, iteration):
-    """Require every local table to receive a finite gradient and change after the step."""
+def _verify_engram_table_training_state(training_state, model, optimizer, iteration):
+    """Require every optimizer-owned table shard to receive a gradient and change."""
     snapshots, model_checksum_before = training_state
-    device = snapshots[0][1].device
+    # DistributedOptimizer may place a complete small parameter on only one
+    # rank of its DP group. A rank with model-visible Engram tables can
+    # therefore own no optimizer table shard and must contribute collective
+    # identity values rather than fail before the WORLD reductions.
+    device = model_checksum_before.device
     local_grad_square_sum = torch.zeros((), dtype=torch.float32, device=device)
     local_table_checksums = torch.zeros(4, dtype=torch.float32, device=device)
+    optimizer_shard_count = torch.tensor(len(snapshots), dtype=torch.int64, device=device)
     local_all_nonzero = True
     local_all_changed = True
     for _, parameter, grad_square_sum, old_checksum in snapshots:
-        value = parameter.detach().float()
+        value = _local_tensor(parameter).detach().float()
         new_checksum = torch.stack((value.sum(), value.square().sum()))
         local_grad_square_sum += grad_square_sum
         local_table_checksums[:2] += old_checksum
@@ -2911,16 +2994,20 @@ def _verify_engram_table_training_state(training_state, model, iteration):
         [int(local_all_nonzero), int(local_all_changed)], dtype=torch.int32, device=device
     )
     peak_memory = torch.tensor(torch.cuda.max_memory_allocated(), dtype=torch.int64, device=device)
-    model_checksums = torch.cat((model_checksum_before, _model_parameter_checksum(model)))
+    model_checksums = torch.cat(
+        (model_checksum_before, _model_parameter_checksum(model, optimizer))
+    )
     torch.distributed.all_reduce(local_grad_square_sum, op=torch.distributed.ReduceOp.SUM)
     torch.distributed.all_reduce(local_table_checksums, op=torch.distributed.ReduceOp.SUM)
     torch.distributed.all_reduce(model_checksums, op=torch.distributed.ReduceOp.SUM)
     torch.distributed.all_reduce(status, op=torch.distributed.ReduceOp.MIN)
+    torch.distributed.all_reduce(optimizer_shard_count, op=torch.distributed.ReduceOp.SUM)
     torch.distributed.all_reduce(peak_memory, op=torch.distributed.ReduceOp.MAX)
     if torch.distributed.get_rank() == 0:
         print(
             "[Engram verify] "
             f"iteration={iteration} global_grad_norm={local_grad_square_sum.sqrt().item():.8e} "
+            f"optimizer_table_shards={optimizer_shard_count.item()} "
             f"all_tables_nonzero={status[0].item()} all_tables_changed={status[1].item()} "
             f"table_sum_before={local_table_checksums[0].item():.8e} "
             f"table_square_sum_before={local_table_checksums[1].item():.8e} "
@@ -2932,6 +3019,10 @@ def _verify_engram_table_training_state(training_state, model, iteration):
             f"model_square_sum_after={model_checksums[3].item():.16e} "
             f"peak_memory_bytes={peak_memory.item()}",
             flush=True,
+        )
+    if optimizer_shard_count.item() == 0:
+        raise RuntimeError(
+            "Engram sparse-table verification found no optimizer-owned table shards globally."
         )
     if not bool(status.all().item()):
         raise RuntimeError(
@@ -3178,13 +3269,17 @@ def train_step(
     # Update parameters.
 
     engram_training_state = (
-        _capture_engram_table_training_state(model) if args.engram_verify_training else None
+        _capture_engram_table_training_state(model, optimizer)
+        if args.engram_verify_training
+        else None
     )
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
     if engram_training_state is not None:
-        _verify_engram_table_training_state(engram_training_state, model, iteration + 1)
-    if args.record_memory_history and (iteration == 0 or iteration + 1 == args.train_iters):
+        _verify_engram_table_training_state(engram_training_state, model, optimizer, iteration + 1)
+    if (args.record_memory_history or args.engram_verify_training) and (
+        iteration == 0 or iteration + 1 == args.train_iters
+    ):
         phase = "after_first_optimizer_step" if iteration == 0 else "after_steady_state"
         _report_engram_memory_state(model, optimizer, phase)
 
