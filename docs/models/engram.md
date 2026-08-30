@@ -113,6 +113,12 @@ addition to gradient, update, and peak-memory evidence. It also writes lightweig
 table/model/master/Adam residency records at construction, the first step, and the last step.
 Normal training does not compute these diagnostics.
 
+With DistributedOptimizer, a small table parameter can fall wholly inside one rank's contiguous
+DP optimizer shard. Other ranks still expose the BF16 model table through DDP but legitimately own
+no FP32 master value or Adam state for that table. Verification treats such ranks as identity
+contributors to the WORLD reductions, requires at least one optimizer-owned table shard globally,
+and applies the finite-gradient/change checks to every shard that is actually owned.
+
 ## Megatron FSDP composition
 
 Engram composes its manual EP ownership with Megatron FSDP as a two-level row partition:

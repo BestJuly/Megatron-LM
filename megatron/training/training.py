@@ -2829,7 +2829,9 @@ def _model_parameter_checksum(model, optimizer):
 def _capture_engram_table_training_state(model, optimizer):
     """Capture scalar evidence before an Engram optimizer step."""
     snapshots = []
+    table_count = 0
     for table in _iter_engram_table_parameters(model):
+        table_count += 1
         parameter, _ = _find_optimizer_parameter(optimizer, table["parameter"])
         if parameter is None:
             continue
@@ -2850,7 +2852,7 @@ def _capture_engram_table_training_state(model, optimizer):
         )
         checksum = torch.stack((value.sum(), value.square().sum()))
         snapshots.append((table["name"], parameter, grad_square_sum, checksum))
-    if not snapshots:
+    if table_count == 0:
         raise RuntimeError("Engram training verification found no sparse table parameters.")
     return snapshots, _model_parameter_checksum(model, optimizer)
 
@@ -2892,9 +2894,7 @@ def _report_engram_memory_state(model, optimizer, phase):
             "optimizer_state_numel": {},
             "optimizer_state_bytes": {},
         }
-        main_parameter, inner_optimizer = _find_optimizer_parameter(
-            optimizer, table["parameter"]
-        )
+        main_parameter, inner_optimizer = _find_optimizer_parameter(optimizer, table["parameter"])
         if main_parameter is not None:
             main_tensor = _local_tensor(main_parameter)
             record["main_numel"] = main_tensor.numel()
@@ -2967,11 +2967,16 @@ def _report_engram_memory_state(model, optimizer, phase):
 
 
 def _verify_engram_table_training_state(training_state, model, optimizer, iteration):
-    """Require every local table to receive a finite gradient and change after the step."""
+    """Require every optimizer-owned table shard to receive a gradient and change."""
     snapshots, model_checksum_before = training_state
-    device = snapshots[0][1].device
+    # DistributedOptimizer may place a complete small parameter on only one
+    # rank of its DP group. A rank with model-visible Engram tables can
+    # therefore own no optimizer table shard and must contribute collective
+    # identity values rather than fail before the WORLD reductions.
+    device = model_checksum_before.device
     local_grad_square_sum = torch.zeros((), dtype=torch.float32, device=device)
     local_table_checksums = torch.zeros(4, dtype=torch.float32, device=device)
+    optimizer_shard_count = torch.tensor(len(snapshots), dtype=torch.int64, device=device)
     local_all_nonzero = True
     local_all_changed = True
     for _, parameter, grad_square_sum, old_checksum in snapshots:
@@ -2996,11 +3001,13 @@ def _verify_engram_table_training_state(training_state, model, optimizer, iterat
     torch.distributed.all_reduce(local_table_checksums, op=torch.distributed.ReduceOp.SUM)
     torch.distributed.all_reduce(model_checksums, op=torch.distributed.ReduceOp.SUM)
     torch.distributed.all_reduce(status, op=torch.distributed.ReduceOp.MIN)
+    torch.distributed.all_reduce(optimizer_shard_count, op=torch.distributed.ReduceOp.SUM)
     torch.distributed.all_reduce(peak_memory, op=torch.distributed.ReduceOp.MAX)
     if torch.distributed.get_rank() == 0:
         print(
             "[Engram verify] "
             f"iteration={iteration} global_grad_norm={local_grad_square_sum.sqrt().item():.8e} "
+            f"optimizer_table_shards={optimizer_shard_count.item()} "
             f"all_tables_nonzero={status[0].item()} all_tables_changed={status[1].item()} "
             f"table_sum_before={local_table_checksums[0].item():.8e} "
             f"table_square_sum_before={local_table_checksums[1].item():.8e} "
@@ -3012,6 +3019,10 @@ def _verify_engram_table_training_state(training_state, model, optimizer, iterat
             f"model_square_sum_after={model_checksums[3].item():.16e} "
             f"peak_memory_bytes={peak_memory.item()}",
             flush=True,
+        )
+    if optimizer_shard_count.item() == 0:
+        raise RuntimeError(
+            "Engram sparse-table verification found no optimizer-owned table shards globally."
         )
     if not bool(status.all().item()):
         raise RuntimeError(
@@ -3265,9 +3276,7 @@ def train_step(
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
     if engram_training_state is not None:
-        _verify_engram_table_training_state(
-            engram_training_state, model, optimizer, iteration + 1
-        )
+        _verify_engram_table_training_state(engram_training_state, model, optimizer, iteration + 1)
     if (args.record_memory_history or args.engram_verify_training) and (
         iteration == 0 or iteration + 1 == args.train_iters
     ):

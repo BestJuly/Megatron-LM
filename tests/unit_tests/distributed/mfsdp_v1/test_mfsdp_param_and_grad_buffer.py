@@ -124,8 +124,7 @@ def test_engram_tables_use_independent_expert_fsdp_buckets():
     parameter_groups, param_to_group, _ = _get_parameter_groups(
         module,
         BucketingPolicy(
-            suggested_bucket_size=None,
-            data_parallel_sharding_strategy="optim_grads_params",
+            suggested_bucket_size=None, data_parallel_sharding_strategy="optim_grads_params"
         ),
         meta_device_init_fp8_params={},
     )

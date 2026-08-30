@@ -581,9 +581,7 @@ def _extract_pipeline_tokens(batch: Any) -> torch.Tensor:
             if not isinstance(sample, dict) or not isinstance(
                 sample.get("input_ids"), torch.Tensor
             ):
-                raise RuntimeError(
-                    "Engram multimodal samples must contain tensor 'input_ids'."
-                )
+                raise RuntimeError("Engram multimodal samples must contain tensor 'input_ids'.")
             input_ids = sample["input_ids"]
             if input_ids.ndim != 1:
                 raise ValueError(

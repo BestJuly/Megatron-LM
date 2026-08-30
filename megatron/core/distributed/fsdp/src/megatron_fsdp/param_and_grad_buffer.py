@@ -1851,12 +1851,9 @@ def _get_parameter_groups(
         weights, which can otherwise place the complete table payload on one rank.
         """
         return (
-            (
-                getattr(param, "shared_embedding", False)
-                or getattr(param, "is_engram_embedding", False)
-            )
-            and policy.data_parallel_sharding_strategy != "no_shard"
-        )
+            getattr(param, "shared_embedding", False)
+            or getattr(param, "is_engram_embedding", False)
+        ) and policy.data_parallel_sharding_strategy != "no_shard"
 
     def _should_split_from_grouped_expert_bucket(
         is_expert_param: bool,

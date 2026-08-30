@@ -16,6 +16,7 @@ from megatron.core.optimizer import (
     _group_param_groups_by_optimizer,
     get_engram_config_overrides,
 )
+from megatron.training import training
 from megatron.training.utils import get_pipeline_prefetched_tokens, prepare_tokens_for_pipeline
 
 from ._test_utils import make_module_config
@@ -85,6 +86,36 @@ def test_standard_optimizer_groups_honor_sparse_adam_override():
     assert grouped == {"sgd": [dense_group], "adam": [sparse_group]}
 
 
+def test_engram_capture_allows_rank_without_local_optimizer_table_shard(monkeypatch):
+    table = torch.nn.Parameter(torch.ones(2, 2))
+    table.is_engram_embedding = True
+    checksum = torch.tensor([3.0, 5.0])
+    table_record = {
+        "name": "model_chunk0.decoder.layers.0.engram.embedding.tables.0.weight",
+        "parameter": table,
+    }
+
+    monkeypatch.setattr(
+        training, "_iter_engram_table_parameters", lambda model: iter([table_record])
+    )
+    monkeypatch.setattr(
+        training, "_find_optimizer_parameter", lambda optimizer, parameter: (None, None)
+    )
+    monkeypatch.setattr(training, "_model_parameter_checksum", lambda model, optimizer: checksum)
+
+    snapshots, actual_checksum = training._capture_engram_table_training_state([object()], object())
+
+    assert snapshots == []
+    assert actual_checksum is checksum
+
+
+def test_engram_capture_still_rejects_model_without_tables(monkeypatch):
+    monkeypatch.setattr(training, "_iter_engram_table_parameters", lambda model: iter(()))
+
+    with pytest.raises(RuntimeError, match="no sparse table parameters"):
+        training._capture_engram_table_training_state([object()], object())
+
+
 def test_pp_token_prefetch_replays_source_batches_in_order(monkeypatch):
     monkeypatch.setattr("megatron.training.utils.common_utils.get_pg_size", lambda _: 1)
     monkeypatch.setattr("megatron.training.utils.common_utils.get_pg_rank", lambda _: 0)
@@ -126,10 +157,7 @@ def test_pp_token_prefetch_accepts_vanilla_multimodal_batch(monkeypatch):
 def test_pp_token_prefetch_rejects_variable_length_multimodal_batch(monkeypatch):
     monkeypatch.setattr("megatron.training.utils.common_utils.get_pg_size", lambda _: 1)
     monkeypatch.setattr("megatron.training.utils.common_utils.get_pg_rank", lambda _: 0)
-    batch = [
-        {"input_ids": torch.tensor([10, 11, 12])},
-        {"input_ids": torch.tensor([20, 21])},
-    ]
+    batch = [{"input_ids": torch.tensor([10, 11, 12])}, {"input_ids": torch.tensor([20, 21])}]
 
     with pytest.raises(ValueError, match="fixed-length input_ids"):
         prepare_tokens_for_pipeline(iter([batch]), 1, 2, 3, object(), object())

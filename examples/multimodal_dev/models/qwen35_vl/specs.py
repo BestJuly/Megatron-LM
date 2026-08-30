@@ -155,9 +155,7 @@ class Qwen35VLVisionSelfAttention(SelfAttention):
 
 
 def get_qwen35_vl_language_spec(
-    config: TransformerConfig,
-    vp_stage: Optional[int] = None,
-    pp_rank: Optional[int] = None,
+    config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
 ) -> TransformerBlockSubmodules:
     """Transformer block spec for the Qwen3.5-VL language decoder.
 
@@ -173,9 +171,7 @@ def get_qwen35_vl_language_spec(
         TransformerBlockSubmodules with per-layer specs.
     """
     return get_transformer_block_with_experimental_attention_variant_spec(
-        config=config,
-        vp_stage=vp_stage,
-        pp_rank=pp_rank,
+        config=config, vp_stage=vp_stage, pp_rank=pp_rank
     )
 
 

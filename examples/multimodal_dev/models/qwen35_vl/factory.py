@@ -14,9 +14,7 @@ from megatron.core.models.engram import EngramConfig, apply_engram_to_layer_spec
 def _build_language_spec(args, language_config, vp_stage=None):
     """Build the Qwen language spec and compose optional Engram memory."""
     language_spec = get_qwen35_vl_language_spec(
-        config=language_config,
-        vp_stage=vp_stage,
-        pp_rank=None,
+        config=language_config, vp_stage=vp_stage, pp_rank=None
     )
     engram_config = EngramConfig.from_args(args, language_config)
     if engram_config is not None:
@@ -68,10 +66,9 @@ def build_model(args, language_config, vision_config, **kwargs):
     """
     from examples.multimodal_dev.models.qwen35_vl.model import Qwen35VLModel
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
+
     language_spec = _build_language_spec(
-        args=args,
-        language_config=language_config,
-        vp_stage=kwargs.get("vp_stage", None),
+        args=args, language_config=language_config, vp_stage=kwargs.get("vp_stage", None)
     )
 
     mtp_block_spec = None
@@ -79,9 +76,7 @@ def build_model(args, language_config, vision_config, **kwargs):
         mtp_block_spec = get_gpt_mtp_block_spec(
             config=language_config,
             spec=language_spec,
-            use_transformer_engine=(
-                args.transformer_impl == "transformer_engine"
-            ),
+            use_transformer_engine=(args.transformer_impl == "transformer_engine"),
             vp_stage=kwargs.get("vp_stage", None),
             pp_rank=None,
         )
@@ -89,9 +84,7 @@ def build_model(args, language_config, vision_config, **kwargs):
     # When --untie-embeddings-and-output-weights is NOT passed, Megatron
     # defaults to tied embeddings (share_embeddings_and_output_weights=True).
     # The 0.8B variant uses tied embeddings, while larger variants untie them.
-    share_embeddings = not getattr(
-        args, "untie_embeddings_and_output_weights", False
-    )
+    share_embeddings = not getattr(args, "untie_embeddings_and_output_weights", False)
 
     return Qwen35VLModel(
         language_config=language_config,

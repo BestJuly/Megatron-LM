@@ -12,11 +12,7 @@ def test_qwen_language_spec_composes_engram(monkeypatch):
     args = SimpleNamespace()
     language_config = object()
 
-    monkeypatch.setattr(
-        factory,
-        "get_qwen35_vl_language_spec",
-        lambda **kwargs: raw_spec,
-    )
+    monkeypatch.setattr(factory, "get_qwen35_vl_language_spec", lambda **kwargs: raw_spec)
     monkeypatch.setattr(
         factory,
         "EngramConfig",
@@ -40,15 +36,9 @@ def test_qwen_language_spec_is_unchanged_without_engram(monkeypatch):
     args = SimpleNamespace()
     language_config = object()
 
+    monkeypatch.setattr(factory, "get_qwen35_vl_language_spec", lambda **kwargs: raw_spec)
     monkeypatch.setattr(
-        factory,
-        "get_qwen35_vl_language_spec",
-        lambda **kwargs: raw_spec,
-    )
-    monkeypatch.setattr(
-        factory,
-        "EngramConfig",
-        SimpleNamespace(from_args=lambda actual_args, actual_config: None),
+        factory, "EngramConfig", SimpleNamespace(from_args=lambda actual_args, actual_config: None)
     )
 
     assert factory._build_language_spec(args, language_config, vp_stage=None) is raw_spec

@@ -22,10 +22,7 @@ def _uses_packed_sequences(args: Any) -> bool:
         getattr(args, "use_packed_sequence", False)
         or getattr(args, "use_varlen_dataset", False)
         or getattr(args, "sequence_packing_scheduler", None) is not None
-        or (
-            getattr(args, "sft", False)
-            and not getattr(args, "use_vanilla_collate_fn", False)
-        )
+        or (getattr(args, "sft", False) and not getattr(args, "use_vanilla_collate_fn", False))
     )
 
 
