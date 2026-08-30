@@ -106,3 +106,30 @@ def test_pp_token_prefetch_replays_source_batches_in_order(monkeypatch):
     malformed = iter([{"tokens": torch.arange(8).view(2, 4)}])
     with pytest.raises(ValueError, match="expected token shape"):
         prepare_tokens_for_pipeline(malformed, 1, 1, 8, object(), object())
+
+
+def test_pp_token_prefetch_accepts_vanilla_multimodal_batch(monkeypatch):
+    monkeypatch.setattr("megatron.training.utils.common_utils.get_pg_size", lambda _: 1)
+    monkeypatch.setattr("megatron.training.utils.common_utils.get_pg_rank", lambda _: 0)
+    batch = [
+        {"input_ids": torch.tensor([10, 11, 12, 13]), "sample_id": 0},
+        {"input_ids": torch.tensor([20, 21, 22, 23]), "sample_id": 1},
+    ]
+
+    iterator = prepare_tokens_for_pipeline(iter([batch]), 1, 2, 4, object(), object())
+
+    assert next(iterator) is batch
+    tokens = get_pipeline_prefetched_tokens(iterator)
+    torch.testing.assert_close(tokens.cpu(), torch.tensor([[10, 11, 12, 13], [20, 21, 22, 23]]))
+
+
+def test_pp_token_prefetch_rejects_variable_length_multimodal_batch(monkeypatch):
+    monkeypatch.setattr("megatron.training.utils.common_utils.get_pg_size", lambda _: 1)
+    monkeypatch.setattr("megatron.training.utils.common_utils.get_pg_rank", lambda _: 0)
+    batch = [
+        {"input_ids": torch.tensor([10, 11, 12])},
+        {"input_ids": torch.tensor([20, 21])},
+    ]
+
+    with pytest.raises(ValueError, match="fixed-length input_ids"):
+        prepare_tokens_for_pipeline(iter([batch]), 1, 2, 3, object(), object())

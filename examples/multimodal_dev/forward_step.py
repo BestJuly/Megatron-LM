@@ -18,6 +18,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_src_rank,
 )
 from megatron.training import get_args
+from megatron.training.utils import get_pipeline_prefetched_tokens
 
 # -------------------------------------------------------------------
 # dtype <-> int mapping for cross-rank broadcast
@@ -329,6 +330,7 @@ def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
     """Get a batch from *data_iterator* and broadcast across TP ranks."""
     device = "cuda"
     args = get_args()
+    engram_tokens = None
 
     if get_tensor_model_parallel_rank() == 0:
         try:
@@ -350,6 +352,18 @@ def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
 
     # Because broadcast will not broadcast packed_seq_params, we move it into pack_or_pad_batch
     batch = pack_or_pad_batch(data, args.use_packed_sequence, args.seq_length, device=device)
+
+    if args.engram_enabled:
+        engram_tokens = get_pipeline_prefetched_tokens(data_iterator)
+        input_ids = batch.get("input_ids")
+        if input_ids is None:
+            raise RuntimeError("Engram multimodal batches must contain packed input_ids.")
+        if input_ids.shape != engram_tokens.shape or not torch.equal(input_ids, engram_tokens):
+            raise RuntimeError(
+                "Engram prefetched tokens do not match multimodal input_ids after collation: "
+                f"prefetched={tuple(engram_tokens.shape)}, collated={tuple(input_ids.shape)}."
+            )
+        batch["input_ids"] = engram_tokens
 
     # Fix shapes produced by default_collate.
     if "position_ids" in batch and batch["position_ids"] is not None:

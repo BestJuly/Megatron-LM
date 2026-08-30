@@ -6,10 +6,22 @@ Encapsulates all Qwen3.5-VL-specific logic needed by ``pretrain_multimodal.py``
 so that the training entry point remains model-agnostic.
 """
 
-from examples.multimodal_dev.models.qwen35_vl.configuration import (
-    MROPE_SECTION,
-    VISION_KWARGS,
-)
+from examples.multimodal_dev.models.qwen35_vl.configuration import MROPE_SECTION, VISION_KWARGS
+from examples.multimodal_dev.models.qwen35_vl.specs import get_qwen35_vl_language_spec
+from megatron.core.models.engram import EngramConfig, apply_engram_to_layer_spec
+
+
+def _build_language_spec(args, language_config, vp_stage=None):
+    """Build the Qwen language spec and compose optional Engram memory."""
+    language_spec = get_qwen35_vl_language_spec(
+        config=language_config,
+        vp_stage=vp_stage,
+        pp_rank=None,
+    )
+    engram_config = EngramConfig.from_args(args, language_config)
+    if engram_config is not None:
+        language_spec = apply_engram_to_layer_spec(language_spec, engram_config)
+    return language_spec
 
 
 def post_language_config(language_config, args):
@@ -54,19 +66,12 @@ def build_model(args, language_config, vision_config, **kwargs):
     Returns:
         A :class:`Qwen35VLModel` instance.
     """
-    from megatron.core.models.gpt.gpt_layer_specs import (
-        get_gpt_mtp_block_spec,
-    )
-
     from examples.multimodal_dev.models.qwen35_vl.model import Qwen35VLModel
-    from examples.multimodal_dev.models.qwen35_vl.specs import (
-        get_qwen35_vl_language_spec,
-    )
-
-    language_spec = get_qwen35_vl_language_spec(
-        config=language_config,
+    from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec
+    language_spec = _build_language_spec(
+        args=args,
+        language_config=language_config,
         vp_stage=kwargs.get("vp_stage", None),
-        pp_rank=None,
     )
 
     mtp_block_spec = None

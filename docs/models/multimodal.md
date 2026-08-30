@@ -33,6 +33,28 @@ See [examples/mimo](https://github.com/NVIDIA/Megatron-LM/tree/main/examples/mim
 | **NVLM** | NVIDIA Vision-Language Model | CLIP / Custom ViT | LLaMA-based |
 | **LLaMA 3.1 Nemotron Nano VL** | Efficient multimodal model | Vision Transformer | LLaMA 3.1 8B |
 
+### Qwen3.5-VL development example
+
+`examples/multimodal_dev` contains the experimental Qwen3.5-VL training path used to validate
+Qwen vision-language model composition with current MCore components. The vanilla collator emits
+a fixed `[B,S]` language-token batch while the vision encoder independently packs
+variable-resolution patch sequences in THD layout. Features are merged back into the language
+sequence at the image-token positions before decoder execution.
+
+Qwen3.5-VL applies vision RoPE in FP32 and casts the result back to the input dtype. Its local
+`Qwen35VLVisionSelfAttention` wrapper deliberately supplies a CP-size-1 group: decoder context
+parallelism must not split the already packed vision sequence. Because the wrapper temporarily
+substitutes MCore's `apply_rotary_pos_emb` entry point, its signature and forwarding semantics
+must track the public MCore API, including `mla_rotary_interleaved`, `inverse`,
+`mla_output_remove_interleaving`, and the THD `max_seqlen` hint. The corresponding unit test calls
+the wrapper with every current argument and verifies that only the CP group is replaced.
+
+When Engram is enabled for the language decoder, schedule-level prefetch extracts the same fixed
+`input_ids` from the raw multimodal samples and the forward step verifies them against the
+collated batch. Variable-length raw language samples are rejected rather than silently padded or
+packed with different n-gram boundaries. Vision THD packing is unaffected because Engram hashes
+language tokens, not visual patch tokens.
+
 ## Vision Encoders
 
 | Model | Description | Key Features |

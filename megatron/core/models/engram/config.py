@@ -16,6 +16,19 @@ TOKENIZER_MAP_FORMAT = "megatron-engram-token-map"
 TOKENIZER_MAP_VERSION = 1
 
 
+def _uses_packed_sequences(args: Any) -> bool:
+    """Return whether the selected data path actually emits packed/THD inputs."""
+    return bool(
+        getattr(args, "use_packed_sequence", False)
+        or getattr(args, "use_varlen_dataset", False)
+        or getattr(args, "sequence_packing_scheduler", None) is not None
+        or (
+            getattr(args, "sft", False)
+            and not getattr(args, "use_vanilla_collate_fn", False)
+        )
+    )
+
+
 def is_prime(value: int) -> bool:
     """Return whether ``value`` is prime using deterministic trial division."""
     if value < 2:
@@ -116,11 +129,7 @@ class EngramConfig:
         config.validate_startup(
             transformer_config,
             expected_tokenizer_vocab_size=args.padded_vocab_size,
-            packed_sequences=bool(
-                getattr(args, "sft", False)
-                or getattr(args, "use_varlen_dataset", False)
-                or getattr(args, "sequence_packing_scheduler", None) is not None
-            ),
+            packed_sequences=_uses_packed_sequences(args),
             use_torch_fsdp2=bool(getattr(args, "use_torch_fsdp2", False)),
             use_megatron_fsdp=bool(getattr(args, "use_megatron_fsdp", False)),
             data_parallel_sharding_strategy=getattr(

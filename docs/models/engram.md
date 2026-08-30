@@ -164,6 +164,16 @@ Layers use their
 global 1-based `layer_number`; therefore selected layers on middle and last stages work without
 stage-specific layer specs or saved per-forward state.
 
+The prefetch boundary also covers the Qwen3.5-VL development data path. It accepts either an
+already-collated mapping containing `tokens`/`input_ids`, or a fixed-length list of multimodal
+sample mappings containing tensor `input_ids`. After the vanilla multimodal collator has assembled
+the model batch, the forward step replaces its token tensor with the prefetched tensor and checks
+shape and elementwise identity first. Engram therefore hashes exactly the token IDs consumed by
+the language decoder without advancing the underlying iterator twice. Empty, malformed, or
+variable-length raw sample lists fail before the pipeline schedule; packed language sequences
+remain outside this milestone. The vision encoder may still use its own internal THD packing,
+because those visual patch sequences are not Engram's language-token input.
+
 ## Optimizer policy
 
 Only sparse table weights carry `is_engram_embedding=True`. A `ParamKey` override selects those

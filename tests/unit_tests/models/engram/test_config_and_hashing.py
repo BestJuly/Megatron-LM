@@ -5,7 +5,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core.models.engram.config import EngramConfig, allocate_table_sizes
+from megatron.core.models.engram.config import (
+    EngramConfig,
+    _uses_packed_sequences,
+    allocate_table_sizes,
+)
 from megatron.core.models.engram.hashing import (
     build_ngram_hashes,
     compress_token_ids,
@@ -72,6 +76,27 @@ def test_prime_allocation_is_global_and_distinct():
     sizes = allocate_table_sizes((10, 10), (1, 5), 2)
     assert sizes == {1: (11, 13, 17, 19), 5: (23, 29, 31, 37)}
     assert len(set(sizes[1] + sizes[5])) == 8
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (SimpleNamespace(sft=True), True),
+        (SimpleNamespace(sft=True, use_vanilla_collate_fn=True), False),
+        (
+            SimpleNamespace(
+                sft=True,
+                use_vanilla_collate_fn=True,
+                use_packed_sequence=True,
+            ),
+            True,
+        ),
+        (SimpleNamespace(use_varlen_dataset=True), True),
+        (SimpleNamespace(sequence_packing_scheduler="dp_balanced"), True),
+    ],
+)
+def test_packed_sequence_detection_tracks_the_runtime_data_path(args, expected):
+    assert _uses_packed_sequences(args) is expected
 
 
 def test_full_hash_then_sequence_parallel_slice(monkeypatch):
