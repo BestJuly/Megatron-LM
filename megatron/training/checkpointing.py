@@ -53,6 +53,7 @@ try:
         preprocess_state_dict_for_uneven_dtensor,
     )
     from megatron.core.transformer.fsdp_dtensor_checkpoint import (
+        handle_engram_in_state_dict,
         handle_experts_in_state_dict,
         handle_fp8_extra_state_case,
         handle_gdn_in_state_dict,
@@ -1343,6 +1344,11 @@ def generate_state_dict(
 
 def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
     state_dict = raw_state_dict.copy()
+    state_dict["model"], optimizer_state_dict = handle_engram_in_state_dict(
+        state_dict["model"], state_dict.get("optimizer")
+    )
+    if optimizer_state_dict is not None:
+        state_dict["optimizer"] = optimizer_state_dict
     handle_fp8_extra_state_case(state_dict["model"])
     if args.swiglu:
         if "optimizer" in state_dict:

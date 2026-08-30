@@ -133,3 +133,42 @@ def test_invalid_configuration_messages(tmp_path):
         config.validate_startup(_startup_transformer_config(mtp_num_layers=1), 16)
     with pytest.raises(ValueError, match="vocabulary mismatch"):
         config.validate_startup(_startup_transformer_config(), 17)
+
+
+def test_megatron_fsdp_startup_contract(tmp_path):
+    artifact = write_tokenizer_map(tmp_path / "map.json", vocab_size=16, layer_ids=(1,))
+    config = EngramConfig(
+        global_vocab_sizes=(17, 19),
+        layer_ids=(1,),
+        max_ngram_order=3,
+        num_hash_heads=2,
+        memory_dim=8,
+        kernel_size=4,
+        hash_seed=0,
+        pad_token_id=0,
+        tokenizer_map_path=str(artifact),
+    )
+    transformer_config = _startup_transformer_config()
+
+    config.validate_startup(
+        transformer_config,
+        16,
+        use_megatron_fsdp=True,
+        data_parallel_sharding_strategy="optim_grads_params",
+        optimizer="adam",
+    )
+    with pytest.raises(ValueError, match="Torch FSDP2"):
+        config.validate_startup(transformer_config, 16, use_torch_fsdp2=True)
+    with pytest.raises(ValueError, match="optim_grads_params"):
+        config.validate_startup(
+            transformer_config,
+            16,
+            use_megatron_fsdp=True,
+            data_parallel_sharding_strategy="optim_grads",
+        )
+    with pytest.raises(ValueError, match="meta-device initialization"):
+        config.validate_startup(
+            transformer_config, 16, use_megatron_fsdp=True, init_model_with_meta_device=True
+        )
+    with pytest.raises(ValueError, match="Adam model optimizer"):
+        config.validate_startup(transformer_config, 16, use_megatron_fsdp=True, optimizer="sgd")

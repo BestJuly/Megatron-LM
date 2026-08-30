@@ -104,6 +104,39 @@ def get_expert_index_from_key(key):
     return None
 
 
+def _is_engram_table_key(key: str) -> bool:
+    """Return whether a state-dict key names an EP-owned Engram table weight."""
+    return ".engram.embedding.tables." in key and key.endswith(".weight")
+
+
+def handle_engram_in_state_dict(model_state_dict, optimizer_state_dict=None, ep_rank=None):
+    """Make Engram table keys unique across EP owners for ``fsdp_dtensor`` checkpoints.
+
+    Engram manually assigns different, potentially uneven row ranges to EP ranks before MFSDP
+    shards each range over expert-DP. DCP therefore needs one key per EP owner; expert-DP ranks
+    still share the same key and contribute DTensor shards to it.
+    """
+    if ep_rank is None:
+        ep_rank = parallel_state.get_expert_model_parallel_rank()
+
+    def rewrite_key(key):
+        if isinstance(key, str) and _is_engram_table_key(key):
+            return f"{key}.engram_ep_rank_{ep_rank}"
+        return key
+
+    model_state_dict = {rewrite_key(key): value for key, value in model_state_dict.items()}
+    if optimizer_state_dict is None:
+        return model_state_dict, None
+
+    optimizer_state_dict = optimizer_state_dict.copy()
+    for mapping_name in ("state", "param_to_group_meta"):
+        if mapping_name in optimizer_state_dict:
+            optimizer_state_dict[mapping_name] = {
+                rewrite_key(key): value for key, value in optimizer_state_dict[mapping_name].items()
+            }
+    return model_state_dict, optimizer_state_dict
+
+
 def handle_experts_in_state_dict(state_dict, num_experts: int | None = None):
     """
     Rewrite expert keys in state dict.

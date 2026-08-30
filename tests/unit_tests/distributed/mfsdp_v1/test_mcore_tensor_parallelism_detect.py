@@ -3,7 +3,10 @@
 import torch
 from torch import nn
 
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+    FullyShardedDataParallel,
+    _module_has_expert_parallel_parameters,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
     get_mcore_tensor_parallel_partition_dim,
     is_mcore_tensor_parallel_duplicated,
@@ -26,6 +29,14 @@ class DummyDistIndex:
 
     def get_submesh(self, dim_name: str, is_expert_parallel: bool = False):
         return self._meshes[(dim_name, is_expert_parallel)]
+
+
+def test_module_detects_engram_style_expert_parallel_parameter():
+    module = nn.Linear(4, 4)
+    assert not _module_has_expert_parallel_parameters(module)
+
+    module.weight.allreduce = False
+    assert _module_has_expert_parallel_parameters(module)
 
 
 def test_get_mcore_tensor_parallel_partition_dim_column_row_and_none():

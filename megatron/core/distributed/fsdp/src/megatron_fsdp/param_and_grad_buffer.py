@@ -48,6 +48,29 @@ from .utils import (
 logger = logging.getLogger(__name__)
 
 
+_FSDP_PARAMETER_ATTRIBUTES = (
+    "requires_grad",
+    "sequence_parallel",
+    "shared",
+    "tensor_model_parallel",
+    "partition_dim",
+    "partition_stride",
+    "allreduce",
+    "is_engram_embedding",
+    "is_embedding_or_output_parameter",
+    "is_embedding_parameter",
+    "_tensor_parallel_mode",
+    "_megatron_fsdp_model",
+)
+
+
+def _copy_fsdp_parameter_attributes(destination, source):
+    """Copy parameter metadata needed after MFSDP materializes a replacement parameter."""
+    for attr_name in _FSDP_PARAMETER_ATTRIBUTES:
+        if hasattr(source, attr_name):
+            setattr(destination, attr_name, getattr(source, attr_name))
+
+
 def _same_tensor_view(a: Optional[torch.Tensor], b: torch.Tensor) -> bool:
     if a is None:
         return False
@@ -1766,6 +1789,15 @@ class ParameterGroup:
     hsdp_comm_gbuf: Optional[DataParallelBuffer] = None
 
 
+def _is_expert_parallel_parameter(name: str, param: torch.nn.Parameter) -> bool:
+    """Classify parameters that must use the expert-DP FSDP mesh.
+
+    ``allreduce=False`` is the authoritative MCore contract. The name fallback preserves
+    compatibility with legacy grouped-MoE parameters that have not yet been annotated.
+    """
+    return not getattr(param, "allreduce", True) or ".experts." in name
+
+
 def _get_parameter_groups(
     module: torch.nn.Module,
     policy: BucketingPolicy,
@@ -1811,18 +1843,20 @@ def _get_parameter_groups(
 
     def _does_param_require_new_bucket(param):
         """
-        Split shared embedding parameters into separate bucket if using distributed
-        optimizer that makes use of reduce-scatters instead of all-reduces.
-        This ensures that the first and last pipeline stage partition optimizer state
-        for the shared embedding parameters the same way across DP replicas, allowing
-        the DP reduce-scatter to be before the embedding all-reduce.
+        Split parameters whose ownership semantics require an independent bucket.
+
+        Shared embeddings need matching optimizer-state partitions on the first and
+        last pipeline stage. Engram tables need each EP-owned row shard to be split
+        across expert-DP instead of sharing one flat bucket with unrelated MoE expert
+        weights, which can otherwise place the complete table payload on one rank.
         """
         return (
-            getattr(param, "shared_embedding", False)
+            (
+                getattr(param, "shared_embedding", False)
+                or getattr(param, "is_engram_embedding", False)
+            )
             and policy.data_parallel_sharding_strategy != "no_shard"
         )
-
-    is_expert_parameter = lambda n, p: ".experts." in n
 
     def _should_split_from_grouped_expert_bucket(
         is_expert_param: bool,
@@ -1857,7 +1891,7 @@ def _get_parameter_groups(
         is_fp8_meta_device_init = meta_device_init_fp8_params.get(name, (False, False))[0]
         param_attrs = dict(
             dtype="float8" if (is_fp8 or is_fp8_meta_device_init) else param.dtype,
-            is_expert_param=is_expert_parameter(name, param),
+            is_expert_param=_is_expert_parallel_parameter(name, param),
             requires_grad=param.requires_grad,
             fsdp_unit_id=None,
         )
@@ -1900,10 +1934,9 @@ def _get_parameter_groups(
         }
         for param in group.params:
             if _does_param_require_new_bucket(param):
-                # We may share the embedding model weight and the final output layer,
-                # which will cause the gradient of this parameter to be generated twice.
-                # To reduce and identify both gradients of these parameters, create a new
-                # bucket for every instance of these parameters in our parameter groups.
+                # Create a distinct bucket for every parameter carrying special
+                # ownership semantics. Shared embeddings can generate gradients twice;
+                # Engram tables must be independently sliced over expert-DP.
                 if len(bucket) > 0:
                     # Append the current bucket to the list of bucket groups.
                     bucket_groups.append(ParameterGroup(bucket, **basic_attrs))
@@ -3217,9 +3250,7 @@ class ParamAndGradBuffer:
 
             new_param.requires_grad_(old_param.requires_grad)
 
-            for tp_attr in ["_tensor_parallel_mode"]:
-                if getattr(old_param, tp_attr, None) is not None:
-                    setattr(new_param, tp_attr, getattr(old_param, tp_attr))
+            _copy_fsdp_parameter_attributes(new_param, old_param)
 
             # For FSDP with delayed_wgrad_compute, `skip_backward_post_hook` needs
             # to be reset on new param for correct grad accumulation of wgrad computation.
@@ -3386,20 +3417,7 @@ class ParamAndGradBuffer:
 
                 def set_param_attribute_closure(param, orig_param):
                     def set_param_attribute():
-                        for attr_name in [
-                            "requires_grad",
-                            "sequence_parallel",
-                            "shared",
-                            "tensor_model_parallel",
-                            "partition_dim",
-                            "partition_stride",
-                            "is_embedding_or_output_parameter",
-                            "is_embedding_parameter",
-                            "_tensor_parallel_mode",
-                            "_megatron_fsdp_model",
-                        ]:
-                            if hasattr(orig_param, attr_name):
-                                setattr(param, attr_name, getattr(orig_param, attr_name))
+                        _copy_fsdp_parameter_attributes(param, orig_param)
 
                     return set_param_attribute
 
