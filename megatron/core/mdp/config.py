@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """MDP configuration, compatibility validation, and the vision config override channel.
 
@@ -67,6 +67,7 @@ class MdpCompatibilityOptions:
     activation_offload_enabled: bool
     overlap_grad_reduce: bool
     overlap_param_gather: bool
+    overlap_param_gather_with_optimizer_step: bool
     delay_grad_reduce: bool
     checkpoint_mode: str
     save_requested: bool
@@ -258,20 +259,23 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "Offload is not validated against the retained encoder forward graph.",
             "False",
         )
-    if options.overlap_grad_reduce:
-        _reject(
-            "overlap_grad_reduce",
-            options.overlap_grad_reduce,
-            "overlap_grad_reduce == False",
-            "Encoder communication must not overlap the decoder schedule or the " "optimizer step.",
-            "False",
-        )
-    if options.overlap_param_gather:
+    if options.overlap_param_gather and not options.overlap_grad_reduce:
         _reject(
             "overlap_param_gather",
             options.overlap_param_gather,
-            "overlap_param_gather == False",
-            "Encoder communication must not overlap the decoder schedule or the " "optimizer step.",
+            "overlap_param_gather requires overlap_grad_reduce",
+            "MDP preserves the native decoder DDP overlap contract; the encoder "
+            "uses a separate synchronous DDP configuration.",
+            "enable overlap_grad_reduce or disable overlap_param_gather",
+        )
+    if options.overlap_param_gather_with_optimizer_step:
+        _reject(
+            "overlap_param_gather_with_optimizer_step",
+            options.overlap_param_gather_with_optimizer_step,
+            "overlap_param_gather_with_optimizer_step == False",
+            "The MDP composite optimizer appends the encoder optimizer after the "
+            "decoder optimizers. Dispatching a decoder parameter gather while later "
+            "members are still stepping crosses the decoder/encoder domain boundary.",
             "False",
         )
     if options.delay_grad_reduce:

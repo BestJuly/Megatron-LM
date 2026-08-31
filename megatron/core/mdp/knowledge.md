@@ -80,6 +80,8 @@ Preserve these unless the feature design is intentionally changed:
 - Encoder and decoder parameter sets are disjoint.
 - Encoder gradients are reduced over WORLD and normalized with the decoder
   finalizer's in-place-reduced global token count.
+- Decoder DDP overlap stays inside the native decoder schedule. The encoder
+  uses an independent synchronous DDP configuration for its P5/P6 lifecycle.
 - The composite optimizer treats decoder and encoder overflow, norm clipping,
   and step success as one atomic decision.
 - MDP-owned buffers must be allocated through `MdpBufferAllocator`.
@@ -100,7 +102,7 @@ The iteration phases are:
 | P1 | `window.py`, `groups.py`, `planner.py`, `bridge.py` | Capture the full iteration, shard pixel reads, broadcast descriptors, build/check the plan, and route pixels. |
 | P2 | `runtime.py`, `activation.py`, model adapter | Pack producer chunks and run the vision encoder with autograd during training. |
 | P3 | `bridge.py`, `storage.py` | Route detached vision embeddings to decoder endpoints and create endpoint leaves. |
-| P4 | Native Megatron schedule | Replay captured microbatches through the unchanged decoder schedule and capture global token count. |
+| P4 | Native Megatron schedule | Replay captured microbatches through the unchanged decoder schedule, finish any native decoder gradient-reduce overlap, and capture global token count. |
 | P5 | `runtime.py`, `activation.py`, `encoder.py` | Route leaf gradients back, run encoder backward, reduce WORLD gradients, and normalize them. |
 | P6 | `optimizer.py` | Union overflow state, compute a combined norm, clip consistently, and step decoder plus encoder optimizers. |
 
@@ -226,6 +228,16 @@ The decoder retains its native dense/expert optimizer domains.
 - all members either step or skip together;
 - LR scheduler binding sees the composite optimizer.
 
+The native decoder may enable `overlap_grad_reduce` and
+`overlap_param_gather`. Its DDP hooks and pipeline schedule retain ownership of
+those operations: decoder gradient communication is drained by the native P4
+finalizer, and decoder parameter all-gathers are dispatched/waited by the
+native forward path. The encoder DDP config is a copy with both overlap modes
+disabled, so its WORLD gradient reduction and parameter synchronization remain
+synchronous in P5/P6. Delayed gradient reduction and
+`overlap_param_gather_with_optimizer_step` remain unsupported because they
+cross that phase/domain boundary.
+
 The current checkpoint support is intentionally narrow:
 
 - synchronous global `torch_dist`;
@@ -268,7 +280,10 @@ Current major constraints:
 - bf16/fp16 mixed precision;
 - synchronous global `torch_dist` checkpointing (exact resume, same world size);
 - no FSDP/HSDP, FP8, full-iteration CUDA graph, CPU activation offload, or
-  communication-overlap modes rejected by `validate_mdp_config`.
+  encoder communication overlap;
+- native decoder `overlap_grad_reduce` and `overlap_param_gather` are supported,
+  while delayed gradient reduction and parameter-gather overlap with the
+  optimizer step are rejected by `validate_mdp_config`.
 
 Always read `validate_mdp_config` before relaxing a constraint. A validation
 change without corresponding runtime/test support is not an implementation.
