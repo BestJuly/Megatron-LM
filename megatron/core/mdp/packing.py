@@ -57,9 +57,17 @@ class GreedySampleStream:
 
     The buffer is training state that carries across iterations: after filling
     an iteration's bins it usually holds a partial list, and dropping those
-    samples would silently skip data. It is **not** checkpointed, so a resume
-    under greedy packing restarts on a batch_sampler boundary and is only
-    approximately reproducible.
+    samples would silently skip data. It is **not** checkpointed, which is why
+    ``validate_mdp_config`` rejects ``--save`` / ``--load`` under greedy packing
+    unless ``--mdp-greedy-packing-approximate-resume`` is passed.
+
+    Sample counting is two-stage. ``__next__`` *drains* samples into a bin, but
+    a bin is only *committed* when the iteration that owns it actually runs:
+    under ``--mdp-overlap-window-capture`` the next iteration's window is filled
+    on a prefetch thread during the current one, and the final prefetch is never
+    consumed at all. ``consumed_samples`` therefore reports committed samples,
+    so ``consumed_train_samples`` counts exactly the samples that were trained
+    on.
 
     Args:
         iterator: The underlying iterator of sample-dict lists.
@@ -101,7 +109,8 @@ class GreedySampleStream:
         self._buffer: List[Any] = []
         self._buffer_cursor = 0
         self._exhausted = False
-        self._consumed_samples = 0
+        self._drained_samples = 0
+        self._committed_samples = 0
         # --mdp-overlap-window-capture captures the next iteration's window on a
         # background thread. Only one capture per iterator is ever in flight (the
         # consumer joins the prefetch before capturing again), but the buffer is
@@ -110,9 +119,34 @@ class GreedySampleStream:
         self._lock = threading.Lock()
 
     @property
+    def drained_samples(self) -> int:
+        """Real samples pulled into bins since construction, committed or not."""
+        return self._drained_samples
+
+    @property
     def consumed_samples(self) -> int:
-        """Real samples drained into bins since construction."""
-        return self._consumed_samples
+        """Real samples whose bins were actually consumed by an iteration."""
+        return self._committed_samples
+
+    def commit(self, count: int) -> None:
+        """Account ``count`` drained samples as consumed.
+
+        Called by the runtime once the window built from those bins is installed
+        for the iteration, never at capture time -- a prefetched window may be
+        captured and then dropped.
+        """
+        if count < 0:
+            raise MdpStateError(
+                f"MDP: greedy packing violates: committed sample count >= 0 (got {count})."
+            )
+        with self._lock:
+            if self._committed_samples + count > self._drained_samples:
+                raise MdpStateError(
+                    "MDP: greedy packing violates: committed samples "
+                    f"({self._committed_samples} + {count}) <= drained samples "
+                    f"({self._drained_samples}); a window was committed twice."
+                )
+            self._committed_samples += count
 
     @property
     def exhausted(self) -> bool:
@@ -177,5 +211,5 @@ class GreedySampleStream:
                 total += length
             if not bin_samples:
                 raise StopIteration
-            self._consumed_samples += len(bin_samples)
+            self._drained_samples += len(bin_samples)
             return bin_samples

@@ -171,10 +171,12 @@ The collator builds normal decoder tensors plus an MDP vision sidecar:
   pre-tail-pad valid `cu_seqlens`, because the static tail is represented as an
   ordinary dummy sequence and would otherwise inflate the FLOPs accumulator.
 
-Under `--thd-static-packing` the tail policy is `append_dummy_seq`, not
-`extend_last`. `extend_last` leaves `cu_seqlens_q` ending at the real token
-count while the tensors are padded to the static target; TE then returns a
-shorter attention output than the padded input. `pad_between_seqs` is derived
+Under `--thd-static-packing` the tail policy is always `append_dummy_seq`:
+`ModelParallelConfig` rejects `extend_last` with static packing at every CP
+size, and `build_static_thd_metadata` no longer implements it. `extend_last`
+leaves `cu_seqlens_q` ending at the real token count while the tensors are
+padded to the static target; TE then returns a shorter attention output than
+the padded input. `pad_between_seqs` is derived
 from the collator's row alignment (`divisible_by > 1`), not hardcoded to
 `True`: at TP=CP=1 no sample is ever padded, so there is provably no gap, and
 claiming otherwise makes FlashAttention ineligible and can drop TE onto its
@@ -264,6 +266,7 @@ Primary flags:
 - `--mdp-overlap-window-capture`
 - `--mdp-debug-plan-payload-check`
 - `--mdp-greedy-packing`
+- `--mdp-greedy-packing-approximate-resume`
 - `--mdp-mock-dataset-config-json`
 
 Packing flags MDP consumes from the core config (all optional, all off by
@@ -272,12 +275,17 @@ default):
 - `--max-seqlen-per-dp-cp-rank` -- required by `--mdp-greedy-packing`; the
   greedy token budget is this times `context_parallel_size`.
 - `--thd-max-packed-sequences` -- caps real sequences per bin, and fixes the
-  `cu_seqlens` entry count under `--thd-static-packing`.
+  `cu_seqlens` entry count under `--thd-static-packing`. The static padding tail
+  occupies one of those slots, so it must exceed the real sequences a microbatch
+  can hold: `greedy_max_real_sequences()` reserves the slot for greedy bins, and
+  `validate_mdp_config` requires
+  `>= max(micro_batch_size, eval_micro_batch_size) + 1` without greedy packing.
 - `--thd-static-packing` -- the data path emits fixed-shape THD batches
   (`T == max_seqlen_per_dp_cp_rank * cp_size`, `cu_seqlens*` of
   `thd_max_packed_sequences + 1` entries). Requires
-  `--pad-packed-seq-alignment max`. Independent of `--mdp-greedy-packing`: all
-  four corners of the 2x2 are reachable.
+  `--pad-packed-seq-alignment max` and the `append_dummy_seq` tail policy
+  (`extend_last` is rejected at every CP size). Independent of
+  `--mdp-greedy-packing`: all four corners of the 2x2 are reachable.
 - `--sequence-packing-scheduler` is **rejected** under MDP. It is not merely
   untested: `training.py` wraps the data iterator whenever it is set, and
   `DpBalancedScheduler.run` then asserts on GPT-only sample keys, deletes every
@@ -294,8 +302,17 @@ to state in any comparison:
   comparable against a fixed-GBS run;
 - DP ranks consume different sample counts, so `consumed_train_samples` is
   computed from a real all-reduced count
-  (`training._mdp_greedy_consumed_samples`) rather than the closed form, and
-  resume determinism weakens (the sample buffer is not checkpointed).
+  (`training._mdp_greedy_consumed_samples`) rather than the closed form. Samples
+  are counted when the window built from them is installed for its iteration,
+  not when they are drained -- under `--mdp-overlap-window-capture` the prefetch
+  thread fills the next iteration's window during the current one, and the final
+  prefetch is dropped unconsumed.
+- Checkpointing is **rejected** with greedy packing unless
+  `--mdp-greedy-packing-approximate-resume` is passed: the cross-iteration
+  sample buffer is not checkpointed, and `MegatronPretrainingSampler` is
+  positioned from one global `consumed_train_samples` that cannot express the
+  per-DP-rank drain counts greedy packing produces, so a resume may skip or
+  repeat samples. Greedy packing is a benchmarking path today.
 
 The stream must be provisioned by **tokens**, not samples: an iteration eats
 about `token_budget / mean_sample_len` samples per bin, so

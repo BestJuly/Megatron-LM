@@ -49,6 +49,7 @@ class MdpConfig:
     pixel_locality: bool = False
     overlap_window_capture: bool = False
     greedy_packing: bool = False
+    greedy_packing_approximate_resume: bool = False
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,9 @@ class MdpCompatibilityOptions:
     thd_static_packing: bool = False
     max_seqlen_per_dp_cp_rank: Optional[int] = None
     thd_max_packed_sequences: Optional[int] = None
+    # max(micro_batch_size, eval_micro_batch_size): the largest number of samples
+    # the collator can be handed in one microbatch without greedy packing.
+    max_samples_per_microbatch: int = 1
 
 
 def thd_row_alignment(options: "MdpCompatibilityOptions") -> int:
@@ -355,6 +359,11 @@ def _validate_packing(config: MdpConfig, options: MdpCompatibilityOptions) -> No
     and reroutes samples across DP with an all-to-all that has no notion of
     variable-size pixel payloads. Without this rejection the run dies deep inside
     an assert about a missing ``tokens`` key.
+
+    Also enforces the two properties the static/greedy packing paths depend on:
+    the ``cu_seqlens`` capacity leaves a slot for the static padding tail, and
+    greedy packing is not silently combined with checkpointing (its sample
+    buffer is not checkpointed).
     """
     if options.sequence_packing_scheduler is not None:
         _reject(
@@ -366,8 +375,49 @@ def _validate_packing(config: MdpConfig, options: MdpCompatibilityOptions) -> No
             "MDP owns its packing (--mdp-greedy-packing).",
             "None",
         )
+    if options.thd_static_packing and not config.greedy_packing:
+        # Without greedy packing a microbatch is exactly micro_batch_size samples
+        # (eval_micro_batch_size on the eval loaders), and the static padding tail
+        # is appended to cu_seqlens as one more ordinary sequence, so the pack
+        # needs that many + 2 entries against a capacity of
+        # thd_max_packed_sequences + 1. greedy_packing makes the same
+        # reservation, through greedy_max_real_sequences().
+        cap = options.thd_max_packed_sequences
+        samples = options.max_samples_per_microbatch
+        if cap is not None and cap < samples + 1:
+            _reject(
+                "thd_max_packed_sequences",
+                cap,
+                f"thd_max_packed_sequences >= max(micro_batch_size, "
+                f"eval_micro_batch_size) + 1 ({samples} + 1)",
+                "Under --thd-static-packing the padding tail is appended to "
+                "cu_seqlens as an ordinary dummy sequence, so one slot of the "
+                "thd_max_packed_sequences + 1 capacity is reserved for it; a full "
+                "microbatch would otherwise overflow it inside _pad_cu_seqlens.",
+                str(samples + 1),
+            )
     if not config.greedy_packing:
         return
+    if (options.save_requested or options.load_requested) and (
+        not config.greedy_packing_approximate_resume
+    ):
+        # The greedy stream buffers samples across iterations: the underlying
+        # iterator advances by a whole batch_sampler batch while only part of it
+        # has been drained into bins. That buffer is not checkpointed, and the
+        # sampler is positioned from a single global consumed_train_samples that
+        # cannot express per-DP-rank drain counts, so a resume may skip or repeat
+        # samples. Greedy packing is a benchmarking path; make that explicit
+        # rather than silently corrupting a resume.
+        _reject(
+            "greedy_packing",
+            config.greedy_packing,
+            "--save / --load is not combined with --mdp-greedy-packing",
+            "The greedy sample buffer is not checkpointed and the sampler cannot be "
+            "repositioned per DP rank, so a resume may skip or repeat samples. Pass "
+            "--mdp-greedy-packing-approximate-resume to accept that, or drop "
+            "--mdp-greedy-packing for runs that checkpoint.",
+            "False",
+        )
     if options.max_seqlen_per_dp_cp_rank is None:
         _reject(
             "max_seqlen_per_dp_cp_rank",

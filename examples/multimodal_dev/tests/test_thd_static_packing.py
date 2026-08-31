@@ -81,60 +81,39 @@ def _make_sample(seq_len, *, base=0, num_patches=4, pixel_dim=8, device="cuda"):
 
 
 class TestBuildStaticThdMetadata:
-    def test_extend_last_keeps_valid_boundaries(self):
+    def test_the_tail_becomes_a_sequence_and_returns_the_real_vector(self):
         cu = torch.tensor([0, 5, 12], dtype=torch.int32)
         cu_padded = torch.tensor([0, 6, 14], dtype=torch.int32)
         q, q_padded, real = build_static_thd_metadata(
-            cu, cu_padded, target_len=32, max_num_seqs=4, tail_padding_policy="extend_last"
-        )
-        assert real is None  # no FLOPs override needed
-        assert q.tolist() == [0, 5, 12, 12, 12]  # valid vector untouched, then padded
-        assert q_padded.tolist() == [0, 6, 32, 32, 32]
-        assert q.numel() == q_padded.numel() == 5
-
-    def test_append_dummy_seq_returns_the_real_vector(self):
-        cu = torch.tensor([0, 5, 12], dtype=torch.int32)
-        cu_padded = torch.tensor([0, 6, 14], dtype=torch.int32)
-        q, q_padded, real = build_static_thd_metadata(
-            cu, cu_padded, target_len=32, max_num_seqs=4, tail_padding_policy="append_dummy_seq"
+            cu, cu_padded, target_len=32, max_num_seqs=4
         )
         assert real is not None and real.tolist() == [0, 5, 12]
         assert q.tolist() == [0, 5, 12, 30, 30]  # tail became an ordinary sequence
         assert q_padded.tolist() == [0, 6, 14, 32, 32]
+        assert q.numel() == q_padded.numel() == 5
 
     def test_exact_fit_needs_no_tail(self):
         cu = torch.tensor([0, 16, 32], dtype=torch.int32)
-        q, q_padded, real = build_static_thd_metadata(
-            cu, cu.clone(), target_len=32, max_num_seqs=3, tail_padding_policy="extend_last"
-        )
-        assert real is None
+        q, q_padded, real = build_static_thd_metadata(cu, cu.clone(), target_len=32, max_num_seqs=3)
+        assert real is None  # nothing was appended, so no FLOPs override
         assert q.tolist() == [0, 16, 32, 32]
 
     def test_overflowing_pack_names_the_flag(self):
         cu = torch.tensor([0, 40], dtype=torch.int32)
         with pytest.raises(AssertionError, match="max-seqlen-per-dp-cp-rank"):
-            build_static_thd_metadata(
-                cu, cu.clone(), target_len=32, max_num_seqs=4, tail_padding_policy="extend_last"
-            )
+            build_static_thd_metadata(cu, cu.clone(), target_len=32, max_num_seqs=4)
 
     def test_too_many_sequences_names_the_flag(self):
         cu = torch.tensor([0, 4, 8, 12, 16], dtype=torch.int32)
         with pytest.raises(AssertionError, match="thd_max_packed_sequences"):
-            build_static_thd_metadata(
-                cu, cu.clone(), target_len=32, max_num_seqs=2, tail_padding_policy="extend_last"
-            )
+            build_static_thd_metadata(cu, cu.clone(), target_len=32, max_num_seqs=2)
 
-    def test_extend_last_is_rejected_under_cp(self):
-        cu = torch.tensor([0, 8], dtype=torch.int32)
-        with pytest.raises(AssertionError, match="before CP slicing"):
-            build_static_thd_metadata(
-                cu,
-                cu.clone(),
-                target_len=32,
-                max_num_seqs=4,
-                tail_padding_policy="extend_last",
-                cp_size=2,
-            )
+    def test_a_full_pack_still_needs_room_for_the_tail(self):
+        # max_num_seqs real sequences plus the dummy tail need max_num_seqs + 2
+        # entries; the caller (config validation) must reserve the slot.
+        cu = torch.tensor([0, 4, 8], dtype=torch.int32)
+        with pytest.raises(AssertionError, match="thd_max_packed_sequences"):
+            build_static_thd_metadata(cu, cu.clone(), target_len=32, max_num_seqs=2)
 
 
 # ---------------------------------------------------------------------------
@@ -283,11 +262,7 @@ class TestFlopsAccounting:
         lengths = [5, 13, 7]
         cu = torch.tensor([0, 5, 18, 25], dtype=torch.int32)
         q, _, real = build_static_thd_metadata(
-            cu,
-            cu.clone(),
-            target_len=MAX_SEQLEN,
-            max_num_seqs=MAX_PACKED,
-            tail_padding_policy="append_dummy_seq",
+            cu, cu.clone(), target_len=MAX_SEQLEN, max_num_seqs=MAX_PACKED
         )
         polluted = (q[1:] - q[:-1]).clamp(min=0).sum().item()
         honest = (real[1:] - real[:-1]).sum().item()

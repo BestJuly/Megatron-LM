@@ -183,7 +183,21 @@ def add_multimodal_args(parser):
             "so --global-batch-size means 'N x token budget' and loss curves are "
             "not iteration-by-iteration comparable against a fixed-GBS run. "
             "Requires --max-seqlen-per-dp-cp-rank. Independent of "
-            "--thd-static-packing."
+            "--thd-static-packing. Rejected together with --save / --load "
+            "unless --mdp-greedy-packing-approximate-resume is passed."
+        ),
+    )
+    group.add_argument(
+        "--mdp-greedy-packing-approximate-resume",
+        action="store_true",
+        default=False,
+        help=(
+            "Allow --mdp-greedy-packing together with --save / --load. The greedy "
+            "sample buffer carries across iterations and is NOT checkpointed, and "
+            "the sampler is repositioned from one global consumed_train_samples "
+            "that cannot express per-DP-rank drain counts, so a resumed run may "
+            "skip or repeat samples. Acceptable for benchmarking, not for "
+            "convergence runs."
         ),
     )
     group.add_argument(
