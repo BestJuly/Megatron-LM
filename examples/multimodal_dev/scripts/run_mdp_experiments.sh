@@ -16,6 +16,10 @@
 #   OVERLAP=0|1      window-capture prefetch on a background thread + side
 #                    CUDA stream (--mdp-overlap-window-capture; ignored when
 #                    MDP=0)
+#   EP_OVERLAP=0|1   native decoder 1F1B EP A2A overlap with delayed wgrad
+#                    compute (default 0). This is independent of MDP window
+#                    capture and requires EP>1 plus VPP>1 when PP>1.
+#   VPP=<n>          virtual stages per PP rank (default 1 = disabled)
 #   PIXEL_LOCALITY=0|1  planner prefers assigning items to their pixel owner
 #                    within the LPT slack (--mdp-pixel-locality; ignored when
 #                    MDP=0)
@@ -54,7 +58,7 @@
 #                    arguments.py (~1822) commented out; it is, on this branch.
 #   EXTRA="..."      extra args appended verbatim
 #
-# Shape overrides: PP TP EP CP MBS GBS SEQ_LEN NUM_LAYERS NUM_EXPERTS
+# Shape overrides: PP VPP TP EP CP MBS GBS SEQ_LEN NUM_LAYERS NUM_EXPERTS
 # MOE_TOPK VISION_NUM_LAYERS MTP_NUM_LAYERS MTP_LOSS_SCALING_FACTOR SEED
 # NPROC PROF_START PROF_END.
 #
@@ -62,19 +66,20 @@
 #   MDP=0 ITERS=50                            bash run_mdp_experiments.sh
 #   MDP=1 ITERS=50                            bash run_mdp_experiments.sh
 #   MDP=1 GRID_CACHE=0 ITERS=50               bash run_mdp_experiments.sh
+#   MDP=1 EP_OVERLAP=1 VPP=2 ITERS=50         bash run_mdp_experiments.sh
 #   MDP=1 NSYS=1 OUT=/path/a4                 bash run_mdp_experiments.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
-export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NVTE_FUSED_ATTN=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export HF_HUB_OFFLINE=1
 
 MDP=${MDP:-0}
 OVERLAP=${OVERLAP:-0}
+EP_OVERLAP=${EP_OVERLAP:-0}
 PIXEL_LOCALITY=${PIXEL_LOCALITY:-0}
 GRID_CACHE=${GRID_CACHE:-1}
 GDN=${GDN:-1}
@@ -85,6 +90,7 @@ PROF_END=${PROF_END:-9}
 ROUTER_FUSION=${ROUTER_FUSION:-1}
 CE_FUSION=${CE_FUSION:-te}
 PP=${PP:-2}
+VPP=${VPP:-1}
 TP=${TP:-1}
 EP=${EP:-2}
 CP=${CP:-1}
@@ -106,6 +112,12 @@ MASTER_PORT=${MASTER_PORT:-29500}
 ENTRY=${ENTRY:-$REPO_ROOT/examples/multimodal_dev/pretrain_multimodal.py}
 EXTRA=${EXTRA:-}
 
+if [ "$EP_OVERLAP" = "1" ]; then
+    export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-32}
+else
+    export CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1}
+fi
+
 export QWEN35_VL_GRID_CACHE=$GRID_CACHE
 # The scenario-pool wrapper (see ENTRY docs above) locates the repo via WT.
 export WT=$REPO_ROOT
@@ -121,6 +133,31 @@ if [ "$MDP" = "1" ]; then
     if [ "$PIXEL_LOCALITY" = "1" ]; then
         MDP_ARGS+=( --mdp-pixel-locality )
     fi
+fi
+
+if [ "$VPP" -lt 1 ]; then
+    echo "ERROR: VPP must be >= 1, got '$VPP'" >&2
+    exit 1
+fi
+VPP_ARGS=()
+if [ "$VPP" -gt 1 ]; then
+    VPP_ARGS=( --num-virtual-stages-per-pipeline-rank "$VPP" )
+fi
+
+EP_OVERLAP_ARGS=()
+if [ "$EP_OVERLAP" = "1" ]; then
+    if [ "$EP" -le 1 ]; then
+        echo "ERROR: EP_OVERLAP=1 requires EP > 1" >&2
+        exit 1
+    fi
+    if [ "$PP" -gt 1 ] && [ "$VPP" -le 1 ]; then
+        echo "ERROR: EP_OVERLAP=1 with PP > 1 requires VPP > 1" >&2
+        exit 1
+    fi
+    EP_OVERLAP_ARGS=(
+        --overlap-moe-expert-parallel-comm
+        --delay-wgrad-compute
+    )
 fi
 
 GDN_ARGS=()
@@ -199,6 +236,7 @@ fi
     --vocab-size 248320 \
     --tensor-model-parallel-size "$TP" \
     --pipeline-model-parallel-size "$PP" \
+    "${VPP_ARGS[@]}" \
     --expert-model-parallel-size "$EP" \
     --context-parallel-size "$CP" \
     --use-distributed-optimizer \
@@ -253,6 +291,7 @@ fi
     "${ROUTER_FUSION_ARGS[@]}" \
     "${CE_ARGS[@]}" \
     "${GDN_ARGS[@]}" \
+    "${EP_OVERLAP_ARGS[@]}" \
     "${PROF_ARGS[@]}" \
     "${MDP_ARGS[@]}" \
     $EXTRA

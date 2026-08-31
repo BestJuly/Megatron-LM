@@ -72,6 +72,7 @@ class MdpCompatibilityOptions:
     checkpoint_mode: str
     save_requested: bool
     load_requested: bool
+    overlap_moe_expert_parallel_comm: bool = False
 
 
 def _reject(option: str, value: Any, condition: str, why: str, suggestion: str = "") -> None:
@@ -187,6 +188,27 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             f"TP * PP * CP = {model_parallel} must evenly divide the world size to "
             "form outer data-parallel planning groups.",
         )
+    if options.overlap_moe_expert_parallel_comm:
+        if options.expert_parallel_size <= 1:
+            _reject(
+                "overlap_moe_expert_parallel_comm",
+                options.overlap_moe_expert_parallel_comm,
+                "EP > 1",
+                "Decoder EP communication overlap requires expert parallelism.",
+                "expert_parallel_size > 1",
+            )
+        if (
+            options.pipeline_parallel_size > 1
+            and options.virtual_pipeline_parallel_size is None
+        ):
+            _reject(
+                "overlap_moe_expert_parallel_comm",
+                options.overlap_moe_expert_parallel_comm,
+                "VPP enabled when PP > 1",
+                "The native combined 1F1B EP-overlap schedule is interleaved "
+                "when pipeline parallelism is enabled.",
+                "virtual_pipeline_parallel_size > 1",
+            )
 
     # --- training semantics ---
     if not options.calculate_per_token_loss:
