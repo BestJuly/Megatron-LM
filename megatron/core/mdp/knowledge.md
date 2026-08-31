@@ -80,6 +80,8 @@ Preserve these unless the feature design is intentionally changed:
 - Encoder and decoder parameter sets are disjoint.
 - Encoder gradients are reduced over WORLD and normalized with the decoder
   finalizer's in-place-reduced global token count.
+- Decoder DDP overlap stays inside the native decoder schedule. The encoder
+  uses an independent synchronous DDP configuration for its P5/P6 lifecycle.
 - The composite optimizer treats decoder and encoder overflow, norm clipping,
   and step success as one atomic decision.
 - MDP-owned buffers must be allocated through `MdpBufferAllocator`.
@@ -100,7 +102,7 @@ The iteration phases are:
 | P1 | `window.py`, `groups.py`, `planner.py`, `bridge.py` | Capture the full iteration, shard pixel reads, broadcast descriptors, build/check the plan, and route pixels. |
 | P2 | `runtime.py`, `activation.py`, model adapter | Pack producer chunks and run the vision encoder with autograd during training. |
 | P3 | `bridge.py`, `storage.py` | Route detached vision embeddings to decoder endpoints and create endpoint leaves. |
-| P4 | Native Megatron schedule | Replay captured microbatches through the unchanged decoder schedule and capture global token count. |
+| P4 | Native Megatron schedule | Replay captured microbatches through the unchanged decoder schedule, finish any native decoder gradient-reduce overlap, and capture global token count. |
 | P5 | `runtime.py`, `activation.py`, `encoder.py` | Route leaf gradients back, run encoder backward, reduce WORLD gradients, and normalize them. |
 | P6 | `optimizer.py` | Union overflow state, compute a combined norm, clip consistently, and step decoder plus encoder optimizers. |
 
@@ -129,7 +131,7 @@ returns to `EMPTY`.
 | `runtime.py` | P0-P5 orchestration, prefetch handoff, per-iteration state and metrics. |
 | `schedule.py` | Native schedule and `finalize_model_grads_func` wrappers. |
 | `optimizer.py` | Decoder/encoder composite optimizer and shared overflow/norm semantics. |
-| `checkpoint.py` | Weight-only `torch_dist` checkpoint facade for the vision model. |
+| `checkpoint.py` | `torch_dist` checkpoint facade for the vision model (save and load). |
 | `integration.py` | Training-loop seams, adapter registration, runtime construction. |
 | `observability.py` | MDP NVTX ranges and iteration metrics helpers. |
 
@@ -153,7 +155,7 @@ returns to `EMPTY`.
 - `megatron/training/training.py`: creates the MDP domain and wraps train/eval
   schedules.
 - `megatron/training/checkpointing.py`: injects MDP vision state into the
-  distributed checkpoint.
+  distributed checkpoint on save and restores it on load.
 - `megatron/training/arguments.py`: permits the validated TE
   cross-entropy-fusion baseline used by the reference launcher.
 
@@ -226,15 +228,28 @@ The decoder retains its native dense/expert optimizer domains.
 - all members either step or skip together;
 - LR scheduler binding sees the composite optimizer.
 
+The native decoder may enable `overlap_grad_reduce` and
+`overlap_param_gather`. Its DDP hooks and pipeline schedule retain ownership of
+those operations: decoder gradient communication is drained by the native P4
+finalizer, and decoder parameter all-gathers are dispatched/waited by the
+native forward path. The encoder DDP config is a copy with both overlap modes
+disabled, so its WORLD gradient reduction and parameter synchronization remain
+synchronous in P5/P6. Delayed gradient reduction and
+`overlap_param_gather_with_optimizer_step` remain unsupported because they
+cross that phase/domain boundary.
+
 The current checkpoint support is intentionally narrow:
 
 - synchronous global `torch_dist`;
-- weight-only MDP facade;
-- vision weights stored under the MDP vision key;
+- vision weights stored under the MDP vision key, saved and loaded through the
+  MDP facade;
+- composite optimizer state for both domains, with the encoder member under a
+  fixed key so the decoder DP-CP and encoder WORLD sharding domains never
+  collide (both otherwise compute `data_parallel_group_idx == 0`);
 - unsupported save/load modes are rejected at startup.
 
-If optimizer-state checkpointing is added, do not assume decoder and WORLD
-encoder optimizers share the same DP sharding group.
+Decoder and WORLD encoder optimizers do not share a DP sharding group; never
+key or reshard them as if they did.
 
 ## Configuration quick reference
 
@@ -263,9 +278,12 @@ Current major constraints:
 - distributed optimizer enabled;
 - per-token loss enabled;
 - bf16/fp16 mixed precision;
-- synchronous global `torch_dist` weight-only checkpointing;
+- synchronous global `torch_dist` checkpointing (exact resume, same world size);
 - no FSDP/HSDP, FP8, full-iteration CUDA graph, CPU activation offload, or
-  communication-overlap modes rejected by `validate_mdp_config`.
+  encoder communication overlap;
+- native decoder `overlap_grad_reduce` and `overlap_param_gather` are supported,
+  while delayed gradient reduction and parameter-gather overlap with the
+  optimizer step are rejected by `validate_mdp_config`.
 
 Always read `validate_mdp_config` before relaxing a constraint. A validation
 change without corresponding runtime/test support is not an implementation.

@@ -150,6 +150,9 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
         activation_offload_enabled=offload,
         overlap_grad_reduce=getattr(args, "overlap_grad_reduce", False),
         overlap_param_gather=getattr(args, "overlap_param_gather", False),
+        overlap_param_gather_with_optimizer_step=bool(
+            getattr(args, "overlap_param_gather_with_optimizer_step", False)
+        ),
         delay_grad_reduce=bool(getattr(args, "delay_grad_reduce", False)),
         overlap_moe_expert_parallel_comm=bool(
             getattr(args, "overlap_moe_expert_parallel_comm", False)

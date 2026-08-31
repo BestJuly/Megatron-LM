@@ -37,6 +37,7 @@ def _options(**overrides):
         activation_offload_enabled=False,
         overlap_grad_reduce=False,
         overlap_param_gather=False,
+        overlap_param_gather_with_optimizer_step=False,
         delay_grad_reduce=False,
         overlap_moe_expert_parallel_comm=False,
         checkpoint_mode="torch_dist",
@@ -132,8 +133,15 @@ def test_invalid_mdp_config_fields_rejected(config_kwargs, match):
         (dict(fp8_enabled=True), "fp8"),
         (dict(cuda_graph_enabled=True), "cuda_graph"),
         (dict(activation_offload_enabled=True), "activation_offload"),
-        (dict(overlap_grad_reduce=True), "overlap_grad_reduce"),
         (dict(overlap_param_gather=True), "overlap_param_gather"),
+        (
+            dict(
+                overlap_grad_reduce=True,
+                overlap_param_gather=True,
+                overlap_param_gather_with_optimizer_step=True,
+            ),
+            "overlap_param_gather_with_optimizer_step",
+        ),
         (dict(delay_grad_reduce=True), "delay_grad_reduce"),
         (
             dict(checkpoint_mode="fully_parallel", save_requested=True),
@@ -156,6 +164,14 @@ def test_unsupported_checkpoint_mode_allowed_without_save_or_load():
 
 def test_fp16_configuration_accepted_for_overflow_tests():
     validate_mdp_config(MdpConfig(enable=True), _options(bf16=False, fp16=True))
+
+
+@pytest.mark.parametrize(
+    "option_kwargs",
+    [dict(overlap_grad_reduce=True), dict(overlap_grad_reduce=True, overlap_param_gather=True)],
+)
+def test_native_decoder_ddp_overlap_is_supported(option_kwargs):
+    validate_mdp_config(MdpConfig(enable=True), _options(**option_kwargs))
 
 
 def test_error_messages_carry_option_value_and_suggestion():
@@ -246,6 +262,7 @@ def _fake_args(**overrides):
         offload_optimizer_states=False,
         overlap_grad_reduce=False,
         overlap_param_gather=False,
+        overlap_param_gather_with_optimizer_step=False,
         delay_grad_reduce=False,
         overlap_moe_expert_parallel_comm=False,
         ckpt_format="torch_dist",
@@ -282,3 +299,14 @@ def test_snapshot_reports_decoder_ep_overlap():
         _fake_args(overlap_moe_expert_parallel_comm=True)
     )
     assert options.overlap_moe_expert_parallel_comm is True
+
+
+def test_snapshot_reports_optimizer_step_param_gather_overlap():
+    from megatron.core.mdp.integration import compatibility_options_from_args
+
+    options = compatibility_options_from_args(
+        _fake_args(overlap_param_gather_with_optimizer_step=True)
+    )
+    assert options.overlap_param_gather_with_optimizer_step
+    with pytest.raises(MdpConfigurationError, match="overlap_param_gather_with_optimizer_step"):
+        validate_mdp_config(MdpConfig(enable=True), options)
