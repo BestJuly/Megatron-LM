@@ -141,9 +141,9 @@ class ModelParallelConfig:
     entries. Set this when packing is done outside --sequence-packing-scheduler (for
     example by MDP's greedy token-budget packer). It is an explicit statement about the
     shape contract of the incoming batches; it does not itself perform any packing.
-    Requires max_seqlen_per_dp_cp_rank, thd_max_packed_sequences, and
-    pad_packed_seq_alignment='max', and is mutually exclusive with
-    sequence_packing_scheduler.
+    Requires max_seqlen_per_dp_cp_rank, thd_max_packed_sequences,
+    pad_packed_seq_alignment='max', and thd_tail_padding_policy='append_dummy_seq',
+    and is mutually exclusive with sequence_packing_scheduler.
     """
 
     expert_model_parallel_size: int = 1
@@ -581,6 +581,20 @@ class ModelParallelConfig:
                     f"{self.max_seqlen_per_dp_cp_rank}), got "
                     f"{self.pad_packed_seq_alignment!r}: any other alignment produces "
                     "variable token counts."
+                )
+            # Rejected at every context-parallel size, unlike the CP-only
+            # restriction on 'extend_last' elsewhere: under static packing it
+            # would leave the valid cu_seqlens ending at the real token count
+            # while the token tensors are padded to the static target, and
+            # TransformerEngine then returns fewer attention rows than its input
+            # (a view mismatch in Attention._apply_output_gate).
+            if (self.thd_tail_padding_policy or "append_dummy_seq") == "extend_last":
+                raise ValueError(
+                    "thd_static_packing requires thd_tail_padding_policy="
+                    "'append_dummy_seq': with 'extend_last' the valid cu_seqlens stops at "
+                    "the real token count while the tensors are padded to the static "
+                    "target, and TransformerEngine returns a shorter attention output "
+                    "than its input."
                 )
 
         if self.sequence_parallel:

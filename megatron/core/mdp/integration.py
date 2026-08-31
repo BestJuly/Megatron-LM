@@ -104,6 +104,9 @@ def mdp_config_from_args(args) -> MdpConfig:
         pixel_locality=getattr(args, "mdp_pixel_locality", False),
         overlap_window_capture=getattr(args, "mdp_overlap_window_capture", False),
         greedy_packing=getattr(args, "mdp_greedy_packing", False),
+        greedy_packing_approximate_resume=getattr(
+            args, "mdp_greedy_packing_approximate_resume", False
+        ),
     )
 
 
@@ -162,6 +165,10 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
         thd_static_packing=bool(getattr(args, "thd_static_packing", False)),
         max_seqlen_per_dp_cp_rank=getattr(args, "max_seqlen_per_dp_cp_rank", None),
         thd_max_packed_sequences=getattr(args, "thd_max_packed_sequences", None),
+        max_samples_per_microbatch=max(
+            int(getattr(args, "micro_batch_size", 1) or 1),
+            int(getattr(args, "eval_micro_batch_size", None) or 0),
+        ),
     )
 
 

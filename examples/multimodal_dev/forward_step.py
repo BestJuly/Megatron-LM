@@ -170,13 +170,13 @@ def accumulate_flops_stats(packed_seq_params, real_cu_seqlens=None) -> None:
     no host sync is added to the hot path.
 
     ``real_cu_seqlens`` overrides ``cu_seqlens_q``. Under ``--thd-static-packing``
-    with the ``append_dummy_seq`` tail policy (forced at CP>1), the static pad is
+    the tail policy is always ``append_dummy_seq``, so the static pad is
     represented as an ordinary extra sequence and therefore lands in
     ``cu_seqlens_q`` itself. Accumulating that would overstate ``sum(L)`` and
     ``sum(L^2)`` by the padding fraction -- exactly the shape of a false speedup,
     since it appears only on the padded side. The collator emits the pre-tail
-    vector as ``flops_cu_seqlens`` in that case. ``extend_last`` (CP=1) leaves
-    ``cu_seqlens_q`` untouched and needs no override.
+    vector as ``flops_cu_seqlens`` in that case; without static packing there is
+    no tail and no override.
 
     Imported lazily: ``megatron.training.training`` pulls in the whole training
     stack, and this module is also imported by unit tests that never build it.
@@ -441,7 +441,6 @@ def pack_or_pad_batch(
         # CP slicing happens later in models/base.py.
         static_target_T = None
         static_max_num_seqs = None
-        static_tail_policy = "extend_last"
         try:
             static_args = get_args()
         except AssertionError:
@@ -449,20 +448,18 @@ def pack_or_pad_batch(
         if static_args is not None and getattr(static_args, "thd_static_packing", False):
             static_target_T = int(static_args.max_seqlen_per_dp_cp_rank) * cp_size
             static_max_num_seqs = int(static_args.thd_max_packed_sequences)
-            # append_dummy_seq, matching what --sequence-packing-scheduler
-            # produces. `extend_last` is *not* usable here even at CP=1: it
-            # leaves cu_seqlens_q ending at the real token count while the
+            # The tail policy is always append_dummy_seq here, matching what
+            # --sequence-packing-scheduler produces; TransformerConfig rejects
+            # thd_static_packing + extend_last, which is unusable at any CP size
+            # (it leaves cu_seqlens_q ending at the real token count while the
             # tensors are padded to target_T, and TE then returns a shorter
-            # attention output than the padded input (observed as a view
-            # mismatch in Attention._apply_output_gate).
+            # attention output than the padded input -- a view mismatch in
+            # Attention._apply_output_gate).
             #
             # The cost is that the pad tail becomes an ordinary sequence in
             # cu_seqlens_q, which would inflate the FLOPs accumulator; the
             # pre-tail vector is therefore emitted separately (see
             # accumulate_flops_stats).
-            static_tail_policy = (
-                getattr(static_args, "thd_tail_padding_policy", None) or "append_dummy_seq"
-            )
 
         # Owner-sharded pixel reading: during MDP window capture of a
         # microbatch owned by another worker, skip pixel
@@ -665,7 +662,6 @@ def pack_or_pad_batch(
                 cu_seqlens_padded_t,
                 target_len=static_target_T,
                 max_num_seqs=static_max_num_seqs,
-                tail_padding_policy=static_tail_policy,
                 cp_size=cp_size,
             )
             # max_seqlen must be the padded static value: the tail belongs to a

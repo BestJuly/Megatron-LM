@@ -42,6 +42,7 @@ def _options(**overrides):
         checkpoint_mode="torch_dist",
         save_requested=False,
         load_requested=False,
+        max_samples_per_microbatch=4,
     )
     base.update(overrides)
     return MdpCompatibilityOptions(**base)
@@ -247,6 +248,17 @@ def test_snapshot_reports_the_real_rank_order():
         validate_mdp_config(MdpConfig(enable=True), remapped_options)
 
 
+def test_snapshot_takes_the_larger_of_the_train_and_eval_microbatch_sizes():
+    # Both loaders hand the collator a whole microbatch, and the eval one may be
+    # the larger of the two, so the static cu_seqlens capacity must cover it.
+    from megatron.core.mdp.integration import compatibility_options_from_args
+
+    options = compatibility_options_from_args(
+        _fake_args(micro_batch_size=4, eval_micro_batch_size=16)
+    )
+    assert options.max_samples_per_microbatch == 16
+
+
 # ---------------------------------------------------------------------------
 # Packing: greedy token budget and the MCore scheduler rejection
 # ---------------------------------------------------------------------------
@@ -333,3 +345,53 @@ def test_static_packing_needs_room_for_a_real_sequence_and_the_dummy():
                 thd_static_packing=True,
             ),
         )
+
+
+def test_static_only_packing_reserves_the_dummy_slot_for_a_full_microbatch():
+    # Without greedy packing a microbatch is exactly micro_batch_size samples
+    # (eval_micro_batch_size on the eval loaders), and the padding tail adds one
+    # more sequence, so a cap equal to that count overflows the cu_seqlens
+    # capacity inside _pad_cu_seqlens.
+    options = _options(
+        max_samples_per_microbatch=8,
+        thd_static_packing=True,
+        max_seqlen_per_dp_cp_rank=8192,
+        thd_max_packed_sequences=8,
+    )
+    with pytest.raises(MdpConfigurationError, match="eval_micro_batch_size\\) \\+ 1"):
+        validate_mdp_config(MdpConfig(enable=True), options)
+    validate_mdp_config(
+        MdpConfig(enable=True), dataclasses.replace(options, thd_max_packed_sequences=9)
+    )
+
+
+def test_static_only_packing_slot_check_does_not_apply_without_static_packing():
+    validate_mdp_config(
+        MdpConfig(enable=True),
+        _options(
+            max_samples_per_microbatch=8,
+            max_seqlen_per_dp_cp_rank=8192,
+            thd_max_packed_sequences=8,
+        ),
+    )
+
+
+@pytest.mark.parametrize("checkpoint_kwargs", [dict(save_requested=True), dict(load_requested=True)])
+def test_greedy_packing_is_rejected_with_checkpointing(checkpoint_kwargs):
+    # The greedy sample buffer carries across iterations and is not
+    # checkpointed, and the sampler cannot be repositioned per DP rank.
+    options = _options(
+        max_seqlen_per_dp_cp_rank=8192, thd_max_packed_sequences=8, **checkpoint_kwargs
+    )
+    with pytest.raises(MdpConfigurationError, match="greedy_packing"):
+        validate_mdp_config(MdpConfig(enable=True, greedy_packing=True), options)
+    validate_mdp_config(
+        MdpConfig(enable=True, greedy_packing=True, greedy_packing_approximate_resume=True),
+        options,
+    )
+
+
+def test_checkpointing_without_greedy_packing_is_unaffected():
+    validate_mdp_config(
+        MdpConfig(enable=True), _options(save_requested=True, load_requested=True)
+    )

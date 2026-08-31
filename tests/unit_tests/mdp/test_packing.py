@@ -5,8 +5,10 @@
 import pytest
 import torch
 
+from megatron.core.mdp.config import MdpConfig
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
 from megatron.core.mdp.packing import GreedySampleStream, decoder_sample_length
+from megatron.core.mdp.runtime import MdpRuntime
 
 
 def _sample(length, tag=0):
@@ -65,7 +67,8 @@ def test_stream_drains_microbatch_lists_sample_by_sample():
     bins = [next(stream), next(stream)]
     # The 4-sample list is split across bins; the leftover carries forward.
     assert _bin_lengths(bins) == [[300, 300, 300], [300, 300, 300]]
-    assert stream.consumed_samples == 6
+    assert stream.drained_samples == 6
+    assert stream.consumed_samples == 0  # drained, but no window consumed them yet
 
 
 def test_leftovers_carry_across_iterations():
@@ -140,3 +143,61 @@ def test_degenerate_distribution_reproduces_fixed_mbs():
     )
     for _ in range(8):
         assert len(next(stream)) == k
+
+
+def test_commit_cannot_exceed_what_was_drained():
+    stream = _stream([500] * 8, mbs=4, budget=1000)
+    next(stream)
+    with pytest.raises(MdpStateError, match="committed samples"):
+        stream.commit(3)  # only 2 were drained; a double commit would land here
+
+
+# ---------------------------------------------------------------------------
+# Runtime accounting: commit on consumption, not on capture
+# ---------------------------------------------------------------------------
+
+
+class _StubRuntime(MdpRuntime):
+    """Only ``MdpRuntime``'s greedy bookkeeping; no distributed state, no CUDA."""
+
+    def __init__(self, *, token_budget, forward_only=False):
+        self.config = MdpConfig(enable=True, greedy_packing=True)
+        self._greedy_token_budget = token_budget
+        self._greedy_max_num_seqs = None
+        self._greedy_row_alignment = 1
+        self._greedy_streams = {}
+        self._forward_only = forward_only
+
+    def _capture(self, data_iterators, num_microbatches):
+        return [next(data_iterators) for _ in range(num_microbatches)]
+
+
+def test_capture_alone_does_not_count_samples_as_consumed():
+    # --mdp-overlap-window-capture captures iteration i+1's window during
+    # iteration i, and the final prefetch is never consumed at all.
+    runtime = _StubRuntime(token_budget=1000)
+    iterator = _microbatches([500] * 8, mbs=4)
+
+    _, pending = runtime._capture_window(iterator, 2)
+    stream, drained = pending
+    assert drained == 4
+    assert runtime.consumed_samples() == 0
+
+    stream.commit(drained)  # the window is installed for its iteration
+    assert runtime.consumed_samples() == 4
+
+    runtime._capture_window(iterator, 2)  # captured, then dropped unconsumed
+    assert runtime.consumed_samples() == 4
+
+
+def test_evaluation_streams_stay_out_of_the_training_count():
+    runtime = _StubRuntime(token_budget=1000, forward_only=True)
+    _, (stream, drained) = runtime._capture_window(_microbatches([500] * 8, mbs=4), 2)
+    stream.commit(drained)
+    assert runtime.consumed_samples() == 0
+
+
+def test_consumed_samples_is_none_without_greedy_packing():
+    runtime = _StubRuntime(token_budget=1000)
+    runtime.config = MdpConfig(enable=True, greedy_packing=False)
+    assert runtime.consumed_samples() is None
