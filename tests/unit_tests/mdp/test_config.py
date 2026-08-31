@@ -39,6 +39,7 @@ def _options(**overrides):
         overlap_param_gather=False,
         overlap_param_gather_with_optimizer_step=False,
         delay_grad_reduce=False,
+        overlap_moe_expert_parallel_comm=False,
         checkpoint_mode="torch_dist",
         save_requested=False,
         load_requested=False,
@@ -49,6 +50,33 @@ def _options(**overrides):
 
 def test_valid_configuration_passes():
     validate_mdp_config(MdpConfig(enable=True), _options())
+
+
+def test_decoder_ep_overlap_configuration_passes_with_vpp():
+    validate_mdp_config(
+        MdpConfig(enable=True),
+        _options(
+            expert_parallel_size=2,
+            pipeline_parallel_size=4,
+            virtual_pipeline_parallel_size=2,
+            overlap_moe_expert_parallel_comm=True,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "option_kwargs",
+    [
+        dict(expert_parallel_size=1, virtual_pipeline_parallel_size=2),
+        dict(expert_parallel_size=2, virtual_pipeline_parallel_size=None),
+    ],
+)
+def test_decoder_ep_overlap_rejects_missing_native_parallelism(option_kwargs):
+    with pytest.raises(MdpConfigurationError, match="overlap_moe_expert_parallel_comm"):
+        validate_mdp_config(
+            MdpConfig(enable=True),
+            _options(overlap_moe_expert_parallel_comm=True, **option_kwargs),
+        )
 
 
 def test_disabled_mdp_skips_all_checks():
@@ -236,6 +264,7 @@ def _fake_args(**overrides):
         overlap_param_gather=False,
         overlap_param_gather_with_optimizer_step=False,
         delay_grad_reduce=False,
+        overlap_moe_expert_parallel_comm=False,
         ckpt_format="torch_dist",
         save=None,
         load=None,
@@ -261,6 +290,15 @@ def test_snapshot_reports_the_real_rank_order():
     assert remapped_options.rank_order == "tp-cp-ep-pp-dp"
     with pytest.raises(MdpConfigurationError, match="rank_order"):
         validate_mdp_config(MdpConfig(enable=True), remapped_options)
+
+
+def test_snapshot_reports_decoder_ep_overlap():
+    from megatron.core.mdp.integration import compatibility_options_from_args
+
+    options = compatibility_options_from_args(
+        _fake_args(overlap_moe_expert_parallel_comm=True)
+    )
+    assert options.overlap_moe_expert_parallel_comm is True
 
 
 def test_snapshot_reports_optimizer_step_param_gather_overlap():

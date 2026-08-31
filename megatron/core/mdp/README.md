@@ -66,7 +66,10 @@ microbatches, synchronous global `torch_dist` checkpoints with exact resume
 `alignment_rows=1` (tests exercise 16), and native decoder DDP
 `overlap_grad_reduce`/`overlap_param_gather`. Decoder overlap remains owned by
 the native PP/VPP schedule; the separate encoder DDP domain stays synchronous
-in P5/P6.
+in P5/P6. Decoder-only EP A2A overlap via
+`--overlap-moe-expert-parallel-comm --delay-wgrad-compute` is supported with
+the native MCore requirements (`EP>1`, and VPP when `PP>1`); the vision encoder
+remains outside that schedule.
 
 Rejected at startup: FSDP/HSDP, FP8/MXFP8, full-iteration CUDA graphs, CPU
 activation offload, delayed gradient reduction,
