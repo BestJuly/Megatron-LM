@@ -47,6 +47,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 
 from examples.multimodal_dev.models.qwen35_vl.specs import _apply_rope_fp32_no_cp
 
+from examples.multimodal_dev.models.qwen35_vl import mrope_triton
 from examples.multimodal_dev.models.qwen35_vl.mrope import get_rope_index
 
 # -----------------------------------------------------------------------------
@@ -693,6 +694,140 @@ def test_thd_cuda_fused_matches_cpu_reference(divisible_by):
 
     assert torch.equal(fused_position_ids.cpu(), reference_position_ids)
     assert torch.equal(fused_deltas.cpu(), reference_deltas)
+
+
+def _multi_tile_samples():
+    """Samples whose segments span several scan tiles.
+
+    The fused kernel walks each segment in fixed-width tiles, so anything
+    shorter than one tile never exercises the loop carry. These samples
+    place images so that they straddle tile boundaries and so that the
+    accumulated position shift has to survive several iterations.
+    """
+    block = mrope_triton._MROPE_POSITION_BLOCK
+    return [
+        # One image starting just before a tile boundary and spanning a full
+        # tile: exercises the current-image-start and grid-row carries.
+        _build_sample(
+            prefix_text_len=block - 24,
+            grids=[(1, 64, 64)],
+            suffix_text_len=300,
+        ),
+        # Two images with different (and non-zero) position shifts, followed
+        # by a long text tail that must keep applying the accumulated shift.
+        _build_sample(
+            prefix_text_len=7,
+            grids=[(1, 32, 32), (1, 48, 48)],
+            suffix_text_len=2 * block,
+        ),
+        # Text-only segment longer than one tile.
+        _build_sample(
+            prefix_text_len=block + 500,
+            grids=[],
+            suffix_text_len=block - 100,
+        ),
+    ]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("divisible_by", [1, 4])
+def test_thd_cuda_fused_multi_tile_segments(divisible_by):
+    """Segments longer than one scan tile match the CPU fallback exactly."""
+    packed, psp, grids, _, _ = _pack_samples(
+        _multi_tile_samples(), divisible_by=divisible_by
+    )
+    assert packed.shape[1] > 4 * mrope_triton._MROPE_POSITION_BLOCK
+    kwargs = dict(
+        spatial_merge_size=SPATIAL_MERGE_SIZE,
+        image_token_id=IMAGE_TOKEN_ID,
+        video_token_id=VIDEO_TOKEN_ID,
+        vision_start_token_id=VISION_START_TOKEN_ID,
+    )
+    reference_position_ids, reference_deltas = get_rope_index(
+        input_ids=packed,
+        image_grid_thw=grids,
+        packed_seq_params=psp,
+        **kwargs,
+    )
+    fused_position_ids, fused_deltas = get_rope_index(
+        input_ids=packed.cuda(),
+        image_grid_thw=grids.cuda(),
+        packed_seq_params=_packed_seq_params_to_cuda(psp),
+        **kwargs,
+    )
+
+    assert torch.equal(fused_position_ids.cpu(), reference_position_ids)
+    assert torch.equal(fused_deltas.cpu(), reference_deltas)
+
+
+def _compiled_variant_count(kernel):
+    """Number of compiled Triton variants, or ``None`` if introspection fails.
+
+    The attribute holding the per-device specialization cache has moved
+    across Triton releases (``cache`` before 3.4, ``device_caches`` after),
+    and its values are sometimes a tuple whose first element is the dict.
+    """
+    for attribute in ("device_caches", "cache"):
+        store = getattr(kernel, attribute, None)
+        if not isinstance(store, dict):
+            continue
+        total = 0
+        found = False
+        for entry in store.values():
+            candidates = entry if isinstance(entry, (tuple, list)) else (entry,)
+            for candidate in candidates:
+                if isinstance(candidate, dict):
+                    total += len(candidate)
+                    found = True
+                    break
+        if found:
+            return total
+    return None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_thd_cuda_fused_does_not_respecialize_per_shape():
+    """Varying packed length and image count reuses one compiled variant.
+
+    Packed lengths and image counts change every microbatch in real THD
+    training, so neither may take part in the Triton specialization key.
+    """
+    kernel = mrope_triton._thd_mrope_position_ids_kernel
+    kwargs = dict(
+        spatial_merge_size=SPATIAL_MERGE_SIZE,
+        image_token_id=IMAGE_TOKEN_ID,
+        video_token_id=VIDEO_TOKEN_ID,
+        vision_start_token_id=VISION_START_TOKEN_ID,
+    )
+    shapes = [
+        [(3, [(1, 4, 4)], 7)],
+        [(11, [(1, 4, 4), (1, 6, 6)], 5)],
+        [(17, [(1, 8, 8)], 23), (6, [(1, 4, 4)], 9)],
+        [(29, [(1, 2, 2), (1, 4, 6), (1, 6, 4)], 13)],
+    ]
+    # Warm the cache once so the baseline excludes first-call compilation.
+    def _run(spec):
+        samples = [_build_sample(p, g, s) for p, g, s in spec]
+        packed, psp, grids, _, _ = _pack_samples(samples, divisible_by=4)
+        return get_rope_index(
+            input_ids=packed.cuda(),
+            image_grid_thw=grids.cuda(),
+            packed_seq_params=_packed_seq_params_to_cuda(psp),
+            **kwargs,
+        )
+
+    _run(shapes[0])
+    before = _compiled_variant_count(kernel)
+    if before is None:
+        pytest.skip("Triton kernel cache is not introspectable")
+    for spec in shapes[1:]:
+        _run(spec)
+    after = _compiled_variant_count(kernel)
+
+    assert after == before, (
+        f"fused THD MRoPE recompiled {after - before} extra variants for "
+        "differing packed lengths / image counts"
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
