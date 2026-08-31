@@ -25,12 +25,7 @@ SUPPORTED_CHECKPOINT_MODE = "torch_dist"
 # Keys that may be overridden on the vision TransformerConfig. Field semantics and
 # cross-field validation are delegated entirely to MCore's own __post_init__.
 VISION_CONFIG_OVERRIDE_ALLOWLIST: frozenset = frozenset(
-    {
-        "recompute_granularity",
-        "recompute_method",
-        "recompute_num_layers",
-        "recompute_modules",
-    }
+    {"recompute_granularity", "recompute_method", "recompute_num_layers", "recompute_modules"}
 )
 
 
@@ -300,7 +295,7 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "checkpoint_mode",
             options.checkpoint_mode,
             f"checkpoint_mode == '{SUPPORTED_CHECKPOINT_MODE}'",
-            "Only the synchronous global torch_dist weight-only checkpoint is "
+            "Only the synchronous global torch_dist checkpoint is "
             "supported; fully-parallel, local, asynchronous, non-persistent, and "
             "constant-structure caching modes are rejected.",
             SUPPORTED_CHECKPOINT_MODE,

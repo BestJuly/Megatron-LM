@@ -12,21 +12,48 @@ WORLD union before any scaler update, ranks that saw no overflow would grow
 their scale while detecting ranks halved theirs — permanently diverging loss
 scales and silently corrupted unscaling. :class:`MdpChainedOptimizer` makes
 the union explicit and atomic.
+
+Checkpointing needs its own overrides for the same reason. The inherited
+``sharded_state_dict`` isolates members with a ``chained_{idx}`` prefix, and
+the encoder's index is the decoder member count — which is not guaranteed
+equal on every rank (a PP stage without expert parameters contributes one
+member instead of two), so the same logical tensor would be written under a
+different key per rank. Isolation must come from a **fixed** key instead,
+which is also what keeps the encoder's WORLD-sharded ZeRO-1 state from
+colliding with the PP-stage-0 decoder optimizer: both compute
+``data_parallel_group_idx == 0`` (the encoder's ``mp`` group is ``None`` and
+``get_pg_rank(None) == 0``), so their
+``optimizer.distributed.dp_group_idx_0.*`` keys are identical without a
+prefix. The inherited ``load_state_dict`` additionally pairs members by
+position after sorting the keys, which no longer reproduces the member order.
 """
 
 import logging
 from contextlib import contextmanager
-from typing import List
+from typing import List, Optional
 
 import torch
 
+from megatron.core.dist_checkpointing.utils import add_prefix_for_sharding
+from megatron.core.mdp.errors import MdpCheckpointError, MdpConfigurationError
 from megatron.core.optimizer.optimizer import ChainedOptimizer, MegatronOptimizer
 
 logger = logging.getLogger(__name__)
 
+#: Fixed checkpoint key and sharding prefix for the encoder member. Published
+#: keys are a compatibility contract — do not rename.
+ENCODER_MEMBER_KEY = "mdp_encoder_optimizer"
+
 
 class MdpChainedOptimizer(ChainedOptimizer):
-    """``ChainedOptimizer`` with an explicit WORLD overflow union."""
+    """``ChainedOptimizer`` with an explicit WORLD overflow union.
+
+    Args:
+        chained_optimizers: the flat member list.
+        encoder_member_index: position of the encoder member, or ``None`` when
+            the composite has no encoder domain (the inherited, decoder-only
+            checkpoint behavior is then used verbatim).
+    """
 
     @torch.no_grad()
     def prepare_grads(self) -> bool:
@@ -53,9 +80,7 @@ class MdpChainedOptimizer(ChainedOptimizer):
             unified = bool(inf_flag.item() > 0.0)
             if unified != found_inf:
                 logger.debug(
-                    "MDP: overflow flag unified over WORLD: local=%s global=%s",
-                    found_inf,
-                    unified,
+                    "MDP: overflow flag unified over WORLD: local=%s global=%s", found_inf, unified
                 )
             found_inf = unified
 
@@ -79,9 +104,89 @@ class MdpChainedOptimizer(ChainedOptimizer):
     #: construction between samples.
     LOSS_SCALE_CHECK_INTERVAL = 50
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self,
+        chained_optimizers: List[MegatronOptimizer],
+        encoder_member_index: Optional[int] = None,
+    ):
+        super().__init__(chained_optimizers)
         self._loss_scale_calls = 0
+        if encoder_member_index is not None and not 0 <= encoder_member_index < len(
+            chained_optimizers
+        ):
+            raise MdpCheckpointError(
+                f"MDP: encoder member index {encoder_member_index} is out of range for "
+                f"{len(chained_optimizers)} members."
+            )
+        self._encoder_member_index = encoder_member_index
+
+    # ------------------------------------------------------------------
+    # Checkpointing
+    # ------------------------------------------------------------------
+
+    def _member_keys(self) -> List[str]:
+        """The per-member checkpoint key, in member order.
+
+        Decoder members keep ``chained_{idx}`` so their keys are unchanged from
+        the native ``ChainedOptimizer``; the encoder member gets the fixed key.
+        """
+        return [
+            ENCODER_MEMBER_KEY if index == self._encoder_member_index else f"chained_{index}"
+            for index in range(len(self.chained_optimizers))
+        ]
+
+    def sharded_state_dict(self, model_sharded_state_dict, is_loading: bool = False, **kwargs):
+        """Per-member sharded state with a fixed, rank-independent encoder key.
+
+        One departure from the inherited implementation: the encoder member is
+        keyed and prefixed by :data:`ENCODER_MEMBER_KEY` instead of
+        ``chained_{idx}``, and it is prefixed regardless of the sharding type —
+        the prefix *is* the isolation between the two sharding domains, not a
+        format detail. Decoder members keep the inherited prefixing rule so a
+        decoder-only checkpoint stays byte-compatible.
+        """
+        if self._encoder_member_index is None:
+            return super().sharded_state_dict(model_sharded_state_dict, is_loading, **kwargs)
+
+        from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+
+        metadata = kwargs.get("metadata") or {}
+        decoder_needs_prefix = (
+            "distrib_optim_sharding_type" in metadata
+            and metadata["distrib_optim_sharding_type"]
+            not in DistributedOptimizer.checkpoint_fully_reshardable_formats
+        ) or not metadata.get("chained_optim_avoid_prefix", False)
+
+        self._synchronize_steps()
+        sharded_state_dict = {}
+        for index, (member, key) in enumerate(zip(self.chained_optimizers, self._member_keys())):
+            member_state = member.sharded_state_dict(model_sharded_state_dict, is_loading, **kwargs)
+            if index == self._encoder_member_index or decoder_needs_prefix:
+                add_prefix_for_sharding(member_state, f"{key}.")
+            sharded_state_dict[key] = member_state
+        return sharded_state_dict
+
+    def load_state_dict(self, state_dict):
+        """Pair members with their state by key, never by position.
+
+        ``ChainedOptimizer.load_state_dict`` zips the member list against
+        ``sorted(state_dict.items())``; with the encoder keyed separately that
+        ordering is no longer guaranteed to be the member ordering, and a
+        silent mis-pairing would load decoder moments into encoder parameters.
+        """
+        if self._encoder_member_index is None:
+            super().load_state_dict(state_dict)
+            return
+        member_keys = self._member_keys()
+        missing = [key for key in member_keys if key not in state_dict]
+        if missing:
+            raise MdpCheckpointError(
+                f"MDP: the checkpoint optimizer state is missing member keys {missing}; "
+                f"it holds {sorted(map(str, state_dict))}."
+            )
+        for member, key in zip(self.chained_optimizers, member_keys):
+            member.load_state_dict(state_dict[key])
+        self._synchronize_steps()
 
     def get_loss_scale(self) -> torch.Tensor:
         """The shared loss scale, sample-asserting the members have not diverged.
@@ -138,12 +243,21 @@ def build_mdp_composite_optimizer(
     ``OptimizerConfig``.
     """
     members: List[MegatronOptimizer] = list(_flatten(decoder_optimizer))
-    members.extend(_flatten(encoder_optimizer))
-    optimizer = MdpChainedOptimizer(members)
+    encoder_members = list(_flatten(encoder_optimizer))
+    if len(encoder_members) != 1:
+        raise MdpConfigurationError(
+            f"MDP: the encoder side flattened to {len(encoder_members)} optimizer members, "
+            "but the checkpoint contract gives the single encoder domain one fixed key "
+            f"({ENCODER_MEMBER_KEY!r}). One replicated encoder means one member."
+        )
+    encoder_member_index = len(members)
+    members.extend(encoder_members)
+    optimizer = MdpChainedOptimizer(members, encoder_member_index=encoder_member_index)
     logger.info(
-        "MDP: composite optimizer with %d members: %s",
+        "MDP: composite optimizer with %d members: %s; checkpoint keys %s",
         len(members),
         [type(member).__name__ for member in members],
+        optimizer._member_keys(),
     )
     return optimizer
 
