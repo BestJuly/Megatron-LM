@@ -1819,6 +1819,18 @@ def pretrain(
     else:
         checkpointing_context = {}
 
+    # Enable the caching-allocator trace before anything allocates, so dumped
+    # snapshots carry allocation history and call sites rather than only the
+    # current live blocks. _build_model_wrapper also calls this, but only on the
+    # cfg_container path (it is guarded by cfg_container.model), which entry
+    # points with their own model_provider -- e.g. examples/multimodal_dev --
+    # never take, silently making --record-memory-history a no-op for them.
+    # args exposes record_memory_history / profile_ranks / memory_snapshot_path,
+    # which is the whole interface this needs.
+    from megatron.training.utils import start_memory_history_recording
+
+    start_memory_history_recording(args)
+
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
@@ -3553,14 +3565,30 @@ def training_log(
 
     # Dump memory snapshot and print metrics to stdout.
     if iteration % args.log_interval == 0 or is_first_iteration:
-        if args.record_memory_history and (
-            is_last_rank() or torch.distributed.get_backend() == 'fake'
-        ):
-            snapshot = torch.cuda.memory._snapshot()
-            from pickle import dump
+        if args.record_memory_history:
+            # Dump on exactly the ranks that recorded. start_memory_history_recording
+            # gates torch.cuda.memory._record_memory_history on --profile-ranks, so
+            # gating the dump on is_last_rank() instead meant that setting
+            # --profile-ranks to anything not containing the last rank recorded
+            # history nowhere it was written out, and wrote out a snapshot with no
+            # history on the last rank. Rank-suffix the filename when more than one
+            # rank dumps, matching the OOM observer's existing convention.
+            profile_ranks = getattr(args, 'profile_ranks', None) or []
+            is_fake = torch.distributed.get_backend() == 'fake'
+            rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+            should_dump = (
+                rank in profile_ranks if profile_ranks else (is_last_rank() or is_fake)
+            )
+            if should_dump:
+                snapshot = torch.cuda.memory._snapshot()
+                from pickle import dump
 
-            with open(args.memory_snapshot_path, 'wb') as f:
-                dump(snapshot, f)
+                path = args.memory_snapshot_path
+                if len(profile_ranks) > 1:
+                    base, ext = os.path.splitext(path)
+                    path = f"{base}_rank-{rank}{ext}"
+                with open(path, 'wb') as f:
+                    dump(snapshot, f)
 
         elapsed_time = timers('interval-time').elapsed(barrier=True, reset=should_reset)
         elapsed_time_per_iteration = elapsed_time / total_iterations
