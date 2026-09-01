@@ -100,10 +100,10 @@ The iteration phases are:
 |---|---|---|
 | P0 | `MdpRuntime.begin_iteration` | Reset iteration state and encoder gradients. |
 | P1 | `window.py`, `groups.py`, `planner.py`, `bridge.py` | Capture the full iteration, shard pixel reads, broadcast descriptors, build/check the plan, and route pixels. |
-| P2 | `runtime.py`, `activation.py`, model adapter | Pack producer chunks and run the vision encoder with autograd during training. |
+| P2 | `runtime.py`, `activation.py`, model adapter | Pack producer chunks. Default training runs the encoder with autograd; complete-encoder recompute runs it under `no_grad` and saves pixels/layouts/output metadata/RNG recipes. |
 | P3 | `bridge.py`, `storage.py` | Route detached vision embeddings to decoder endpoints and create endpoint leaves. |
 | P4 | Native Megatron schedule | Replay captured microbatches through the unchanged decoder schedule, finish any native decoder gradient-reduce overlap, and capture global token count. |
-| P5 | `runtime.py`, `activation.py`, `encoder.py` | Route leaf gradients back, run encoder backward, reduce WORLD gradients, and normalize them. |
+| P5 | `runtime.py`, `activation.py`, `encoder.py` | Route leaf gradients back; run retained-graph backward or replay complete encoder chunks with restored RNG before backward; reduce WORLD gradients and normalize them. |
 | P6 | `optimizer.py` | Union overflow state, compute a combined norm, clip consistently, and step decoder plus encoder optimizers. |
 
 Evaluation runs P0-P4, skips autograd/backward, releases retained state, and
@@ -127,7 +127,7 @@ returns to `EMPTY`.
 | `bridge.py` | Canonical ledger and `all_to_all_single` transport for all three payload phases. |
 | `window.py` | Whole-iteration capture, microbatch replay cursors, pixel ownership context. |
 | `packing.py` | Greedy token-budget bin filling and the cross-iteration sample buffer (`--mdp-greedy-packing`). |
-| `activation.py` | Encoder forward handle, chunk output retention, multi-tensor backward. |
+| `activation.py` | Retained-graph and complete-replay encoder handles, RNG recipes, chunk backward. |
 | `encoder.py` | Encoder process groups, DDP/ZeRO-1 domain, gradient finalization. |
 | `runtime.py` | P0-P5 orchestration, prefetch handoff, per-iteration state and metrics. |
 | `schedule.py` | Native schedule and `finalize_model_grads_func` wrappers. |
@@ -273,7 +273,10 @@ Primary flags:
 - `--mdp-enable`
 - `--mdp-encoder-cp` (currently must be 1)
 - `--mdp-encoder-max-payload-rows`
-- `--mdp-vision-config-override KEY=VALUE`
+- `--encoder-recompute-granularity selective|full|whole`
+- `--encoder-recompute-method uniform|block`
+- `--encoder-recompute-num-layers`
+- `--encoder-recompute-modules MODULE [MODULE ...]`
 - `--mdp-locality-slack-permille`
 - `--mdp-pixel-locality`
 - `--mdp-row-alignment`
@@ -364,6 +367,47 @@ about `token_budget / mean_sample_len` samples per bin, so
 `token_budget / MBS`. The mock provider scales its dataset accordingly
 (`mdp_mock._greedy_sample_scale`); a real dataset must be sized by the
 operator.
+
+Encoder recompute arguments currently require `--mdp-enable`; the native
+multimodal path continues to use `--recompute-vision`, and MDP rejects that
+native-path switch. With no encoder granularity, P2 retains the normal
+graph-connected encoder outputs.
+
+`selective` and `full` use MCore's native Transformer checkpointing. The
+typed encoder arguments are copied to the vision `TransformerConfig` through
+`dataclasses.replace`, so MCore's own field and cross-field validation remains
+authoritative. `selective` accepts `--encoder-recompute-modules`; `full`
+uses `--encoder-recompute-method` and
+`--encoder-recompute-num-layers`. Here `full` retains MCore's established
+meaning: checkpoint complete Transformer layers or layer groups, not the
+complete vision encoder.
+
+`--encoder-recompute-granularity whole` follows the original MDP design: P2
+runs patch embedding, positions/RoPE, all Transformer layers, and the patch
+merger under `no_grad`; the producer retains valid packed pixels, immutable
+chunk layouts, P2 output metadata, and CPU/CUDA/model-parallel RNG state per
+chunk. In P5 it forks the ambient RNG, restores each chunk's P2 state, replays
+the complete encoder with gradients enabled, immediately backpropagates the
+routed output gradient, and finally restores the P5-entry RNG.
+Chunk-at-a-time replay makes `encoder_max_payload_rows` bound the rebuilt
+graph, but not all live state: every producer's packed pixels survive across
+P4, and P5 materializes all routed chunk-output gradients before the first
+replay. The initial P5 peak is therefore all retained pixels plus all routed
+gradients plus one chunk's activation graph. Consumed pixel and gradient
+references are dropped after each chunk backward, so their live storage
+decreases through P5, but this does not reduce that initial peak. Smaller
+chunks reduce only the rebuilt-graph term and add more serial replay/backward
+launches.
+
+Whole replay adds one full encoder forward: encoder forward FLOPs are
+approximately doubled, while encoder backward still runs once. Prefer native
+`selective` or `full` Transformer recompute when checkpointing Transformer
+activations saves enough memory; use `whole` when the additional patch
+embedding, position/RoPE, and patch-merger activation savings justify replaying
+the complete encoder. `whole` rejects native Transformer recompute on the
+effective vision config, including config supplied directly by an adapter,
+because nesting the mechanisms would replay the vision Transformer twice in
+P5.
 
 There is deliberately no pixel-sharding flag. Pixel owner sharding is part of
 the MDP definition in this baseline.

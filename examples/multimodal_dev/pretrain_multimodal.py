@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Standalone entry point for multimodal_dev model training (FSDP + EP).
 
@@ -32,7 +32,10 @@ sys.path.insert(
     os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")),
 )
 
-from examples.multimodal_dev.arguments import add_multimodal_args
+from examples.multimodal_dev.arguments import (
+    add_multimodal_args,
+    validate_encoder_recompute_args,
+)
 from examples.multimodal_dev.forward_step import forward_step
 from megatron.core.enums import ModelType
 from megatron.training import get_args, pretrain
@@ -196,9 +199,9 @@ def _setup_mdp(args):
         )
     if getattr(args, "recompute_vision", False):
         raise RuntimeError(
-            "--recompute-vision is the native-path switch; with --mdp-enable use "
-            "--mdp-vision-config-override recompute_granularity=full (and friends) "
-            "so the vision config flows through the MDP override channel"
+            "--recompute-vision is the native-path switch and is not supported "
+            "with --mdp-enable; use --encoder-recompute-granularity "
+            "{selective,full,whole} for the MDP encoder"
         )
     mdp_integration.validate_from_args(args)
     from megatron.core.mdp.checkpoint import assert_supported_checkpoint_config
@@ -214,6 +217,7 @@ if __name__ == "__main__":
         extra_args_provider=add_multimodal_args,
         args_defaults={},
     )
+    validate_encoder_recompute_args(args)
     if getattr(args, "mdp_enable", False):
         _setup_mdp(args)
     full_config = pretrain_cfg_container_from_args(args)
