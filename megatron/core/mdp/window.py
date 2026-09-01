@@ -61,6 +61,13 @@ def _decoder_offset_in_sample(item, microbatch_id: int, output_rows: int) -> int
             f"MDP: {where} violates: decoder positions are contiguous "
             f"({start}..{positions[-1]} for {output_rows} rows)."
         )
+    if item.sample_padded_len <= 0:
+        # The adapter did not supply the sample span. That is inert at CP=1,
+        # where the split is the identity and the offset is never read; at CP>1
+        # the planner's split_item rejects a non-positive span, so an adapter
+        # that never learned to emit it fails loudly there rather than routing
+        # rows by a fabricated offset here.
+        return 0
     offset = start - item.sample_padded_start
     if offset < 0 or offset + output_rows > item.sample_padded_len:
         raise MdpConfigurationError(
