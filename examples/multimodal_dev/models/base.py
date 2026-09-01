@@ -206,33 +206,44 @@ class MultimodalModel(MegatronModule):
                     packed_seq_params=packed_seq_params,
                 )
 
+        # An MDP endpoint supplies a pre-encoded leaf through `vision_embeddings`.
+        # At CP>1 that leaf holds only THIS rank's rows, in rank-local order, so
+        # the scatter has to run after the CP split against the rank-local
+        # image-token mask. Captured before the native encoder runs, because the
+        # native path assigns into the same local name.
+        external_vision_embeddings = vision_embeddings is not None
+        scatter_after_cp_split = (
+            external_vision_embeddings
+            and parallel_state.get_context_parallel_world_size() > 1
+        )
+
+        # True only when this call built the embedding itself; a caller-supplied
+        # decoder_input must not be scattered into after the split.
+        embedded_here = False
+
         if self.pre_process:
-            # An MDP endpoint supplies the pre-encoded leaf. The native path
-            # encodes pixels here; both feed the same scatter below.
+            # The native path encodes pixels here; both feed the same scatter.
             if vision_embeddings is None:
                 if self.vision_model is not None and pixel_values is not None:
                     with nvtx_phase("native_vision_encoder_forward"):
                         vision_embeddings = self.vision_model(pixel_values, image_grid_thw)
 
             if decoder_input is None:
+                embedded_here = True
                 with nvtx_phase("text_embedding"):
                     text_embeddings = self.language_model.embedding(
                         input_ids=input_ids, position_ids=None
                     )
 
-                if vision_embeddings is not None:
+                if vision_embeddings is not None and not scatter_after_cp_split:
                     with nvtx_phase("scatter_vision_embeddings"):
                         decoder_input = self._scatter_vision_embeddings(
                             input_ids, text_embeddings, vision_embeddings
                         )
                 else:
-                    if bool((input_ids == self.image_token_id).any()):
-                        raise RuntimeError(
-                            "input_ids contain image-token slots but no vision "
-                            "source was provided (neither pixel_values nor "
-                            "vision_embeddings); the text path would silently "
-                            "train on placeholder embeddings"
-                        )
+                    # Either there is no vision source at all, or the scatter is
+                    # deferred to after the split. Both cases are checked below
+                    # against the rank-local sequence.
                     decoder_input = text_embeddings
         else:
             # Intermediate PP/VPP chunks receive their activation through
@@ -252,6 +263,30 @@ class MultimodalModel(MegatronModule):
             packed_seq_params=packed_seq_params,
             padding_mask=padding_mask,
         )
+
+        if embedded_here:
+            if scatter_after_cp_split:
+                # masked_scatter is pure data movement, so scatter-then-split and
+                # split-then-scatter write the same values to the same places;
+                # the leaf's rows are ordered by rank-local position, which is
+                # the order this mask enumerates. The row-count assertion inside
+                # is now the per-shard consistency check.
+                with nvtx_phase("scatter_vision_embeddings"):
+                    decoder_input = self._scatter_vision_embeddings(
+                        input_ids, decoder_input, vision_embeddings
+                    )
+            elif vision_embeddings is None and bool(
+                (input_ids == self.image_token_id).any()
+            ):
+                # Checked on the rank-local shard: under decoder CP an endpoint
+                # legitimately holds no vision rows for a microbatch that has
+                # them globally, and zero local rows implies zero local slots.
+                raise RuntimeError(
+                    "input_ids contain image-token slots but no vision "
+                    "source was provided (neither pixel_values nor "
+                    "vision_embeddings); the text path would silently "
+                    "train on placeholder embeddings"
+                )
 
         return dict(
             input_ids=input_ids,

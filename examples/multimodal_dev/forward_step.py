@@ -305,6 +305,11 @@ def _build_packed_seq_params_from_cu_seqlens(
     )
 
 
+# Columns of ``vision_item_meta``: sample_index, image_ordinal, grid t/h/w,
+# payload_row_start, sample_padded_start, sample_padded_len.
+VISION_ITEM_META_COLUMNS = 8
+
+
 def build_vision_sidecar(
     batch: list[Dict[str, Any]],
     cu_seqlens_padded: list[int],
@@ -314,9 +319,17 @@ def build_vision_sidecar(
     """Build the per-item vision sidecar for a THD-packed batch.
 
     For every vision item, records ``(sample_index, image_ordinal, t, h, w,
-    payload_row_start)`` plus that item's decoder image-token positions in the
-    packed ``[1, T]`` layout, ordered by ``(sample_index, image_ordinal)``.
-    Both outputs are plain integer tensors so they survive the TP broadcast.
+    payload_row_start, sample_padded_start, sample_padded_len)`` plus that
+    item's decoder image-token positions in the packed ``[1, T]`` layout,
+    ordered by ``(sample_index, image_ordinal)``. Both outputs are plain
+    integer tensors so they survive the TP broadcast.
+
+    The last two columns are the enclosing sample's span in
+    ``cu_seqlens_padded``. They are what lets MDP decide, in pure integer host
+    arithmetic and without a device round-trip, which context-parallel rank
+    owns each of the item's decoder rows once the decoder is CP-sharded (see
+    :mod:`megatron.core.mdp.cp_partition`). They are free here because
+    ``cu_seqlens_padded`` is already a host list at this point.
 
     Consistency guards (fail the batch rather than silently degrade):
 
@@ -378,7 +391,16 @@ def build_vision_sidecar(
                     "contiguous"
                 )
             meta_rows.append(
-                [sample_index, ordinal, t, h, w, payload_row_start]
+                [
+                    sample_index,
+                    ordinal,
+                    t,
+                    h,
+                    w,
+                    payload_row_start,
+                    cu_seqlens_padded[sample_index],
+                    cu_seqlens_padded[sample_index + 1] - cu_seqlens_padded[sample_index],
+                ]
             )
             payload_row_start += t * h * w
             position_chunks.append(item_positions.to(torch.int64) + cu_seqlens_padded[sample_index])
@@ -388,7 +410,7 @@ def build_vision_sidecar(
             "vision_decoder_positions": torch.cat(position_chunks),
         }
     return {
-        "vision_item_meta": torch.empty(0, 6, dtype=torch.int64),
+        "vision_item_meta": torch.empty(0, VISION_ITEM_META_COLUMNS, dtype=torch.int64),
         "vision_decoder_positions": torch.empty(0, dtype=torch.int64),
     }
 
@@ -849,12 +871,17 @@ def mdp_forward_step(runtime, data_iterator, model, return_schedule_plan: bool =
     )
 
     vision_embeddings = None
-    if is_pipeline_first_stage() and not record.text_only:
+    # `record.text_only` is a whole-microbatch property; whether THIS rank holds
+    # vision rows is a per-(microbatch, cp_rank) fact only the plan knows. Under
+    # decoder CP an endpoint with no rows for a vision-bearing microbatch is a
+    # normal state, not a routing failure.
+    if is_pipeline_first_stage() and runtime.expects_leaf(record.microbatch_id):
         vision_embeddings = runtime.storage.get_leaf(record.microbatch_id)
         if vision_embeddings is None:
             raise RuntimeError(
-                f"MDP: microbatch {record.microbatch_id} has vision items but no "
-                "leaf in endpoint storage; P3 embedding routing did not complete"
+                f"MDP: microbatch {record.microbatch_id} has vision rows for this "
+                "endpoint but no leaf in endpoint storage; P3 embedding routing "
+                "did not complete"
             )
 
     model_inputs = dict(

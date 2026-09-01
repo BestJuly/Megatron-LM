@@ -88,6 +88,48 @@ def test_extension_hook_encoder_cp2():
     assert seen == set(range(16))
 
 
+@pytest.mark.parametrize(
+    "pp,cp,dp",
+    [(2, 2, 2), (1, 2, 4), (4, 2, 1), (2, 4, 1), (1, 4, 2), (1, 8, 1), (2, 1, 4)],
+)
+def test_decoder_endpoints_are_the_pipeline_stage_zero_ranks(pp, cp, dp):
+    """Every PP0 rank runs pre_process, so every PP0 rank consumes vision rows.
+
+    The group's members are ordered cp-fastest, so the endpoints are the first
+    ``cp`` entries. This pins the index formula the whole decoder-CP routing
+    rests on: get it wrong and the plan names ranks that are internally
+    consistent but physically wrong, which surfaces as a bridge hang.
+    """
+    world = pp * cp * dp
+    rank_map = build_rank_map(
+        MdpRankSpec(world_size=world, tp=1, pp=pp, cp=cp, ep=1, encoder_cp=1)
+    )
+    for outer_dp_rank, group in enumerate(rank_map.planning_groups()):
+        endpoints = rank_map.decoder_endpoint_ranks(outer_dp_rank)
+        assert endpoints == group[:cp]
+        assert len(endpoints) == cp
+        assert rank_map.endpoint_rank(outer_dp_rank) == endpoints[0]
+        for index_in_group, rank in enumerate(group):
+            view = rank_map.view(rank)
+            assert view.my_cp_rank == index_in_group % cp
+            assert view.my_pp_rank == index_in_group // cp
+            assert view.is_decoder_endpoint == (index_in_group < cp)
+            assert view.decoder_endpoint_ranks == endpoints
+            # Exactly one rank per group is still the descriptor source.
+            assert (view.lane_id is not None) == (rank == endpoints[0])
+
+
+def test_cp1_leaves_the_endpoint_set_degenerate():
+    rank_map = build_rank_map(
+        MdpRankSpec(world_size=8, tp=1, pp=2, cp=1, ep=1, encoder_cp=1)
+    )
+    for outer_dp_rank, group in enumerate(rank_map.planning_groups()):
+        view = rank_map.view(group[0])
+        assert view.decoder_endpoint_ranks == (view.endpoint_rank,)
+        assert view.is_decoder_endpoint
+        assert rank_map.view(group[1]).is_decoder_endpoint is False
+
+
 def test_local_view_has_no_global_lists():
     # O(W^2) guard: a view carries only its own group, not all groups.
     rank_map = build_rank_map(_spec(world_size=8, pp=2))

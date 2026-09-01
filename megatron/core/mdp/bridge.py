@@ -36,8 +36,12 @@ class BridgePhase(Enum):
 
 @dataclass(frozen=True)
 class BridgeBufferKey:
-    """Identifies one transported buffer. ``slice_id`` is always 0 in v1 and
-    distinguishes multiple slices of one item once decoder CP lands."""
+    """Identifies one transported buffer.
+
+    ``slice_id`` distinguishes the per-endpoint runs a vision item's decoder
+    rows break into under decoder context parallelism. It is 0 for every buffer
+    at CP=1, and always 0 in the PIXEL phase, whose payload is per item.
+    """
 
     global_item_id: int
     slice_id: int = 0
@@ -127,7 +131,15 @@ class ModalityBridge:
         never a linear scan).
         """
         entries = []
-        for route in plan.routes:
+        # Pixels belong to the item, not to a decoder-CP slice of it: an item
+        # split across endpoints still has exactly one pixel payload and one
+        # owner. Routing per slice here would post the same payload cp times.
+        routes = (
+            tuple(route for route in plan.routes if route.slice_id == 0)
+            if phase is BridgePhase.PIXEL
+            else plan.routes
+        )
+        for route in routes:
             producer_ranks = rank_map.worker_ranks(plan.outer_dp_rank, route.producer_worker_id)
             if len(producer_ranks) != 1:
                 raise MdpBridgeError(
@@ -152,7 +164,10 @@ class ModalityBridge:
                 src, dst = owner_rank, producer_rank
             else:  # GRADIENT flows owner endpoint -> producer
                 src, dst = route.endpoint_rank, producer_rank
-            key = BridgeBufferKey(global_item_id=route.global_item_id)
+            key = BridgeBufferKey(
+                global_item_id=route.global_item_id,
+                slice_id=0 if phase is BridgePhase.PIXEL else route.slice_id,
+            )
             spec = tensor_specs.get(key)
             if spec is None:
                 raise MdpBridgeError(
@@ -376,6 +391,17 @@ class ModalityBridge:
                 f"MDP: key {entry.key} violates: one received buffer per key."
             )
         dest = dest_views.get(entry.key) if dest_views is not None else None
+        if dest is None and dest_views is not None:
+            # Partial coverage is always a bug: the runtime derives its
+            # destination views from the same plan the ledger came from, so a
+            # missing key means the two disagree. Falling through to the
+            # allocator below would land the payload in a buffer nobody reads —
+            # a silent data loss, which is exactly the shape a decoder-CP
+            # slicing mistake takes.
+            raise MdpBridgeError(
+                f"MDP: key {entry.key} violates: when destination views are "
+                "supplied they cover every entry this rank receives."
+            )
         if dest is not None:
             if dest.numel() != entry.element_count:
                 raise MdpBridgeError(

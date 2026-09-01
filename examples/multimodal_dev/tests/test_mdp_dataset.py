@@ -24,7 +24,11 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from examples.multimodal_dev.data.mdp_mock import MdpThdMockDataset, item_sentinel
-from examples.multimodal_dev.forward_step import build_vision_sidecar, pack_or_pad_batch
+from examples.multimodal_dev.forward_step import (
+    VISION_ITEM_META_COLUMNS,
+    build_vision_sidecar,
+    pack_or_pad_batch,
+)
 from tests.unit_tests.test_utilities import Utils
 
 IMAGE_TOKEN_ID = 248056
@@ -78,7 +82,7 @@ def test_sidecar_metadata_and_sentinels():
     pixels = packed["pixel_values"].cpu()
 
     expected_items = sum(int(s["image_grid_thw"].shape[0]) for s in batch)
-    assert meta.shape == (expected_items, 6)
+    assert meta.shape == (expected_items, VISION_ITEM_META_COLUMNS)
     # Ordered by (sample_index, image_ordinal).
     order = [(int(r[0]), int(r[1])) for r in meta]
     assert order == sorted(order)
@@ -128,6 +132,13 @@ def test_true_and_padded_cu_seqlens_differ_under_alignment():
     positions = packed["vision_decoder_positions"].cpu()
     input_ids = packed["input_ids"][0].cpu()
     assert (input_ids[positions] == IMAGE_TOKEN_ID).all()
+    # The sample-span columns must mirror cu_seqlens_q_padded exactly: MDP
+    # derives each row's context-parallel owner from them without ever
+    # touching the device vector again.
+    for row in meta.tolist():
+        sample_index = int(row[0])
+        assert int(row[6]) == int(padded_cu[sample_index])
+        assert int(row[7]) == int(padded_cu[sample_index + 1] - padded_cu[sample_index])
 
 
 def test_sidecar_positions_respect_interleaved_text():
@@ -158,7 +169,7 @@ def test_text_only_batch_produces_empty_sidecar():
     packed = pack_or_pad_batch(
         [dict(s) for s in batch], use_packed_sequence=True, with_vision_sidecar=True
     )
-    assert packed["vision_item_meta"].shape == (0, 6)
+    assert packed["vision_item_meta"].shape == (0, VISION_ITEM_META_COLUMNS)
     assert packed["vision_decoder_positions"].numel() == 0
     assert packed["pixel_values"].shape[0] == 0
 

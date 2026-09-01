@@ -138,6 +138,7 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
         tensor_parallel_size=args.tensor_model_parallel_size,
         pipeline_parallel_size=args.pipeline_model_parallel_size,
         context_parallel_size=args.context_parallel_size,
+        cp_partition_mode=getattr(args, "cp_partition_mode", "zigzag"),
         expert_parallel_size=getattr(args, "expert_model_parallel_size", 1),
         rank_order=rank_order,
         virtual_pipeline_parallel_size=getattr(

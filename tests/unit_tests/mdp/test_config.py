@@ -125,7 +125,10 @@ def test_invalid_mdp_config_fields_rejected(config_kwargs, match):
     [
         (dict(rank_order="tp-ep-dp-pp-cp"), "rank_order"),
         (dict(tensor_parallel_size=2), "tensor_parallel_size"),
-        (dict(context_parallel_size=2), "context_parallel_size"),
+        (
+            dict(context_parallel_size=2, cp_partition_mode="contiguous"),
+            "cp_partition_mode",
+        ),
         (dict(world_size=6, pipeline_parallel_size=4), "world_size"),
         (dict(calculate_per_token_loss=False), "calculate_per_token_loss"),
         (dict(use_distributed_optimizer=False), "use_distributed_optimizer"),
@@ -323,6 +326,51 @@ def test_snapshot_takes_the_larger_of_the_train_and_eval_microbatch_sizes():
         _fake_args(micro_batch_size=4, eval_micro_batch_size=16)
     )
     assert options.max_samples_per_microbatch == 16
+
+
+# ---------------------------------------------------------------------------
+# Decoder context parallelism
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("cp_size", [2, 4, 8])
+def test_decoder_context_parallelism_is_accepted(cp_size):
+    validate_mdp_config(
+        MdpConfig(enable=True), _options(world_size=8 * cp_size, context_parallel_size=cp_size)
+    )
+
+
+def test_contiguous_cp_partition_is_rejected_only_when_cp_is_on():
+    # At CP=1 the partition mode is inert, so it must not gate the run; at CP>1
+    # it decides which rank owns each row and MDP inverts the zigzag map only.
+    validate_mdp_config(
+        MdpConfig(enable=True), _options(cp_partition_mode="contiguous")
+    )
+    with pytest.raises(MdpConfigurationError, match="cp_partition_mode"):
+        validate_mdp_config(
+            MdpConfig(enable=True),
+            _options(
+                world_size=16, context_parallel_size=2, cp_partition_mode="contiguous"
+            ),
+        )
+
+
+def test_static_packing_rejects_an_odd_per_rank_length_under_cp():
+    # build_static_thd_metadata asserts dummy_seq_len % (2*cp) == 0 mid-run;
+    # this must fail at startup instead, and in BOTH packing modes -- the greedy
+    # branch used to be the only place any CP alignment was checked.
+    for greedy in (False, True):
+        with pytest.raises(MdpConfigurationError, match="max_seqlen_per_dp_cp_rank"):
+            validate_mdp_config(
+                MdpConfig(enable=True, greedy_packing=greedy),
+                _options(
+                    world_size=16,
+                    context_parallel_size=2,
+                    thd_static_packing=True,
+                    max_seqlen_per_dp_cp_rank=4097,
+                    thd_max_packed_sequences=8,
+                ),
+            )
 
 
 # ---------------------------------------------------------------------------
