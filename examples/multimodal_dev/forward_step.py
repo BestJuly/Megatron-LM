@@ -761,11 +761,66 @@ def pack_or_pad_batch(
 # get_batch
 # -------------------------------------------------------------------
 
+#: BENCHMARK HACK -- native-path greedy streams, keyed by ``id()`` of the
+#: underlying data iterator. Mirrors ``MdpRuntime._greedy_streams``.
+_NATIVE_GREEDY_STREAMS: Dict[int, Any] = {}
+
+
+def _native_greedy_iterator(data_iterator, args):
+    """BENCHMARK HACK: greedy token-budget packing on the non-MDP path.
+
+    ``GreedySampleStream`` is installed only by ``MdpRuntime._greedy_stream``,
+    i.e. only under ``--mdp-enable``. With MDP off, ``pack_or_pad_batch``
+    concatenates exactly ``micro_batch_size`` raw samples per bin, so an
+    MDP-off baseline packs its microbatches differently from the MDP run it is
+    supposed to be compared against, and any throughput delta between them
+    mixes "greedy packing" with "modality decoupling".
+
+    Wrapping the iterator here makes both paths consume identical bins, which
+    is the only thing an apple-to-apple A/B needs. Everything else about the
+    native path is untouched.
+
+    Not a product feature: the dataset-size scaling this needs already keys off
+    ``mdp_greedy_packing`` alone (``data/mdp_mock.py::_greedy_sample_scale``),
+    but ``consumed_train_samples`` accounting stays MDP-gated
+    (``megatron/training/training.py``), so a run using this path under-reports
+    consumed samples. Fine for throughput-only work, wrong for anything that
+    reads the sample counter.
+    """
+    if not getattr(args, "mdp_greedy_packing", False):
+        return data_iterator
+    if getattr(args, "mdp_enable", False):
+        # MDP owns the stream; wrapping again would double-consume.
+        return data_iterator
+
+    cached = _NATIVE_GREEDY_STREAMS.get(id(data_iterator))
+    if cached is not None:
+        return cached
+
+    from megatron.core.mdp.config import greedy_max_real_sequences, thd_row_alignment
+    from megatron.core.mdp.integration import compatibility_options_from_args
+    from megatron.core.mdp.packing import GreedySampleStream, decoder_sample_length
+
+    # Same construction as MdpRuntime's, derived from the same arg snapshot, so
+    # the two paths cannot drift apart.
+    compat = compatibility_options_from_args(args)
+    stream = GreedySampleStream(
+        data_iterator,
+        token_budget=args.max_seqlen_per_dp_cp_rank * args.context_parallel_size,
+        max_num_seqs=greedy_max_real_sequences(compat),
+        align=thd_row_alignment(compat),
+        length_of=decoder_sample_length,
+    )
+    _NATIVE_GREEDY_STREAMS[id(data_iterator)] = stream
+    return stream
+
 
 def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
     """Get a batch from *data_iterator* and broadcast across TP ranks."""
     device = "cuda"
     args = get_args()
+
+    data_iterator = _native_greedy_iterator(data_iterator, args)
 
     group = get_tensor_model_parallel_group()
     # Single-member TP group: skip the device flag tensor and the broadcast
