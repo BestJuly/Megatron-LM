@@ -43,6 +43,8 @@ class MdpConfig:
     debug_plan_payload_check: bool = False
     pixel_locality: bool = False
     overlap_window_capture: bool = False
+    greedy_packing: bool = False
+    greedy_packing_approximate_resume: bool = False
 
 
 @dataclass(frozen=True)
@@ -73,6 +75,30 @@ class MdpCompatibilityOptions:
     save_requested: bool
     load_requested: bool
     overlap_moe_expert_parallel_comm: bool = False
+    sequence_parallel: bool = False
+    sequence_packing_scheduler: Optional[str] = None
+    thd_static_packing: bool = False
+    max_seqlen_per_dp_cp_rank: Optional[int] = None
+    thd_max_packed_sequences: Optional[int] = None
+    # max(micro_batch_size, eval_micro_batch_size): the largest number of samples
+    # the collator can be handed in one microbatch without greedy packing.
+    max_samples_per_microbatch: int = 1
+
+
+def thd_row_alignment(options: "MdpCompatibilityOptions") -> int:
+    """Row alignment the MDP collator pads each packed sample to.
+
+    Mirrors ``pack_or_pad_batch``'s ``divisible_by`` (zigzag CP wants an even
+    per-rank split; SP additionally splits across TP). The greedy token budget
+    must be a multiple of this, or a full bin cannot be partitioned legally.
+    """
+    if options.context_parallel_size > 1:
+        return (
+            options.tensor_parallel_size * options.context_parallel_size * 2
+            if options.sequence_parallel
+            else options.context_parallel_size * 2
+        )
+    return options.tensor_parallel_size if options.sequence_parallel else 1
 
 
 def _reject(option: str, value: Any, condition: str, why: str, suggestion: str = "") -> None:
@@ -147,6 +173,7 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "False",
         )
     _validate_override_entries(config.vision_config_overrides)
+    _validate_packing(config, options)
 
     # --- parallel dimensions and rank mapping preconditions ---
     if options.rank_order != SUPPORTED_RANK_ORDER:
@@ -321,6 +348,126 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "supported; fully-parallel, local, asynchronous, non-persistent, and "
             "constant-structure caching modes are rejected.",
             SUPPORTED_CHECKPOINT_MODE,
+        )
+
+
+def greedy_max_real_sequences(options: "MdpCompatibilityOptions") -> Optional[int]:
+    """Real sequences a greedy bin may hold, or ``None`` for no cap.
+
+    ``thd_max_packed_sequences`` is the *final* static THD capacity. Under
+    ``--thd-static-packing`` the padding tail is represented as an ordinary
+    dummy sequence appended to ``cu_seqlens``, so one slot must be reserved for
+    it -- exactly what ``_get_scheduler_max_real_num_seqs`` does for
+    ``dp_balanced``. Without the reservation a bin filled to the cap overflows
+    the ``thd_max_packed_sequences + 1`` entry budget and dies inside
+    ``_pad_cu_seqlens``.
+    """
+    cap = options.thd_max_packed_sequences
+    if cap is None:
+        return None
+    return int(cap) - 1 if options.thd_static_packing else int(cap)
+
+
+def _validate_packing(config: MdpConfig, options: MdpCompatibilityOptions) -> None:
+    """Reject packing configurations MDP cannot honor.
+
+    ``--sequence-packing-scheduler`` is rejected outright, not merely untested:
+    ``training.py`` wraps the data iterator whenever it is set, and
+    ``DpBalancedScheduler.run`` then asserts on GPT-only sample keys, deletes
+    every key outside those six (dropping ``pixel_values`` / ``image_grid_thw``),
+    and reroutes samples across DP with an all-to-all that has no notion of
+    variable-size pixel payloads. Without this rejection the run dies deep inside
+    an assert about a missing ``tokens`` key.
+
+    Also enforces the two properties the static/greedy packing paths depend on:
+    the ``cu_seqlens`` capacity leaves a slot for the static padding tail, and
+    greedy packing is not silently combined with checkpointing (its sample
+    buffer is not checkpointed).
+    """
+    if options.sequence_packing_scheduler is not None:
+        _reject(
+            "sequence_packing_scheduler",
+            options.sequence_packing_scheduler,
+            "sequence_packing_scheduler is None",
+            "MCore's packing schedulers assert on GPT-only sample keys, drop the "
+            "pixel payload, and reroute samples across DP without pixel awareness. "
+            "MDP owns its packing (--mdp-greedy-packing).",
+            "None",
+        )
+    if options.thd_static_packing and not config.greedy_packing:
+        # Without greedy packing a microbatch is exactly micro_batch_size samples
+        # (eval_micro_batch_size on the eval loaders), and the static padding tail
+        # is appended to cu_seqlens as one more ordinary sequence, so the pack
+        # needs that many + 2 entries against a capacity of
+        # thd_max_packed_sequences + 1. greedy_packing makes the same
+        # reservation, through greedy_max_real_sequences().
+        cap = options.thd_max_packed_sequences
+        samples = options.max_samples_per_microbatch
+        if cap is not None and cap < samples + 1:
+            _reject(
+                "thd_max_packed_sequences",
+                cap,
+                f"thd_max_packed_sequences >= max(micro_batch_size, "
+                f"eval_micro_batch_size) + 1 ({samples} + 1)",
+                "Under --thd-static-packing the padding tail is appended to "
+                "cu_seqlens as an ordinary dummy sequence, so one slot of the "
+                "thd_max_packed_sequences + 1 capacity is reserved for it; a full "
+                "microbatch would otherwise overflow it inside _pad_cu_seqlens.",
+                str(samples + 1),
+            )
+    if not config.greedy_packing:
+        return
+    if (options.save_requested or options.load_requested) and (
+        not config.greedy_packing_approximate_resume
+    ):
+        # The greedy stream buffers samples across iterations: the underlying
+        # iterator advances by a whole batch_sampler batch while only part of it
+        # has been drained into bins. That buffer is not checkpointed, and the
+        # sampler is positioned from a single global consumed_train_samples that
+        # cannot express per-DP-rank drain counts, so a resume may skip or repeat
+        # samples. Greedy packing is a benchmarking path; make that explicit
+        # rather than silently corrupting a resume.
+        _reject(
+            "greedy_packing",
+            config.greedy_packing,
+            "--save / --load is not combined with --mdp-greedy-packing",
+            "The greedy sample buffer is not checkpointed and the sampler cannot be "
+            "repositioned per DP rank, so a resume may skip or repeat samples. Pass "
+            "--mdp-greedy-packing-approximate-resume to accept that, or drop "
+            "--mdp-greedy-packing for runs that checkpoint.",
+            "False",
+        )
+    if options.max_seqlen_per_dp_cp_rank is None:
+        _reject(
+            "max_seqlen_per_dp_cp_rank",
+            options.max_seqlen_per_dp_cp_rank,
+            "max_seqlen_per_dp_cp_rank is set when --mdp-greedy-packing is on",
+            "The greedy token budget is max_seqlen_per_dp_cp_rank x "
+            "context_parallel_size; there is no default for it.",
+        )
+    alignment = thd_row_alignment(options)
+    budget = options.max_seqlen_per_dp_cp_rank * options.context_parallel_size
+    if budget % alignment != 0:
+        _reject(
+            "max_seqlen_per_dp_cp_rank",
+            options.max_seqlen_per_dp_cp_rank,
+            f"the greedy token budget ({budget}) is divisible by the collator row "
+            f"alignment ({alignment})",
+            "A bin filled to the budget must still split legally across CP/SP ranks; "
+            "discovering this inside TransformerEngine gives a far worse error.",
+        )
+    minimum = 2 if options.thd_static_packing else 1
+    if (
+        options.thd_max_packed_sequences is not None
+        and options.thd_max_packed_sequences < minimum
+    ):
+        _reject(
+            "thd_max_packed_sequences",
+            options.thd_max_packed_sequences,
+            f"thd_max_packed_sequences >= {minimum}",
+            "It caps the real sequences per greedy bin; under --thd-static-packing "
+            "one slot is reserved for the padding tail's dummy sequence.",
+            "8",
         )
 
 
