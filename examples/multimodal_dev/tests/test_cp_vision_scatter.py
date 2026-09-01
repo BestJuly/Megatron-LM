@@ -37,6 +37,7 @@ from examples.multimodal_dev.models.base import MultimodalModel, _thd_cp_partiti
 from megatron.core.mdp.cp_partition import split_item
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.parallel_state import get_context_parallel_rank
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -210,6 +211,7 @@ def test_split_then_scatter_matches_scatter_then_split(grids_per_sample):
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=1, context_parallel_size=cp_size
     )
+    model_parallel_cuda_manual_seed(1234)
     try:
         model = _model(cp_size, sample_len * len(grids_per_sample))
         samples = _samples(grids_per_sample, sample_len)
@@ -255,6 +257,7 @@ def test_an_endpoint_with_no_vision_rows_is_not_an_error():
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=1, context_parallel_size=cp_size
     )
+    model_parallel_cuda_manual_seed(1234)
     try:
         model = _model(cp_size, sample_len)
         # A single small block near the start of the sample lands inside one
