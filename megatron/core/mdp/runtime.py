@@ -553,6 +553,10 @@ class MdpRuntime:
         self._chunk_layouts = ()
         self._chunk_of_item = {}
         self._captured_num_tokens = None
+        # Every per-iteration reference above is now cleared, so any MDP buffer
+        # still outstanding (packed pixels and gradient-regroup buffers are
+        # dropped by scope, not released explicitly) can go back to the pool.
+        self.allocator.reclaim_iteration()
         self._iteration += 1
         self._state = MdpRuntimeState.EMPTY
 

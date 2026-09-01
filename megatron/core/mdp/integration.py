@@ -23,7 +23,7 @@ from typing import Callable, Optional
 
 import torch
 
-from megatron.core.mdp.allocator import DirectBufferAllocator
+from megatron.core.mdp.allocator import DirectBufferAllocator, PooledBufferAllocator
 from megatron.core.mdp.bridge import ModalityBridge
 from megatron.core.mdp.config import (
     SUPPORTED_RANK_ORDER,
@@ -98,6 +98,7 @@ def mdp_config_from_args(args) -> MdpConfig:
         greedy_packing_approximate_resume=getattr(
             args, "mdp_greedy_packing_approximate_resume", False
         ),
+        buffer_pool=not getattr(args, "mdp_no_buffer_pool", False),
     )
 
 
@@ -240,7 +241,9 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
         params_dtype = torch.float16
     else:
         params_dtype = torch.float32
-    allocator = DirectBufferAllocator()
+    allocator = (
+        PooledBufferAllocator() if mdp_config.buffer_pool else DirectBufferAllocator()
+    )
     compat = compatibility_options_from_args(args)
     greedy_token_budget = (
         args.max_seqlen_per_dp_cp_rank * args.context_parallel_size

@@ -84,7 +84,9 @@ Preserve these unless the feature design is intentionally changed:
   uses an independent synchronous DDP configuration for its P5/P6 lifecycle.
 - The composite optimizer treats decoder and encoder overflow, norm clipping,
   and step success as one atomic decision.
-- MDP-owned buffers must be allocated through `MdpBufferAllocator`.
+- MDP-owned buffers must be allocated through `MdpBufferAllocator`, and never
+  outlive one iteration: `end_iteration` calls `reclaim_iteration()` and any
+  block still outstanding is recycled.
 
 ## Phase machine
 
@@ -122,7 +124,7 @@ returns to `EMPTY`.
 | `groups.py` | Process-group creation and fixed-width descriptor broadcast. |
 | `plan.py` | Route/layout schema, row-capacity policy, chunk splitting, plan digest. |
 | `planner.py` | Integer deterministic LPT assignment, pixel locality preference, consistency check. |
-| `allocator.py` | The only allocation entry point for MDP-owned communication/storage buffers. |
+| `allocator.py` | The only allocation entry point for MDP-owned communication/storage buffers. `PooledBufferAllocator` (default) recycles blocks at bucketed sizes; `--mdp-no-buffer-pool` selects the direct allocator. |
 | `storage.py` | Endpoint embedding leaves and lifecycle checks. |
 | `bridge.py` | Canonical ledger and `all_to_all_single` transport for all three payload phases. |
 | `window.py` | Whole-iteration capture, microbatch replay cursors, pixel ownership context. |

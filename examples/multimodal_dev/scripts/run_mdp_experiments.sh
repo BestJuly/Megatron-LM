@@ -52,6 +52,15 @@
 #                    knob picks the right one for the current MDP setting.
 #                    Note it is independent
 #                    of the decoder --recompute-* flags (DECODER_RECOMPUTE).
+#   ENCODER_RECOMPUTE_GRANULARITY=full|selective|whole
+#                    MDP-only: how the vision encoder is recomputed when
+#                    VISION_RECOMPUTE=1 (default full = native MCore
+#                    Transformer recompute). "whole" selects MDP's
+#                    complete-encoder replay (no_grad in P2, RNG-restored
+#                    replay in P5). Ignored when MDP=0.
+#   MDP_BUFFER_POOL=0|1       MDP-only: recycle MDP-owned buffers through the
+#                    pooled allocator (default 1). 0 passes
+#                    --mdp-no-buffer-pool, restoring the direct allocator.
 #   DECODER_RECOMPUTE=0|1     decoder activation recompute (default 0 = off).
 #                    Turn on per experiment when the shape would otherwise
 #                    OOM, or to match a reference run that used it. Values
@@ -131,6 +140,8 @@ DISPATCHER=${DISPATCHER:-flex}
 FLEX_BACKEND=${FLEX_BACKEND:-hybridep}
 HYBRIDEP_NUM_SMS=${HYBRIDEP_NUM_SMS:-32}
 VISION_RECOMPUTE=${VISION_RECOMPUTE:-1}
+ENCODER_RECOMPUTE_GRANULARITY=${ENCODER_RECOMPUTE_GRANULARITY:-full}
+MDP_BUFFER_POOL=${MDP_BUFFER_POOL:-1}
 DECODER_RECOMPUTE=${DECODER_RECOMPUTE:-0}
 DECODER_RECOMPUTE_GRANULARITY=${DECODER_RECOMPUTE_GRANULARITY:-full}
 DECODER_RECOMPUTE_METHOD=${DECODER_RECOMPUTE_METHOD:-uniform}
@@ -196,6 +207,9 @@ if [ "$MDP" = "1" ]; then
     if [ "$OVERLAP" = "1" ]; then
         MDP_ARGS+=( --mdp-overlap-window-capture )
     fi
+    if [ "$MDP_BUFFER_POOL" = "0" ]; then
+        MDP_ARGS+=( --mdp-no-buffer-pool )
+    fi
     if [ "$PIXEL_LOCALITY" = "1" ]; then
         MDP_ARGS+=( --mdp-pixel-locality )
     fi
@@ -210,9 +224,16 @@ fi
 VISION_RECOMPUTE_ARGS=()
 if [ "$VISION_RECOMPUTE" = "1" ]; then
     if [ "$MDP" = "1" ]; then
-        VISION_RECOMPUTE_ARGS=( --encoder-recompute-granularity full
-                                --encoder-recompute-method uniform
-                                --encoder-recompute-num-layers 1 )
+        if [ "$ENCODER_RECOMPUTE_GRANULARITY" = "whole" ]; then
+            # MDP's own complete-encoder replay: P2 runs the encoder under
+            # no_grad and P5 replays whole chunks with restored RNG. "whole"
+            # rejects the native method/num-layers knobs.
+            VISION_RECOMPUTE_ARGS=( --encoder-recompute-granularity whole )
+        else
+            VISION_RECOMPUTE_ARGS=( --encoder-recompute-granularity "$ENCODER_RECOMPUTE_GRANULARITY"
+                                    --encoder-recompute-method uniform
+                                    --encoder-recompute-num-layers 1 )
+        fi
     else
         VISION_RECOMPUTE_ARGS=( --recompute-vision )
     fi

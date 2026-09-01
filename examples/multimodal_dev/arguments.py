@@ -234,6 +234,21 @@ def add_multimodal_args(parser):
         ),
     )
     group.add_argument(
+        "--mdp-no-buffer-pool",
+        action="store_true",
+        default=False,
+        help=(
+            "Allocate every MDP-owned buffer directly instead of recycling it "
+            "through the pooled allocator. The pool exists because "
+            "--mdp-row-alignment is 1 in production, so every bridge, pixel, "
+            "leaf and gradient-regroup buffer is requested at a size that "
+            "tracks this iteration's vision item count; a fresh size per "
+            "iteration prevents block reuse and leaves reserved memory far "
+            "above the live set. Use this to measure that effect, not for "
+            "production runs."
+        ),
+    )
+    group.add_argument(
         "--mdp-greedy-packing-approximate-resume",
         action="store_true",
         default=False,
