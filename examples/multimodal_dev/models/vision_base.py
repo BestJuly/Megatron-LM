@@ -34,8 +34,10 @@ from megatron.core.mdp.errors import MdpConfigurationError
 from megatron.core.mdp.protocols import CapturedMicrobatch, CapturedVisionItem
 
 #: Fixed integer columns of a ``vision_item_meta`` row before the shape key:
-#: ``(sample_index, image_ordinal, payload_row_start)``.
-META_PREFIX_COLUMNS = 3
+#: ``(sample_index, image_ordinal, payload_row_start, sample_padded_start,
+#: sample_padded_len)``. The last two are the enclosing sample's span in
+#: ``cu_seqlens_padded``, from which MDP derives the decoder-CP row split.
+META_PREFIX_COLUMNS = 5
 
 
 @dataclass(frozen=True)
@@ -174,7 +176,9 @@ class BaseGridVisionAdapter:
         # copy per item avoids a device sync per vision item.
         positions_cpu = positions.cpu().tolist()
         for row in meta.cpu().tolist():
-            sample_id, ordinal, payload_row_start = (int(v) for v in row[:META_PREFIX_COLUMNS])
+            (sample_id, ordinal, payload_row_start, sample_padded_start, sample_padded_len) = (
+                int(v) for v in row[:META_PREFIX_COLUMNS]
+            )
             shape_key = tuple(int(v) for v in row[META_PREFIX_COLUMNS:])
             output_rows = spec.output_rows_of(shape_key)
             decoder_positions = tuple(
@@ -190,6 +194,8 @@ class BaseGridVisionAdapter:
                     payload_rows=spec.payload_rows_of(shape_key),
                     output_rows=output_rows,
                     decoder_positions=decoder_positions,
+                    sample_padded_start=sample_padded_start,
+                    sample_padded_len=sample_padded_len,
                 )
             )
         if position_cursor != positions.numel():

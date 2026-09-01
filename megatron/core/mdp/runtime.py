@@ -33,7 +33,7 @@ from megatron.core.mdp.allocator import MdpBufferAllocator
 from megatron.core.mdp.bridge import BridgeBufferKey, BridgePhase, BridgeTensorSpec, ModalityBridge
 from megatron.core.mdp.config import MdpConfig
 from megatron.core.mdp.encoder import EncoderDomain, finalize_encoder_grads
-from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
+from megatron.core.mdp.errors import MdpConfigurationError, MdpPlanError, MdpStateError
 from megatron.core.mdp.groups import MdpProcessGroups, broadcast_descriptors
 from megatron.core.mdp.observability import MdpIterationMetrics, nvtx_phase, worker_loads_from_plan
 from megatron.core.mdp.packing import GreedySampleStream, decoder_sample_length
@@ -351,9 +351,12 @@ class MdpRuntime:
         # P3: embedding exchange straight into the endpoint leaves.
         emb_dest = {}
         leaves = []  # (microbatch_id, valid leaf view)
-        if self.rank_view.lane_id is not None:
+        if self.rank_view.is_decoder_endpoint:
             with nvtx_phase("p3_leaf_assembly"):
-                for layout in plan.layouts:
+                # Only this endpoint's layouts: at CP>1 the plan also carries
+                # every CP peer's leaf layout, and building those here would
+                # allocate cp leaves per microbatch on every endpoint.
+                for layout in plan.layouts_for_endpoint(self.rank_view.global_rank):
                     if self._static_leaf_rows is not None:
                         leaf = self._static_leaf(layout.microbatch_id, layout.total_output_rows)
                         # Written through a detached alias: the leaf already requires grad.
@@ -369,19 +372,24 @@ class MdpRuntime:
                             tag="leaf",
                         )
                     for segment in layout.segments:
-                        emb_dest[BridgeBufferKey(segment.global_item_id)] = target[
-                            segment.leaf_row_start : segment.leaf_row_start + segment.output_rows
-                        ]
+                        emb_dest[BridgeBufferKey(segment.global_item_id, segment.slice_id)] = (
+                            target[
+                                segment.leaf_row_start : segment.leaf_row_start
+                                + segment.output_rows
+                            ]
+                        )
                     if self._static_leaf_rows is None:
                         leaf = leaf[: layout.total_output_rows]
                     leaves.append((layout.microbatch_id, leaf))
         with nvtx_phase("p3_embedding_exchange"):
             emb_specs = self._iter_specs[BridgePhase.EMBEDDING]
             emb_local = {}
-            for item_id, (chunk_index, segment) in self._chunk_of_item.items():
-                emb_local[BridgeBufferKey(item_id)] = detached[chunk_index][
-                    segment.output_row_start : segment.output_row_start + segment.output_rows
-                ]
+            for route in plan.routes_for_producer(self.rank_view.my_worker_id):
+                chunk_index, segment = self._chunk_of_item[route.global_item_id]
+                start = segment.output_row_start + route.item_row_start
+                emb_local[BridgeBufferKey(route.global_item_id, route.slice_id)] = detached[
+                    chunk_index
+                ][start : start + route.item_rows]
             # One alltoall instead of batched P2P: same ledger and payload,
             # but no per-edge kernel pairs and no torch.cuda.synchronize
             # workaround (all_to_all_single stream-orders its receive buffer).
@@ -442,6 +450,23 @@ class MdpRuntime:
             return
         for leaf in self._static_leaves.values():
             leaf.grad = None
+
+    def expects_leaf(self, microbatch_id: int) -> bool:
+        """Whether this rank should hold an embedding leaf for a microbatch.
+
+        ``MdpMicrobatchRecord.text_only`` is a property of the whole microbatch,
+        but leaf presence is a property of ``(microbatch, this endpoint)``: under
+        decoder CP an endpoint legitimately receives no vision rows from a
+        microbatch that has them globally, because the zigzag split put all of
+        that microbatch's image tokens on its peers. The plan is the authority.
+        """
+        if not self.rank_view.is_decoder_endpoint or self._plan is None:
+            return False
+        try:
+            layout = self._plan.layout_for_microbatch(microbatch_id, self.rank_view.global_rank)
+        except MdpPlanError:
+            return False
+        return not layout.text_only
 
     def capture_global_num_tokens(self, token_tensor: Optional[torch.Tensor]) -> None:
         """Store a reference to the in-place reduced global token tensor.
@@ -525,10 +550,11 @@ class MdpRuntime:
                             tag="grad_regroup",
                         )
                         for segment in chunk.segments:
-                            grad_dest[BridgeBufferKey(segment.global_item_id)] = grad_buffer[
-                                segment.output_row_start : segment.output_row_start
-                                + segment.output_rows
-                            ]
+                            for route in plan.routes_for_item(segment.global_item_id):
+                                start = segment.output_row_start + route.item_row_start
+                                grad_dest[
+                                    BridgeBufferKey(segment.global_item_id, route.slice_id)
+                                ] = grad_buffer[start : start + route.item_rows]
                         chunk_grads.append(grad_buffer[: chunk.total_output_rows])
                     # Drop only the loop-local base-tensor reference; this does not
                     # release its storage. The grad_dest and chunk_grads views
@@ -538,15 +564,17 @@ class MdpRuntime:
             with nvtx_phase("p5_grad_exchange"):
                 grad_specs = self._iter_specs[BridgePhase.GRADIENT]
                 grad_local = {}
-                if self.rank_view.lane_id is not None:
-                    for layout in plan.layouts:
+                if self.rank_view.is_decoder_endpoint:
+                    for layout in plan.layouts_for_endpoint(self.rank_view.global_rank):
                         if layout.text_only:
                             # A persistent text-only leaf spliced zero rows: nothing to route.
                             self.storage.release(layout.microbatch_id)
                             continue
                         grad = self.storage.pop_grad(layout.microbatch_id)
                         for segment in layout.segments:
-                            grad_local[BridgeBufferKey(segment.global_item_id)] = grad[
+                            grad_local[
+                                BridgeBufferKey(segment.global_item_id, segment.slice_id)
+                            ] = grad[
                                 segment.leaf_row_start : segment.leaf_row_start
                                 + segment.output_rows
                             ]
@@ -821,12 +849,27 @@ class MdpRuntime:
             )
 
     def _tensor_specs(self, plan: MdpBatchPlan, *, pixels: bool) -> dict:
+        """Buffer sizing per transported key.
+
+        PIXEL is keyed by item and sized by ``payload_rows``: one payload per
+        item regardless of how many decoder endpoints its rows reach.
+        EMBEDDING/GRADIENT are keyed by ``(item, slice_id)`` and sized by that
+        slice's rows, which sum to the item's ``output_rows``.
+        """
         specs = {}
         for route in plan.routes:
             segment = plan.segment_for_item(route.global_item_id)
-            valid = segment.payload_rows if pixels else segment.output_rows
-            width = self.adapter.payload_width if pixels else self.output_hidden_size
-            specs[BridgeBufferKey(route.global_item_id)] = BridgeTensorSpec(
+            if pixels:
+                if route.slice_id != 0:
+                    continue
+                key = BridgeBufferKey(route.global_item_id)
+                valid = segment.payload_rows
+                width = self.adapter.payload_width
+            else:
+                key = BridgeBufferKey(route.global_item_id, route.slice_id)
+                valid = route.item_rows
+                width = self.output_hidden_size
+            specs[key] = BridgeTensorSpec(
                 valid_rows=valid,
                 capacity_rows=plan.capacity_policy.capacity_of(valid),
                 width=width,
