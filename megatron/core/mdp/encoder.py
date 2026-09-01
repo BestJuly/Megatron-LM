@@ -16,7 +16,11 @@ from typing import Any, Sequence
 import torch
 
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.mdp.config import MdpConfig, apply_vision_config_overrides
+from megatron.core.mdp.config import (
+    MdpConfig,
+    apply_encoder_recompute_config,
+    validate_effective_vision_config,
+)
 from megatron.core.mdp.errors import MdpConfigurationError
 from megatron.core.mdp.groups import MdpProcessGroups
 from megatron.core.mdp.protocols import MdpModelAdapter
@@ -106,8 +110,8 @@ def build_encoder_domain(
 ) -> EncoderDomain:
     """Assemble the encoder domain (API design 14.2).
 
-    Order: vision config from the override channel; encoder via the adapter's
-    shared factory; the same mixed-precision wrapper depth as the decoder;
+    Order: typed encoder recompute config; encoder via the adapter's shared
+    factory; the same mixed-precision wrapper depth as the decoder;
     DDP over the encoder process groups; DistributedOptimizer from the DDP
     buffers.
     """
@@ -130,12 +134,11 @@ def build_encoder_domain(
                 "the encoder P5/P6 domain."
             )
 
-    effective_config = apply_vision_config_overrides(
-        model_config, mdp_config.vision_config_overrides
-    )
+    effective_config = apply_encoder_recompute_config(model_config, mdp_config)
+    validate_effective_vision_config(mdp_config, effective_config)
     logger.info(
-        "MDP: effective vision config overrides: %s",
-        list(mdp_config.vision_config_overrides),
+        "MDP: effective encoder recompute granularity: %s",
+        mdp_config.encoder_recompute_granularity,
     )
     encoder = adapter.build_encoder(effective_config, pg_collection=encoder_pgs)
     if wrap_mixed_precision and (

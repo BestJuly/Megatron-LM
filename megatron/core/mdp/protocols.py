@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """MDP model-adapter protocol and the carrier types between adapter and core.
 
@@ -113,8 +113,9 @@ class MdpModelAdapter(Protocol):
         The adapter reads the ordered ``grid_thw`` from ``layout.segments`` and
         constructs a vision-only ``PackedSeqParams(qkv_format="thd")``; it must
         never read or reuse the decoder ``PackedSeqParams``, and it is unaware
-        that chunking exists. During training the return value stays
-        graph-connected; only the view passed to the EMBEDDING bridge may be
-        detached.
+        that chunking exists. In the default training mode the return value
+        stays graph-connected; in complete-encoder recompute mode core first
+        calls it under ``no_grad`` in P2 and then calls it again with gradients
+        enabled in P5. Only detached views cross the EMBEDDING bridge.
         """
         ...
