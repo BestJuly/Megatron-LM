@@ -293,6 +293,84 @@ def extend_thd_padding_before_cp_slice(
     return cu_seqlens_padded, max_seqlen, global_target_len
 
 
+def thd_shapes_are_static(config) -> bool:
+    """Whether the incoming THD batches have fixed shapes.
+
+    The THD CUDA-graph machinery -- static ``hidden_states``, static
+    ``cu_seqlens_*``, static ``padding_mask``, and the tensor <-> PackedSeqParams
+    bridge -- needs exactly one thing from the data path: that ``T`` and the
+    ``cu_seqlens`` entry count do not vary per microbatch. It does not care
+    *who* guarantees that.
+
+    Three producers do:
+
+    - ``--sequence-packing-scheduler`` (``dp_balanced`` / ``default_dynamic_cp``);
+    - ``--dynamic-context-parallel``;
+    - ``--thd-static-packing``, for collators that pack outside the scheduler
+      (MDP's greedy packer).
+
+    Deliberately **not** derived from ``pad_packed_seq_alignment is not None``:
+    that would silently change behavior for existing GPT ``--sft`` runs that set
+    an alignment without a scheduler. An explicit opt-in cannot.
+    """
+    return bool(
+        getattr(config, 'sequence_packing_scheduler', None) is not None
+        or getattr(config, 'dynamic_context_parallel', False)
+        or getattr(config, 'thd_static_packing', False)
+    )
+
+
+def thd_collate_row_alignment(
+    *, context_parallel_size: int, tensor_model_parallel_size: int, sequence_parallel: bool
+) -> int:
+    """Row alignment a THD collator must pad each packed sample to.
+
+    Zigzag context parallelism needs an even per-rank split, and sequence
+    parallelism additionally splits the packed rows across TP. Single source of
+    truth for the rule: the collator pads with it, MDP validates the greedy token
+    budget against it, and ``thd_static_pad_between_seqs`` derives from it.
+    """
+    if context_parallel_size > 1:
+        return (
+            tensor_model_parallel_size * context_parallel_size * 2
+            if sequence_parallel
+            else context_parallel_size * 2
+        )
+    return tensor_model_parallel_size if sequence_parallel else 1
+
+
+def thd_static_pad_between_seqs(config) -> bool:
+    """Batch-independent ``pad_between_seqs`` for a fixed-shape THD data path.
+
+    ``pad_between_seqs`` cannot be a graph input (it is a capture-time Python
+    branch) and cannot be inferred from the cu_seqlens tensors during capture (a
+    device comparison would synchronize), so the CUDA-graph path needs a value
+    that is correct for *every* replay batch. Answering "True, always" is safe
+    but expensive: TE disables FlashAttention for THD whenever padding may exist
+    between sequences, and when cuDNN fused attention does not support the head
+    configuration either, the fallback is the unfused O(T^2) backend.
+
+    Under ``thd_static_packing`` the answer is knowable without looking at any
+    batch. A collator setting that flag pads each sample to
+    ``thd_collate_row_alignment``, so gaps between sequences exist exactly when
+    that alignment exceeds 1. **That is the contract the flag asserts**; a
+    collator that leaves gaps at alignment 1 must not set it.
+
+    Without ``thd_static_packing`` (the ``--sequence-packing-scheduler`` path,
+    which does pad each sub-sample) the conservative ``True`` is retained.
+    """
+    if not getattr(config, 'thd_static_packing', False):
+        return True
+    return (
+        thd_collate_row_alignment(
+            context_parallel_size=config.context_parallel_size,
+            tensor_model_parallel_size=config.tensor_model_parallel_size,
+            sequence_parallel=config.sequence_parallel,
+        )
+        > 1
+    )
+
+
 def build_static_thd_metadata(
     cu_seqlens: Tensor,
     cu_seqlens_padded: Tensor,
