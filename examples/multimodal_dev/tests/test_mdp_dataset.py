@@ -27,6 +27,7 @@ if _REPO_ROOT not in sys.path:
 from examples.multimodal_dev.data.mdp_mock import MdpThdMockDataset, item_sentinel
 from examples.multimodal_dev.forward_step import build_vision_sidecar, pack_or_pad_batch
 from examples.multimodal_dev.models.qwen35_vl.mdp_adapter import build_collate_spec
+from examples.multimodal_dev.models.vision_base import META_PREFIX_COLUMNS
 from tests.unit_tests.test_utilities import Utils
 
 IMAGE_TOKEN_ID = 248056
@@ -86,7 +87,7 @@ def test_sidecar_metadata_and_sentinels():
     pixels = packed["pixel_values"].cpu()
 
     expected_items = sum(int(s["image_grid_thw"].shape[0]) for s in batch)
-    assert meta.shape == (expected_items, 3 + SPEC.shape_key_width)
+    assert meta.shape == (expected_items, META_PREFIX_COLUMNS + SPEC.shape_key_width)
     # Ordered by (sample_index, image_ordinal).
     order = [(int(r[0]), int(r[1])) for r in meta]
     assert order == sorted(order)
@@ -98,7 +99,7 @@ def test_sidecar_metadata_and_sentinels():
     for row in meta:
         # Row layout: fixed prefix, then the model's shape key.
         sample_index, ordinal, payload_row_start = (int(v) for v in row[:3])
-        t, h, w = (int(v) for v in row[3:])
+        t, h, w = (int(v) for v in row[META_PREFIX_COLUMNS:])
         payload_rows = t * h * w
         output_rows = t * (h // MERGE) * (w // MERGE)
         # Sentinel round-trip: the packed pixel slice is exactly this item.
@@ -140,6 +141,16 @@ def test_sidecar_positions_follow_the_alignment_tail():
     positions = packed["vision_decoder_positions"].cpu()
     input_ids = packed["input_ids"][0].cpu()
     assert (input_ids[positions] == IMAGE_TOKEN_ID).all()
+    # The sample-span columns must mirror cu_seqlens_q_padded exactly: MDP
+    # derives each row's context-parallel owner from them without ever
+    # touching the device vector again.
+    meta = packed["vision_item_meta"].cpu()
+    padded_cu = params.cu_seqlens_q_padded.cpu()
+    assert meta.shape[0] > 0
+    for row in meta.tolist():
+        sample_index = int(row[0])
+        assert int(row[3]) == int(padded_cu[sample_index])
+        assert int(row[4]) == int(padded_cu[sample_index + 1] - padded_cu[sample_index])
 
 
 def test_sidecar_positions_respect_interleaved_text():
@@ -159,7 +170,7 @@ def test_sidecar_positions_respect_interleaved_text():
     meta = packed["vision_item_meta"].cpu()
     positions = packed["vision_decoder_positions"].cpu()
     assert meta.shape[0] == len(grids)
-    t0, h0, w0 = (int(v) for v in meta[0][3:6])
+    t0, h0, w0 = (int(v) for v in meta[0][META_PREFIX_COLUMNS : META_PREFIX_COLUMNS + 3])
     first_rows = t0 * (h0 // MERGE) * (w0 // MERGE)
     first_end = int(positions[first_rows - 1])
     second_start = int(positions[first_rows])
@@ -176,7 +187,7 @@ def test_text_only_batch_produces_empty_sidecar():
         with_vision_sidecar=True,
         vision_collate_spec=SPEC,
     )
-    assert packed["vision_item_meta"].shape == (0, 3 + SPEC.shape_key_width)
+    assert packed["vision_item_meta"].shape == (0, META_PREFIX_COLUMNS + SPEC.shape_key_width)
     assert packed["vision_decoder_positions"].numel() == 0
     assert packed["pixel_values"].shape[0] == 0
 

@@ -110,9 +110,32 @@ def test_split_rejects_nonpositive_cap():
 # ------------------------- digest -------------------------
 
 
-def _entry(item_id, worker=0, order=0, endpoint=0, grid=(1, 4, 4)):
+def _entry(
+    item_id,
+    worker=0,
+    order=0,
+    endpoint=0,
+    grid=(1, 4, 4),
+    slice_id=0,
+    item_row_start=0,
+    item_rows=None,
+):
     t, h, w = grid
-    return (item_id, worker, order, endpoint, t * h * w, t * (h // 2) * (w // 2), t, h, w)
+    output_rows = t * (h // 2) * (w // 2)
+    return (
+        item_id,
+        slice_id,
+        worker,
+        order,
+        endpoint,
+        item_row_start,
+        output_rows if item_rows is None else item_rows,
+        t * h * w,
+        output_rows,
+        t,
+        h,
+        w,
+    )
 
 
 def test_digest_is_deterministic_and_16_bytes():
@@ -132,7 +155,7 @@ def test_digest_covers_the_minimal_sufficient_set():
     base = compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [_entry(0)], shape_key_width=3)
     # Same row counts, different shape key -> the producer would build different
     # encoder metadata -> the digest must change (design doc 7.4).
-    same_rows_other_shape = (0, 0, 0, 0, 16, 4, 1, 2, 8)
+    same_rows_other_shape = (0, 0, 0, 0, 0, 0, 4, 16, 4, 1, 2, 8)
     assert (
         compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [same_rows_other_shape], shape_key_width=3)
         != base
@@ -163,8 +186,8 @@ def test_digest_is_shape_key_width_aware():
     plan mismatch into a clean error would then miss it.
     """
     policy = RowCapacityPolicy()
-    narrow = (0, 0, 0, 0, 16, 4, 4, 4)
-    wide = (0, 0, 0, 0, 16, 4, 4, 4, 0)
+    narrow = (0, 0, 0, 0, 0, 0, 4, 16, 4, 4, 4)
+    wide = (0, 0, 0, 0, 0, 0, 4, 16, 4, 4, 4, 0)
     assert compute_plan_digest(
         PLAN_SCHEMA_VERSION, policy, [narrow], shape_key_width=2
     ) != compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [wide], shape_key_width=3)
@@ -172,13 +195,47 @@ def test_digest_is_shape_key_width_aware():
         compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [narrow], shape_key_width=3)
 
 
+def test_digest_covers_the_decoder_cp_slice_table():
+    policy = RowCapacityPolicy()
+    base = compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [_entry(0)], shape_key_width=3)
+    # Decoder-CP slice identity is part of the digest. Without this, two ranks
+    # that derive different slice tables would agree on the digest, pass the
+    # consistency check, and then hang in all_to_all_single with mismatched
+    # split sizes.
+    assert (
+        compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [_entry(0, item_row_start=2)], shape_key_width=3)
+        != base
+    )
+    assert (
+        compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [_entry(0, item_rows=1)], shape_key_width=3) != base
+    )
+    assert (
+        compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [_entry(0, slice_id=1)], shape_key_width=3) != base
+    )
+    # The CP topology itself is in the header, so a cp mismatch is diagnosed
+    # even when every per-slice record happens to coincide.
+    assert compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [_entry(0)], shape_key_width=3, cp_size=2) != base
+
+
 # ------------------------- batch plan indexes -------------------------
 
 
 def _plan():
     routes = (
-        RouteSlice(global_item_id=0, producer_worker_id=1, endpoint_rank=0, owner_worker_id=0),
-        RouteSlice(global_item_id=1, producer_worker_id=0, endpoint_rank=0, owner_worker_id=0),
+        RouteSlice(
+            global_item_id=0,
+            producer_worker_id=1,
+            endpoint_rank=0,
+            owner_worker_id=0,
+            item_rows=16,
+        ),
+        RouteSlice(
+            global_item_id=1,
+            producer_worker_id=0,
+            endpoint_rank=0,
+            owner_worker_id=0,
+            item_rows=4,
+        ),
     )
     encoder_layouts = (
         EncoderThdLayout(producer_worker_id=0, segments=(_segment(1, (1, 4, 4)),)),
