@@ -5,7 +5,11 @@
 # MDP_opt study shape: 20 decoder layers + 1 MTP layer, 128 experts top-8,
 # REAL GDN hybrid attention, 13 vision layers, TP1 x CP1 x PP2 x EP2 -> DP2
 # over NPROC=4 GB200, MBS=16 / GBS=256 (accum 8), 20 iters, THD packed,
-# mdp_mock data. Every one of those is an env override (see below), so the
+# mdp_mock data, flex/hybridep MoE dispatcher, vision-encoder full recompute,
+# precision-aware optimizer, forced uniform routing, GDN fusion and manual GC
+# (the last four match the GB200 EP8 reference run; decoder recompute, which
+# that reference also used, stays OFF here and is opt-in per experiment).
+# Every one of those is an env override (see below), so the
 # older light shape is still reachable e.g. with
 #   PP=4 EP=1 NPROC=8 NUM_LAYERS=8 NUM_EXPERTS=8 MOE_TOPK=2 \
 #   VISION_NUM_LAYERS=7 MTP_NUM_LAYERS=0 MBS=4 GBS=128 ITERS=10
@@ -32,6 +36,40 @@
 #                    standard attention (for containers without a working
 #                    FLA; FLA git main + Triton>=3.7.1 or tilelang required
 #                    for the GDN backward on Hopper, see FLA #640).
+#   DISPATCHER=flex|alltoall  MoE token dispatcher (default flex). flex adds
+#                    --moe-flex-dispatcher-backend $FLEX_BACKEND, and for
+#                    hybridep also --moe-hybridep-num-sms $HYBRIDEP_NUM_SMS.
+#                    This matches the GB200/GB300 benchmark recipes; the
+#                    previous hardcoded default was alltoall, so results
+#                    taken before this change are not comparable.
+#   FLEX_BACKEND=<name>       flex dispatcher backend (default hybridep)
+#   HYBRIDEP_NUM_SMS=<n>      hybridep SM budget (default 32)
+#   VISION_RECOMPUTE=0|1      full activation recompute for the vision
+#                    encoder (default 1). The switch differs by path: the
+#                    native path takes --recompute-vision, while MDP rejects
+#                    that flag outright (pretrain_multimodal.py) and requires
+#                    its typed --encoder-recompute-* arguments instead. This
+#                    knob picks the right one for the current MDP setting.
+#                    Note it is independent
+#                    of the decoder --recompute-* flags (DECODER_RECOMPUTE).
+#   DECODER_RECOMPUTE=0|1     decoder activation recompute (default 0 = off).
+#                    Turn on per experiment when the shape would otherwise
+#                    OOM, or to match a reference run that used it. Values
+#                    via DECODER_RECOMPUTE_GRANULARITY (full),
+#                    DECODER_RECOMPUTE_METHOD (uniform) and
+#                    DECODER_RECOMPUTE_NUM_LAYERS (1).
+#   PRECISION_AWARE_OPT=0|1   fp32 master grads/params + bf16 Adam moments
+#                    (default 1). Saves 4 bytes per parameter against the
+#                    all-fp32 default.
+#   FORCE_LOAD_BALANCING=0|1  --moe-router-force-load-balancing (default 1).
+#                    Uniform routing removes expert-load jitter from
+#                    iteration timing. MUST be 0 for any convergence /
+#                    fine-tuning run: it freezes data-dependent routing.
+#   GDN_FUSION=0|1   fused streamed pre-gated-delta-rule (default 1, requires
+#                    GDN=1 and causal-conv1d in the container).
+#   MANUAL_GC=0|1    disable automatic GC, collect every MANUAL_GC_INTERVAL
+#                    iterations instead (default 1 / 50). Removes random GC
+#                    pauses from steady-state timing.
 #   NSYS=0|1         wrap in nsys (default 0). Requires OUT=<basename>.
 #                    Capture window: iterations PROF_START..PROF_END-1 via
 #                    cudaProfilerApi (defaults 7..8), NVTX on all ranks.
@@ -89,6 +127,22 @@ PROF_START=${PROF_START:-7}
 PROF_END=${PROF_END:-9}
 ROUTER_FUSION=${ROUTER_FUSION:-1}
 CE_FUSION=${CE_FUSION:-te}
+DISPATCHER=${DISPATCHER:-flex}
+FLEX_BACKEND=${FLEX_BACKEND:-hybridep}
+HYBRIDEP_NUM_SMS=${HYBRIDEP_NUM_SMS:-32}
+VISION_RECOMPUTE=${VISION_RECOMPUTE:-1}
+DECODER_RECOMPUTE=${DECODER_RECOMPUTE:-0}
+DECODER_RECOMPUTE_GRANULARITY=${DECODER_RECOMPUTE_GRANULARITY:-full}
+DECODER_RECOMPUTE_METHOD=${DECODER_RECOMPUTE_METHOD:-uniform}
+DECODER_RECOMPUTE_NUM_LAYERS=${DECODER_RECOMPUTE_NUM_LAYERS:-1}
+PRECISION_AWARE_OPT=${PRECISION_AWARE_OPT:-1}
+FORCE_LOAD_BALANCING=${FORCE_LOAD_BALANCING:-1}
+# Tracked separately so GDN=0 can silently drop the fusion when it was merely
+# left at its default, but still fail loudly when the caller asked for both.
+GDN_FUSION_EXPLICIT=${GDN_FUSION+set}
+GDN_FUSION=${GDN_FUSION:-1}
+MANUAL_GC=${MANUAL_GC:-1}
+MANUAL_GC_INTERVAL=${MANUAL_GC_INTERVAL:-50}
 PP=${PP:-2}
 VPP=${VPP:-1}
 TP=${TP:-1}
@@ -124,6 +178,18 @@ export WT=$REPO_ROOT
 export PYTHONPATH=${FLA_PATH:+$FLA_PATH:}$REPO_ROOT:${PYTHONPATH:-}
 cd "$REPO_ROOT"
 
+DISPATCHER_ARGS=( --moe-token-dispatcher-type "$DISPATCHER" )
+case "$DISPATCHER" in
+    flex)
+        DISPATCHER_ARGS+=( --moe-flex-dispatcher-backend "$FLEX_BACKEND" )
+        if [ "$FLEX_BACKEND" = "hybridep" ]; then
+            DISPATCHER_ARGS+=( --moe-hybridep-num-sms "$HYBRIDEP_NUM_SMS" )
+        fi
+        ;;
+    alltoall) ;;
+    *) echo "ERROR: DISPATCHER must be flex|alltoall, got '$DISPATCHER'" >&2; exit 1 ;;
+esac
+
 MDP_ARGS=()
 if [ "$MDP" = "1" ]; then
     MDP_ARGS=( --mdp-enable )
@@ -132,6 +198,23 @@ if [ "$MDP" = "1" ]; then
     fi
     if [ "$PIXEL_LOCALITY" = "1" ]; then
         MDP_ARGS+=( --mdp-pixel-locality )
+    fi
+fi
+
+# Vision-encoder full recompute. --recompute-vision sets granularity=full,
+# method=uniform, num_layers=1 on the vision config (pretrain_multimodal.py:88);
+# MDP raises on that flag and takes the same three values through its own typed
+# encoder-recompute arguments, so spell them out to keep both paths identical.
+# (PR #53 replaced the earlier --mdp-vision-config-override channel with these;
+# "full" additionally rejects --encoder-recompute-modules, which is not used.)
+VISION_RECOMPUTE_ARGS=()
+if [ "$VISION_RECOMPUTE" = "1" ]; then
+    if [ "$MDP" = "1" ]; then
+        VISION_RECOMPUTE_ARGS=( --encoder-recompute-granularity full
+                                --encoder-recompute-method uniform
+                                --encoder-recompute-num-layers 1 )
+    else
+        VISION_RECOMPUTE_ARGS=( --recompute-vision )
     fi
 fi
 
@@ -169,6 +252,56 @@ if [ "$GDN" = "1" ]; then
                --linear-value-head-dim 128
                --linear-num-key-heads 16
                --linear-num-value-heads 32 )
+    # Fused streamed pre-gated-delta-rule. transformer_config.py rejects it
+    # unless the attention variant is gated_delta_net, so it lives inside this
+    # branch; it also needs causal-conv1d in the container
+    # (megatron/core/fusions/fused_pre_gated_delta_rule.py).
+    if [ "$GDN_FUSION" = "1" ]; then
+        GDN_ARGS+=( --gdn-pre-gated-delta-rule-fusion )
+    fi
+elif [ "$GDN_FUSION" = "1" ]; then
+    if [ -n "$GDN_FUSION_EXPLICIT" ]; then
+        echo "ERROR: GDN_FUSION=1 requires GDN=1 (the fusion is only supported with" >&2
+        echo "       experimental_attention_variant=gated_delta_net)." >&2
+        exit 1
+    fi
+    # Default value only -- GDN=0 is the documented fallback for containers
+    # without a working FLA, so drop the fusion instead of blocking it.
+    GDN_FUSION=0
+fi
+
+# Decoder activation recompute. Off by default -- turn on per experiment when
+# the shape would otherwise OOM, or to match a reference run that used it.
+DECODER_RECOMPUTE_ARGS=()
+if [ "$DECODER_RECOMPUTE" = "1" ]; then
+    DECODER_RECOMPUTE_ARGS=( --recompute-granularity "$DECODER_RECOMPUTE_GRANULARITY"
+                             --recompute-method "$DECODER_RECOMPUTE_METHOD"
+                             --recompute-num-layers "$DECODER_RECOMPUTE_NUM_LAYERS" )
+fi
+
+# Precision-aware optimizer: fp32 master grads/params with bf16 Adam moments,
+# saving 4 bytes per parameter against the all-fp32 default.
+PRECISION_AWARE_OPT_ARGS=()
+if [ "$PRECISION_AWARE_OPT" = "1" ]; then
+    PRECISION_AWARE_OPT_ARGS=( --use-precision-aware-optimizer
+                               --main-grads-dtype fp32
+                               --main-params-dtype fp32
+                               --exp-avg-dtype bf16
+                               --exp-avg-sq-dtype bf16 )
+fi
+
+# Uniform routing for throughput measurement. It freezes data-dependent
+# routing, so it must be off for any convergence / fine-tuning run.
+FORCE_LOAD_BALANCING_ARGS=()
+if [ "$FORCE_LOAD_BALANCING" = "1" ]; then
+    FORCE_LOAD_BALANCING_ARGS=( --moe-router-force-load-balancing )
+fi
+
+# Disable Python's automatic GC and collect on a fixed interval instead, so
+# random collection pauses stop polluting steady-state iteration timing.
+MANUAL_GC_ARGS=()
+if [ "$MANUAL_GC" = "1" ]; then
+    MANUAL_GC_ARGS=( --manual-gc --manual-gc-interval "$MANUAL_GC_INTERVAL" )
 fi
 
 # MTP_NUM_LAYERS=0 omits the MTP args entirely (Megatron treats the arg's
@@ -195,6 +328,18 @@ case "$CE_FUSION" in
     off)    CE_ARGS=() ;;
     *) echo "ERROR: CE_FUSION must be te|native|off, got '$CE_FUSION'" >&2; exit 1 ;;
 esac
+
+# Memory snapshot (MEMSNAP=1). Records the caching-allocator trace on every
+# rank in --profile-ranks and dumps one pickle per rank, for memory_viz /
+# mem-profile. Independent of NSYS.
+MEMSNAP_ARGS=()
+if [ "${MEMSNAP:-0}" = "1" ]; then
+    MEMSNAP_OUT="${MEMSNAP_OUT:?MEMSNAP=1 requires MEMSNAP_OUT=<snapshot pickle path>}"
+    MEMSNAP_RANKS=$(seq -s' ' 0 $((NPROC * NNODES - 1)))
+    MEMSNAP_ARGS=( --record-memory-history
+                   --memory-snapshot-path "$MEMSNAP_OUT"
+                   --profile-ranks $MEMSNAP_RANKS )
+fi
 
 PROF_ARGS=()
 TORCHRUN=( torchrun
@@ -278,11 +423,14 @@ fi
     --moe-router-topk "$MOE_TOPK" \
     --moe-grouped-gemm \
     --moe-aux-loss-coeff 1e-3 \
-    --moe-token-dispatcher-type alltoall \
+    "${DISPATCHER_ARGS[@]}" \
     --moe-router-dtype fp32 \
     --moe-permute-fusion \
     --vision-num-layers "$VISION_NUM_LAYERS" \
     --log-interval 1 \
+    --log-throughput \
+    --log-device-memory-used \
+    --log-memory-interval 5 \
     --eval-interval 100000 \
     --eval-iters 2 \
     --seed "$SEED" \
@@ -294,4 +442,10 @@ fi
     "${EP_OVERLAP_ARGS[@]}" \
     "${PROF_ARGS[@]}" \
     "${MDP_ARGS[@]}" \
+    "${VISION_RECOMPUTE_ARGS[@]}" \
+    "${DECODER_RECOMPUTE_ARGS[@]}" \
+    "${PRECISION_AWARE_OPT_ARGS[@]}" \
+    "${FORCE_LOAD_BALANCING_ARGS[@]}" \
+    "${MANUAL_GC_ARGS[@]}" \
+    "${MEMSNAP_ARGS[@]}" \
     $EXTRA
