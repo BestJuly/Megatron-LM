@@ -23,9 +23,9 @@ from typing import Iterator, Optional, Sequence, Union
 import torch
 
 from megatron.core.mdp.activation import (
-    EncoderAllRecomputeHandle,
     EncoderForwardHandle,
     EncoderOutputMetadata,
+    EncoderWholeRecomputeHandle,
     capture_encoder_rng_state,
 )
 from megatron.core.mdp.allocator import MdpBufferAllocator
@@ -106,7 +106,7 @@ class MdpRuntime:
         self._iter_specs: dict = {}
         self._iter_ledgers: dict = {}
         self._handle: Optional[
-            Union[EncoderForwardHandle, EncoderAllRecomputeHandle]
+            Union[EncoderForwardHandle, EncoderWholeRecomputeHandle]
         ] = None
         self._eval_outputs: Sequence = ()
         self._chunk_layouts: Sequence = ()
@@ -274,21 +274,22 @@ class MdpRuntime:
             )
             window.release_pixels()
 
-        # P2: retain the normal autograd graph, or (Design-Doc all recompute)
+        # P2: retain the normal autograd graph, or whole-encoder recompute
         # run under no_grad and retain only the replay recipe. Evaluation also
         # runs under no_grad but retains neither graph nor recipe.
         chunk_outputs = []
         chunk_rng_states = []
         encoder = self.encoder_domain.encoder_ddp
-        all_recompute = (
-            not forward_only and self.config.encoder_recompute == "all"
+        whole_recompute = (
+            not forward_only
+            and self.config.encoder_recompute_granularity == "whole"
         )
         forward_start = time.monotonic()
         for chunk_index, chunk in enumerate(self._chunk_layouts):
             payload = chunk_payloads[chunk_index]
             payload_valid = payload[: chunk.total_payload_rows]
-            if forward_only or all_recompute:
-                if all_recompute:
+            if forward_only or whole_recompute:
+                if whole_recompute:
                     chunk_rng_states.append(capture_encoder_rng_state())
                 with torch.no_grad(), nvtx_phase("p2_encoder_forward"):
                     output = self.adapter.encode(encoder, payload_valid, chunk)
@@ -305,8 +306,8 @@ class MdpRuntime:
         self._encoder_forward_ms = (time.monotonic() - forward_start) * 1000.0
 
         if self._chunk_layouts and not forward_only:
-            if all_recompute:
-                self._handle = EncoderAllRecomputeHandle(
+            if whole_recompute:
+                self._handle = EncoderWholeRecomputeHandle(
                     iteration=self._iteration,
                     producer_worker_id=self.rank_view.my_worker_id,
                     chunk_payloads=[
@@ -488,7 +489,7 @@ class MdpRuntime:
                 grad_dest.clear()
             if self._handle is not None:
                 with nvtx_phase("p5_encoder_backward"):
-                    if isinstance(self._handle, EncoderAllRecomputeHandle):
+                    if isinstance(self._handle, EncoderWholeRecomputeHandle):
                         self._handle.backward(
                             chunk_grads,
                             encoder=self.encoder_domain.encoder_ddp,

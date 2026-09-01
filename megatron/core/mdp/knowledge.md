@@ -255,8 +255,10 @@ Primary flags:
 - `--mdp-enable`
 - `--mdp-encoder-cp` (currently must be 1)
 - `--mdp-encoder-max-payload-rows`
-- `--mdp-encoder-recompute none|all`
-- `--mdp-vision-config-override KEY=VALUE`
+- `--encoder-recompute-granularity selective|full|whole`
+- `--encoder-recompute-method uniform|block`
+- `--encoder-recompute-num-layers`
+- `--encoder-recompute-modules MODULE [MODULE ...]`
 - `--mdp-locality-slack-permille`
 - `--mdp-pixel-locality`
 - `--mdp-row-alignment`
@@ -264,39 +266,46 @@ Primary flags:
 - `--mdp-overlap-window-capture`
 - `--mdp-debug-plan-payload-check`
 
-Two mutually exclusive vision activation-recompute mechanisms are supported.
-The default `--mdp-encoder-recompute none` retains the P2 graph and may use
-repeatable TransformerConfig overrides. For example,
-`recompute_modules=mlp` and `recompute_modules=core_attn,mlp` are parsed as
-module lists for selective recompute. Full recompute uses MCore's native
-`TransformerConfig` validation for `recompute_method` and
-`recompute_num_layers`.
+Encoder recompute arguments currently require `--mdp-enable`; the native
+multimodal path continues to use `--recompute-vision`, and MDP rejects that
+native-path switch. With no encoder granularity, P2 retains the normal
+graph-connected encoder outputs.
 
-`--mdp-encoder-recompute all` follows the original MDP design: P2 runs patch
-embedding, positions/RoPE, all Transformer layers, and the patch merger under
-`no_grad`; the producer retains valid packed pixels, immutable chunk layouts,
-P2 output metadata, and CPU/CUDA/model-parallel RNG state per chunk. In P5 it
-forks the ambient RNG, restores each chunk's P2 state, replays the complete
-encoder with gradients enabled, immediately backpropagates the routed output
-gradient, and finally restores the P5-entry RNG. Chunk-at-a-time replay makes
-`encoder_max_payload_rows` bound the rebuilt graph, but not all live state:
-every producer's packed pixels survive across P4, and P5 materializes all
-routed chunk-output gradients before the first replay. The initial P5 peak is
-therefore all retained pixels plus all routed gradients plus one chunk's
-activation graph. Consumed pixel and gradient references are dropped after
-each chunk backward, so their live storage decreases through P5, but this does
-not reduce that initial peak. Smaller chunks reduce only the rebuilt-graph
-term and add more serial replay/backward launches.
+`selective` and `full` use MCore's native Transformer checkpointing. The
+typed encoder arguments are copied to the vision `TransformerConfig` through
+`dataclasses.replace`, so MCore's own field and cross-field validation remains
+authoritative. `selective` accepts `--encoder-recompute-modules`; `full`
+uses `--encoder-recompute-method` and
+`--encoder-recompute-num-layers`. Here `full` retains MCore's established
+meaning: checkpoint complete Transformer layers or layer groups, not the
+complete vision encoder.
 
-Complete replay adds one full encoder forward: encoder forward FLOPs are
+`--encoder-recompute-granularity whole` follows the original MDP design: P2
+runs patch embedding, positions/RoPE, all Transformer layers, and the patch
+merger under `no_grad`; the producer retains valid packed pixels, immutable
+chunk layouts, P2 output metadata, and CPU/CUDA/model-parallel RNG state per
+chunk. In P5 it forks the ambient RNG, restores each chunk's P2 state, replays
+the complete encoder with gradients enabled, immediately backpropagates the
+routed output gradient, and finally restores the P5-entry RNG.
+Chunk-at-a-time replay makes `encoder_max_payload_rows` bound the rebuilt
+graph, but not all live state: every producer's packed pixels survive across
+P4, and P5 materializes all routed chunk-output gradients before the first
+replay. The initial P5 peak is therefore all retained pixels plus all routed
+gradients plus one chunk's activation graph. Consumed pixel and gradient
+references are dropped after each chunk backward, so their live storage
+decreases through P5, but this does not reduce that initial peak. Smaller
+chunks reduce only the rebuilt-graph term and add more serial replay/backward
+launches.
+
+Whole replay adds one full encoder forward: encoder forward FLOPs are
 approximately doubled, while encoder backward still runs once. Prefer native
 `selective` or `full` Transformer recompute when checkpointing Transformer
-activations saves enough memory; use `all` when the additional patch
+activations saves enough memory; use `whole` when the additional patch
 embedding, position/RoPE, and patch-merger activation savings justify replaying
-the complete encoder. This mode rejects native vision recompute on the
-effective vision config, whether it came from the override channel or directly
-from an adapter, because nesting the mechanisms would replay the vision
-Transformer twice in P5.
+the complete encoder. `whole` rejects native Transformer recompute on the
+effective vision config, including config supplied directly by an adapter,
+because nesting the mechanisms would replay the vision Transformer twice in
+P5.
 
 There is deliberately no pixel-sharding flag. Pixel owner sharding is part of
 the MDP definition in this baseline.

@@ -25,10 +25,10 @@ EMPTY`) driving seven phases:
 |---|---|---|
 | P0 | `begin_iteration` | Zero encoder grads, reset iteration state |
 | P1 | `begin_iteration` | Capture the iteration window, broadcast fixed-width descriptors from the PP0 endpoint, run deterministic LPT to logical workers, check the plan digest across the group, exchange pixels |
-| P2 | `begin_iteration` | Chunked encoder forward on encoder THD. Default training retains graph-connected outputs; `--mdp-encoder-recompute all` runs under `no_grad` and retains pixels/layouts/RNG recipes; evaluation retains neither graph nor recipe |
+| P2 | `begin_iteration` | Chunked encoder forward on encoder THD. Default training retains graph-connected outputs; `--encoder-recompute-granularity whole` runs under `no_grad` and retains pixels/layouts/RNG recipes; evaluation retains neither graph nor recipe |
 | P3 | `begin_iteration` | Exchange detached embeddings; endpoint assembles one detached leaf per vision-bearing microbatch |
 | P4 | native schedule | Replay iterators feed the unmodified decoder schedule; the wrapped `finalize_model_grads_func` captures the in-place-reduced global token count |
-| P5 | `end_iteration` | Exchange leaf gradients back; default mode runs one multi-tensor backward (native MCore Transformer recompute replays here), while `all` restores RNG and replays complete encoder chunks one by one before backward; WORLD sum-reduce with prescale 1, scale by `1/clamp(T_global, 1)` |
+| P5 | `end_iteration` | Exchange leaf gradients back; default mode runs one multi-tensor backward (native MCore Transformer recompute replays here), while `whole` restores RNG and replays complete encoder chunks one by one before backward; WORLD sum-reduce with prescale 1, scale by `1/clamp(T_global, 1)` |
 | P6 | composite optimizer | WORLD MAX overflow union before any scaler update, combined-norm shared clipping, one atomic step for `[decoder_dense, decoder_expert?, encoder]` |
 
 Key contracts: encoder and decoder THD packings are fully separate (linked
@@ -42,7 +42,7 @@ schedule model list.
 
 | File | Contents |
 |---|---|
-| `config.py` | `MdpConfig`, support-matrix validation, vision config override allowlist |
+| `config.py` | `MdpConfig`, support-matrix validation, typed encoder recompute configuration |
 | `rank_mapping.py` | Pure-compute outer-DP planning groups and logical workers from `RankGenerator` coordinates |
 | `groups.py` | Process-group installation, fixed-width descriptor broadcast |
 | `plan.py` / `planner.py` | Minimal-sufficient plan data model, blake2b digest, deterministic integer LPT, group consistency check |
@@ -59,12 +59,11 @@ schedule model list.
 Supported: Qwen3.5-VL (one vision encoder), `TP=1`, decoder `CP=1`,
 `encoder_cp=1`, native PP/VPP/EP, fully replicated encoder with WORLD ZeRO-1,
 `calculate_per_token_loss=True`, bf16 main path (fp16 covered by
-overflow-union tests), THD packed sequences on both sides, either native MCore
-vision Transformer recompute (`None`/`selective`/`full`) via the override
-channel or Design-Doc complete-encoder recompute (`--mdp-encoder-recompute
-all`), text-only
-microbatches, synchronous global `torch_dist` weight-only checkpoints,
-`alignment_rows=1` (tests exercise 16), and native decoder DDP
+overflow-union tests), THD packed sequences on both sides, native MCore vision
+Transformer recompute (`selective`/`full`) or Design-Doc whole-encoder replay
+(`--encoder-recompute-granularity whole`), text-only microbatches, synchronous
+global `torch_dist` weight-only checkpoints, `alignment_rows=1` (tests
+exercise 16), and native decoder DDP
 `overlap_grad_reduce`/`overlap_param_gather`. Decoder overlap remains owned by
 the native PP/VPP schedule; the separate encoder DDP domain stays synchronous
 in P5/P6.
@@ -75,9 +74,9 @@ activation offload, delayed gradient reduction,
 instances, `calculate_per_token_loss=False`, non-`torch_dist` checkpoint formats,
 non-weight-only save/load, invalid rank mappings.
 
-Complete-encoder replay is deliberately exclusive with vision
-`TransformerConfig` recompute overrides. Nesting the two would add a third
-vision forward in P5 and obscure both the memory and compute contract.
+Whole-encoder replay is deliberately exclusive with native vision
+`TransformerConfig` recompute. Nesting the two would add a third vision
+forward in P5 and obscure both the memory and compute contract.
 
 `encoder_max_payload_rows` caps one rebuilt activation graph, not the complete
 P5 footprint. Producers retain all packed pixels across P4, and P5 materializes
@@ -94,7 +93,7 @@ activations justifies the extra complete forward.
 
 Registered extension hooks (each exercised by a test at a non-degenerate
 value): logical workers + `worker_ranks()` for encoder CP, single-valued
-endpoints + multi-slice routes for decoder CP, the vision config override
-allowlist + row-capacity policy for FP8, and the unified buffer allocator for
-full-iteration CUDA graphs. The hooks guarantee no breaking schema change is
+endpoints + multi-slice routes for decoder CP, typed encoder recompute
+configuration + row-capacity policy for FP8, and the unified buffer allocator
+for full-iteration CUDA graphs. The hooks guarantee no breaking schema change is
 needed later; they do not mean the capability is implemented.

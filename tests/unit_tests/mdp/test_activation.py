@@ -8,9 +8,9 @@ import pytest
 import torch
 
 from megatron.core.mdp.activation import (
-    EncoderAllRecomputeHandle,
     EncoderForwardHandle,
     EncoderOutputMetadata,
+    EncoderWholeRecomputeHandle,
     build_encoder_packed_seq_params,
 )
 from megatron.core.mdp.allocator import DirectBufferAllocator
@@ -151,7 +151,7 @@ def test_forward_only_release_needs_no_backward():
     assert handle.consumed
 
 
-def test_all_recompute_handle_replays_and_releases(monkeypatch):
+def test_whole_recompute_handle_replays_and_releases(monkeypatch):
     layout = _layout()
     chunks = split_encoder_layout(layout, max_payload_rows=80)
     assert len(chunks) == 2
@@ -185,7 +185,7 @@ def test_all_recompute_handle_replays_and_releases(monkeypatch):
     monkeypatch.setattr(random, "_fork_rng", _noop_fork_rng)
     monkeypatch.setattr(random, "_set_all_rng_states", lambda *unused: None)
 
-    handle = EncoderAllRecomputeHandle(
+    handle = EncoderWholeRecomputeHandle(
         iteration=0,
         producer_worker_id=0,
         chunk_payloads=payloads,

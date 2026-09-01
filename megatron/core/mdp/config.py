@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""MDP configuration, compatibility validation, and the vision config override channel.
+"""MDP configuration and compatibility validation.
 
 Pure-compute module: no ``torch.distributed`` calls, no device tensors, no argparse.
 The training entry point converts Megatron args into :class:`MdpCompatibilityOptions`;
@@ -9,7 +9,7 @@ core reads only that structure so the full rejection list is unit-testable.
 
 import dataclasses
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Optional
 
 from megatron.core.mdp.errors import MdpConfigurationError
 
@@ -22,18 +22,7 @@ SUPPORTED_RANK_ORDER = "tp-cp-ep-dp-pp"
 # The only checkpoint format supported by the MDP checkpoint facade.
 SUPPORTED_CHECKPOINT_MODE = "torch_dist"
 
-# Keys that may be overridden on the vision TransformerConfig. Field semantics and
-# cross-field validation are delegated entirely to MCore's own __post_init__.
-VISION_CONFIG_OVERRIDE_ALLOWLIST: frozenset = frozenset(
-    {
-        "recompute_granularity",
-        "recompute_method",
-        "recompute_num_layers",
-        "recompute_modules",
-    }
-)
-
-ENCODER_RECOMPUTE_MODES: frozenset = frozenset({"none", "all"})
+ENCODER_RECOMPUTE_GRANULARITIES = (None, "selective", "full", "whole")
 
 
 @dataclass(frozen=True)
@@ -43,8 +32,10 @@ class MdpConfig:
     enable: bool = False
     encoder_cp: int = 1
     encoder_max_payload_rows: Optional[int] = None
-    encoder_recompute: str = "none"
-    vision_config_overrides: tuple = ()
+    encoder_recompute_granularity: Optional[str] = None
+    encoder_recompute_method: Optional[str] = None
+    encoder_recompute_num_layers: Optional[int] = None
+    encoder_recompute_modules: Optional[tuple[str, ...]] = None
     locality_slack_permille: int = 10
     row_alignment: int = 1
     plan_check_interval: int = 1
@@ -117,24 +108,51 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "The chunk cap is measured in patch rows.",
             "None",
         )
-    if config.encoder_recompute not in ENCODER_RECOMPUTE_MODES:
+    granularity = config.encoder_recompute_granularity
+    if granularity not in ENCODER_RECOMPUTE_GRANULARITIES:
         _reject(
-            "encoder_recompute",
-            config.encoder_recompute,
-            f"one of {sorted(ENCODER_RECOMPUTE_MODES)}",
-            "The complete-encoder replay path has only an off mode and the "
-            "Design-Doc all-recompute mode.",
-            "none",
+            "encoder_recompute_granularity",
+            granularity,
+            f"one of {ENCODER_RECOMPUTE_GRANULARITIES}",
+            "Encoder recompute supports native MCore selective/full Transformer "
+            "checkpointing and Design-Doc whole-encoder replay.",
+            "None",
         )
-    if config.encoder_recompute == "all" and config.vision_config_overrides:
+
+    native_options = {
+        "encoder_recompute_method": config.encoder_recompute_method,
+        "encoder_recompute_num_layers": config.encoder_recompute_num_layers,
+        "encoder_recompute_modules": config.encoder_recompute_modules,
+    }
+    if granularity in (None, "whole"):
+        for option, value in native_options.items():
+            if value is not None:
+                _reject(
+                    option,
+                    value,
+                    f"None when encoder_recompute_granularity == {granularity!r}",
+                    "Native Transformer recompute details do not apply when encoder "
+                    "recompute is disabled or spans the whole encoder.",
+                    "None",
+                )
+    elif granularity == "selective":
+        for option in ("encoder_recompute_method", "encoder_recompute_num_layers"):
+            value = native_options[option]
+            if value is not None:
+                _reject(
+                    option,
+                    value,
+                    "None when encoder_recompute_granularity == 'selective'",
+                    "Selective recompute is configured only by encoder_recompute_modules.",
+                    "None",
+                )
+    elif config.encoder_recompute_modules is not None:
         _reject(
-            "vision_config_overrides",
-            config.vision_config_overrides,
-            "empty when encoder_recompute == 'all'",
-            "Complete-encoder replay and nested TransformerConfig checkpointing "
-            "would replay the vision Transformer twice in P5 and make the mode's "
-            "memory/compute contract ambiguous.",
-            "()",
+            "encoder_recompute_modules",
+            config.encoder_recompute_modules,
+            "None when encoder_recompute_granularity == 'full'",
+            "Module selection applies only to selective recompute.",
+            "None",
         )
     if not (0 <= config.locality_slack_permille < 1000):
         _reject(
@@ -172,7 +190,6 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "is only validated without tensor parallelism.",
             "False",
         )
-    _validate_override_entries(config.vision_config_overrides)
 
     # --- parallel dimensions and rank mapping preconditions ---
     if options.rank_order != SUPPORTED_RANK_ORDER:
@@ -266,8 +283,8 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "fp8_enabled",
             options.fp8_enabled,
             "FP8 disabled",
-            "FP8/MXFP8 gradient-buffer reuse is not validated with MDP; the vision "
-            "config override channel is reserved for a future FP8 recipe.",
+            "FP8/MXFP8 gradient-buffer reuse is not validated with MDP; row-aligned "
+            "allocation is only a future-facing hook, not an FP8 recipe.",
             "False",
         )
     if options.cuda_graph_enabled:
@@ -329,50 +346,26 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
         )
 
 
-def _validate_override_entries(overrides: Sequence) -> None:
-    """Shared structural validation for vision config override entry sequences."""
-    seen = set()
-    previous_key = None
-    for entry in overrides:
-        if not (isinstance(entry, tuple) and len(entry) == 2 and isinstance(entry[0], str)):
-            raise MdpConfigurationError(
-                f"MDP: vision config override entry {entry!r} violates: entries are "
-                "(key, value) tuples with a string key."
-            )
-        key = entry[0]
-        if key not in VISION_CONFIG_OVERRIDE_ALLOWLIST:
-            raise MdpConfigurationError(
-                f"MDP: vision config override key {key!r} violates: key in allowlist "
-                f"{sorted(VISION_CONFIG_OVERRIDE_ALLOWLIST)}. Overrides outside the "
-                "current support matrix are rejected."
-            )
-        if key in seen:
-            raise MdpConfigurationError(
-                f"MDP: vision config override key {key!r} violates: keys are unique."
-            )
-        if previous_key is not None and key < previous_key:
-            raise MdpConfigurationError(
-                f"MDP: vision config override key {key!r} violates: entries are "
-                "key-sorted. A canonical, immutable, sorted sequence is required so "
-                "cross-rank consistency assertions and startup logs can consume it "
-                "directly."
-            )
-        seen.add(key)
-        previous_key = key
-
-
-def apply_vision_config_overrides(
-    base_config: "TransformerConfig", overrides: Sequence
+def apply_encoder_recompute_config(
+    base_config: "TransformerConfig", config: MdpConfig
 ) -> "TransformerConfig":
-    """Build the vision TransformerConfig from the decoder base plus the override entries.
+    """Apply native encoder recompute settings through TransformerConfig validation.
 
-    Field-level and cross-field validation are delegated to MCore's own
-    ``__post_init__`` via ``dataclasses.replace``; MDP does not duplicate those rules.
+    Whole recompute is implemented by the MDP phase machine rather than nested
+    MCore checkpointing, so it leaves the vision TransformerConfig unchanged.
     """
-    _validate_override_entries(overrides)
-    if not overrides:
+    granularity = config.encoder_recompute_granularity
+    if granularity in (None, "whole"):
         return base_config
-    return dataclasses.replace(base_config, **dict(overrides))
+
+    modules = config.encoder_recompute_modules
+    return dataclasses.replace(
+        base_config,
+        recompute_granularity=granularity,
+        recompute_method=config.encoder_recompute_method,
+        recompute_num_layers=config.encoder_recompute_num_layers,
+        recompute_modules=list(modules) if modules is not None else None,
+    )
 
 
 def validate_effective_vision_config(
@@ -380,12 +373,15 @@ def validate_effective_vision_config(
 ) -> None:
     """Reject unsupported combinations visible only after adapter resolution."""
     recompute_granularity = getattr(effective_config, "recompute_granularity", None)
-    if config.encoder_recompute == "all" and recompute_granularity is not None:
+    if (
+        config.encoder_recompute_granularity == "whole"
+        and recompute_granularity is not None
+    ):
         _reject(
             "effective vision recompute_granularity",
             recompute_granularity,
-            "None when encoder_recompute == 'all'",
-            "Complete-encoder replay cannot wrap native Transformer recompute; "
+            "None when encoder_recompute_granularity == 'whole'",
+            "Whole-encoder replay cannot wrap native Transformer recompute; "
             "otherwise the vision Transformer is replayed twice in P5.",
             "None",
         )

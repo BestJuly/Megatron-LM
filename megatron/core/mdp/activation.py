@@ -160,7 +160,7 @@ class EncoderForwardHandle:
 
 
 @dataclass
-class EncoderAllRecomputeHandle:
+class EncoderWholeRecomputeHandle:
     """The producer's P2 recipe for complete encoder replay in P5.
 
     Unlike :class:`EncoderForwardHandle`, this handle owns no graph-connected
@@ -190,7 +190,7 @@ class EncoderAllRecomputeHandle:
         }
         if len(lengths) != 1:
             raise MdpStateError(
-                "MDP: all-recompute handle violates: one payload, layout, output "
+                "MDP: whole-recompute handle violates: one payload, layout, output "
                 "metadata record, and RNG state per chunk."
             )
         for index, (payload, layout, metadata) in enumerate(
@@ -198,13 +198,13 @@ class EncoderAllRecomputeHandle:
         ):
             if payload.shape[0] != layout.total_payload_rows:
                 raise MdpStateError(
-                    f"MDP: all-recompute chunk {index} violates: payload rows == "
+                    f"MDP: whole-recompute chunk {index} violates: payload rows == "
                     f"layout.total_payload_rows ({payload.shape[0]} != "
                     f"{layout.total_payload_rows})."
                 )
             if metadata.shape[0] != layout.total_output_rows:
                 raise MdpStateError(
-                    f"MDP: all-recompute chunk {index} violates: output rows == "
+                    f"MDP: whole-recompute chunk {index} violates: output rows == "
                     f"layout.total_output_rows ({metadata.shape[0]} != "
                     f"{layout.total_output_rows})."
                 )
@@ -225,11 +225,11 @@ class EncoderAllRecomputeHandle:
         """Replay each chunk, backpropagate it, and consume its pixels and gradient."""
         if self._backward_done:
             raise MdpStateError(
-                "MDP: all-recompute handle violates: exactly one backward."
+                "MDP: whole-recompute handle violates: exactly one backward."
             )
         if len(chunk_grads) != len(self.chunk_layouts):
             raise MdpStateError(
-                "MDP: all-recompute backward violates: one gradient per chunk "
+                "MDP: whole-recompute backward violates: one gradient per chunk "
                 f"({len(chunk_grads)} grads, {len(self.chunk_layouts)} chunks)."
             )
         for index, (grad, metadata) in enumerate(
@@ -237,17 +237,17 @@ class EncoderAllRecomputeHandle:
         ):
             if grad is None:
                 raise MdpStateError(
-                    f"MDP: all-recompute chunk {index} gradient was already consumed."
+                    f"MDP: whole-recompute chunk {index} gradient was already consumed."
                 )
             if grad.shape != metadata.shape or grad.dtype != metadata.dtype:
                 raise MdpStateError(
-                    f"MDP: all-recompute chunk {index} gradient violates: shape and "
+                    f"MDP: whole-recompute chunk {index} gradient violates: shape and "
                     f"dtype match the P2 output ({tuple(grad.shape)}/{grad.dtype} vs "
                     f"{tuple(metadata.shape)}/{metadata.dtype})."
                 )
             if grad.device != metadata.device:
                 raise MdpStateError(
-                    f"MDP: all-recompute chunk {index} gradient violates: device "
+                    f"MDP: whole-recompute chunk {index} gradient violates: device "
                     "matches the P2 output."
                 )
 
@@ -268,7 +268,7 @@ class EncoderAllRecomputeHandle:
                 grad = chunk_grads[index]
                 if payload is None or grad is None:
                     raise MdpStateError(
-                        f"MDP: all-recompute chunk {index} replay inputs were "
+                        f"MDP: whole-recompute chunk {index} replay inputs were "
                         "already consumed."
                     )
                 _set_all_rng_states(*rng_state)
@@ -280,14 +280,14 @@ class EncoderAllRecomputeHandle:
                     or output.device != metadata.device
                 ):
                     raise MdpStateError(
-                        f"MDP: all-recompute chunk {index} violates: replay output "
+                        f"MDP: whole-recompute chunk {index} violates: replay output "
                         "metadata matches P2."
                     )
                 if output.shape[0] and (
                     not output.requires_grad or output.grad_fn is None
                 ):
                     raise MdpStateError(
-                        f"MDP: all-recompute chunk {index} output is not "
+                        f"MDP: whole-recompute chunk {index} output is not "
                         "graph-connected during P5 replay."
                     )
                 torch.autograd.backward(output, grad)
@@ -301,7 +301,7 @@ class EncoderAllRecomputeHandle:
         """Drop pixels and replay metadata after the one required backward."""
         if not self._backward_done:
             raise MdpStateError(
-                "MDP: all-recompute handle violates: release only after backward."
+                "MDP: whole-recompute handle violates: release only after backward."
             )
         self.chunk_payloads = []
         self.chunk_layouts = ()
