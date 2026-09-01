@@ -46,7 +46,7 @@ schedule model list.
 | `rank_mapping.py` | Pure-compute outer-DP planning groups and logical workers from `RankGenerator` coordinates |
 | `groups.py` | Process-group installation, fixed-width descriptor broadcast |
 | `plan.py` / `planner.py` | Minimal-sufficient plan data model, blake2b digest, deterministic integer LPT, group consistency check |
-| `allocator.py` / `storage.py` | Single allocation point for MDP buffers; endpoint leaf storage |
+| `allocator.py` / `storage.py` | Single allocation point for MDP buffers, pooled and recycled per iteration; endpoint leaf storage |
 | `bridge.py` | One ledger + transport for pixels/embeddings/gradients |
 | `window.py` / `activation.py` | Iteration window with VPP replay cursors; forward handle, chunking, encoder THD params |
 | `packing.py` | Greedy token-budget bin filling and the cross-iteration sample buffer |

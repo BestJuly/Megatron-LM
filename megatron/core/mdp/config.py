@@ -60,6 +60,7 @@ class MdpConfig:
     overlap_window_capture: bool = False
     greedy_packing: bool = False
     greedy_packing_approximate_resume: bool = False
+    buffer_pool: bool = True
 
 
 @dataclass(frozen=True)
