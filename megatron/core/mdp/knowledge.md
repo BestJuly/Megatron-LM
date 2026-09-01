@@ -51,6 +51,12 @@ EMBEDDING: encoder producer -> decoder endpoint
 GRADIENT:  decoder endpoint -> encoder producer
 ```
 
+A *decoder endpoint* is a rank that runs `pre_process` and therefore consumes
+vision rows: every pipeline-stage-0 rank of the planning group. At CP=1 that is
+one rank; at CP>1 it is `cp` ranks, one per `cp_rank`. Do not confuse it with the
+*descriptor source*, which is always exactly one rank (`group[0]`) because it
+assigns `global_item_id` values and broadcasts the records.
+
 Local routes are copied directly; remote routes are packed into collective
 buffers. Every planning-group member enters every collective, including ranks
 with zero-length splits.
@@ -167,6 +173,9 @@ The collator builds normal decoder tensors plus an MDP vision sidecar:
 - `vision_item_meta`: per-item sample, ordinal, `(t,h,w)`, and payload start;
 - `vision_decoder_positions`: absolute image-token positions in the decoder's
   packed physical layout;
+- `vision_item_meta` also carries each item's enclosing sample span
+  (`sample_padded_start`, `sample_padded_len`) so the decoder-CP owner of every
+  row is derivable in integer host arithmetic without touching the device;
 - `pixel_values`: present only on the owner worker for that microbatch;
 - `image_grid_thw`: present on all workers and used to derive item shapes;
 - `flops_cu_seqlens`: present only under `--thd-static-packing`; the
@@ -230,6 +239,55 @@ pending training window. Any change to captured tensor ownership must update the
 The collator also uses a pinned single-buffer path, and bridge receives can land
 directly in final consumer views. Preserve those destination-view contracts
 when changing payload shapes.
+
+## Decoder context parallelism
+
+At CP>1 the decoder shards its packed sequence with TransformerEngine's
+per-sample zigzag: a sample's padded length `L` is cut into `2*cp` chunks of
+`C = L // (2*cp)`, and `cp_rank r` takes chunk `r` followed by chunk
+`2*cp-1-r`. The collator already pads every sample to a multiple of `2*cp`
+(`pack_or_pad_batch`'s `divisible_by`, mirrored by `thd_row_alignment`).
+
+A vision item owns a contiguous run of decoder positions, so chunk boundaries
+cut that run into per-rank runs. `megatron/core/mdp/cp_partition.py` is the
+integer inverse of TE's `thd_get_partitioned_indices` and produces the coarsest
+legal decomposition:
+
+- at most `2*cp - 1` runs per item (the `cp-1`/`cp` chunk pair is adjacent,
+  same-rank and locally contiguous, so it fuses);
+- at most **2** runs of one item on one rank (chunks `r` and `2*cp-1-r`) — this
+  is why the routed unit is a slice with a `slice_id`, not an item;
+- at `cp=1` the identity, so the CP=1 plan is bit-identical to the pre-CP one.
+
+Consequences that are easy to get wrong:
+
+- **Nothing is replicated and nothing is reduced.** Each vision row lands on
+  exactly one endpoint, so its gradient exists on exactly one rank and the
+  bridge's `copy_` stays correct. An accumulate mode would be wrong, and no
+  CP-scoped process group is needed: slices ride the existing planning-group
+  `all_to_all_single`.
+- **PIXEL is per item, not per slice.** Pixels are CP-invariant; routing them
+  per slice multiplies pixel traffic by up to `2*cp-1`.
+- **An endpoint with zero rows for a vision-bearing microbatch is normal.**
+  Roughly 5% of `(microbatch, cp_rank)` pairs are empty in the mock workload.
+  No leaf is created for an empty shard, and `mdp_forward_step` decides whether
+  to expect one from the plan, never from the microbatch-global `text_only`.
+- **The scatter moves after the CP split.** The native path scatters the full
+  vision output into the full sequence and then splits; an MDP endpoint holds
+  only its own rows, so it splits first and scatters into the rank-local stream
+  using the rank-local image-token mask. `masked_scatter` is pure data movement,
+  so the reordering is bitwise neutral, and the leaf's rows are ordered by
+  rank-local position, which is the order that mask enumerates.
+- **The split is in the plan digest**, along with `cp_size`. Each member derives
+  its slice table locally, so a divergence would otherwise produce identical
+  digests and then a mismatched `all_to_all_single`.
+- `install_mdp_process_groups` cross-checks the derived `(cp_rank, pp_rank)`
+  against live MPU state once per job, because a rank map that is
+  self-consistent but names the wrong physical ranks fails as a hang.
+
+`cp_partition_mode` must be `zigzag`. Under `contiguous` the decoder would slice
+its sequence differently from the plan and every embedding would land on the
+wrong rank with no shape error.
 
 ## Optimizer and checkpoint semantics
 
@@ -343,7 +401,7 @@ Current major constraints:
 
 - Qwen3.5-VL adapter;
 - TP=1;
-- decoder CP=1;
+- decoder CP>=1 with `cp_partition_mode=zigzag` (`contiguous` is rejected);
 - encoder CP=1;
 - distributed optimizer enabled;
 - per-token loss enabled;
@@ -387,6 +445,8 @@ python -m pytest -q \
   tests/unit_tests/mdp/test_rank_mapping.py \
   tests/unit_tests/mdp/test_plan.py \
   tests/unit_tests/mdp/test_planner.py \
+  tests/unit_tests/mdp/test_planner_cp.py \
+  tests/unit_tests/mdp/test_cp_partition.py \
   tests/unit_tests/mdp/test_window.py
 ```
 
