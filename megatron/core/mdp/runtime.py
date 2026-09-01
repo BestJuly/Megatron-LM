@@ -34,6 +34,7 @@ from megatron.core.mdp.config import MdpConfig
 from megatron.core.mdp.encoder import EncoderDomain, finalize_encoder_grads
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
 from megatron.core.mdp.groups import MdpProcessGroups, broadcast_descriptors
+from megatron.core.mdp.packing import GreedySampleStream, decoder_sample_length
 from megatron.core.mdp.observability import (
     MdpIterationMetrics,
     nvtx_phase,
@@ -77,6 +78,9 @@ class MdpRuntime:
         params_dtype: torch.dtype,
         num_vpp_chunks: int = 1,
         device: Optional[torch.device] = None,
+        greedy_token_budget: Optional[int] = None,
+        greedy_max_num_seqs: Optional[int] = None,
+        greedy_row_alignment: int = 1,
     ) -> None:
         self.config = config
         self.rank_map = rank_map
@@ -122,6 +126,15 @@ class MdpRuntime:
         self._prefetch_thread = None
         self._prefetch_box: Optional[dict] = None
         self._prefetch_stream: Optional[torch.cuda.Stream] = None
+        # Greedy token-budget packing (--mdp-greedy-packing). One
+        # GreedySampleStream per underlying data iterator, so train and eval keep
+        # independent sample buffers: an eval window must never consume (or be
+        # consumed by) the training stream's leftovers. Keyed by iterator
+        # identity, which the training loop keeps stable for the whole run.
+        self._greedy_token_budget = greedy_token_budget
+        self._greedy_max_num_seqs = greedy_max_num_seqs
+        self._greedy_row_alignment = greedy_row_alignment
+        self._greedy_streams: dict = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -163,10 +176,18 @@ class MdpRuntime:
 
         # P1: window capture, descriptor broadcast, plan, pixel dispatch.
         plan_start = time.monotonic()
-        window = self._take_prefetched_window(data_iterators, num_microbatches)
+        window, pending_greedy = self._take_prefetched_window(data_iterators, num_microbatches)
         if window is None:
             with nvtx_phase("p1_window_capture"):
-                window = self._capture_window(data_iterators, num_microbatches)
+                window, pending_greedy = self._capture_window(data_iterators, num_microbatches)
+        # This window is now the iteration's; its samples are consumed, not just
+        # drained. Anything the prefetch thread fills for the *next* iteration
+        # stays uncommitted until that iteration installs it. Committed before
+        # the prefetch starts: commit takes the stream's buffer lock, which the
+        # prefetch thread holds for the whole capture it is supposed to overlap.
+        if pending_greedy is not None:
+            stream, drained = pending_greedy
+            stream.commit(drained)
         # The data iterator is fully consumed for this iteration; the next
         # window can be captured concurrently with everything that follows.
         if self.config.overlap_window_capture and not forward_only:
@@ -501,7 +522,87 @@ class MdpRuntime:
     # Internals
     # ------------------------------------------------------------------
 
-    def _capture_window(self, data_iterators, num_microbatches: int) -> MdpIterationWindow:
+    @staticmethod
+    def _first_iterator(data_iterators):
+        if isinstance(data_iterators, (list, tuple)):
+            return data_iterators[0] if data_iterators else None
+        return data_iterators
+
+    def _greedy_stream(self, data_iterators):
+        """The greedy sample stream for this data iterator, created on first use."""
+        iterator = self._first_iterator(data_iterators)
+        entry = self._greedy_streams.get(id(iterator))
+        if entry is None:
+            entry = (
+                GreedySampleStream(
+                    iterator,
+                    token_budget=self._greedy_token_budget,
+                    max_num_seqs=self._greedy_max_num_seqs,
+                    align=self._greedy_row_alignment,
+                    length_of=decoder_sample_length,
+                ),
+                # Evaluation runs forward_only; recorded so its consumption is
+                # kept out of consumed_train_samples.
+                self._forward_only,
+            )
+            self._greedy_streams[id(iterator)] = entry
+        return entry[0]
+
+    def consumed_samples(self) -> Optional[int]:
+        """Real samples consumed by greedy *training* packing, or ``None`` when off.
+
+        ``training.py`` reads the delta per iteration because the closed form
+        ``dp x mbs x num_microbatches`` is wrong under greedy packing. Evaluation
+        streams are excluded: they consume their own samples, and folding them in
+        would charge an eval pass to the next training iteration.
+
+        Counts committed, not drained, samples. Under
+        ``--mdp-overlap-window-capture`` the prefetch thread drains iteration
+        i+1's samples during iteration i and the final prefetch is dropped
+        unconsumed; commit happens when the window is installed for its
+        iteration, so neither shifts the count.
+        """
+        if not self.config.greedy_packing:
+            return None
+        return sum(
+            stream.consumed_samples
+            for stream, forward_only in self._greedy_streams.values()
+            if not forward_only
+        )
+
+    def _capture_window(self, data_iterators, num_microbatches: int):
+        """Capture one window, plus the greedy commit it owes.
+
+        Returns ``(window, pending)`` where ``pending`` is ``(stream, count)``
+        for the samples this window drained, or ``None`` without greedy packing.
+        The caller commits the count only once the window is installed for an
+        iteration; a prefetched window that is never consumed commits nothing.
+        """
+        if not self.config.greedy_packing:
+            return self._capture(data_iterators, num_microbatches), None
+        stream = self._greedy_stream(data_iterators)
+        drained_before = stream.drained_samples
+        try:
+            window = self._capture(stream, num_microbatches)
+            return window, (stream, stream.drained_samples - drained_before)
+        except MdpStateError as error:
+            if not stream.exhausted:
+                raise
+            # Greedy fills a fixed number of bins to a token budget, so an
+            # iteration eats roughly token_budget/mean_sample_len samples per
+            # bin, not micro_batch_size. Megatron provisions the sampler as
+            # train_iters x global_batch_size *samples*, which under-counts
+            # whenever the mean sample is shorter than the per-bin share.
+            raise MdpStateError(
+                f"{error} Under --mdp-greedy-packing the sample stream must be "
+                "provisioned by tokens, not by samples: each bin consumes about "
+                f"{self._greedy_token_budget} tokens' worth of samples, so raise "
+                "--train-samples / the dataset size (roughly by "
+                "token_budget / (mean_sample_len x micro_batch_size)), or lower "
+                "--max-seqlen-per-dp-cp-rank."
+            ) from error
+
+    def _capture(self, data_iterators, num_microbatches: int) -> MdpIterationWindow:
         return MdpIterationWindow.capture(
             data_iterators,
             num_microbatches=num_microbatches,
@@ -521,11 +622,11 @@ class MdpRuntime:
         return (id(iterator), num_microbatches)
 
     def _take_prefetched_window(self, data_iterators, num_microbatches: int):
-        """Return the prefetched window for this iterator, or ``None``."""
+        """Return ``(window, pending_greedy)``, or ``(None, None)`` if unavailable."""
         if self._prefetch_thread is None:
-            return None
+            return None, None
         if self._prefetch_key != self._window_prefetch_key(data_iterators, num_microbatches):
-            return None  # different iterator (eval); keep the pending prefetch
+            return None, None  # different iterator (eval); keep the pending prefetch
         with nvtx_phase("p1_window_prefetch_join"):
             self._prefetch_thread.join()
         box = self._prefetch_box
@@ -560,7 +661,7 @@ class MdpRuntime:
                 _record(getattr(params, name, None))
         for tensor in window.payload_sidecar().values():
             _record(tensor)
-        return window
+        return window, box.get("greedy")
 
     def _start_window_prefetch(self, data_iterators, num_microbatches: int) -> None:
         """Capture the next window on a background thread and a side stream.
@@ -588,7 +689,7 @@ class MdpRuntime:
                 torch.cuda.set_device(self.device)
                 with torch.cuda.stream(stream):
                     with nvtx_phase("p1_window_capture_prefetch"):
-                        box["window"] = self._capture_window(
+                        box["window"], box["greedy"] = self._capture_window(
                             data_iterators, num_microbatches
                         )
                     event = torch.cuda.Event()
