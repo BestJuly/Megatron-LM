@@ -201,9 +201,9 @@ def _setup_mdp(args):
             "consumes the per-sample dict list only the identity collate produces"
         )
     mdp_integration.validate_from_args(args)
-    from megatron.core.mdp.checkpoint import assert_weight_only_checkpoint
+    from megatron.core.mdp.checkpoint import assert_supported_checkpoint_config
 
-    assert_weight_only_checkpoint(args)
+    assert_supported_checkpoint_config(args)
     mdp_integration.set_adapter_builder(_mdp_adapter_builder)
 
 

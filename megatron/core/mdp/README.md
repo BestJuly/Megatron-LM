@@ -51,7 +51,7 @@ schedule model list.
 | `window.py` / `activation.py` | Iteration window with VPP replay cursors; forward handle, chunking, encoder THD params |
 | `runtime.py` / `schedule.py` | Phase machine; schedule and finalizer wrappers |
 | `encoder.py` / `optimizer.py` | Encoder DDP over WORLD + ZeRO-1; composite optimizer with WORLD overflow union |
-| `checkpoint.py` | Weight-only torch_dist facade (`vision_model.*` with WORLD replica metadata) |
+| `checkpoint.py` | torch_dist facade: `vision_model.*` save and load with WORLD replica metadata |
 | `integration.py` / `observability.py` | Training-loop seams; iteration metrics and NVTX markers |
 
 ## Support matrix (v1)
@@ -62,17 +62,42 @@ Supported: Qwen3.5-VL (one vision encoder), `TP=1`, decoder `CP=1`,
 overflow-union tests), THD packed sequences on both sides, native MCore vision
 Transformer recompute (`selective`/`full`) or Design-Doc whole-encoder replay
 (`--encoder-recompute-granularity whole`), text-only microbatches, synchronous
-global `torch_dist` weight-only checkpoints, `alignment_rows=1` (tests
+global `torch_dist` checkpoints with exact resume (model, optimizer,
+LR-scheduler and RNG state at the same world size), `alignment_rows=1` (tests
 exercise 16), and native decoder DDP
 `overlap_grad_reduce`/`overlap_param_gather`. Decoder overlap remains owned by
 the native PP/VPP schedule; the separate encoder DDP domain stays synchronous
-in P5/P6.
+in P5/P6. Decoder-only EP A2A overlap via
+`--overlap-moe-expert-parallel-comm --delay-wgrad-compute` is supported with
+the native MCore requirements (`EP>1`, and VPP when `PP>1`); the vision encoder
+remains outside that schedule.
 
 Rejected at startup: FSDP/HSDP, FP8/MXFP8, full-iteration CUDA graphs, CPU
 activation offload, delayed gradient reduction,
 `overlap_param_gather_with_optimizer_step`, multiple distributed-optimizer
-instances, `calculate_per_token_loss=False`, non-`torch_dist` checkpoint formats,
-non-weight-only save/load, invalid rank mappings.
+instances, `calculate_per_token_loss=False`, non-`torch_dist` checkpoint
+formats, fully-parallel / asynchronous / non-persistent / constant-structure
+checkpoint modes, invalid rank mappings.
+
+### Checkpoint support matrix
+
+Every "supported" row below was measured on 4x GB300 with the tiny MDP proxy
+(4 decoder layers, 8 experts top-2, 2 vision layers, seq 1024, GBS 8, seed
+1234), `--ckpt-format torch_dist --no-ckpt-fully-parallel-save`. Deltas are
+against the trajectory the checkpoint was taken from; the run-to-run floor for
+this shape is ~8.6e-2 in grad norm.
+
+| Scenario | Status | Evidence |
+|---|---|---|
+| MDP -> MDP, identical parallel layout, full resume (model + optimizer + LR scheduler + RNG) | **Supported** | Resumed iterations reproduce the reference at d=0.000E+00 except one iteration at 4.6e-3, inside the floor |
+| Cross-PP restart, weights only (`--no-load-optim`) | **Supported** | PP=2 save -> PP=4 load: the first resumed iteration matches the PP=2 source exactly in loss *and* grad norm; later iterations drift as expected without optimizer state |
+| Cross-PP restart **with** optimizer state, saved with `--dist-ckpt-optim-fully-reshardable` | **Supported** | Same save/load pair tracks the source to 1e-3 grad norm and 1.2e-4 loss -- two orders tighter than weight-only, and tighter than the floor |
+| Cross-PP restart with optimizer state, checkpoint saved with the defaults | **Rejected, by design** | Upstream raises before training starts (`distrib_optim_sharding_type == 'dp_reshardable'`). The flag is a **save-time** decision; a checkpoint already written without it can only be restarted weight-only. Note the upstream message names `--ckpt-fully-parallel-save`, which is a different flag and is itself rejected under MDP |
+| Checkpoint missing encoder weights (e.g. a non-strict `--dist-ckpt-strictness` dropped them) | **Rejected, loudly** | `load_encoder_state` raises `MdpCheckpointError` instead of resuming from the random initialization |
+| TransformerEngine `_extra_state` drift between the checkpoint and the running TE | **Tolerated** | The delegated load retries non-strictly, matching what `load_model_state_dict` gives every decoder chunk |
+| Cross-TP / cross-EP / cross-CP restart, and changing the world size | **Untested** | Only the pipeline dimension was moved; no claim either way |
+| native (non-MDP) checkpoint -> MDP, or MDP -> native | **Not supported** | Decoder keys line up, but the encoder is saved through its DDP wrapper and carries an extra `module.` level (`vision_model.module.<param>` vs `vision_model.<param>`) |
+| Fully-parallel save/load, asynchronous, non-persistent, constant-structure caching, non-`torch_dist` formats | **Rejected at startup** | `assert_supported_checkpoint_config` and `validate_mdp_config` |
 
 Whole-encoder replay is deliberately exclusive with native vision
 `TransformerConfig` recompute. Nesting the two would add a third vision

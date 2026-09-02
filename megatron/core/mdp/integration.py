@@ -145,6 +145,9 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
             getattr(args, "overlap_param_gather_with_optimizer_step", False)
         ),
         delay_grad_reduce=bool(getattr(args, "delay_grad_reduce", False)),
+        overlap_moe_expert_parallel_comm=bool(
+            getattr(args, "overlap_moe_expert_parallel_comm", False)
+        ),
         checkpoint_mode=getattr(args, "ckpt_format", "torch_dist"),
         save_requested=getattr(args, "save", None) is not None,
         load_requested=getattr(args, "load", None) is not None,

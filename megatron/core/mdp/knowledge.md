@@ -131,7 +131,7 @@ returns to `EMPTY`.
 | `runtime.py` | P0-P5 orchestration, prefetch handoff, per-iteration state and metrics. |
 | `schedule.py` | Native schedule and `finalize_model_grads_func` wrappers. |
 | `optimizer.py` | Decoder/encoder composite optimizer and shared overflow/norm semantics. |
-| `checkpoint.py` | Weight-only `torch_dist` checkpoint facade for the vision model. |
+| `checkpoint.py` | `torch_dist` checkpoint facade for the vision model (save and load). |
 | `integration.py` | Training-loop seams, adapter registration, runtime construction. |
 | `observability.py` | MDP NVTX ranges and iteration metrics helpers. |
 
@@ -155,7 +155,7 @@ returns to `EMPTY`.
 - `megatron/training/training.py`: creates the MDP domain and wraps train/eval
   schedules.
 - `megatron/training/checkpointing.py`: injects MDP vision state into the
-  distributed checkpoint.
+  distributed checkpoint on save and restores it on load.
 - `megatron/training/arguments.py`: permits the validated TE
   cross-entropy-fusion baseline used by the reference launcher.
 
@@ -241,12 +241,15 @@ cross that phase/domain boundary.
 The current checkpoint support is intentionally narrow:
 
 - synchronous global `torch_dist`;
-- weight-only MDP facade;
-- vision weights stored under the MDP vision key;
+- vision weights stored under the MDP vision key, saved and loaded through the
+  MDP facade;
+- composite optimizer state for both domains, with the encoder member under a
+  fixed key so the decoder DP-CP and encoder WORLD sharding domains never
+  collide (both otherwise compute `data_parallel_group_idx == 0`);
 - unsupported save/load modes are rejected at startup.
 
-If optimizer-state checkpointing is added, do not assume decoder and WORLD
-encoder optimizers share the same DP sharding group.
+Decoder and WORLD encoder optimizers do not share a DP sharding group; never
+key or reshard them as if they did.
 
 ## Configuration quick reference
 
@@ -320,7 +323,7 @@ Current major constraints:
 - distributed optimizer enabled;
 - per-token loss enabled;
 - bf16/fp16 mixed precision;
-- synchronous global `torch_dist` weight-only checkpointing;
+- synchronous global `torch_dist` checkpointing (exact resume, same world size);
 - no FSDP/HSDP, FP8, full-iteration CUDA graph, CPU activation offload, or
   encoder communication overlap;
 - native decoder `overlap_grad_reduce` and `overlap_param_gather` are supported,
