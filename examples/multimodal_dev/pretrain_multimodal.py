@@ -23,6 +23,7 @@ Usage::
         ... (other megatron args)
 """
 
+import dataclasses
 import importlib
 import os
 import sys
@@ -34,6 +35,7 @@ sys.path.insert(
 
 from examples.multimodal_dev.arguments import (
     add_multimodal_args,
+    encoder_recompute_overrides_from_args,
     validate_encoder_recompute_args,
 )
 from examples.multimodal_dev.forward_step import forward_step
@@ -88,10 +90,11 @@ def model_provider(
     vision_config.fp16 = language_config.fp16
     vision_config.apply_rope_fusion = language_config.apply_rope_fusion
 
-    if getattr(args, "recompute_vision", False):
-        vision_config.recompute_granularity = "full"
-        vision_config.recompute_method = "uniform"
-        vision_config.recompute_num_layers = 1
+    encoder_recompute_overrides = encoder_recompute_overrides_from_args(args)
+    if encoder_recompute_overrides:
+        vision_config = dataclasses.replace(
+            vision_config, **encoder_recompute_overrides
+        )
 
     # --- vision FLOPs metadata ---
     vision_flops_fn = registry.get("vision_flops_fn")
@@ -196,12 +199,6 @@ def _setup_mdp(args):
         raise RuntimeError(
             "--mdp-enable requires --use-vanilla-collate-fn: pack_or_pad_batch "
             "consumes the per-sample dict list only the identity collate produces"
-        )
-    if getattr(args, "recompute_vision", False):
-        raise RuntimeError(
-            "--recompute-vision is the native-path switch and is not supported "
-            "with --mdp-enable; use --encoder-recompute-granularity "
-            "{selective,full,whole} for the MDP encoder"
         )
     mdp_integration.validate_from_args(args)
     from megatron.core.mdp.checkpoint import assert_weight_only_checkpoint

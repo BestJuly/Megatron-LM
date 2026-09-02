@@ -458,7 +458,10 @@ class MdpRuntime:
                                 + segment.output_rows
                             ]
                         chunk_grads.append(grad_buffer[: chunk.total_output_rows])
-                    # The chunk and destination views own the storage from here.
+                    # Drop only the loop-local base-tensor reference; this does not
+                    # release its storage. The grad_dest and chunk_grads views
+                    # intentionally keep it alive through gradient exchange and
+                    # encoder backward.
                     del grad_buffer
             with nvtx_phase("p5_grad_exchange"):
                 grad_specs = self._iter_specs[BridgePhase.GRADIENT]

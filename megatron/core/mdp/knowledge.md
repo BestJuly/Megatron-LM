@@ -266,10 +266,11 @@ Primary flags:
 - `--mdp-overlap-window-capture`
 - `--mdp-debug-plan-payload-check`
 
-Encoder recompute arguments currently require `--mdp-enable`; the native
-multimodal path continues to use `--recompute-vision`, and MDP rejects that
-native-path switch. With no encoder granularity, P2 retains the normal
-graph-connected encoder outputs.
+The typed encoder recompute arguments are shared by native `multimodal_dev` and
+MDP training. Native training supports no recompute, `selective`, and `full`;
+`whole` is MDP-only because it relies on the P2/P5 replay protocol. With no
+encoder granularity, the native path keeps normal encoder activations and MDP
+P2 retains the normal graph-connected encoder outputs.
 
 `selective` and `full` use MCore's native Transformer checkpointing. The
 typed encoder arguments are copied to the vision `TransformerConfig` through

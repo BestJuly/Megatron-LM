@@ -3,23 +3,58 @@
 """Extra CLI arguments for multimodal_dev standalone training."""
 
 
-_ENCODER_RECOMPUTE_ARG_NAMES = (
-    "encoder_recompute_granularity",
-    "encoder_recompute_method",
-    "encoder_recompute_num_layers",
-    "encoder_recompute_modules",
-)
-
-
 def validate_encoder_recompute_args(args) -> None:
-    """Reject encoder recompute flags outside MDP until that path supports them."""
-    requested = [
+    """Validate the shared native/MDP encoder recompute argument matrix."""
+    granularity = getattr(args, "encoder_recompute_granularity", None)
+    method = getattr(args, "encoder_recompute_method", None)
+    num_layers = getattr(args, "encoder_recompute_num_layers", None)
+    modules = getattr(args, "encoder_recompute_modules", None)
+
+    if granularity == "whole" and not getattr(args, "mdp_enable", False):
+        raise RuntimeError(
+            "--encoder-recompute-granularity whole requires --mdp-enable"
+        )
+
+    if granularity in (None, "whole"):
+        incompatible = {
+            "encoder_recompute_method": method,
+            "encoder_recompute_num_layers": num_layers,
+            "encoder_recompute_modules": modules,
+        }
+    elif granularity == "selective":
+        incompatible = {
+            "encoder_recompute_method": method,
+            "encoder_recompute_num_layers": num_layers,
+        }
+    else:  # full
+        incompatible = {"encoder_recompute_modules": modules}
+
+    invalid = [
         f"--{name.replace('_', '-')}"
-        for name in _ENCODER_RECOMPUTE_ARG_NAMES
-        if getattr(args, name, None) is not None
+        for name, value in incompatible.items()
+        if value is not None
     ]
-    if requested and not getattr(args, "mdp_enable", False):
-        raise RuntimeError(f"{', '.join(requested)} currently require --mdp-enable")
+    if invalid:
+        raise RuntimeError(
+            f"{', '.join(invalid)} cannot be used with "
+            f"--encoder-recompute-granularity {granularity}"
+        )
+
+
+def encoder_recompute_overrides_from_args(args) -> dict:
+    """Return native TransformerConfig overrides for encoder recompute."""
+    validate_encoder_recompute_args(args)
+    granularity = getattr(args, "encoder_recompute_granularity", None)
+    if granularity in (None, "whole"):
+        return {}
+
+    modules = getattr(args, "encoder_recompute_modules", None)
+    return {
+        "recompute_granularity": granularity,
+        "recompute_method": getattr(args, "encoder_recompute_method", None),
+        "recompute_num_layers": getattr(args, "encoder_recompute_num_layers", None),
+        "recompute_modules": list(modules) if modules is not None else None,
+    }
 
 
 def add_multimodal_args(parser):
@@ -89,16 +124,6 @@ def add_multimodal_args(parser):
         ),
     )
     group.add_argument(
-        "--recompute-vision",
-        action="store_true",
-        default=False,
-        help=(
-            "Enable full activation recomputation for vision encoder layers. "
-            "Uses uniform method and recomputes every layer. "
-            "Independent of the decoder --recompute-* flags."
-        ),
-    )
-    group.add_argument(
         "--use-packed-sequence",
         action="store_true",
         default=False,
@@ -138,10 +163,10 @@ def add_multimodal_args(parser):
         choices=("selective", "full", "whole"),
         default=None,
         help=(
-            "MDP vision-encoder recompute granularity. 'selective' and 'full' "
-            "use native MCore Transformer recompute; 'whole' runs the complete "
-            "encoder under no_grad in P2 and replays it in P5. Encoder recompute "
-            "arguments currently require --mdp-enable."
+            "Vision-encoder recompute granularity. 'selective' and 'full' use "
+            "native MCore Transformer recompute in both native and MDP paths; "
+            "'whole' runs the complete encoder under no_grad in P2 and replays "
+            "it in P5, and therefore requires --mdp-enable."
         ),
     )
     group.add_argument(

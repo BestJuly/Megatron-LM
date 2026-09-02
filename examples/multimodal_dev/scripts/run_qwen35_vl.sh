@@ -486,7 +486,11 @@ else
     RECOMPUTE_ARGS=()
 fi
 if [ "$RECOMPUTE_VISION" -eq 1 ]; then
-    RECOMPUTE_ARGS+=( --recompute-vision )
+    RECOMPUTE_ARGS+=(
+        --encoder-recompute-granularity full
+        --encoder-recompute-method uniform
+        --encoder-recompute-num-layers 1
+    )
 fi
 
 # --- Checkpoint loading ---
