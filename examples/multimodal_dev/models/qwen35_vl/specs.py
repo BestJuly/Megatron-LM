@@ -6,12 +6,17 @@ Provides ModuleSpec builders that define the transformer layer composition.
 Both the standalone and MIMO training paths import from here.
 """
 
+import dataclasses
+import math
 from typing import Optional
+
+import torch.nn.functional as F
 
 from examples.multimodal_dev.models.base import _NO_CP_GROUP
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_transformer_block_with_experimental_attention_variant_spec,
 )
+from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -153,6 +158,64 @@ def get_qwen35_vl_language_spec(
     )
 
 
+# head_dims where cuDNN's fused THD attention BACKWARD requests a grossly
+# oversized workspace. Measured on TE 2.18.0 / cuDNN 9.25.0.15 / GB300 with the
+# vision encoder's real packed batch (206 sequences, 61,524 tokens, max_seqlen
+# 1024): head_dim 72 asks for 75,436 MB, while 64/80/96/128 all land in
+# 865-1,722 MB. That single transient was 55.7% of the training step's
+# allocation peak. FlashAttention is not an escape hatch -- at head_dim 72 it
+# fails outright with "ICE IR Verification Failed".
+#
+# This is an EMPIRICAL table, not an exhaustive one: only 64/72/80/96/128/144
+# were measured, and 72 was the sole outlier. Revisit when TE or cuDNN moves.
+# See agent_works/mdp-fast-pass-0901/repro/CONCLUSION.md for the reproducer.
+_PADDED_ATTENTION_HEAD_DIMS = {72: 80}
+
+
+class PaddedHeadDimDotProductAttention(TEDotProductAttention):
+    """Widen head_dim into a well-supported size for the attention call only.
+
+    q/k/v are zero-padded on the head dimension before the attention and the
+    output is sliced back down, so the surrounding module is unchanged:
+    ``linear_qkv`` still emits ``num_heads * real_kv`` and ``linear_proj`` still
+    consumes it, which keeps checkpoints compatible. Zeros contribute nothing to
+    ``Q.K^T`` and only produce zero columns in the output, so the result is
+    mathematically identical -- provided ``softmax_scale`` stays at
+    ``1/sqrt(real_kv)``. TE would otherwise derive ``1/sqrt(padded)`` from
+    ``config.kv_channels`` and silently change the numerics; that is the one
+    thing this class must not get wrong.
+
+    Both the pad and the slice have static shapes (they depend on tensor.shape,
+    never on tensor values), so they remain CUDA-graph capturable.
+    """
+
+    def __init__(self, config, *args, **kwargs):
+        real_kv = config.kv_channels
+        pad_kv = _PADDED_ATTENTION_HEAD_DIMS.get(real_kv)
+        if pad_kv:
+            # Only the copy handed to TE is widened; the caller's config, and
+            # therefore every projection around this module, keeps real_kv.
+            config = dataclasses.replace(config, kv_channels=pad_kv)
+            kwargs.setdefault("softmax_scale", 1.0 / math.sqrt(real_kv))
+        super().__init__(config, *args, **kwargs)
+        self._real_kv = real_kv
+        self._pad_kv = pad_kv
+        self._pad_width = pad_kv - real_kv if pad_kv else 0
+
+    def forward(self, query, key, value, *args, **kwargs):
+        """Pad, attend, slice back."""
+        if not self._pad_width:
+            return super().forward(query, key, value, *args, **kwargs)
+        query, key, value = (
+            F.pad(t, (0, self._pad_width)) for t in (query, key, value)
+        )
+        out = super().forward(query, key, value, *args, **kwargs)
+        return (
+            out.view(*out.shape[:-1], -1, self._pad_kv)[..., : self._real_kv]
+            .reshape(*out.shape[:-1], -1)
+        )
+
+
 def get_qwen35_vl_vision_spec() -> ModuleSpec:
     """ModuleSpec for vision encoder transformer layers.
 
@@ -165,4 +228,9 @@ def get_qwen35_vl_vision_spec() -> ModuleSpec:
     """
     spec = get_vit_layer_with_transformer_engine_spec()
     spec.submodules.self_attention.module = Qwen35VLVisionSelfAttention
+    # Works around an oversized cuDNN THD backward workspace at head_dim 72;
+    # inert for every other head_dim. See _PADDED_ATTENTION_HEAD_DIMS.
+    spec.submodules.self_attention.submodules.core_attention = (
+        PaddedHeadDimDotProductAttention
+    )
     return spec
