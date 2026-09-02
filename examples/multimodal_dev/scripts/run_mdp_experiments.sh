@@ -60,9 +60,11 @@
 #                    so this also switches the hidden_size/ffn_hidden_size/
 #                    num_attention_heads/moe_ffn_hidden_size/
 #                    moe_shared_expert_intermediate_size/linear_num_value_heads
-#                    CLI values below to match. NUM_LAYERS/NUM_EXPERTS/
-#                    MOE_TOPK/VISION_NUM_LAYERS/MTP_NUM_LAYERS stay independent
-#                    env overrides either way.
+#                    CLI values below to match. Each variant additionally
+#                    supplies its own NUM_LAYERS/NUM_EXPERTS/MOE_TOPK/
+#                    VISION_NUM_LAYERS defaults, so selecting a variant yields
+#                    a self-consistent shape with no further env args; all four
+#                    remain overridable. MTP_NUM_LAYERS is variant-independent.
 #   EXTRA="..."      extra args appended verbatim
 #
 # Shape overrides: PP TP EP CP MBS GBS SEQ_LEN NUM_LAYERS NUM_EXPERTS
@@ -102,10 +104,11 @@ CP=${CP:-1}
 MBS=${MBS:-16}
 GBS=${GBS:-256}
 SEQ_LEN=${SEQ_LEN:-8192}
-NUM_LAYERS=${NUM_LAYERS:-20}
-NUM_EXPERTS=${NUM_EXPERTS:-128}
-MOE_TOPK=${MOE_TOPK:-8}
-VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-13}
+# NUM_LAYERS / NUM_EXPERTS / MOE_TOPK / VISION_NUM_LAYERS are per-variant and
+# are defaulted inside the MODEL_VARIANT case block below, so each proxy is a
+# self-consistent shape without the caller restating them. They must NOT be
+# defaulted here: an assignment ahead of the case block would always win over
+# the ``${VAR:-...}`` in each arm and pin every variant to one shape.
 MTP_NUM_LAYERS=${MTP_NUM_LAYERS:-1}
 MTP_LOSS_SCALING_FACTOR=${MTP_LOSS_SCALING_FACTOR:-0.1}
 SEED=${SEED:-1234}
@@ -123,6 +126,10 @@ MODEL_VARIANT=${MODEL_VARIANT:-35b_a3b_light}
 # switch on MODEL_VARIANT too (see MODEL_VARIANT doc above).
 case "$MODEL_VARIANT" in
     35b_a3b_light)
+        NUM_LAYERS=${NUM_LAYERS:-12}
+        NUM_EXPERTS=${NUM_EXPERTS:-128}
+        MOE_TOPK=${MOE_TOPK:-8}
+        VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-8}
         HIDDEN_SIZE=2048
         FFN_HIDDEN_SIZE=4096
         NUM_ATTENTION_HEADS=16
@@ -131,6 +138,10 @@ case "$MODEL_VARIANT" in
         LINEAR_NUM_VALUE_HEADS=32
         ;;
     397b_a17b_light)
+        NUM_LAYERS=${NUM_LAYERS:-8}
+        NUM_EXPERTS=${NUM_EXPERTS:-32}
+        MOE_TOPK=${MOE_TOPK:-10}
+        VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-8}
         HIDDEN_SIZE=4096
         FFN_HIDDEN_SIZE=10240
         NUM_ATTENTION_HEADS=32
