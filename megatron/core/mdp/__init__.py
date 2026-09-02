@@ -8,10 +8,9 @@ training accounting untouched. See ``megatron/core/mdp/README.md``.
 """
 
 from megatron.core.mdp.config import (
-    VISION_CONFIG_OVERRIDE_ALLOWLIST,
     MdpCompatibilityOptions,
     MdpConfig,
-    apply_vision_config_overrides,
+    apply_encoder_recompute_config,
     validate_mdp_config,
 )
 from megatron.core.mdp.errors import (

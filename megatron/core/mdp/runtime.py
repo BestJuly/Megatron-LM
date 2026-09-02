@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """MDP runtime: the P0-P6 phase machine.
 
@@ -22,7 +22,12 @@ from typing import Iterator, Optional, Sequence, Union
 
 import torch
 
-from megatron.core.mdp.activation import EncoderForwardHandle
+from megatron.core.mdp.activation import (
+    EncoderForwardHandle,
+    EncoderOutputMetadata,
+    EncoderWholeRecomputeHandle,
+    capture_encoder_rng_state,
+)
 from megatron.core.mdp.allocator import MdpBufferAllocator
 from megatron.core.mdp.bridge import (
     BridgeBufferKey,
@@ -100,7 +105,9 @@ class MdpRuntime:
         self._plan: Optional[MdpBatchPlan] = None
         self._iter_specs: dict = {}
         self._iter_ledgers: dict = {}
-        self._handle: Optional[EncoderForwardHandle] = None
+        self._handle: Optional[
+            Union[EncoderForwardHandle, EncoderWholeRecomputeHandle]
+        ] = None
         self._eval_outputs: Sequence = ()
         self._chunk_layouts: Sequence = ()
         self._chunk_of_item: dict = {}
@@ -267,14 +274,23 @@ class MdpRuntime:
             )
             window.release_pixels()
 
-        # P2: grad-enabled encoder forward per chunk (no_grad for evaluation).
+        # P2: retain the normal autograd graph, or whole-encoder recompute
+        # run under no_grad and retain only the replay recipe. Evaluation also
+        # runs under no_grad but retains neither graph nor recipe.
         chunk_outputs = []
+        chunk_rng_states = []
         encoder = self.encoder_domain.encoder_ddp
+        whole_recompute = (
+            not forward_only
+            and self.config.encoder_recompute_granularity == "whole"
+        )
         forward_start = time.monotonic()
         for chunk_index, chunk in enumerate(self._chunk_layouts):
             payload = chunk_payloads[chunk_index]
             payload_valid = payload[: chunk.total_payload_rows]
-            if forward_only:
+            if forward_only or whole_recompute:
+                if whole_recompute:
+                    chunk_rng_states.append(capture_encoder_rng_state())
                 with torch.no_grad(), nvtx_phase("p2_encoder_forward"):
                     output = self.adapter.encode(encoder, payload_valid, chunk)
             else:
@@ -290,13 +306,30 @@ class MdpRuntime:
         self._encoder_forward_ms = (time.monotonic() - forward_start) * 1000.0
 
         if self._chunk_layouts and not forward_only:
-            self._handle = EncoderForwardHandle(
-                iteration=self._iteration,
-                producer_worker_id=self.rank_view.my_worker_id,
-                chunk_outputs=tuple(chunk_outputs),
-                chunk_layouts=tuple(self._chunk_layouts),
-            )
-            detached = self._handle.detached_outputs()
+            if whole_recompute:
+                self._handle = EncoderWholeRecomputeHandle(
+                    iteration=self._iteration,
+                    producer_worker_id=self.rank_view.my_worker_id,
+                    chunk_payloads=[
+                        payload[: chunk.total_payload_rows]
+                        for payload, chunk in zip(chunk_payloads, self._chunk_layouts)
+                    ],
+                    chunk_layouts=tuple(self._chunk_layouts),
+                    output_metadata=tuple(
+                        EncoderOutputMetadata.from_tensor(output)
+                        for output in chunk_outputs
+                    ),
+                    chunk_rng_states=tuple(chunk_rng_states),
+                )
+                detached = tuple(output.detach() for output in chunk_outputs)
+            else:
+                self._handle = EncoderForwardHandle(
+                    iteration=self._iteration,
+                    producer_worker_id=self.rank_view.my_worker_id,
+                    chunk_outputs=tuple(chunk_outputs),
+                    chunk_layouts=tuple(self._chunk_layouts),
+                )
+                detached = self._handle.detached_outputs()
         else:
             self._handle = None
             self._eval_outputs = tuple(chunk_outputs)
@@ -398,10 +431,11 @@ class MdpRuntime:
         else:
             # P5: gradient exchange, producer multi-tensor backward, WORLD
             # encoder-gradient reduction and 1/T_global normalization.
-            # Regroup buffers first: the exchange writes each routed gradient
-            # straight to its chunk offset (the wire is params_dtype; the
-            # destination copy casts to the chunk output dtype, exactly like
-            # the former two-step unpack + regroup did).
+            # Regroup every chunk before the one gradient exchange: the
+            # collective writes each routed gradient straight to its chunk
+            # offset (the wire is params_dtype; the destination copy casts to
+            # the chunk output dtype). Therefore encoder_max_payload_rows bounds
+            # one replay graph, not the full set of P5 gradient buffers.
             chunk_grads = []
             grad_dest = {}
             if self._handle is not None:
@@ -410,7 +444,7 @@ class MdpRuntime:
                         # Match the chunk output dtype: a mixed-precision wrapper
                         # (Float16Module) returns fp32 at the module boundary even
                         # when parameters and transport run in bf16.
-                        output_dtype = self._handle.chunk_outputs[chunk_index].dtype
+                        output_dtype = self._handle.output_dtype(chunk_index)
                         grad_buffer = self.allocator.acquire(
                             rows=plan.capacity_policy.capacity_of(chunk.total_output_rows),
                             width=self.hidden_size,
@@ -424,6 +458,11 @@ class MdpRuntime:
                                 + segment.output_rows
                             ]
                         chunk_grads.append(grad_buffer[: chunk.total_output_rows])
+                    # Drop only the loop-local base-tensor reference; this does not
+                    # release its storage. The grad_dest and chunk_grads views
+                    # intentionally keep it alive through gradient exchange and
+                    # encoder backward.
+                    del grad_buffer
             with nvtx_phase("p5_grad_exchange"):
                 grad_specs = self._iter_specs[BridgePhase.GRADIENT]
                 grad_local = {}
@@ -448,9 +487,19 @@ class MdpRuntime:
                     device=self.device,
                     dest_views=grad_dest,
                 )
+                # The chunk views remain in chunk_grads; segment views are no
+                # longer needed after the collective has populated them.
+                grad_dest.clear()
             if self._handle is not None:
                 with nvtx_phase("p5_encoder_backward"):
-                    self._handle.backward(chunk_grads)
+                    if isinstance(self._handle, EncoderWholeRecomputeHandle):
+                        self._handle.backward(
+                            chunk_grads,
+                            encoder=self.encoder_domain.encoder_ddp,
+                            encode=self.adapter.encode,
+                        )
+                    else:
+                        self._handle.backward(chunk_grads)
                     self._handle.release()
             with nvtx_phase("p5_finalize_encoder_grads"):
                 finalize_encoder_grads(
