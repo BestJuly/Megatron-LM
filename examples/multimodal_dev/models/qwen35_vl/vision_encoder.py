@@ -28,6 +28,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from megatron.core.mdp.errors import MdpConfigurationError
+
 # Experiment kill-switch: QWEN35_VL_GRID_CACHE=0 restores the original
 # per-grid loop implementations (pre grid-cache behavior) for A/B runs.
 _GRID_CACHE_ENABLED = os.environ.get("QWEN35_VL_GRID_CACHE", "1") != "0"
@@ -44,15 +46,10 @@ def _nvtx(name: str):
 
 from examples.multimodal_dev.models.qwen35_vl.vision_pos_cache import GridCache
 from examples.multimodal_dev.observability import backward_range_begin, backward_range_end
-from megatron.core.models.common.vision_module.vision_module import (
-    VisionModule,
-)
-from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.tensor_parallel.layers import (
-    ColumnParallelLinear,
-    RowParallelLinear,
-)
 from megatron.core.extensions.transformer_engine import TENorm
+from megatron.core.models.common.vision_module.vision_module import VisionModule
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -382,9 +379,7 @@ class Qwen35VLVisionEncoder(VisionModule):
 
         # --- Transformer blocks ---
         if transformer_layer_spec is None:
-            from examples.multimodal_dev.models.qwen35_vl.specs import (
-                get_qwen35_vl_vision_spec,
-            )
+            from examples.multimodal_dev.models.qwen35_vl.specs import get_qwen35_vl_vision_spec
             transformer_layer_spec = get_qwen35_vl_vision_spec()
 
         # Threading pg_collection through is mandatory once encoder CP exists:
@@ -666,9 +661,29 @@ class Qwen35VLVisionEncoder(VisionModule):
         MPU's CP group belongs to the DECODER.
         """
         group = getattr(self.pg_collection, "cp", None) if self.pg_collection else None
+        configured = int(getattr(self.config, "context_parallel_size", 1) or 1)
         if group is None:
+            if configured != 1:
+                raise MdpConfigurationError(
+                    f"MDP: vision config context_parallel_size={configured} violates: "
+                    "an encoder built without a pg_collection is not context-parallel. "
+                    "Pass the encoder-CP pg_collection or leave the config at 1."
+                )
             return 1, 0, None
         size = torch.distributed.get_world_size(group=group)
+        # The sharding below and the RoPE hook in specs.py both have to agree
+        # on `encoder_cp`, and they read it from two different places (this
+        # group, and config.context_parallel_size). A mismatch is exactly the
+        # failure that cost six debugging rounds in test_encoder_cp_parity:
+        # TE built attention for CP=1, the tensor was sharded for CP=2, and the
+        # output was half zeros with no error anywhere. Make it an error here.
+        if size != configured:
+            raise MdpConfigurationError(
+                f"MDP: encoder-CP group has size {size} but the vision config says "
+                f"context_parallel_size={configured}; they must match. Under "
+                "--mdp-encoder-cp the runtime sets context_parallel_size = encoder_cp "
+                "on the vision config before building the encoder."
+            )
         if size == 1:
             return 1, 0, None
         return size, torch.distributed.get_rank(group=group), group
@@ -692,10 +707,7 @@ class Qwen35VLVisionEncoder(VisionModule):
                 grids, encoder_cp, encoder_cp_rank, device
             )
 
-        from megatron.core.mdp.encoder_cp_partition import (
-            gather_permutation,
-            shard_rows,
-        )
+        from megatron.core.mdp.encoder_cp_partition import gather_permutation, shard_rows
 
         frames = []
         for t, h, w in grids:

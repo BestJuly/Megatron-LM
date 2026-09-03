@@ -8,8 +8,9 @@ Both the standalone and MIMO training paths import from here.
 
 from typing import Optional
 
-from examples.multimodal_dev.models.base import _NO_CP_GROUP
 import torch
+
+from examples.multimodal_dev.models.base import _NO_CP_GROUP
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_transformer_block_with_experimental_attention_variant_spec,
 )
@@ -104,9 +105,38 @@ def _apply_rope_fp32_vision_cp(
     range_name = "qwen35_vl.vision_encoder.rope_apply"
     nvtx_range_push(range_name)
     try:
-        effective = cp_group
-        if effective is None or torch.distributed.get_world_size(group=effective) == 1:
+        # Discriminate on the VISION CONFIG, never on the group we were handed.
+        # The group is `self.pg_collection.cp` of the attention module, and in
+        # the native (non-MDP) build no pg_collection is passed, so
+        # TransformerBlock falls back to the MPU groups and hands us the
+        # DECODER's CP group. Under `--context-parallel-size 2` that group has
+        # size 2 while the vision tensor is NOT sharded -- an earlier version of
+        # this wrapper passed it through and `_is_raw_mrope_freqs_thd` raised
+        # `freqs sequence length must match local tokens times cp_size` on the
+        # first vision-bearing microbatch of every native CP>1 run.
+        #
+        # Only MDP encoder CP sets `context_parallel_size = encoder_cp` on the
+        # vision config (megatron/core/mdp/encoder.py); the native vision config
+        # leaves it at 1. That is the fact that says whether THIS encoder's
+        # tensor is sharded, so it is the fact to branch on.
+        encoder_cp = int(getattr(config, "context_parallel_size", 1) or 1)
+        if encoder_cp == 1:
             effective = _NO_CP_GROUP
+        else:
+            if cp_group is None:
+                raise RuntimeError(
+                    f"vision config says context_parallel_size={encoder_cp} but the "
+                    "attention module has no CP group; the encoder was built without "
+                    "the encoder-CP pg_collection."
+                )
+            group_size = torch.distributed.get_world_size(group=cp_group)
+            if group_size != encoder_cp:
+                raise RuntimeError(
+                    f"vision config says context_parallel_size={encoder_cp} but the "
+                    f"attention CP group has size {group_size}. RoPE would be applied "
+                    "for the wrong sharding: wrong values, no shape error."
+                )
+            effective = cp_group
         return _apply_rope_fp32(
             t,
             freqs,

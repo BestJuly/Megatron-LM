@@ -29,23 +29,18 @@ from megatron.core.mdp.activation import (
     capture_encoder_rng_state,
 )
 from megatron.core.mdp.allocator import MdpBufferAllocator
-from megatron.core.mdp.bridge import (
-    BridgeBufferKey,
-    BridgePhase,
-    BridgeTensorSpec,
-    ModalityBridge,
-)
+from megatron.core.mdp.bridge import BridgeBufferKey, BridgePhase, BridgeTensorSpec, ModalityBridge
 from megatron.core.mdp.config import MdpConfig
 from megatron.core.mdp.encoder import EncoderDomain, finalize_encoder_grads
 from megatron.core.mdp.errors import MdpConfigurationError, MdpPlanError, MdpStateError
 from megatron.core.mdp.groups import MdpProcessGroups, broadcast_descriptors
-from megatron.core.mdp.packing import GreedySampleStream, decoder_sample_length
 from megatron.core.mdp.observability import (
-    rank_loads_from_worker_loads,
     MdpIterationMetrics,
     nvtx_phase,
+    rank_loads_from_worker_loads,
     worker_loads_from_plan,
 )
+from megatron.core.mdp.packing import GreedySampleStream, decoder_sample_length
 from megatron.core.mdp.plan import MdpBatchPlan, split_encoder_layout
 from megatron.core.mdp.planner import MdpPlanner, assert_consistent_plan
 from megatron.core.mdp.protocols import MdpModelAdapter

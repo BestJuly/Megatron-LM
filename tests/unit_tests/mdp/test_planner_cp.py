@@ -260,8 +260,8 @@ def test_locality_preference_does_not_collapse_to_worker_zero():
     `index // ranks_per_worker` sent every endpoint to worker 0 once
     ranks_per_worker >= cp -- a constant bias with no locality behind it.
     """
-    from megatron.core.mdp.planner import MdpPlanner
     from megatron.core.mdp.plan import RowCapacityPolicy
+    from megatron.core.mdp.planner import MdpPlanner
 
     # cp=2, pp=2, encoder_cp=2: group of 4, workers {0: ranks 0-1, 1: ranks 2-3},
     # endpoints = group[:2] = ranks 0 and 1. Only rank 0 is a worker lead.
