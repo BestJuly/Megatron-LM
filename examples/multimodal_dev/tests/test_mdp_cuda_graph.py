@@ -15,8 +15,8 @@ which is an end-to-end property of the data path rather than something a unit te
 can construct. What is covered here is everything that is *not* the packing
 contract -- layer discovery through the multimodal wrapper, the loud failure when
 discovery finds nothing, and per-layer capture/replay numerics on the decoder. The
-packing contract itself is covered by the GPU end-to-end run recorded in
-``agent_works/mdp-partial-cudagraph-decoder/summary_v2.md``.
+packing contract itself is only exercised end-to-end on GPU, by a real
+``--thd-static-packing`` run with ``--cuda-graph-impl``.
 
 These tests need exactly 1 rank::
 

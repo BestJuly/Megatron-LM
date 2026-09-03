@@ -168,7 +168,14 @@ def get_qwen35_vl_language_spec(
 #
 # This is an EMPIRICAL table, not an exhaustive one: only 64/72/80/96/128/144
 # were measured, and 72 was the sole outlier. Revisit when TE or cuDNN moves.
-# See agent_works/mdp-fast-pass-0901/repro/CONCLUSION.md for the reproducer.
+#
+# To reproduce without Megatron: build a THD pack of bf16 q/k/v shaped
+# (total_tokens, 16, head_dim), drive it through
+# transformer_engine.pytorch.DotProductAttention with qkv_format="thd" and
+# attn_mask_type="padding" (THD accepts only padding/padding_causal), run
+# forward + backward, and read torch.cuda.max_memory_allocated(). Sweeping
+# head_dim over 64/72/80/96/128 reproduces the table above; even a uniform
+# 60x1024 pack is enough to trigger it, so no captured data is required.
 _PADDED_ATTENTION_HEAD_DIMS = {72: 80}
 
 
