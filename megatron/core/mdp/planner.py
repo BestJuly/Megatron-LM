@@ -52,6 +52,9 @@ class MdpPlanner:
         self._ranks_per_worker = len(rank_view.planning_group_ranks) // len(
             rank_view.worker_ids
         )
+        # Ranks per logical worker IS encoder_cp; the planner needs it both to
+        # validate frame alignment and to make the digest encoder_cp-sensitive.
+        self._encoder_cp = self._ranks_per_worker
 
     def build_plan(
         self,
@@ -226,6 +229,7 @@ class MdpPlanner:
             self._capacity_policy,
             digest_entries,
             cp_size=self._cp_size,
+            ranks_per_worker=self._encoder_cp,
         )
 
         plan = MdpBatchPlan(
@@ -256,11 +260,22 @@ class MdpPlanner:
         rows_by_worker = {}
         for interval in self._slice_item(descriptor):
             endpoint = self._endpoints[interval.cp_rank]
-            worker = (
-                self._rank_view.planning_group_ranks.index(endpoint)
-                // self._ranks_per_worker
-            )
+            index = self._rank_view.planning_group_ranks.index(endpoint)
+            # EMBEDDING is sourced by the worker's LEAD rank, so a self-edge
+            # exists only when that lead IS this endpoint. Mapping the endpoint
+            # through `index // ranks_per_worker` answers a different question
+            # and, once encoder_cp >= cp, sends EVERY endpoint to worker 0 --
+            # a constant preference that biases the LPT load inside the slack
+            # window while buying no locality at all.
+            if index % self._ranks_per_worker != 0:
+                continue  # not any worker's lead: no self-edge is available
+            worker = index // self._ranks_per_worker
             rows_by_worker[worker] = rows_by_worker.get(worker, 0) + interval.rows
+        if not rows_by_worker:
+            # No endpoint of this item is a worker lead. Express that as "no
+            # preference" (-1 matches no worker id) rather than defaulting to
+            # worker 0, so the choice falls through to pure load balance.
+            return -1
         return min(rows_by_worker, key=lambda w: (-rows_by_worker[w], w))
 
     def _slice_item(self, descriptor) -> tuple:
@@ -319,6 +334,18 @@ class MdpPlanner:
                     f"{item_id} violates: cost is a non-negative integer."
                 )
             t, h, w = descriptor.grid_thw
+            if self._encoder_cp > 1 and (h * w) % (2 * self._encoder_cp) != 0:
+                raise MdpPlanError(
+                    f"MDP: item {item_id} grid_thw={descriptor.grid_thw} violates: "
+                    f"each frame's h*w ({h * w}) is divisible by 2 * encoder_cp "
+                    f"({2 * self._encoder_cp}). The vision encoder packs one THD "
+                    "sub-sequence per frame and has no frame-padding path, so a "
+                    "non-conforming grid cannot be context-parallel split. "
+                    "Checked here in integer host arithmetic so every member "
+                    "reaches the same verdict; otherwise TE aborts mid-iteration "
+                    "on whichever image happens to be non-conforming, and a short "
+                    "smoke run passes while a long one dies."
+                )
             if t * h * w != descriptor.payload_rows:
                 raise MdpPlanError(
                     f"MDP: payload_rows={descriptor.payload_rows} for item {item_id} "

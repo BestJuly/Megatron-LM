@@ -28,6 +28,9 @@ class MdpIterationMetrics:
     decoder_schedule_ms: float
     encoder_backward_ms: float
     worker_loads: tuple
+    # The same loads divided by encoder_cp: what each GPU actually encodes.
+    # Identical to worker_loads at encoder_cp == 1.
+    rank_loads: tuple
     empty_workers: int
     bridge_stats: Mapping
     allocator_reuse: Mapping
@@ -52,9 +55,29 @@ def nvtx_phase(name: str, prefix: str = "mdp"):
 
 
 def worker_loads_from_plan(plan, num_workers: int) -> tuple:
-    """Per-logical-worker payload rows for all ``num_workers`` workers."""
+    """Payload rows per logical worker for all ``num_workers`` workers.
+
+    These are LOGICAL-worker units. At ``encoder_cp > 1`` a worker is
+    ``encoder_cp`` GPUs sharing one chunk, so a load here is ``encoder_cp``
+    times what any single GPU encodes -- see :func:`rank_loads_from_worker_loads`
+    for the per-GPU view. Reporting only this number at ``encoder_cp > 1``
+    overstates per-GPU vision work by exactly that factor, and at
+    ``encoder_cp == cp*pp`` there is a single worker per group so the tuple
+    carries no balance information at all.
+    """
     loads = {
         layout.producer_worker_id: layout.total_payload_rows
         for layout in plan.encoder_layouts
     }
     return tuple(loads.get(worker_id, 0) for worker_id in range(num_workers))
+
+
+def rank_loads_from_worker_loads(worker_loads: tuple, encoder_cp: int) -> tuple:
+    """What each GPU actually encodes: the worker's load split ``encoder_cp`` ways.
+
+    Identity at ``encoder_cp == 1``. The split is even because the zigzag shard
+    gives every rank ``sum(frame_lengths) // encoder_cp`` rows exactly.
+    """
+    if encoder_cp <= 1:
+        return worker_loads
+    return tuple(load // encoder_cp for load in worker_loads)

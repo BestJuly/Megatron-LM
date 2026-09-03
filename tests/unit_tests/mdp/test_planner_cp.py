@@ -250,3 +250,42 @@ def test_an_item_straddling_its_sample_is_rejected_as_a_plan_error():
     descriptor = _descriptor(0, offset=62, sample_padded_start=0, sample_padded_len=64)
     with pytest.raises(MdpPlanError, match="cannot be split"):
         _planner(2).build_plan(0, [descriptor], [0])
+
+
+def test_locality_preference_does_not_collapse_to_worker_zero():
+    """At encoder_cp >= cp the old mapping preferred worker 0 for every item.
+
+    EMBEDDING is sourced by a worker's LEAD rank, so a self-edge exists only
+    when that lead is the endpoint. Mapping endpoints through
+    `index // ranks_per_worker` sent every endpoint to worker 0 once
+    ranks_per_worker >= cp -- a constant bias with no locality behind it.
+    """
+    from megatron.core.mdp.planner import MdpPlanner
+    from megatron.core.mdp.plan import RowCapacityPolicy
+
+    # cp=2, pp=2, encoder_cp=2: group of 4, workers {0: ranks 0-1, 1: ranks 2-3},
+    # endpoints = group[:2] = ranks 0 and 1. Only rank 0 is a worker lead.
+    group = (0, 1, 2, 3)
+    view = MdpRankView(
+        global_rank=0, outer_dp_rank=0, lane_id=0, my_worker_id=0,
+        endpoint_rank=0, planning_group_ranks=group, worker_ids=(0, 1),
+        decoder_endpoint_ranks=group[:2], my_cp_rank=0, my_pp_rank=0,
+        my_encoder_cp_rank=0,
+    )
+    planner = MdpPlanner(
+        view, locality_slack_permille=10, capacity_policy=RowCapacityPolicy()
+    )
+    # An item lying entirely in a chunk owned by cp_rank 1 -> endpoint group[1],
+    # which is NOT a worker lead, so no self-edge is available.
+    only_on_endpoint1 = _descriptor(
+        0, offset=16, sample_padded_start=0, sample_padded_len=64
+    )
+    assert planner._preferred_endpoint_worker(only_on_endpoint1) == -1, (
+        "an endpoint that is not a worker lead offers no self-edge; the planner "
+        "must express that as no preference rather than defaulting to worker 0"
+    )
+    # An item on cp_rank 0 -> endpoint group[0] == worker 0's lead: real self-edge.
+    on_endpoint0 = _descriptor(
+        0, offset=0, sample_padded_start=0, sample_padded_len=64
+    )
+    assert planner._preferred_endpoint_worker(on_endpoint0) == 0

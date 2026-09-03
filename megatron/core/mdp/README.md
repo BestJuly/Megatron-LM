@@ -58,7 +58,7 @@ schedule model list.
 ## Support matrix (v1)
 
 Supported: Qwen3.5-VL (one vision encoder), `TP=1`, decoder `CP>=1`
-(`cp_partition_mode=zigzag`), `encoder_cp=1`, native PP/VPP/EP, fully replicated encoder with WORLD ZeRO-1,
+(`cp_partition_mode=zigzag`), `encoder_cp` in {1, 2}, native PP/VPP/EP, fully replicated encoder with WORLD ZeRO-1,
 `calculate_per_token_loss=True`, bf16 main path (fp16 covered by
 overflow-union tests), THD packed sequences on both sides, native MCore vision
 Transformer recompute (`selective`/`full`) or Design-Doc whole-encoder replay

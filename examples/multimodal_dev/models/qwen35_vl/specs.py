@@ -9,6 +9,7 @@ Both the standalone and MIMO training paths import from here.
 from typing import Optional
 
 from examples.multimodal_dev.models.base import _NO_CP_GROUP
+import torch
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_transformer_block_with_experimental_attention_variant_spec,
 )
@@ -81,26 +82,38 @@ def _apply_rope_fp32(
     return out.to(orig_dtype)
 
 
-def _apply_rope_fp32_no_cp(
+def _apply_rope_fp32_vision_cp(
     t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None, max_seqlen=None
 ):
-    """Same as ``_apply_rope_fp32`` but forces CP-size=1.
+    """``_apply_rope_fp32`` with the ENCODER's CP group, never the decoder's.
 
     The vision encoder uses THD packed sequences for variable-resolution
-    images.  When the language model uses CP>1, the global CP group would
-    incorrectly split the vision seqlens.  This wrapper substitutes a
-    trivial group so the vision RoPE sees the full packed sequence.
+    images. When the language model uses CP>1, the global CP group would
+    incorrectly split the vision seqlens -- so when the encoder is not itself
+    context-parallel this substitutes a trivial group and the vision RoPE sees
+    the full packed sequence, exactly as before.
+
+    Under ``--mdp-encoder-cp e > 1`` the encoder IS context-parallel over its
+    own group of size ``e``, and that group must be used: leaving the size-1
+    dummy in place while the tensor holds zigzag-sharded rows makes
+    ``_apply_rotary_pos_emb_thd`` take its ``cp_size == 1`` branch and give
+    every row the frequency of its LOCAL index instead of its global position.
+    Wrong values, no shape error. The caller passes the encoder's group, and a
+    size-1 group is indistinguishable from the old behaviour.
     """
     range_name = "qwen35_vl.vision_encoder.rope_apply"
     nvtx_range_push(range_name)
     try:
+        effective = cp_group
+        if effective is None or torch.distributed.get_world_size(group=effective) == 1:
+            effective = _NO_CP_GROUP
         return _apply_rope_fp32(
             t,
             freqs,
             config,
             cu_seqlens,
             mscale,
-            cp_group=_NO_CP_GROUP,
+            cp_group=effective,
             max_seqlen=max_seqlen,
         )
     finally:
@@ -121,7 +134,7 @@ class Qwen35VLVisionSelfAttention(SelfAttention):
         import megatron.core.transformer.attention as _attn_mod
 
         _orig = _attn_mod.apply_rotary_pos_emb
-        _attn_mod.apply_rotary_pos_emb = _apply_rope_fp32_no_cp
+        _attn_mod.apply_rotary_pos_emb = _apply_rope_fp32_vision_cp
         try:
             return super().forward(*args, **kwargs)
         finally:

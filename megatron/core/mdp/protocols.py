@@ -133,6 +133,13 @@ class MdpModelAdapter(Protocol):
     ) -> "Tensor":
         """Run encoder forward on one already-rebased chunk sub-layout.
 
+        Under ``--mdp-encoder-cp e > 1`` ``payload`` holds only THIS rank's
+        zigzag shard of the chunk -- ``1/e`` of the patch rows, frame by frame
+        in chunk order, exactly ``shard_rows(frame_lengths(layout.segments), e,
+        my_encoder_cp_rank)`` -- while ``layout`` still describes the whole
+        chunk. The encoder must consume it as pre-sharded input and not shard
+        again.
+
         The adapter reads the ordered ``grid_thw`` from ``layout.segments`` and
         constructs a vision-only ``PackedSeqParams(qkv_format="thd")``; it must
         never read or reuse the decoder ``PackedSeqParams``, and it is unaware

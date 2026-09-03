@@ -8,7 +8,7 @@ fixed-width descriptor records inside each planning group.
 """
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Optional, Sequence
 
 import torch
 import torch.distributed as dist
@@ -30,6 +30,9 @@ class MdpProcessGroups:
     planning_group: dist.ProcessGroup
     encoder_reduction_group: dist.ProcessGroup
     world_group: dist.ProcessGroup
+    # This rank's logical worker: the encoder_cp ranks that collaboratively
+    # encode one vision chunk. A singleton at encoder_cp=1.
+    encoder_cp_group: Optional[dist.ProcessGroup] = None
 
 
 class MdpGroupRegistry:
@@ -70,7 +73,7 @@ class MdpGroupRegistry:
     def assert_no_leak(self) -> None:
         """Every created key must be a planning group or a registered alias."""
         for key in self._groups:
-            if key[0] not in ("planning", "world_alias"):
+            if key[0] not in ("planning", "world_alias", "encoder_cp"):
                 raise MdpConfigurationError(
                     f"MDP: group registry violates: no unexpected groups (found {key})."
                 )
@@ -81,15 +84,16 @@ def install_mdp_process_groups(
 ) -> MdpProcessGroups:
     """Install MDP process groups; every rank creates groups in the same order.
 
-    One planning group per outer-DP group, in ascending ``outer_dp_rank`` order.
+    One planning group per outer-DP group, in ascending ``outer_dp_rank`` order,
+    then one encoder-CP group per logical worker in ascending
+    ``(outer_dp_rank, worker_id)`` order. ``dist.new_group`` is a WORLD
+    collective, so the order must be identical on every rank and every rank must
+    enter every creation, including the groups it does not join — a divergence
+    here hangs with no message rather than raising.
+
     With ``encoder_cp=1`` the encoder reduction group aliases WORLD; no duplicate
     same-sized group is created.
     """
-    if rank_map.spec.encoder_cp != 1:
-        raise MdpConfigurationError(
-            f"MDP: encoder_cp={rank_map.spec.encoder_cp} violates: encoder_cp == 1. "
-            "Encoder-CP group construction requires revalidating DDP/ZeRO semantics."
-        )
     world = dist.group.WORLD
     my_rank = dist.get_rank()
     my_planning_group = None
@@ -97,6 +101,16 @@ def install_mdp_process_groups(
         group = group_registry.get_or_create(("planning", outer_dp_rank), ranks)
         if my_rank in ranks:
             my_planning_group = group
+    my_encoder_cp_group = None
+    if rank_map.spec.encoder_cp > 1:
+        for outer_dp_rank in range(len(rank_map.planning_groups())):
+            for worker_id in range(rank_map.num_workers_per_group):
+                ranks = rank_map.worker_ranks(outer_dp_rank, worker_id)
+                group = group_registry.get_or_create(
+                    ("encoder_cp", outer_dp_rank, worker_id), ranks
+                )
+                if my_rank in ranks:
+                    my_encoder_cp_group = group
     group_registry.register_alias(
         ("world_alias",), tuple(range(rank_map.spec.world_size)), world
     )
@@ -106,11 +120,53 @@ def install_mdp_process_groups(
             "group."
         )
     _assert_rank_map_matches_mpu(rank_map, my_rank)
+    _assert_encoder_cp_group_matches_map(rank_map, my_rank, my_encoder_cp_group)
     return MdpProcessGroups(
         planning_group=my_planning_group,
         encoder_reduction_group=world,
         world_group=world,
+        encoder_cp_group=my_encoder_cp_group,
     )
+
+
+def _assert_encoder_cp_group_matches_map(
+    rank_map: MdpRankMap, my_rank: int, group
+) -> None:
+    """Cross-check the encoder-CP group against the rank map's own coordinate.
+
+    Unlike the decoder's CP group there is no MPU counterpart to compare
+    against, so the map is the only available truth. It is still worth
+    asserting: an off-by-one between ``my_encoder_cp_rank`` and the group's rank
+    ordering produces silently wrong vision shards — every rank encodes a
+    plausible slice of the chunk, the shapes agree, and the loss is merely
+    wrong. Runs once per job.
+    """
+    encoder_cp = rank_map.spec.encoder_cp
+    if encoder_cp == 1:
+        if group is not None:
+            raise MdpConfigurationError(
+                "MDP: encoder_cp=1 violates: no encoder-CP group is created."
+            )
+        return
+    if group is None:
+        raise MdpConfigurationError(
+            f"MDP: rank {my_rank} violates: every rank belongs to exactly one "
+            f"logical worker at encoder_cp={encoder_cp}."
+        )
+    view = rank_map.view(my_rank)
+    size = dist.get_world_size(group=group)
+    rank_in_group = dist.get_rank(group=group)
+    if size != encoder_cp:
+        raise MdpConfigurationError(
+            f"MDP: encoder-CP group of rank {my_rank} has size {size} violates: "
+            f"size == encoder_cp ({encoder_cp})."
+        )
+    if rank_in_group != view.my_encoder_cp_rank:
+        raise MdpConfigurationError(
+            f"MDP: rank {my_rank} is index {rank_in_group} in its encoder-CP group "
+            f"violates: it equals my_encoder_cp_rank ({view.my_encoder_cp_rank}). "
+            "The vision chunk would be sharded against the wrong coordinate."
+        )
 
 
 def _assert_rank_map_matches_mpu(rank_map: MdpRankMap, my_rank: int) -> None:

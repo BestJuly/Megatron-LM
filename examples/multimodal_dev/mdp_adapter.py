@@ -129,8 +129,14 @@ class Qwen35VLMdpAdapter:
     # ------------------------------------------------------------------
 
     def build_encoder(self, model_config, *, pg_collection) -> torch.nn.Module:
-        """Same factory as the non-MDP path (models/qwen35_vl/model.py)."""
-        del pg_collection  # the encoder has no model parallelism in v1
+        """Same factory as the non-MDP path (models/qwen35_vl/model.py).
+
+        ``pg_collection`` MUST be threaded through. It used to be discarded,
+        which made TransformerBlock fall back to ``use_mpu_process_groups()`` --
+        i.e. the vision attention would ring over the DECODER's context-parallel
+        group. That is invisible at ``encoder_cp == cp``, where the logical
+        worker's ranks and the decoder CP group are the same set.
+        """
         kwargs = self._vision_kwargs
         return Qwen35VLVisionEncoder(
             config=model_config,
@@ -141,6 +147,7 @@ class Qwen35VLMdpAdapter:
             spatial_merge_size=kwargs["spatial_merge_size"],
             out_hidden_size=kwargs["out_hidden_size"],
             max_num_positions=kwargs["max_num_positions"],
+            pg_collection=pg_collection,
         )
 
     def encode(self, encoder: torch.nn.Module, payload: torch.Tensor, layout) -> torch.Tensor:
@@ -159,7 +166,11 @@ class Qwen35VLMdpAdapter:
         grid_thw = torch.tensor(
             [segment.grid_thw for segment in layout.segments], dtype=torch.long
         )
-        return encoder(payload, grid_thw)
+        # Under encoder CP the runtime delivers this rank's zigzag shard of the
+        # chunk (1/e of the rows), not the whole chunk; the encoder must not
+        # shard it a second time. At encoder_cp=1 the shard IS the chunk and the
+        # flag is inert.
+        return encoder(payload, grid_thw, pixels_are_sharded=True)
 
 
 def build_mdp_adapter(args, language_config) -> Qwen35VLMdpAdapter:

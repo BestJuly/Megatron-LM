@@ -27,6 +27,11 @@ from megatron.core.mdp.protocols import CapturedMicrobatch, MdpModelAdapter, Vis
 _PIXEL_OWNERSHIP = threading.local()
 
 
+# A worker id no rank can hold, used to mark "this rank is not the materializer
+# even though its worker owns the microbatch" without widening the context tuple.
+_NOT_AN_OWNER = -1
+
+
 def pixel_capture_suppressed() -> bool:
     """True when the in-progress capture microbatch is NOT owned by this worker.
 
@@ -162,6 +167,7 @@ class MdpIterationWindow:
         lane_id: Optional[int],
         my_worker_id: int,
         num_workers: int,
+        my_encoder_cp_rank: int = 0,
     ) -> "MdpIterationWindow":
         """Consume one real iterator and build records, descriptors, and sidecar.
 
@@ -171,7 +177,12 @@ class MdpIterationWindow:
         planning group (one endpoint per group generates them).
 
         Every worker materializes and cuts pixels only for the microbatches it owns
-        (``microbatch_id % num_workers == my_worker_id``); the ownership context
+        (``microbatch_id % num_workers == my_worker_id``), and under
+        ``encoder_cp>1`` only the worker's LEAD rank does: ``my_worker_id`` is
+        identical across a worker's ranks, so without the extra condition all
+        ``encoder_cp`` of them would decode and H2D the identical payload. The
+        lead is also the bridge's PIXEL source, so the rank that materializes is
+        the rank that sends. The ownership context
         set around each ``adapter.get_batch`` call lets the model collate path
         skip pixel materialization on non-owners.
         """
@@ -192,9 +203,14 @@ class MdpIterationWindow:
         merge = adapter.spatial_merge_size
         for microbatch_id in range(num_microbatches):
             owner_worker_id = microbatch_id % num_workers
-            owns_pixels = owner_worker_id == my_worker_id
+            owns_pixels = (
+                owner_worker_id == my_worker_id and my_encoder_cp_rank == 0
+            )
             try:
-                _PIXEL_OWNERSHIP.value = (owner_worker_id, my_worker_id)
+                _PIXEL_OWNERSHIP.value = (
+                    owner_worker_id,
+                    my_worker_id if my_encoder_cp_rank == 0 else _NOT_AN_OWNER,
+                )
                 with nvtx_phase("p1_get_batch"):
                     captured = adapter.get_batch(iterator)
             finally:

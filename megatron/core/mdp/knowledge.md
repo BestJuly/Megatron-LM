@@ -300,7 +300,7 @@ decoder CP and several of that feature's rules **invert**:
 | what is split | the decoder's packed text sequence | the encoder's packed vision sequence |
 | split by | destination (which endpoint holds a row) | source (which rank computes a row) |
 | effect on workers | `num_workers_per_group = cp*pp/e` grows | it *shrinks*; producer ids change, so the plan CONTENT changes |
-| PIXEL phase | per item, CP-invariant | per (item, encoder shard) |
+| PIXEL phase | per item, CP-invariant | per (item, encoder shard): rank `r` of the producing worker receives only `shard_rows(frames, e, r)` of the item, keyed `BridgeBufferKey(item, 0, shard_id=r)` |
 | gradient reduction | none needed; each row lives on one rank | still none, but only because exactly one rank per worker is the GRADIENT destination |
 
 Geometry, pinned:
@@ -311,7 +311,7 @@ Geometry, pinned:
 - the transformer-block output is **all-gathered and un-zigzagged inside the
   encoder, before the patch merger**, so `adapter.encode`'s return contract is
   byte-identical to `e=1` and the plan, routes and bridge layouts are untouched.
-  This is not a convenience: `_fast_pos_embed_interpolate`'s merger folds
+  This is not a convenience: `Qwen35VLPatchMerger` folds
   `merge**2 = 4` *consecutive* rows, so a rank-local merger needs
   `h*w % (8*e) == 0`; 28 of the 137 frames in the shipped mock pool violate that
   at `e=2`, and `view(-1, merge_dim)` **succeeds anyway**, silently merging
@@ -346,6 +346,49 @@ Non-negotiable invariants specific to this feature:
   supplied. The vision pack has no padding, so the **same tensor object** is
   passed as the padded variant; TE special-cases that identity and keeps
   `pad_between_seqs=False`, preserving FlashAttention eligibility.
+
+**PIXEL is delivered per shard.** `patch_embed` is per patch row
+(`pixel_values` is already `[rows, 3*T*P*P]`), so sending rank `r` exactly the
+rows it will encode is exact, not an approximation. The owner builds one
+`index_select` per shard (one extra copy of the item in total, replacing `e`
+whole-item sends); each producing rank allocates `1/e` of the chunk payload and
+receives its shards at `payload_row_start/e`; the adapter calls the encoder
+with `pixels_are_sharded=True`, which skips the encoder's own slice and instead
+asserts the delivered row count equals `shard_rows(...)` for this rank. Every
+frame is divisible by `2*e` (plan-time check), so every item and every prefix
+divides exactly; a remainder is an error, never rounded.
+
+Invariant: **the PIXEL key's shard axis and the per-shard sizing come from one
+place** (`runtime._tensor_specs`), and `build_ledger` only reads it. Splitting
+the key without splitting the spec would hand every rank the item's FIRST rows
+at full size with matching sizes on both ends of the wire -- a silently wrong
+loss. `test_pixel_shard_routing.py` checks the ledger row-for-row against
+`shard_rows` and that a per-item spec is refused for per-shard keys.
+
+Measured cost of encoder CP (oci-hsg GB200, `qwen35_vl_mdp_light`, uniform
+2048-token samples, 20 iters, 2026-09-02, **before** per-shard delivery):
+peak memory +15-31% and vision encoder +52% wall time at `e=2`. The time is
+the ring attention's per-layer P2P exchange, which the vision pack's short
+per-frame sub-sequences cannot amortise (NVTX attributes 101% of the delta to
+`AttnFuncWithCPAndKVP2P`, MLP unchanged); per-shard delivery does not touch
+it. **The memory is the same thing, measured.** Same-commit arms with per-shard
+delivery in place leave the peak where it was -- e=1 18,701 MB, e=2 21,459 MB
+(cp=1) and 21,242 MB (cp=2), against 18,707 / 21,502 / 21,282 with whole-item
+fan-out -- so the earlier attribution to fan-out and full-chunk `patch_embed`
+was wrong. CUDA allocator snapshots of rank 7 (`record_memory_history`,
+`mem-profile peak summary/diff`) show the e=2 peak is set by **TE's
+context-parallel fused-attention backward workspace**: at e=1 the vision
+attention's `fused_attn_bwd` (`backends.py:1798:backward`) allocates a
+transient 4.56 GB workspace per layer; at e=2 the same call is reached through
+`context_parallel.py:1253:cp_p2p_bwd_fused_attn` (`AttnFuncWithCPAndKVP2P.
+backward`) and allocates **9.13 GB** -- 2x, because the worker's vision
+sequence doubles when `num_workers_per_group` halves and the CP backward sizes
+its workspace by the full sequence, not the local shard. Activations meanwhile
+DROP (11.0 -> 4.1 GB at the peak moment), which is the sharding doing its job;
+the workspace eats the saving and then some. So encoder CP's time and memory
+costs have one cause -- TE's ring attention on the encoder -- and nothing in
+MDP's own data path moves either. Encoder CP still exists for long vision
+sequences and single items too large for one rank, not as a general speed-up.
 
 Current scope: `encoder_cp in (1, 2)`, `cp_comm_type="p2p"`, and either `e | cp`
 or `cp | e` so a worker's rank block is uniform. `e >= 4` additionally requires
@@ -479,7 +522,7 @@ adds a non-causal decoder spec owns dropping the flag (or padding every sample).
 Primary flags:
 
 - `--mdp-enable`
-- `--mdp-encoder-cp` (currently must be 1)
+- `--mdp-encoder-cp` (1 or 2)
 - `--mdp-encoder-max-payload-rows`
 - `--encoder-recompute-granularity selective|full|whole`
 - `--encoder-recompute-method uniform|block`
@@ -608,7 +651,7 @@ Current major constraints:
 - Qwen3.5-VL adapter;
 - TP=1;
 - decoder CP>=1 with `cp_partition_mode=zigzag` (`contiguous` is rejected);
-- encoder CP=1;
+- encoder CP in {1, 2} (`--mdp-encoder-cp`), zigzag, gathered before the merger;
 - distributed optimizer enabled;
 - per-token loss enabled;
 - bf16/fp16 mixed precision;

@@ -277,6 +277,47 @@ class Qwen35VLPatchMerger(MegatronModule):
 # Qwen35VLVisionEncoder — top-level encoder module
 # -------------------------------------------------------------------
 
+class _GatherChunkAlongSeq(torch.autograd.Function):
+    """All-gather the encoder-CP shards and restore chunk order.
+
+    Forward: every rank holds ``[L/e, H]`` (its zigzag chunks, compacted); the
+    gather produces rank-major ``[L, H]`` which ``perm`` un-zigzags back into
+    chunk order.
+
+    Backward is a **reduce-scatter**, and that is the load-bearing half. After
+    the gather every rank runs the merger on the full sequence, but only the
+    designated rank's output feeds the bridge, so only that rank receives a real
+    gradient; the others are driven with explicitly zeroed buffers. Summing
+    (real + zeros) and then taking each rank's own block is what delivers rank
+    r's gradient to the blocks that actually computed rank r's rows. A plain
+    "take my slice" backward would leave every non-designated rank's
+    transformer blocks with no gradient at all -- silently, since the shapes
+    are fine and the run converges on 1/e of the encoder.
+    """
+
+    @staticmethod
+    def forward(ctx, local, perm, group, encoder_cp):
+        ctx.group = group
+        ctx.encoder_cp = encoder_cp
+        ctx.save_for_backward(perm)
+        gathered = local.new_empty((local.shape[0] * encoder_cp,) + tuple(local.shape[1:]))
+        torch.distributed.all_gather_into_tensor(gathered, local.contiguous(), group=group)
+        return gathered.index_select(0, perm)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        (perm,) = ctx.saved_tensors
+        # Undo the un-zigzag: grad of the gathered buffer, in rank-major order.
+        grad_gathered = grad_out.new_empty(grad_out.shape)
+        grad_gathered.index_copy_(0, perm, grad_out.contiguous())
+        local_rows = grad_out.shape[0] // ctx.encoder_cp
+        grad_local = grad_out.new_empty((local_rows,) + tuple(grad_out.shape[1:]))
+        torch.distributed.reduce_scatter_tensor(
+            grad_local, grad_gathered, group=ctx.group
+        )
+        return grad_local, None, None, None
+
+
 class Qwen35VLVisionEncoder(VisionModule):
     """Megatron-native Qwen3.5-VL vision encoder.
 
@@ -311,6 +352,7 @@ class Qwen35VLVisionEncoder(VisionModule):
         spatial_merge_size: int = 2,
         out_hidden_size: int = 3584,
         max_num_positions: int = 2304,
+        pg_collection=None,
     ):
         super().__init__(config=config)
 
@@ -345,12 +387,21 @@ class Qwen35VLVisionEncoder(VisionModule):
             )
             transformer_layer_spec = get_qwen35_vl_vision_spec()
 
+        # Threading pg_collection through is mandatory once encoder CP exists:
+        # without it TransformerBlock falls back to use_mpu_process_groups(), and
+        # the vision attention would ring over the DECODER's CP group. At
+        # encoder_cp == cp those two rank sets numerically coincide, so that bug
+        # is invisible at world=16/pp=2/cp=2/encoder_cp=2 -- the one topology the
+        # registered hook test uses.
+        self.pg_collection = pg_collection
+        block_kwargs = {} if pg_collection is None else {"pg_collection": pg_collection}
         self.decoder = TransformerBlock(
             config=config,
             spec=transformer_layer_spec,
             pre_process=True,
             post_process=True,
             post_layer_norm=False,
+            **block_kwargs,
         )
 
         # --- Patch merger ---
@@ -605,6 +656,60 @@ class Qwen35VLVisionEncoder(VisionModule):
         return pos_ids
 
     # ---------------------------------------------------------------
+    # Encoder context parallelism
+    # ---------------------------------------------------------------
+
+    def _encoder_cp_state(self):
+        """``(encoder_cp, encoder_cp_rank, group)`` for this rank.
+
+        Derived from the collection MDP threaded in, never from the MPU: the
+        MPU's CP group belongs to the DECODER.
+        """
+        group = getattr(self.pg_collection, "cp", None) if self.pg_collection else None
+        if group is None:
+            return 1, 0, None
+        size = torch.distributed.get_world_size(group=group)
+        if size == 1:
+            return 1, 0, None
+        return size, torch.distributed.get_rank(group=group), group
+
+    def _encoder_cp_indices(self, grid_thw, encoder_cp, encoder_cp_rank, device):
+        """Row index of this rank's shard, and the un-zigzag gather permutation.
+
+        Served from the grid cache when one is present: the result depends only
+        on the grid combination, the CP degree and this rank's CP position, but
+        the encoder asks for it on every forward and again on every
+        whole-encoder replay, and building it walks the entire vision pack in
+        Python before two host-to-device copies. Stub objects in the unit tests
+        call this method unbound and have no cache, so the uncached path stays.
+        """
+        grids = tuple(
+            tuple(int(v) for v in row) for row in grid_thw.tolist()
+        )
+        grid_cache = getattr(self, "_grid_cache", None)
+        if grid_cache is not None:
+            return grid_cache.encoder_cp_indices(
+                grids, encoder_cp, encoder_cp_rank, device
+            )
+
+        from megatron.core.mdp.encoder_cp_partition import (
+            gather_permutation,
+            shard_rows,
+        )
+
+        frames = []
+        for t, h, w in grids:
+            frames.extend([h * w] * t)
+        rows = []
+        for run in shard_rows(frames, encoder_cp, encoder_cp_rank):
+            rows.extend(range(run.start, run.start + run.rows))
+        shard = torch.tensor(rows, dtype=torch.long, device=device)
+        perm = torch.tensor(
+            gather_permutation(frames, encoder_cp), dtype=torch.long, device=device
+        )
+        return shard, perm
+
+    # ---------------------------------------------------------------
     # PackedSeqParams for variable-length attention
     # ---------------------------------------------------------------
 
@@ -635,6 +740,13 @@ class Qwen35VLVisionEncoder(VisionModule):
                 qkv_format="thd",
                 cu_seqlens_q=cu_seqlens,
                 cu_seqlens_kv=cu_seqlens,
+                # TE aborts for qkv_format="thd" under CP unless the padded
+                # variants are present. The vision pack has no padding, so the
+                # SAME tensor object is passed: TE special-cases that identity
+                # and keeps pad_between_seqs=False, so FlashAttention stays
+                # eligible and the selected backend does not change.
+                cu_seqlens_q_padded=cu_seqlens,
+                cu_seqlens_kv_padded=cu_seqlens,
                 max_seqlen_q=max_seqlen,
                 max_seqlen_kv=max_seqlen,
             )
@@ -648,6 +760,8 @@ class Qwen35VLVisionEncoder(VisionModule):
             qkv_format="thd",
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens,
+            cu_seqlens_kv_padded=cu_seqlens,
             max_seqlen_q=max_seqlen,
             max_seqlen_kv=max_seqlen,
         )
@@ -660,13 +774,20 @@ class Qwen35VLVisionEncoder(VisionModule):
         self,
         pixel_values: Tensor,
         grid_thw: Tensor,
+        pixels_are_sharded: bool = False,
     ) -> Tensor:
         """Encode images / video frames.
 
         Args:
             pixel_values: ``[total_patches, C * T * pH * pW]``
-                pre-extracted flat patches in block-merge order.
-            grid_thw: ``[num_images, 3]`` (T, H, W) in patch-grid units.
+                pre-extracted flat patches in block-merge order -- or, with
+                ``pixels_are_sharded`` under encoder CP, only THIS rank's zigzag
+                shard of them (``total_patches / encoder_cp`` rows).
+            grid_thw: ``[num_images, 3]`` (T, H, W) in patch-grid units, always
+                describing the WHOLE chunk.
+            pixels_are_sharded: the caller (the MDP runtime) already delivered
+                this rank's shard, so the encoder must not slice again. Inert at
+                ``encoder_cp=1``, where the shard is the chunk.
 
         Returns:
             ``[total_merged_patches, out_hidden_size]`` visual embeddings.
@@ -685,9 +806,37 @@ class Qwen35VLVisionEncoder(VisionModule):
         # timelines comparable.
         hidden_states, bwd_marked = backward_range_begin(hidden_states)
 
+        # Encoder context parallelism: this rank encodes only its zigzag shard
+        # of the chunk. `encoder_cp == 1` short-circuits to the identity, so the
+        # non-CP path below is untouched.
+        encoder_cp, encoder_cp_rank, cp_group = self._encoder_cp_state()
+        shard_index = None
+        if encoder_cp > 1:
+            shard_index, gather_perm = self._encoder_cp_indices(
+                grid_thw, encoder_cp, encoder_cp_rank, hidden_states.device
+            )
+            if pixels_are_sharded:
+                # The runtime sent exactly shard_rows(...) rows in local order,
+                # so patch_embed above already ran on the shard alone. All that
+                # is left is to check the payload and the layout agree.
+                if hidden_states.shape[0] != shard_index.numel():
+                    raise RuntimeError(
+                        f"pixels_are_sharded: got {hidden_states.shape[0]} patch rows, "
+                        f"but this rank's shard of the chunk described by grid_thw is "
+                        f"{shard_index.numel()} rows; the delivered payload and the "
+                        "layout disagree."
+                    )
+            else:
+                hidden_states = hidden_states.index_select(0, shard_index)
+
         # 2. Learned position embedding (bilinear interpolation)
         with _nvtx("pos_embed_interpolate"):
             pos_embeds = self._fast_pos_embed_interpolate(grid_thw)
+            if shard_index is not None:
+                # A per-token additive term, so it is sliced to the same rows --
+                # unlike the RoPE table below, which TE indexes by GLOBAL
+                # position and must therefore stay whole.
+                pos_embeds = pos_embeds.index_select(0, shard_index)
             hidden_states = hidden_states + pos_embeds
 
         # 3. 2D Vision RoPE
@@ -709,6 +858,20 @@ class Qwen35VLVisionEncoder(VisionModule):
                 packed_seq_params=packed_seq_params,
             )
             hidden_states = hidden_states.squeeze(1)
+
+        # Gather BEFORE the merger, never after. The merger folds
+        # `merge**2 = 4` CONSECUTIVE rows (`view(-1, merge_dim)`), so a
+        # rank-local merger would need every zigzag chunk to be a multiple of 4
+        # -- 28 of the 137 frames in the shipped mock pool are not, at
+        # encoder_cp=2 alone -- and the reshape SUCCEEDS anyway, silently
+        # merging patches from different 2x2 spatial blocks. Gathering here
+        # keeps the requirement at `h*w % (2*encoder_cp) == 0` and makes this
+        # function's output byte-identical to the encoder_cp=1 path.
+        if encoder_cp > 1:
+            with _nvtx("encoder_cp_gather"):
+                hidden_states = _GatherChunkAlongSeq.apply(
+                    hidden_states, gather_perm, cp_group, encoder_cp
+                )
 
         # 5. Patch merger
         with _nvtx("patch_merger"):

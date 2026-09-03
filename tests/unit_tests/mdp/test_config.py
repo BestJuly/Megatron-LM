@@ -89,7 +89,7 @@ def test_disabled_mdp_skips_all_checks():
 @pytest.mark.parametrize(
     "config_kwargs, match",
     [
-        (dict(encoder_cp=2), "encoder_cp"),
+        (dict(encoder_cp=3), "encoder_cp"),
         (dict(encoder_max_payload_rows=0), "encoder_max_payload_rows"),
         (
             dict(encoder_recompute_granularity="partial"),
@@ -359,6 +359,31 @@ def test_snapshot_takes_the_larger_of_the_train_and_eval_microbatch_sizes():
         _fake_args(micro_batch_size=4, eval_micro_batch_size=16)
     )
     assert options.max_samples_per_microbatch == 16
+
+
+# ---------------------------------------------------------------------------
+# Encoder context parallelism
+# ---------------------------------------------------------------------------
+
+
+def test_encoder_cp2_is_accepted():
+    validate_mdp_config(MdpConfig(enable=True, encoder_cp=2), _options())
+
+
+def test_encoder_cp_beyond_two_is_rejected_with_the_alignment_reason():
+    # Not "unimplemented": e>=4 needs every frame to satisfy h*w % (2e) == 0 and
+    # the vision encoder has no frame-padding path.
+    with pytest.raises(MdpConfigurationError, match="frame-padding"):
+        validate_mdp_config(MdpConfig(enable=True, encoder_cp=4), _options())
+
+
+def test_encoder_cp_must_divide_or_be_divided_by_cp():
+    # cp=3 with encoder_cp=2 makes a worker's rank block ragged across stages.
+    with pytest.raises(MdpConfigurationError, match="divides CP"):
+        validate_mdp_config(
+            MdpConfig(enable=True, encoder_cp=2),
+            _options(world_size=12, context_parallel_size=3, pipeline_parallel_size=2),
+        )
 
 
 # ---------------------------------------------------------------------------

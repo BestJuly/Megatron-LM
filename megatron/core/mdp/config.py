@@ -126,14 +126,29 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
         return
 
     # --- MdpConfig field validation ---
-    if config.encoder_cp != 1:
+    if config.encoder_cp not in (1, 2):
         _reject(
             "encoder_cp",
             config.encoder_cp,
-            "encoder_cp == 1",
-            "Encoder context parallelism is a registered extension hook, not an "
-            "implemented capability.",
-            "1",
+            "encoder_cp in (1, 2)",
+            "Encoder context parallelism is implemented for e=2. Beyond that "
+            "every vision frame must satisfy h*w % (2*encoder_cp) == 0, which "
+            "real grids violate data-dependently (14 of the 137 frames in the "
+            "shipped mock pool at e=4), and the vision encoder has no "
+            "frame-padding path to fix it.",
+            "2",
+        )
+    if config.encoder_cp > 1 and (
+        options.context_parallel_size % config.encoder_cp != 0
+        and config.encoder_cp % options.context_parallel_size != 0
+    ):
+        _reject(
+            "encoder_cp",
+            config.encoder_cp,
+            "encoder_cp divides CP or CP divides encoder_cp",
+            "A logical worker is a contiguous block of a cp-fastest planning "
+            "group, so any other ratio makes one worker straddle two pipeline "
+            "stages while another does not.",
         )
     if config.encoder_max_payload_rows is not None and config.encoder_max_payload_rows <= 0:
         _reject(

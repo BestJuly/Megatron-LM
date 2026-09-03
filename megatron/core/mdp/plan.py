@@ -15,7 +15,7 @@ from typing import Optional, Sequence
 
 from megatron.core.mdp.errors import MdpPlanError
 
-PLAN_SCHEMA_VERSION = 6
+PLAN_SCHEMA_VERSION = 7
 
 
 @dataclass(frozen=True)
@@ -227,8 +227,13 @@ def compute_plan_digest(
     capacity_policy: RowCapacityPolicy,
     entries: Sequence[tuple],
     cp_size: int = 1,
+    ranks_per_worker: int = 1,
 ) -> bytes:
     """Digest of the minimal sufficient set with fixed-width packing plus blake2b.
+
+    The header additionally carries ``cp_size`` (decoder CP) and
+    ``ranks_per_worker`` (encoder CP), so a topology mismatch is diagnosed even
+    when every per-item record happens to coincide.
 
     ``entries`` are 12-int tuples in ascending ``(global_item_id, slice_id)``
     order: ``(global_item_id, slice_id, producer_worker_id, order_in_producer,
@@ -243,8 +248,19 @@ def compute_plan_digest(
     diagnosable error.
     """
     hasher = hashlib.blake2b(digest_size=16)
+    # ranks_per_worker is encoder_cp. Without it an encoder_cp=1 and an
+    # encoder_cp=2 plan over the same descriptors hash IDENTICALLY -- the
+    # per-item records carry producer_worker_id, but with few descriptors LPT
+    # assigns worker 0 either way, while worker_ranks(0, 0) resolves to (0,)
+    # versus (0, 1). The digest exists to be sound, not probabilistic.
     hasher.update(
-        struct.pack("<3q", schema_version, capacity_policy.alignment_rows, cp_size)
+        struct.pack(
+            "<4q",
+            schema_version,
+            capacity_policy.alignment_rows,
+            cp_size,
+            ranks_per_worker,
+        )
     )
     for entry in entries:
         hasher.update(struct.pack("<12q", *entry))

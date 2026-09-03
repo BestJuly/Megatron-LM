@@ -110,6 +110,7 @@ class GridCache:
         self._rope: Dict[tuple, Tensor] = {}
         self._psp: Dict[tuple, Tuple[Tensor, int]] = {}
         self._freq: Dict[tuple, Tensor] = {}
+        self._cp_idx: Dict[tuple, Tuple[Tensor, Tensor]] = {}
 
     def freqs(self, rot_pos_emb_module, max_hw: int, device) -> Tensor:
         """Frequency lookup table (depends only on the module's fixed dim/theta)."""
@@ -150,3 +151,41 @@ class GridCache:
             cu = staging.to(device, non_blocking=True)
             self._psp[key] = (cu, max(seqlens))
         return self._psp[key]
+
+    def encoder_cp_indices(
+        self, grids: tuple, encoder_cp: int, encoder_cp_rank: int, device
+    ) -> Tuple[Tensor, Tensor]:
+        """This rank's zigzag shard rows and the un-zigzag gather permutation.
+
+        Both depend only on the frame geometry, the CP degree and this rank's
+        CP position, none of which change between calls for a repeated grid
+        combination -- yet the encoder needs them on every forward, and again
+        on every whole-encoder replay in backward. Building them per call
+        expands the whole vision pack into Python lists and then stages two
+        pageable host-to-device copies against the compute stream; at 524,288
+        rows the host arithmetic alone measures ~56 ms.
+
+        Cached here rather than in the encoder so the eviction and device
+        keying match the other grid-derived tensors. Uploaded from pinned
+        staging with a non-blocking copy, like ``packed_seq`` above.
+        """
+        from megatron.core.mdp.encoder_cp_partition import gather_permutation, shard_rows
+
+        key = (grids, encoder_cp, encoder_cp_rank, str(device))
+        if key not in self._cp_idx:
+            frames = [int(h) * int(w) for t, h, w in grids for _ in range(int(t))]
+            rows = []
+            for run in shard_rows(frames, encoder_cp, encoder_cp_rank):
+                rows.extend(range(run.start, run.start + run.rows))
+            perm = gather_permutation(frames, encoder_cp)
+            # Pinning requires CUDA; this cache is also exercised with CPU
+            # devices in the unit tests, where pinning would raise rather than
+            # merely be pointless.
+            pin = torch.device(device).type == "cuda" and torch.cuda.is_available()
+            shard_staging = torch.tensor(rows, dtype=torch.long, pin_memory=pin)
+            perm_staging = torch.tensor(perm, dtype=torch.long, pin_memory=pin)
+            self._cp_idx[key] = (
+                shard_staging.to(device, non_blocking=pin),
+                perm_staging.to(device, non_blocking=pin),
+            )
+        return self._cp_idx[key]

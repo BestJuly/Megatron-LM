@@ -191,6 +191,16 @@ def test_digest_covers_the_minimal_sufficient_set():
     # The CP topology itself is in the header, so a cp mismatch is diagnosed
     # even when every per-slice record happens to coincide.
     assert compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [_entry(0)], cp_size=2) != base
+    # Encoder CP likewise. Without it an encoder_cp=1 and an encoder_cp=2 plan
+    # over the same descriptors hash identically -- with few descriptors LPT
+    # picks worker 0 either way, while worker_ranks(0, 0) resolves to (0,) vs
+    # (0, 1).
+    assert (
+        compute_plan_digest(
+            PLAN_SCHEMA_VERSION, policy, [_entry(0)], ranks_per_worker=2
+        )
+        != base
+    )
 
 
 # ------------------------- batch plan indexes -------------------------
