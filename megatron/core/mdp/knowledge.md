@@ -289,6 +289,70 @@ Consequences that are easy to get wrong:
 its sequence differently from the plan and every embedding would land on the
 wrong rank with no shape error.
 
+## Encoder context parallelism
+
+`--mdp-encoder-cp e` makes one **logical worker** span `e` physical ranks, so a
+single vision chunk is encoded collaboratively. It is a different axis from
+decoder CP and several of that feature's rules **invert**:
+
+| | decoder CP | encoder CP |
+|---|---|---|
+| what is split | the decoder's packed text sequence | the encoder's packed vision sequence |
+| split by | destination (which endpoint holds a row) | source (which rank computes a row) |
+| effect on workers | `num_workers_per_group = cp*pp/e` grows | it *shrinks*; producer ids change, so the plan CONTENT changes |
+| PIXEL phase | per item, CP-invariant | per (item, encoder shard) |
+| gradient reduction | none needed; each row lives on one rank | still none, but only because exactly one rank per worker is the GRADIENT destination |
+
+Geometry, pinned:
+
+- each frame of the chunk (`h*w` rows, one sub-sequence per temporal frame) is
+  **zigzag**-sharded across the worker's `e` ranks, matching TE's own chunking;
+  contiguous is not an option because TE implements only zigzag.
+- the transformer-block output is **all-gathered and un-zigzagged inside the
+  encoder, before the patch merger**, so `adapter.encode`'s return contract is
+  byte-identical to `e=1` and the plan, routes and bridge layouts are untouched.
+  This is not a convenience: `_fast_pos_embed_interpolate`'s merger folds
+  `merge**2 = 4` *consecutive* rows, so a rank-local merger needs
+  `h*w % (8*e) == 0`; 28 of the 137 frames in the shipped mock pool violate that
+  at `e=2`, and `view(-1, merge_dim)` **succeeds anyway**, silently merging
+  patches from different 2x2 spatial blocks. Gathering first reduces the
+  requirement to `h*w % (2*e) == 0`, which every frame satisfies at `e=2`
+  because `h` and `w` are always multiples of the merge size.
+- the gather is an autograd-aware op; its backward is the reduce-scatter that
+  re-partitions the incoming gradient.
+
+Non-negotiable invariants specific to this feature:
+
+- **`pgs.dp_cp`, `pgs.intra_dp_cp` and `pgs.intra_dist_opt` stay WORLD.** Only
+  the inert `pgs.dp` may narrow. `setup_process_groups_for_ddp` overwrites
+  `intra_dp_cp := dp_cp` at one optimizer instance, so `dp_cp` alone is both the
+  SUM-reduce group and the ZeRO-1 shard count; shrinking it drops the cross-CP
+  partial sum and the encoder silently trains on `1/e` of its own gradient.
+- **Exactly one rank per worker is the EMBEDDING source and the GRADIENT
+  destination.** `finalize_encoder_grads` is an undefended WORLD SUM with
+  prescale 1: delivering a row's gradient to more than one of the worker's ranks
+  multiplies the encoder gradient by exactly `e`, stays finite, trips no check,
+  and is absorbed by the composite optimizer's shared-norm clipping. It presents
+  as a converging run with a wrong effective learning rate.
+- The non-designated ranks must have their gradient regroup buffers **explicitly
+  zeroed**; `DirectBufferAllocator.acquire` returns `torch.empty`, and those
+  ranks have no `dest_view` to fill it.
+- The encoder must attend over **its own** CP group. The adapter used to
+  `del pg_collection`, which made attention fall back to the MPU's *decoder* CP
+  group. At `e == cp` the two rank sets numerically coincide, so that bug is
+  invisible at `world=16/pp=2/cp=2/e=2` — test any new plumbing at a topology
+  where they differ.
+- TE aborts for `qkv_format="thd"` with CP unless `cu_seqlens_*_padded` is
+  supplied. The vision pack has no padding, so the **same tensor object** is
+  passed as the padded variant; TE special-cases that identity and keeps
+  `pad_between_seqs=False`, preserving FlashAttention eligibility.
+
+Current scope: `encoder_cp in (1, 2)`, `cp_comm_type="p2p"`, and either `e | cp`
+or `cp | e` so a worker's rank block is uniform. `e >= 4` additionally requires
+every frame to satisfy `h*w % (2*e) == 0`, which real grids violate
+data-dependently (14 of 137 mock frames at `e=4`), and the vision encoder has no
+frame-padding path to fix it — that is separate, explicitly scoped work.
+
 ## Optimizer and checkpoint semantics
 
 The vision encoder is replicated over WORLD and uses its own DDP/ZeRO-1 domain.
