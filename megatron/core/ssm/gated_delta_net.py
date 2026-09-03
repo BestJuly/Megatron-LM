@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2025, Songlin Yang, Jan Kautz, Ali Hatamizadeh.
 
 # Some of this code was adopted from https://github.com/huggingface/transformers
@@ -60,6 +60,28 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=1)
+def _get_cudnn_gated_delta_rule():
+    """Enable and return cuDNN Frontend's FLA-compatible GDR implementation.
+
+    ``cudnn.fla.accelerate_fla`` patches FLA's public GDR entry point while preserving
+    its signature and fallback behavior. Resolve it lazily so importing Megatron does
+    not require cudnn-frontend unless this backend is selected.
+    """
+    try:
+        import cudnn.fla as cudnn_fla
+        from fla.ops import gated_delta_rule as fla_gated_delta_rule
+
+        cudnn_fla.accelerate_fla(verbose=False, targets="gdn")
+    except (AttributeError, ImportError) as error:
+        raise ImportError(
+            "gdn_kernel_backend='cudnn' requires a cuDNN Frontend build with "
+            "cudnn.fla GDN support."
+        ) from error
+
+    return fla_gated_delta_rule.chunk_gated_delta_rule
 
 
 @dataclass
@@ -243,6 +265,8 @@ class GatedDeltaNet(MegatronModule):
 
         if self.config.deterministic_mode:
             self.gated_delta_rule = torch_chunk_gated_delta_rule
+        elif self.config.gdn_kernel_backend == "cudnn":
+            self.gated_delta_rule = _get_cudnn_gated_delta_rule()
         else:
             self.gated_delta_rule = chunk_gated_delta_rule
 

@@ -408,6 +408,10 @@ class TransformerConfig(ModelParallelConfig):
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
 
+    gdn_kernel_backend: Literal["fla", "cudnn"] = "fla"
+    """Gated delta rule kernel backend. The cuDNN backend uses cuDNN Frontend's
+    FLA-compatible GDN adapter and retains its automatic FLA fallback for unsupported cases."""
+
     gdn_pre_gated_delta_rule_fusion: bool = False
     """Whether to use the streamed Triton fusion for GatedDeltaNet pre-GDR preprocessing."""
 
@@ -1638,6 +1642,12 @@ class TransformerConfig(ModelParallelConfig):
                         f"gdn_conv_pad_alignment must be positive when set, "
                         f"got {self.gdn_conv_pad_alignment}."
                     )
+                if self.gdn_kernel_backend == "cudnn" and self.deterministic_mode:
+                    raise ValueError(
+                        "gdn_kernel_backend='cudnn' is incompatible with deterministic_mode=True; "
+                        "leave gdn_kernel_backend='fla' so deterministic mode can select the "
+                        "PyTorch GDR implementation."
+                    )
 
             if self.context_parallel_size > 1:
                 assert self.linear_cp_mode in ("headwise", "chunkwise"), (
@@ -1778,6 +1788,18 @@ class TransformerConfig(ModelParallelConfig):
         ):
             raise ValueError(
                 "gdn_pre_gated_delta_rule_fusion is only supported with "
+                "experimental_attention_variant='gated_delta_net'."
+            )
+
+        if self.gdn_kernel_backend not in ("fla", "cudnn"):
+            raise ValueError("gdn_kernel_backend must be one of: fla, cudnn.")
+
+        if (
+            self.gdn_kernel_backend != "fla"
+            and self.experimental_attention_variant != "gated_delta_net"
+        ):
+            raise ValueError(
+                "gdn_kernel_backend is only configurable with "
                 "experimental_attention_variant='gated_delta_net'."
             )
 
