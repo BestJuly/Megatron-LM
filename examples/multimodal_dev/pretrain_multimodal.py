@@ -35,8 +35,10 @@ sys.path.insert(
 
 from examples.multimodal_dev.arguments import (
     add_multimodal_args,
+    encoder_ffn_overrides_from_args,
     encoder_fp8_overrides_from_args,
     encoder_recompute_overrides_from_args,
+    validate_encoder_ffn_args,
     validate_encoder_fp8_args,
     validate_encoder_recompute_args,
 )
@@ -92,9 +94,13 @@ def model_provider(
     vision_config.fp16 = language_config.fp16
     vision_config.apply_rope_fusion = language_config.apply_rope_fusion
 
+    # Applied on the MDP path too, where this vision_config never builds a
+    # tower: its only consumer there is vision_flops_fn, and the padded FFN
+    # width is the arithmetic the MDP encoder actually performs.
     encoder_overrides = {
         **encoder_recompute_overrides_from_args(args),
         **encoder_fp8_overrides_from_args(args),
+        **encoder_ffn_overrides_from_args(args),
     }
     if encoder_overrides:
         vision_config = dataclasses.replace(vision_config, **encoder_overrides)
@@ -164,8 +170,11 @@ def datasets_provider(train_val_test_num_samples, vp_stage=None):
 def _mdp_adapter_builder(args):
     """Build the Qwen3.5-VL MDP adapter plus its vision TransformerConfig.
 
-    Mirrors model_provider's vision-config assembly so the MDP encoder is
-    built from exactly the same configuration as the native path.
+    Mirrors model_provider's vision-config assembly, minus the encoder
+    recompute/FP8/FFN-width overrides, deliberately: build_encoder_domain
+    applies those itself, and it needs this config to carry the checkpoint
+    architecture's ffn_hidden_size (the real width zero_pad_vision_mlp_channels
+    and the checkpoint facade pad up from).
     """
     from examples.multimodal_dev.mdp_adapter import build_mdp_adapter
     from examples.multimodal_dev.models import MODEL_REGISTRY
@@ -219,6 +228,7 @@ if __name__ == "__main__":
     )
     validate_encoder_recompute_args(args)
     validate_encoder_fp8_args(args)
+    validate_encoder_ffn_args(args)
     # Fail fast on a quantization recipe the collate path cannot align, before
     # the model and datasets are built (the result is cached on the argument values).
     quantized_row_alignment(args)

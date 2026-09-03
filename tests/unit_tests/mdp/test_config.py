@@ -125,6 +125,9 @@ def test_disabled_mdp_skips_all_checks():
             ),
             "encoder_recompute_modules",
         ),
+        (dict(encoder_ffn_hidden_size=0), "encoder_ffn_hidden_size"),
+        (dict(encoder_ffn_hidden_size="4320"), "encoder_ffn_hidden_size"),
+        (dict(zero_pad_vision_ffn=True), "zero_pad_vision_ffn"),
         (dict(locality_slack_permille=1000), "locality_slack_permille"),
         (dict(locality_slack_permille=-1), "locality_slack_permille"),
         (dict(row_alignment=0), "row_alignment"),
@@ -198,34 +201,48 @@ def test_whole_encoder_recompute_without_native_options_is_valid():
 
 
 @pytest.mark.parametrize(
-    "decoder_fp8, decoder_recipe, encoder_fp8, match",
+    "decoder_fp8, decoder_recipe, encoder_fp8, ffn_hidden_size, match",
     [
         # The encoder inherits the decoder's recipe, so the accepting rows also
         # pin that every ENCODER_COMPATIBLE_FP8_RECIPES member is a real
         # Fp8Recipe value. decoder_recipe is never None: args.fp8_recipe defaults
         # to "delayed", so a None column would exercise these gates unreachably.
-        ("hybrid", "tensorwise", True, None),
-        ("hybrid", "blockwise", True, None),
-        ("e4m3", "mxfp8", True, None),
+        ("hybrid", "tensorwise", True, None, None),
+        ("hybrid", "blockwise", True, None, None),
+        ("e4m3", "mxfp8", True, None, None),
         # Nothing to inherit: encoder-only FP8 is not supported.
-        (None, "delayed", True, "enable decoder FP8 first"),
-        (None, "tensorwise", True, "enable decoder FP8 first"),
+        (None, "delayed", True, None, "enable decoder FP8 first"),
+        (None, "tensorwise", True, None, "enable decoder FP8 first"),
         # A delayed-scaling (or custom) decoder cannot lend its recipe to the
         # encoder: the encoder's per-chunk, rank-dependent forward count would
         # push the amax history unevenly, and TE's global amax reduction on
         # every depth-0 autocast exit would give the decoder's own buffers
         # rank-dependent collective counts. --fp8-format hybrid alone leaves the
         # recipe at "delayed", so this is the most common FP8 command line.
-        ("hybrid", "delayed", True, "fp8_recipe="),
-        ("hybrid", "custom", True, "fp8_recipe="),
+        ("hybrid", "delayed", True, None, "fp8_recipe="),
+        ("hybrid", "custom", True, None, "fp8_recipe="),
         # With the encoder off the decoder recipe is unrestricted (PR #55).
-        ("hybrid", "delayed", False, None),
-        (None, "delayed", False, None),
+        ("hybrid", "delayed", False, None, None),
+        (None, "delayed", False, None, None),
+        # encoder_ffn_hidden_size alignment against the inherited recipe: TE
+        # quantizes the vision FFN weights on the first encoder forward, so an
+        # unaligned width has to be rejected at startup rather than mid-run. The
+        # last row pins that the rule is armed by encoder FP8 only.
+        ("hybrid", "mxfp8", True, 4304, "encoder_ffn_hidden_size"),
+        ("hybrid", "mxfp8", True, 4320, None),
+        ("hybrid", "tensorwise", True, 4312, "encoder_ffn_hidden_size"),
+        ("hybrid", "tensorwise", True, 4320, None),
+        ("hybrid", "mxfp8", False, 4304, None),
     ],
 )
-def test_encoder_fp8_gates(decoder_fp8, decoder_recipe, encoder_fp8, match):
+def test_encoder_fp8_gates(decoder_fp8, decoder_recipe, encoder_fp8, ffn_hidden_size, match):
     """The rejections config.py guards behind ``if config.encoder_fp8``."""
-    config = MdpConfig(enable=True, encoder_fp8=encoder_fp8)
+    config = MdpConfig(
+        enable=True,
+        encoder_fp8=encoder_fp8,
+        encoder_ffn_hidden_size=ffn_hidden_size,
+        zero_pad_vision_ffn=ffn_hidden_size is not None,
+    )
     options = _options(decoder_fp8=decoder_fp8, decoder_fp8_recipe=decoder_recipe)
     if match is None:
         validate_mdp_config(config, options)
@@ -353,6 +370,8 @@ def _fake_args(**overrides):
         # of None would disarm the decoder-amax gate in every args-level test.
         fp8_recipe="delayed",
         encoder_fp8=False,
+        encoder_ffn_hidden_size=None,
+        mdp_zero_pad_vision_ffn=False,
         cuda_graph_impl="none",
         cpu_offloading=False,
         fine_grained_activation_offloading=False,
@@ -416,6 +435,23 @@ def test_snapshot_carries_the_flags_the_rejections_read(flag):
     )
     with pytest.raises(MdpConfigurationError, match=flag):
         validate_mdp_config(MdpConfig(enable=True), options)
+
+
+def test_zero_pad_vision_ffn_reaches_the_config_from_args():
+    """--mdp-zero-pad-vision-ffn and --encoder-ffn-hidden-size are read
+    tolerantly, and both fallbacks equal the production defaults, so a typo in
+    either read is silent: every other zero_pad test builds MdpConfig directly,
+    and on a real run the flag would never turn on -- the encoder would take the
+    widened FFN as its real architecture and load the official checkpoint into
+    the wrong shape."""
+    from megatron.core.mdp.integration import mdp_config_from_args
+
+    default = mdp_config_from_args(_fake_args())
+    assert (default.encoder_ffn_hidden_size, default.zero_pad_vision_ffn) == (None, False)
+    padded = mdp_config_from_args(
+        _fake_args(encoder_ffn_hidden_size=4320, mdp_zero_pad_vision_ffn=True)
+    )
+    assert (padded.encoder_ffn_hidden_size, padded.zero_pad_vision_ffn) == (4320, True)
 
 
 def test_decoder_fp8_is_accepted_by_the_support_matrix():

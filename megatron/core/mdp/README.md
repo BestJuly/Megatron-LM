@@ -99,6 +99,12 @@ FP8 is supported on both sides, on one recipe:
   own delayed buffers would see rank-dependent collective counts; `custom` is
   unvalidated. `validate_effective_vision_config` cross-checks the built config
   against the snapshot, so FP8 cannot reach the encoder by any other route.
+- An FP8 encoder needs its vision `ffn_hidden_size` aligned to the recipe's
+  block size (32 for MXFP8, 16 otherwise), which the official Qwen3.5-VL 4304
+  is not. `--encoder-ffn-hidden-size 4320` builds the FFN at the aligned width;
+  `--mdp-zero-pad-vision-ffn` alongside it keeps that from being an
+  architecture change: the extra channels are zeroed at construction and
+  provably stay at zero (`zero_pad_vision_mlp_channels` in `encoder.py`).
 
 Rejected at startup: FSDP/HSDP, `--encoder-fp8` without decoder FP8, a
 `delayed`/`custom` recipe alongside an FP8 encoder, an encoder

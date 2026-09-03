@@ -127,7 +127,7 @@ returns to `EMPTY`.
 | `bridge.py` | Canonical ledger and `all_to_all_single` transport for all three payload phases. |
 | `window.py` | Whole-iteration capture, microbatch replay cursors, pixel ownership context. |
 | `activation.py` | Retained-graph and complete-replay encoder handles, RNG recipes, chunk backward. |
-| `encoder.py` | Encoder process groups, DDP/ZeRO-1 domain, gradient finalization. |
+| `encoder.py` | Encoder process groups, DDP/ZeRO-1 domain, vision FFN zero-padding, gradient finalization. |
 | `runtime.py` | P0-P5 orchestration, prefetch handoff, per-iteration state and metrics. |
 | `schedule.py` | Native schedule and `finalize_model_grads_func` wrappers. |
 | `optimizer.py` | Decoder/encoder composite optimizer and shared overflow/norm semantics. |
@@ -269,7 +269,8 @@ encoder's per-chunk, rank-dependent forward count -- doubled by P2/P5
 whole-encoder replay -- would push the amax history unevenly, and TE all-reduces
 its global amax buffer on every depth-0 `fp8_autocast` exit so the decoder's own
 delayed buffers would see rank-dependent collective counts; `custom`:
-unvalidated). Those gates run before the vision config
+unvalidated), and requires `--encoder-ffn-hidden-size`, when given, to be
+aligned to the recipe's block size. Those gates run before the vision config
 exists, so `validate_effective_vision_config` re-checks the built config
 against the snapshot inside `build_encoder_domain`: an adapter that set `fp8`
 on its own, or lost it, fails loudly rather than training an encoder the gates
@@ -284,17 +285,30 @@ the same encoder and see the same recipe. Every compatible recipe derives its
 scale from the current tensor and keeps no cross-forward state, which is what
 makes the replay numerically equivalent.
 
-Quantized GEMMs constrain the decoder's packed row count: `pack_or_pad_batch`
-extends the last sample's padded region until the packed total is a multiple of
-`get_fp8_align_size(fp8_recipe)` (32 for MXFP8, 16 otherwise). Every other
-sample keeps its exact length, which is what lets that call site declare
-`pad_between_seqs=False` and keep FlashAttention/FusedAttention eligible for
-THD. Alignments it cannot derive fail loudly instead: with
-`--use-packed-sequence`, `--fp4-format` and `--fp8-recipe custom` raise
-`NotImplementedError`. Without `--use-packed-sequence` it contributes nothing:
-BSHD collation is untouched by FP8. Under MDP that branch is unreachable (MDP
-requires packed sequences); natively it is reachable and, exactly as on base,
-unguarded -- a BSHD + FP8 run outside MDP gets no alignment from this stack.
+Quantized GEMMs constrain three shapes, each padded by a different owner:
+
+- decoder packed-sequence rows: `pack_or_pad_batch` extends the last sample's
+  padded region until the packed total is a multiple of
+  `get_fp8_align_size(fp8_recipe)` (32 for MXFP8, 16 otherwise). Every other
+  sample keeps its exact length, which is what lets that call site declare
+  `pad_between_seqs=False` and keep FlashAttention/FusedAttention eligible for
+  THD. Alignments it cannot derive fail loudly instead: with
+  `--use-packed-sequence`, `--fp4-format` and `--fp8-recipe custom` raise
+  `NotImplementedError`. Without `--use-packed-sequence` it contributes nothing:
+  BSHD collation is untouched by FP8. Under MDP that branch is unreachable (MDP
+  requires packed sequences); natively it is reachable and, exactly as on base,
+  unguarded -- a BSHD + FP8 run outside MDP gets no alignment from this stack;
+- encoder chunk payload rows: `Qwen35VLMdpAdapter.encode` appends one synthetic
+  all-zero grid item before the encoder call and strips its output rows after
+  (`tests/unit_tests/mdp/test_encoder_payload_padding.py`);
+- vision `ffn_hidden_size`: `--encoder-ffn-hidden-size` builds the aligned
+  width and `--mdp-zero-pad-vision-ffn` keeps it checkpoint-compatible, applied
+  by `zero_pad_vision_mlp_channels`.
+
+The FFN padding is inert rather than masked: `linear_fc1`'s padded rows and
+bias and `linear_fc2`'s padded columns are zeroed, and the vision MLP has no
+normalization between them, so `GELU(0)=0` and the chain rule keep both those
+activations and their gradients at exactly zero.
 
 ### Decoder packed-row alignment: derivation
 
@@ -369,6 +383,8 @@ Primary flags:
 - `--encoder-fp8` (inherits the decoder's `--fp8-format`/`--fp8-recipe`;
   requires `--mdp-enable` and decoder FP8; recipe must be
   tensorwise|blockwise|mxfp8)
+- `--encoder-ffn-hidden-size N` (with `--mdp-zero-pad-vision-ffn` to stay
+  checkpoint-compatible)
 - `--mdp-locality-slack-permille`
 - `--mdp-pixel-locality`
 - `--mdp-row-alignment`

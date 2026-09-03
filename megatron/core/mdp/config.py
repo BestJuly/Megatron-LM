@@ -72,6 +72,13 @@ class MdpConfig:
     # encoder has no recipe of its own and never enables FP8 attention. False
     # keeps the encoder in bf16 whatever the decoder's --fp8 says.
     encoder_fp8: bool = False
+    # Vision FFN width to build at (e.g. MXFP8's 32-channel block alignment:
+    # 4304 -> 4320). Alone it is a raw architecture change ("Approach A",
+    # checkpoint-incompatible); with zero_pad_vision_ffn the extra channels are
+    # zero-initialized and provably inert ("Approach B", checkpoint-compatible,
+    # see zero_pad_vision_mlp_channels in encoder.py).
+    encoder_ffn_hidden_size: Optional[int] = None
+    zero_pad_vision_ffn: bool = False
     locality_slack_permille: int = 10
     row_alignment: int = 1
     plan_check_interval: int = 1
@@ -118,6 +125,11 @@ class MdpCompatibilityOptions:
     # args.reuse_grad_buf_for_mxfp8_param_ag. Rejected outright under MDP; see
     # validate_mdp_config for the composite-optimizer mechanism.
     reuse_grad_buf_for_mxfp8_param_ag: bool = False
+
+
+def _is_positive_int(value: Any) -> bool:
+    """True only for a real positive integer (bool is an int subclass in Python)."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
 def encoder_fp8_align_size(fp8_recipe: Optional[str]) -> int:
@@ -214,6 +226,28 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "Module selection applies only to selective recompute.",
             "None",
         )
+    if config.encoder_ffn_hidden_size is not None and not _is_positive_int(
+        config.encoder_ffn_hidden_size
+    ):
+        _reject(
+            "encoder_ffn_hidden_size",
+            config.encoder_ffn_hidden_size,
+            "None or a positive integer",
+            "encoder_ffn_hidden_size is the width the encoder FFN is built at (and, "
+            "with zero_pad_vision_ffn, the width the checkpoint architecture is "
+            "zero-padded up to).",
+            "None",
+        )
+    if config.zero_pad_vision_ffn and config.encoder_ffn_hidden_size is None:
+        _reject(
+            "zero_pad_vision_ffn",
+            config.zero_pad_vision_ffn,
+            "encoder_ffn_hidden_size is set",
+            "zero_pad_vision_ffn pads the vision FFN's real (checkpoint) hidden size "
+            "up to encoder_ffn_hidden_size; with no target there is nothing to pad "
+            "to.",
+            "--encoder-ffn-hidden-size <alignment target>",
+        )
     if config.encoder_fp8:
         if options.decoder_fp8 is None:
             _reject(
@@ -240,6 +274,18 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
                 "collective counts (see ENCODER_COMPATIBLE_FP8_RECIPES). 'custom' is "
                 "unvalidated.",
                 "--fp8-recipe tensorwise",
+            )
+        align = encoder_fp8_align_size(options.decoder_fp8_recipe)
+        if config.encoder_ffn_hidden_size is not None and config.encoder_ffn_hidden_size % align:
+            _reject(
+                "encoder_ffn_hidden_size",
+                config.encoder_ffn_hidden_size,
+                f"encoder_ffn_hidden_size % {align} == 0 for fp8_recipe "
+                f"'{options.decoder_fp8_recipe}'",
+                "TE quantizes the vision FFN weights on the first encoder forward "
+                "and aborts when a GEMM dimension is not a multiple of the recipe's "
+                "block size.",
+                str((config.encoder_ffn_hidden_size + align - 1) // align * align),
             )
     if not (0 <= config.locality_slack_permille < 1000):
         _reject(
@@ -504,6 +550,20 @@ def apply_encoder_fp8_config(
     )
 
 
+def apply_encoder_ffn_config(
+    base_config: "TransformerConfig", config: MdpConfig
+) -> "TransformerConfig":
+    """Build the vision FFN at ``encoder_ffn_hidden_size`` when one is set.
+
+    The base config keeps the checkpoint architecture's width, which is what
+    ``zero_pad_vision_mlp_channels`` and the checkpoint facade read as the real
+    width; only the built encoder is widened.
+    """
+    if config.encoder_ffn_hidden_size is None:
+        return base_config
+    return dataclasses.replace(base_config, ffn_hidden_size=config.encoder_ffn_hidden_size)
+
+
 def validate_effective_vision_config(
     config: MdpConfig,
     effective_config: "TransformerConfig",
@@ -576,8 +636,10 @@ def validate_effective_vision_config(
                 "recipe; a different recipe on the built config bypasses it.",
                 repr(expected_recipe),
             )
-        # The width the FFN is actually built at. The shipped Qwen3.5-VL 4304 is
-        # not a multiple of MXFP8's 32, and without this check that configuration
+        # The width the FFN is actually built at, whether it came from
+        # encoder_ffn_hidden_size (already gated in validate_mdp_config) or from
+        # the base vision config -- the shipped Qwen3.5-VL 4304 is not a
+        # multiple of MXFP8's 32, and without this check that configuration
         # passes every validator and dies inside TE on the first forward.
         align = encoder_fp8_align_size(effective_recipe)
         effective_ffn = getattr(effective_config, "ffn_hidden_size", None)
@@ -590,5 +652,6 @@ def validate_effective_vision_config(
                 "TE quantizes the vision FFN weights on the first encoder forward and "
                 "aborts when a GEMM dimension is not a multiple of the recipe's block "
                 "size.",
-                f"widen the vision ffn_hidden_size to a multiple of {align} ({aligned})",
+                f"--encoder-ffn-hidden-size {aligned} (with --mdp-zero-pad-vision-ffn to "
+                "keep official checkpoints loadable)",
             )

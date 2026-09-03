@@ -7,8 +7,10 @@ from types import SimpleNamespace
 import pytest
 
 from examples.multimodal_dev.arguments import (
+    encoder_ffn_overrides_from_args,
     encoder_fp8_overrides_from_args,
     encoder_recompute_overrides_from_args,
+    validate_encoder_ffn_args,
     validate_encoder_fp8_args,
     validate_encoder_recompute_args,
 )
@@ -21,6 +23,8 @@ _DEFAULTS = {
     "encoder_fp8": False,
     "fp8": None,
     "fp8_recipe": "delayed",
+    "encoder_ffn_hidden_size": None,
+    "mdp_zero_pad_vision_ffn": False,
 }
 
 
@@ -150,3 +154,28 @@ def test_encoder_fp8_args_matrix(mdp_enable, options, match):
     else:
         with pytest.raises(RuntimeError, match=match):
             validate_encoder_fp8_args(args)
+
+
+@pytest.mark.parametrize(
+    "mdp_enable, options, match",
+    [
+        (True, {"mdp_zero_pad_vision_ffn": True}, "requires --encoder-ffn-hidden-size"),
+        (
+            False,
+            {"mdp_zero_pad_vision_ffn": True, "encoder_ffn_hidden_size": 4320},
+            "requires --mdp-enable",
+        ),
+        (True, {"encoder_ffn_hidden_size": 0}, "must be positive"),
+        # The width alone is an ordinary architecture change, allowed natively.
+        (False, {"encoder_ffn_hidden_size": 4320}, None),
+        (True, {"mdp_zero_pad_vision_ffn": True, "encoder_ffn_hidden_size": 4320}, None),
+    ],
+)
+def test_encoder_ffn_args_matrix(mdp_enable, options, match):
+    args = _args(mdp_enable=mdp_enable, **options)
+    if match is None:
+        validate_encoder_ffn_args(args)
+        assert encoder_ffn_overrides_from_args(args) == {"ffn_hidden_size": 4320}
+    else:
+        with pytest.raises(RuntimeError, match=match):
+            validate_encoder_ffn_args(args)
