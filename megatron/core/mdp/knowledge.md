@@ -251,6 +251,21 @@ The current checkpoint support is intentionally narrow:
 Decoder and WORLD encoder optimizers do not share a DP sharding group; never
 key or reshard them as if they did.
 
+## FP8 and quantized-GEMM alignment
+
+Decoder and encoder FP8 are configured separately. `args.fp8` reaches only the
+decoder; the vision `TransformerConfig` is built by the adapter and never reads
+it, and the typed encoder arguments (`--encoder-recompute-*`) carry no FP8
+field. Decoder FP8 is not an MDP incompatibility, so `MdpCompatibilityOptions`
+carries no field for it at all; the one thing it asks of MDP, the THD row
+alignment, reads `args.fp8` directly in `forward_step.py`.
+
+Encoder FP8 is rejected where it becomes observable rather than inferred from
+args: `validate_effective_vision_config` runs on the resolved vision config
+inside `build_encoder_domain` and refuses `fp8 is not None`. A future adapter
+that wires FP8 into the vision config trips that check instead of silently
+training an FP8 encoder the support matrix never validated.
+
 ## Configuration quick reference
 
 Primary flags:
@@ -324,11 +339,13 @@ Current major constraints:
 - per-token loss enabled;
 - bf16/fp16 mixed precision;
 - synchronous global `torch_dist` checkpointing (exact resume, same world size);
-- no FSDP/HSDP, FP8, full-iteration CUDA graph, CPU activation offload, or
-  encoder communication overlap;
+- decoder FP8 supported, encoder FP8 rejected;
+- no FSDP/HSDP, full-iteration CUDA graph, CPU activation offload, or encoder
+  communication overlap;
 - native decoder `overlap_grad_reduce` and `overlap_param_gather` are supported,
-  while delayed gradient reduction and parameter-gather overlap with the
-  optimizer step are rejected by `validate_mdp_config`.
+  while delayed gradient reduction, parameter-gather overlap with the optimizer
+  step, and MXFP8 grad-buffer reuse for the parameter all-gather are rejected by
+  `validate_mdp_config`.
 
 Always read `validate_mdp_config` before relaxing a constraint. A validation
 change without corresponding runtime/test support is not an implementation.

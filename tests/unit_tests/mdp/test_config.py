@@ -34,7 +34,6 @@ def _options(**overrides):
         fp16=False,
         bf16=True,
         fsdp_enabled=False,
-        fp8_enabled=False,
         cuda_graph_enabled=False,
         activation_offload_enabled=False,
         overlap_grad_reduce=False,
@@ -148,7 +147,6 @@ def test_invalid_mdp_config_fields_rejected(config_kwargs, match):
         (dict(distributed_optimizer_instances=2), "distributed_optimizer_instances"),
         (dict(bf16=False), "fp16/bf16"),
         (dict(fsdp_enabled=True), "fsdp"),
-        (dict(fp8_enabled=True), "fp8"),
         (dict(cuda_graph_enabled=True), "cuda_graph"),
         (dict(activation_offload_enabled=True), "activation_offload"),
         (dict(overlap_param_gather=True), "overlap_param_gather"),
@@ -221,6 +219,7 @@ class _FakeTransformerConfig:
     recompute_num_layers: object = None
     recompute_modules: object = None
     hidden_size: int = 64
+    fp8: object = None
 
     def __post_init__(self):
         if self.recompute_granularity not in (None, "selective", "full"):
@@ -318,6 +317,7 @@ def _fake_args(**overrides):
         overlap_param_gather_with_optimizer_step=False,
         delay_grad_reduce=False,
         overlap_moe_expert_parallel_comm=False,
+        reuse_grad_buf_for_mxfp8_param_ag=False,
         ckpt_format="torch_dist",
         save=None,
         load=None,
@@ -354,15 +354,50 @@ def test_snapshot_reports_decoder_ep_overlap():
     assert options.overlap_moe_expert_parallel_comm is True
 
 
-def test_snapshot_reports_optimizer_step_param_gather_overlap():
+@pytest.mark.parametrize(
+    "flag", ["overlap_param_gather_with_optimizer_step", "reuse_grad_buf_for_mxfp8_param_ag"]
+)
+def test_snapshot_carries_the_flags_the_rejections_read(flag):
+    """compatibility_options_from_args() is the only place these args become
+    MdpCompatibilityOptions state, and every field below defaults to False, so
+    a key read under the wrong name leaves validate_mdp_config's rejection
+    permanently inert -- and the suite green."""
     from megatron.core.mdp.integration import compatibility_options_from_args
 
-    options = compatibility_options_from_args(
-        _fake_args(overlap_param_gather_with_optimizer_step=True)
+    options = compatibility_options_from_args(_fake_args(**{flag: True}))
+    assert getattr(options, flag), (
+        f"compatibility_options_from_args() must snapshot args.{flag}, or "
+        "validate_mdp_config's rejection of it can never fire on a real run"
     )
-    assert options.overlap_param_gather_with_optimizer_step
-    with pytest.raises(MdpConfigurationError, match="overlap_param_gather_with_optimizer_step"):
+    with pytest.raises(MdpConfigurationError, match=flag):
         validate_mdp_config(MdpConfig(enable=True), options)
+
+
+def test_decoder_fp8_is_accepted_by_the_support_matrix():
+    # --fp8 configures the decoder only; the vision TransformerConfig is built
+    # by the adapter builder and never reads it. The compatibility snapshot
+    # carries no decoder-FP8 field at all, so validate_mdp_config cannot reject
+    # it -- encoder FP8 is refused on the resolved vision config instead (see
+    # the test below).
+    from megatron.core.mdp.integration import compatibility_options_from_args
+
+    options = compatibility_options_from_args(_fake_args(fp8="hybrid"))
+    # The only fp8-named field is the mxfp8 grad-buffer-reuse reject, which is
+    # an MDP incompatibility in its own right, not a decoder-FP8 switch.
+    assert [field.name for field in dataclasses.fields(options) if "fp8" in field.name] == [
+        "reuse_grad_buf_for_mxfp8_param_ag"
+    ]
+    validate_mdp_config(MdpConfig(enable=True), options)
+
+
+def test_effective_vision_config_with_fp8_is_rejected():
+    # The reject lives on the resolved vision config, where encoder FP8 is
+    # observable, not on an args-derived flag that no wired path can set. An
+    # adapter that wires fp8 into the vision config must trip this.
+    with pytest.raises(MdpConfigurationError, match="effective vision fp8"):
+        validate_effective_vision_config(
+            MdpConfig(enable=True), _FakeTransformerConfig(fp8="hybrid")
+        )
 
 
 @pytest.mark.parametrize(

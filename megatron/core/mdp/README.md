@@ -72,9 +72,16 @@ in P5/P6. Decoder-only EP A2A overlap via
 the native MCore requirements (`EP>1`, and VPP when `PP>1`); the vision encoder
 remains outside that schedule.
 
-Rejected at startup: FSDP/HSDP, FP8/MXFP8, full-iteration CUDA graphs, CPU
+Decoder FP8 is supported. The decoder uses the native `--fp8`/`--fp8-recipe`
+flags; the vision `TransformerConfig` is built separately by the model adapter
+and never inherits them, so decoder FP8 leaves the encoder domain untouched
+(`validate_effective_vision_config` re-asserts that against the resolved vision
+config inside `build_encoder_domain`).
+
+Rejected at startup: FSDP/HSDP, encoder FP8, full-iteration CUDA graphs, CPU
 activation offload, delayed gradient reduction,
-`overlap_param_gather_with_optimizer_step`, multiple distributed-optimizer
+`overlap_param_gather_with_optimizer_step`,
+`reuse_grad_buf_for_mxfp8_param_ag`, multiple distributed-optimizer
 instances, `calculate_per_token_loss=False`, non-`torch_dist` checkpoint
 formats, fully-parallel / asynchronous / non-persistent / constant-structure
 checkpoint modes, invalid rank mappings.
@@ -118,7 +125,7 @@ activations justifies the extra complete forward.
 
 Registered extension hooks (each exercised by a test at a non-degenerate
 value): logical workers + `worker_ranks()` for encoder CP, single-valued
-endpoints + multi-slice routes for decoder CP, typed encoder recompute
-configuration + row-capacity policy for FP8, and the unified buffer allocator
+endpoints + multi-slice routes for decoder CP, the typed encoder configuration
++ row-capacity policy for encoder FP8, and the unified buffer allocator
 for full-iteration CUDA graphs. The hooks guarantee no breaking schema change is
 needed later; they do not mean the capability is implemented.
