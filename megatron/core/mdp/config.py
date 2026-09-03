@@ -440,17 +440,36 @@ def _validate_cuda_graph_options(
         return
 
     if config.overlap_window_capture:
-        _reject(
-            "overlap_window_capture",
-            config.overlap_window_capture,
-            "overlap_window_capture == False when per-layer CUDA graphs are enabled",
-            "Window prefetch runs H2D copies and allocations from a background thread "
-            "on a side CUDA stream while graph capture is in flight, which "
-            "cudaStreamCaptureModeGlobal treats as an unsafe concurrent action. The "
-            "prefetch started in iteration N is still running when the capture step "
-            "runs, so the conflict is timing-dependent rather than reproducible.",
-            "False",
-        )
+        # EXPERIMENT ESCAPE HATCH. Default path is unchanged: without the env
+        # var this still raises exactly as before. It exists because the
+        # rejection below rests on a *predicted* race that was never measured,
+        # and grading that prediction requires running the combination.
+        # A clean run does NOT prove safety -- the failure mode is described as
+        # timing-dependent, so absence of a crash in N iterations is weak
+        # evidence. Do not remove the guard on the strength of one green run.
+        import os
+
+        if os.environ.get("MDP_ALLOW_OVERLAP_WITH_CUDA_GRAPHS") == "1":
+            print(
+                "MDP WARNING: overlap_window_capture + per-layer CUDA graphs is "
+                "normally REJECTED (config.py). Running anyway because "
+                "MDP_ALLOW_OVERLAP_WITH_CUDA_GRAPHS=1. This is an experiment; "
+                "the guarded failure is a capture-vs-prefetch race and is "
+                "timing-dependent.",
+                flush=True,
+            )
+        else:
+            _reject(
+                "overlap_window_capture",
+                config.overlap_window_capture,
+                "overlap_window_capture == False when per-layer CUDA graphs are enabled",
+                "Window prefetch runs H2D copies and allocations from a background thread "
+                "on a side CUDA stream while graph capture is in flight, which "
+                "cudaStreamCaptureModeGlobal treats as an unsafe concurrent action. The "
+                "prefetch started in iteration N is still running when the capture step "
+                "runs, so the conflict is timing-dependent rather than reproducible.",
+                "False",
+            )
 
     if not options.thd_static_packing:
         _reject(
