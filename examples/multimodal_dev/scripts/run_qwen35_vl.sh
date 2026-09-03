@@ -6,7 +6,7 @@
 #   ./examples/multimodal_dev/scripts/run_qwen35_vl.sh
 #
 # Environment variables:
-#   MODEL_VARIANT: proxy (default), pp_proxy, 0.8b, 2b, 4b, 9b, 27b, 35b_a3b, 122b_a10b, 397b_a17b, 35b_a3b_light
+#   MODEL_VARIANT: proxy (default), pp_proxy, 0.8b, 2b, 4b, 9b, 27b, 35b_a3b, 122b_a10b, 397b_a17b, 35b_a3b_light, 397b_a17b_light
 #   CKPT_LOAD: path to a pre-converted checkpoint to load (enables --load + --finetune)
 #   CKPT_FORMAT: checkpoint format override (e.g. torch_dist); auto-detected when empty
 #   TP, EP, PP: parallelism sizes (PP>1 forces USE_FSDP=0)
@@ -76,9 +76,9 @@ CP=${CP:-1}
 FORCE_LOAD_BALANCING=${FORCE_LOAD_BALANCING:-0}
 
 # Variant-aware architecture defaults.
-# The model provider builds configs from the variant dict in
-# multimodal_dev/models/qwen35_vl/configuration.py, but Megatron also
-# uses these CLI args internally (PP splits, param counting).
+# These CLI args -- not configuration.py's _VARIANT_CONFIGS -- are the real
+# language-decoder config source; keep them in sync by hand with
+# configuration.py and run_mdp_experiments.sh.
 case "$MODEL_VARIANT" in
     0.8b)
         NUM_LAYERS=${NUM_LAYERS:-24}
@@ -191,6 +191,16 @@ case "$MODEL_VARIANT" in
         NUM_QUERY_GROUPS=2
         LINEAR_NUM_VALUE_HEADS=64
         VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-27}
+        ;;
+    397b_a17b_light)
+        NUM_LAYERS=${NUM_LAYERS:-8}
+        NUM_EXPERTS=${NUM_EXPERTS:-32}
+        HIDDEN_SIZE=4096
+        FFN_HIDDEN_SIZE=10240
+        NUM_ATTN_HEADS=32
+        NUM_QUERY_GROUPS=2
+        LINEAR_NUM_VALUE_HEADS=64
+        VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-8}
         ;;
     *)
         : "${NUM_LAYERS:?NUM_LAYERS must be set for MODEL_VARIANT=$MODEL_VARIANT}"
@@ -443,7 +453,7 @@ case "$MODEL_VARIANT" in
     122b_a10b)
         MOE_TOPK=8; MOE_FFN_HIDDEN=1024; MOE_SHARED_HIDDEN=1024
         ;;
-    397b_a17b)
+    397b_a17b|397b_a17b_light)
         MOE_TOPK=10; MOE_FFN_HIDDEN=1024; MOE_SHARED_HIDDEN=1024
         ;;
     0.8b|2b|4b|9b|27b)
