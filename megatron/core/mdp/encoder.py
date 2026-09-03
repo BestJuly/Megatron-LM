@@ -18,6 +18,7 @@ import torch
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.mdp.config import (
     MdpConfig,
+    apply_encoder_fp8_config,
     apply_encoder_recompute_config,
     validate_effective_vision_config,
 )
@@ -47,12 +48,31 @@ def build_encoder_ddp_config(
     Decoder gradient-reduce and parameter-gather overlap is owned by the native
     decoder schedule. The encoder has a separate backward/finalization lifecycle in
     P5/P6, so it must not inherit those schedule-driven hooks.
+
+    The two MXFP8 parameter-gather fields are projected for the same reason.
+    ``reuse_grad_buf_for_mxfp8_param_ag`` aliases the parameter all-gather
+    receive buffer onto the gradient buffer, which is only safe under the
+    decoder's staging order: the training loop stages main params into the
+    shared buffer before the forward, and the decoder's parameter-gather
+    forward pre-hook then all-gathers and zeroes it before backward writes any
+    gradient into it. Forcing ``overlap_param_gather=False`` leaves the encoder
+    without that pre-hook, so the staged parameters would still be in the shared
+    buffer when P5 accumulates encoder gradients into it. ``fp8_param_gather``
+    is projected with it because ``DistributedDataParallelConfig.__post_init__``
+    couples the two (``reuse_grad_buf_for_mxfp8_param_ag`` asserts it), and that
+    assert is the only reader of the field outside Megatron-FSDP, which MDP
+    rejects. It does not change what the encoder holds: DDP dispatches on the
+    parameter's actual storage, and the encoder's parameters are never
+    quantized, because ``apply_encoder_fp8_config`` copies ``fp8``/``fp8_recipe``
+    only, never ``fp8_param``.
     """
     return replace(
         decoder_ddp_config,
         overlap_grad_reduce=False,
         overlap_param_gather=False,
         align_param_gather=False,
+        fp8_param_gather=False,
+        reuse_grad_buf_for_mxfp8_param_ag=False,
     )
 
 
@@ -107,10 +127,11 @@ def build_encoder_domain(
     optimizer_config,
     encoder_pgs: ProcessGroupCollection,
     wrap_mixed_precision: bool = True,
+    compat_options=None,
 ) -> EncoderDomain:
     """Assemble the encoder domain (API design 14.2).
 
-    Order: typed encoder recompute config; encoder via the adapter's shared
+    Order: typed encoder recompute and FP8 config; encoder via the adapter's shared
     factory; the same mixed-precision wrapper depth as the decoder;
     DDP over the encoder process groups; DistributedOptimizer from the DDP
     buffers.
@@ -135,10 +156,13 @@ def build_encoder_domain(
             )
 
     effective_config = apply_encoder_recompute_config(model_config, mdp_config)
-    validate_effective_vision_config(mdp_config, effective_config)
+    effective_config = apply_encoder_fp8_config(effective_config, mdp_config, compat_options)
+    validate_effective_vision_config(mdp_config, effective_config, compat_options)
     logger.info(
-        "MDP: effective encoder recompute granularity: %s",
+        "MDP: effective encoder recompute granularity: %s, fp8: %s (recipe %s)",
         mdp_config.encoder_recompute_granularity,
+        getattr(effective_config, "fp8", None),
+        getattr(effective_config, "fp8_recipe", None) if mdp_config.encoder_fp8 else None,
     )
     encoder = adapter.build_encoder(effective_config, pg_collection=encoder_pgs)
     if wrap_mixed_precision and (

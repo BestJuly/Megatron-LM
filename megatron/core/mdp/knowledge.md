@@ -253,18 +253,36 @@ key or reshard them as if they did.
 
 ## FP8 and quantized-GEMM alignment
 
-Decoder and encoder FP8 are configured separately. `args.fp8` reaches only the
-decoder; the vision `TransformerConfig` is built by the adapter and never reads
-it, and the typed encoder arguments (`--encoder-recompute-*`) carry no FP8
-field. Decoder FP8 is not an MDP incompatibility, so `MdpCompatibilityOptions`
-carries no field for it at all; the one thing it asks of MDP, the THD row
-alignment, reads `args.fp8` directly in `forward_step.py`.
+FP8 runs on one recipe for both sides. `args.fp8`/`args.fp8_recipe` configure
+the decoder; `--encoder-fp8` (`MdpConfig.encoder_fp8`) makes the vision encoder
+inherit them, copied onto the vision `TransformerConfig` by
+`apply_encoder_fp8_config` from the compatibility snapshot
+(`MdpCompatibilityOptions.decoder_fp8` / `decoder_fp8_recipe`), next to
+`apply_encoder_recompute_config`. The encoder has no recipe of its own and FP8
+attention is not offered for it.
 
-Encoder FP8 is rejected where it becomes observable rather than inferred from
-args: `validate_effective_vision_config` runs on the resolved vision config
-inside `build_encoder_domain` and refuses `fp8 is not None`. A future adapter
-that wires FP8 into the vision config trips that check instead of silently
-training an FP8 encoder the support matrix never validated.
+`validate_mdp_config` leaves decoder-only FP8 alone. Once the encoder runs FP8
+it requires decoder FP8 to be on (encoder-only FP8 is not supported: pure launch
+overhead in measurement, and it would need its own recipe plumbing), requires
+the shared recipe to be in `ENCODER_COMPATIBLE_FP8_RECIPES` (`delayed`: the
+encoder's per-chunk, rank-dependent forward count -- doubled by P2/P5
+whole-encoder replay -- would push the amax history unevenly, and TE all-reduces
+its global amax buffer on every depth-0 `fp8_autocast` exit so the decoder's own
+delayed buffers would see rank-dependent collective counts; `custom`:
+unvalidated). Those gates run before the vision config
+exists, so `validate_effective_vision_config` re-checks the built config
+against the snapshot inside `build_encoder_domain`: an adapter that set `fp8`
+on its own, or lost it, fails loudly rather than training an encoder the gates
+never saw, and the built `ffn_hidden_size` -- whichever config it came from --
+must be a multiple of the recipe's block size (Qwen3.5-VL's 4304 is not, for
+MXFP8).
+
+The FP8 context is opened per layer inside `TransformerBlock.forward` off the
+config fields, so the wiring is complete once the fields are set: the P2
+forward and, with `--encoder-recompute-granularity whole`, the P5 replay call
+the same encoder and see the same recipe. Every compatible recipe derives its
+scale from the current tensor and keeps no cross-forward state, which is what
+makes the replay numerically equivalent.
 
 Quantized GEMMs constrain the decoder's packed row count: `pack_or_pad_batch`
 extends the last sample's padded region until the packed total is a multiple of
@@ -348,6 +366,9 @@ Primary flags:
 - `--encoder-recompute-method uniform|block`
 - `--encoder-recompute-num-layers`
 - `--encoder-recompute-modules MODULE [MODULE ...]`
+- `--encoder-fp8` (inherits the decoder's `--fp8-format`/`--fp8-recipe`;
+  requires `--mdp-enable` and decoder FP8; recipe must be
+  tensorwise|blockwise|mxfp8)
 - `--mdp-locality-slack-permille`
 - `--mdp-pixel-locality`
 - `--mdp-row-alignment`
@@ -410,7 +431,8 @@ Current major constraints:
 - per-token loss enabled;
 - bf16/fp16 mixed precision;
 - synchronous global `torch_dist` checkpointing (exact resume, same world size);
-- decoder FP8 supported, encoder FP8 rejected;
+- decoder FP8 unrestricted on its own; with `--encoder-fp8` the shared recipe
+  must be in `ENCODER_COMPATIBLE_FP8_RECIPES` (no `delayed`/`custom`);
 - no FSDP/HSDP, full-iteration CUDA graph, CPU activation offload, or encoder
   communication overlap;
 - native decoder `overlap_grad_reduce` and `overlap_param_gather` are supported,

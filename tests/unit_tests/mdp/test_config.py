@@ -12,6 +12,7 @@ import pytest
 from megatron.core.mdp.config import (
     MdpCompatibilityOptions,
     MdpConfig,
+    apply_encoder_fp8_config,
     apply_encoder_recompute_config,
     validate_effective_vision_config,
     validate_mdp_config,
@@ -196,6 +197,43 @@ def test_whole_encoder_recompute_without_native_options_is_valid():
     )
 
 
+@pytest.mark.parametrize(
+    "decoder_fp8, decoder_recipe, encoder_fp8, match",
+    [
+        # The encoder inherits the decoder's recipe, so the accepting rows also
+        # pin that every ENCODER_COMPATIBLE_FP8_RECIPES member is a real
+        # Fp8Recipe value. decoder_recipe is never None: args.fp8_recipe defaults
+        # to "delayed", so a None column would exercise these gates unreachably.
+        ("hybrid", "tensorwise", True, None),
+        ("hybrid", "blockwise", True, None),
+        ("e4m3", "mxfp8", True, None),
+        # Nothing to inherit: encoder-only FP8 is not supported.
+        (None, "delayed", True, "enable decoder FP8 first"),
+        (None, "tensorwise", True, "enable decoder FP8 first"),
+        # A delayed-scaling (or custom) decoder cannot lend its recipe to the
+        # encoder: the encoder's per-chunk, rank-dependent forward count would
+        # push the amax history unevenly, and TE's global amax reduction on
+        # every depth-0 autocast exit would give the decoder's own buffers
+        # rank-dependent collective counts. --fp8-format hybrid alone leaves the
+        # recipe at "delayed", so this is the most common FP8 command line.
+        ("hybrid", "delayed", True, "fp8_recipe="),
+        ("hybrid", "custom", True, "fp8_recipe="),
+        # With the encoder off the decoder recipe is unrestricted (PR #55).
+        ("hybrid", "delayed", False, None),
+        (None, "delayed", False, None),
+    ],
+)
+def test_encoder_fp8_gates(decoder_fp8, decoder_recipe, encoder_fp8, match):
+    """The rejections config.py guards behind ``if config.encoder_fp8``."""
+    config = MdpConfig(enable=True, encoder_fp8=encoder_fp8)
+    options = _options(decoder_fp8=decoder_fp8, decoder_fp8_recipe=decoder_recipe)
+    if match is None:
+        validate_mdp_config(config, options)
+    else:
+        with pytest.raises(MdpConfigurationError, match=match):
+            validate_mdp_config(config, options)
+
+
 def test_error_messages_carry_option_value_and_suggestion():
     try:
         validate_mdp_config(
@@ -220,6 +258,8 @@ class _FakeTransformerConfig:
     recompute_modules: object = None
     hidden_size: int = 64
     fp8: object = None
+    fp8_recipe: object = "delayed"
+    ffn_hidden_size: int = 4320
 
     def __post_init__(self):
         if self.recompute_granularity not in (None, "selective", "full"):
@@ -308,6 +348,11 @@ def _fake_args(**overrides):
         use_custom_fsdp=False,
         use_megatron_fsdp=False,
         fp8=None,
+        # Megatron's *production* default: TransformerConfig sets fp8_recipe to
+        # "delayed" whether or not --fp8-format was passed. A getattr fallback
+        # of None would disarm the decoder-amax gate in every args-level test.
+        fp8_recipe="delayed",
+        encoder_fp8=False,
         cuda_graph_impl="none",
         cpu_offloading=False,
         fine_grained_activation_offloading=False,
@@ -374,30 +419,127 @@ def test_snapshot_carries_the_flags_the_rejections_read(flag):
 
 
 def test_decoder_fp8_is_accepted_by_the_support_matrix():
-    # --fp8 configures the decoder only; the vision TransformerConfig is built
-    # by the adapter builder and never reads it. The compatibility snapshot
-    # carries no decoder-FP8 field at all, so validate_mdp_config cannot reject
-    # it -- encoder FP8 is refused on the resolved vision config instead (see
-    # the test below).
+    # --fp8 configures the decoder; the encoder only inherits it under
+    # --encoder-fp8. The snapshot carries the decoder format and recipe for
+    # that path, and validate_mdp_config must not reject decoder-only FP8.
     from megatron.core.mdp.integration import compatibility_options_from_args
 
     options = compatibility_options_from_args(_fake_args(fp8="hybrid"))
-    # The only fp8-named field is the mxfp8 grad-buffer-reuse reject, which is
-    # an MDP incompatibility in its own right, not a decoder-FP8 switch.
-    assert [field.name for field in dataclasses.fields(options) if "fp8" in field.name] == [
-        "reuse_grad_buf_for_mxfp8_param_ag"
-    ]
+    assert options.decoder_fp8 == "hybrid"
+    # args.fp8_recipe carries the recipe the encoder inherits, and
+    # test_encoder_fp8_gates builds decoder_fp8_recipe by hand, so this is the
+    # one place args.fp8_recipe -> decoder_fp8_recipe is pinned.
+    assert options.decoder_fp8_recipe == "delayed"
     validate_mdp_config(MdpConfig(enable=True), options)
 
 
-def test_effective_vision_config_with_fp8_is_rejected():
-    # The reject lives on the resolved vision config, where encoder FP8 is
-    # observable, not on an args-derived flag that no wired path can set. An
-    # adapter that wires fp8 into the vision config must trip this.
-    with pytest.raises(MdpConfigurationError, match="effective vision fp8"):
+@pytest.mark.parametrize("decoder_recipe, match", [("delayed", "fp8_recipe="), ("mxfp8", None)])
+def test_decoder_amax_gate_fires_end_to_end_from_args(decoder_recipe, match):
+    """--fp8-format hybrid leaves --fp8-recipe at its "delayed" default, so the
+    single most common FP8 command line is exactly the one the recipe gate has
+    to reject once the encoder inherits it. A typo in the args.fp8_recipe read
+    makes decoder_fp8_recipe None -- not in ENCODER_COMPATIBLE_FP8_RECIPES --
+    which would reject even the valid row, and a typo in the --encoder-fp8 read
+    leaves MdpConfig.encoder_fp8 False and every encoder gate inert; the two
+    rows together pin all three reads."""
+    from megatron.core.mdp.integration import mdp_config_from_args, validate_from_args
+
+    args = _fake_args(mdp_enable=True, fp8="hybrid", fp8_recipe=decoder_recipe, encoder_fp8=True)
+    assert mdp_config_from_args(args).encoder_fp8
+    if match is None:
+        validate_from_args(args)
+    else:
+        with pytest.raises(MdpConfigurationError, match=match):
+            validate_from_args(args)
+
+
+@pytest.mark.parametrize(
+    "encoder_fp8, decoder_fp8, decoder_recipe, effective_fp8, effective_recipe, effective_ffn, match",
+    [
+        # fp8 on the built config that MdpConfig never asked for: the gates ran
+        # against MdpConfig, so this encoder was never validated.
+        (False, "hybrid", "mxfp8", "hybrid", "mxfp8", 4320, "effective vision fp8="),
+        # Asked for and lost on the way: the run would silently be bf16.
+        (True, "hybrid", "mxfp8", None, "delayed", 4320, "effective vision fp8="),
+        # Same format, a recipe other than the decoder's: the recipe gate was
+        # checked on the decoder's recipe, so this one bypassed it.
+        (True, "hybrid", "mxfp8", "hybrid", "tensorwise", 4320, "effective vision fp8_recipe"),
+        (True, "hybrid", "mxfp8", "hybrid", "mxfp8", 4320, None),
+        (False, None, "delayed", None, "delayed", 4320, None),
+        # The base vision config's own width, with no --encoder-ffn-hidden-size
+        # in play: Qwen3.5-VL's 4304 is not a multiple of MXFP8's 32 and would
+        # otherwise pass every validator and die inside TE on the first forward.
+        (True, "hybrid", "mxfp8", "hybrid", "mxfp8", 4304, "effective vision ffn_hidden_size"),
+        (True, "hybrid", "tensorwise", "hybrid", "tensorwise", 4304, None),
+        (False, None, "delayed", None, "delayed", 4304, None),
+    ],
+)
+def test_effective_vision_config_fp8_must_match_mdp_config(
+    encoder_fp8, decoder_fp8, decoder_recipe, effective_fp8, effective_recipe, effective_ffn, match
+):
+    """validate_effective_vision_config is where encoder FP8 becomes observable;
+    it must agree with the snapshot the encoder inherits from, and the built FFN
+    width must be one the recipe can quantize."""
+    config = MdpConfig(enable=True, encoder_fp8=encoder_fp8)
+    options = _options(decoder_fp8=decoder_fp8, decoder_fp8_recipe=decoder_recipe)
+    effective = _FakeTransformerConfig(
+        fp8=effective_fp8, fp8_recipe=effective_recipe, ffn_hidden_size=effective_ffn
+    )
+    if match is None:
+        validate_effective_vision_config(config, effective, options)
+    else:
+        with pytest.raises(MdpConfigurationError, match=match):
+            validate_effective_vision_config(config, effective, options)
+
+
+@pytest.mark.parametrize(
+    "options, match",
+    [
+        # No snapshot at all: the encoder cannot know what to inherit.
+        (None, "needs the compatibility snapshot"),
+        # A snapshot with the decoder in bf16: nothing to inherit. Without its
+        # own reject this would compare None == None against a bf16 vision
+        # config and pass.
+        ("decoder_off", "decoder FP8 enabled"),
+    ],
+)
+def test_effective_vision_config_is_self_sufficient_under_encoder_fp8(options, match):
+    if options == "decoder_off":
+        options = _options(decoder_fp8=None, decoder_fp8_recipe="delayed")
+    with pytest.raises(MdpConfigurationError, match=match):
         validate_effective_vision_config(
-            MdpConfig(enable=True), _FakeTransformerConfig(fp8="hybrid")
+            MdpConfig(enable=True, encoder_fp8=True), _FakeTransformerConfig(), options
         )
+
+
+def test_apply_encoder_fp8_config_copies_the_decoder_recipe():
+    base = _FakeTransformerConfig()
+    decoder = _options(decoder_fp8="hybrid", decoder_fp8_recipe="mxfp8")
+    assert apply_encoder_fp8_config(base, MdpConfig(enable=True), decoder) is base
+    assert apply_encoder_fp8_config(base, MdpConfig(enable=True), None) is base
+
+    result = apply_encoder_fp8_config(base, MdpConfig(enable=True, encoder_fp8=True), decoder)
+    assert result is not base
+    assert (result.fp8, result.fp8_recipe) == ("hybrid", "mxfp8")
+    assert base.fp8 is None
+    # (encoder_fp8 with the decoder in bf16 is rejected upstream, by
+    # validate_mdp_config and validate_effective_vision_config, and tested
+    # there; the apply-level refusal is defense in depth only.)
+    # The two adapters compose: recompute first, FP8 second, neither undoes the other.
+    both = apply_encoder_fp8_config(
+        apply_encoder_recompute_config(
+            base,
+            MdpConfig(
+                enable=True,
+                encoder_recompute_granularity="full",
+                encoder_recompute_method="uniform",
+                encoder_recompute_num_layers=1,
+            ),
+        ),
+        MdpConfig(enable=True, encoder_fp8=True),
+        _options(decoder_fp8="e4m3", decoder_fp8_recipe="tensorwise"),
+    )
+    assert (both.recompute_granularity, both.fp8, both.fp8_recipe) == ("full", "e4m3", "tensorwise")
 
 
 @pytest.mark.parametrize(

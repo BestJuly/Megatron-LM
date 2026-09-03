@@ -72,19 +72,37 @@ in P5/P6. Decoder-only EP A2A overlap via
 the native MCore requirements (`EP>1`, and VPP when `PP>1`); the vision encoder
 remains outside that schedule.
 
-Decoder FP8 is supported. The decoder uses the native `--fp8`/`--fp8-recipe`
-flags; the vision `TransformerConfig` is built separately by the model adapter
-and never inherits them, so decoder FP8 leaves the encoder domain untouched
-(`validate_effective_vision_config` re-asserts that against the resolved vision
-config inside `build_encoder_domain`). Its one requirement falls on the collated
-decoder sequence: quantized GEMMs need the packed row count to be a multiple of
-`get_fp8_align_size(fp8_recipe)` (32 for MXFP8, 16 otherwise), which
-`pack_or_pad_batch` in `examples/multimodal_dev/forward_step.py` supplies by
-extending the last sample's padded region. Alignments that call site cannot
-derive fail loudly instead: with `--use-packed-sequence`, `--fp4-format` and
-`--fp8-recipe custom` raise `NotImplementedError`.
+FP8 is supported on both sides, on one recipe:
 
-Rejected at startup: FSDP/HSDP, encoder FP8, full-iteration CUDA graphs, CPU
+- The decoder uses the native `--fp8`/`--fp8-recipe` flags. The vision
+  `TransformerConfig` is built separately and never inherits them on its own,
+  so decoder-only FP8 is unrestricted and leaves the encoder domain untouched.
+  Its one shape requirement falls on the collated sequence: quantized GEMMs
+  need the packed row count to be a multiple of `get_fp8_align_size(fp8_recipe)`,
+  which `pack_or_pad_batch` in `examples/multimodal_dev/forward_step.py`
+  supplies by extending the last sample's padded region. Alignments that call
+  site cannot derive fail loudly instead: with `--use-packed-sequence`,
+  `--fp4-format` and `--fp8-recipe custom` raise `NotImplementedError`.
+- `--encoder-fp8` runs the vision encoder under the **decoder's** `--fp8-format`
+  and `--fp8-recipe`; the encoder has no recipe of its own and FP8 attention is
+  not offered for it. `apply_encoder_fp8_config` copies the two fields from the
+  compatibility snapshot onto the vision `TransformerConfig`, next to
+  `apply_encoder_recompute_config`. It requires decoder FP8 (encoder-only FP8 is
+  not supported: it measured as pure launch overhead and would need its own
+  recipe plumbing) and `--mdp-enable` (the payload-row alignment lives in the
+  MDP adapter). With the encoder on, the shared recipe must be one of
+  `ENCODER_COMPATIBLE_FP8_RECIPES` = `{tensorwise, blockwise, mxfp8}`
+  (`config.py`): `delayed` is rejected because its amax history is
+  cross-iteration state that the per-chunk, rank-dependent encoder forwards and
+  the P2/P5 whole-encoder replay would push unevenly, and because TE all-reduces
+  the global amax buffer on every depth-0 `fp8_autocast` exit, so the decoder's
+  own delayed buffers would see rank-dependent collective counts; `custom` is
+  unvalidated. `validate_effective_vision_config` cross-checks the built config
+  against the snapshot, so FP8 cannot reach the encoder by any other route.
+
+Rejected at startup: FSDP/HSDP, `--encoder-fp8` without decoder FP8, a
+`delayed`/`custom` recipe alongside an FP8 encoder, an encoder
+`ffn_hidden_size` the recipe cannot quantize, full-iteration CUDA graphs, CPU
 activation offload, delayed gradient reduction,
 `overlap_param_gather_with_optimizer_step`,
 `reuse_grad_buf_for_mxfp8_param_ag`, multiple distributed-optimizer
@@ -131,7 +149,7 @@ activations justifies the extra complete forward.
 
 Registered extension hooks (each exercised by a test at a non-degenerate
 value): logical workers + `worker_ranks()` for encoder CP, single-valued
-endpoints + multi-slice routes for decoder CP, the typed encoder configuration
-+ row-capacity policy for encoder FP8, and the unified buffer allocator
+endpoints + multi-slice routes for decoder CP, the plan-level row-capacity
+policy (`--mdp-row-alignment`), and the unified buffer allocator
 for full-iteration CUDA graphs. The hooks guarantee no breaking schema change is
 needed later; they do not mean the capability is implemented.

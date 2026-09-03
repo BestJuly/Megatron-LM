@@ -35,7 +35,9 @@ sys.path.insert(
 
 from examples.multimodal_dev.arguments import (
     add_multimodal_args,
+    encoder_fp8_overrides_from_args,
     encoder_recompute_overrides_from_args,
+    validate_encoder_fp8_args,
     validate_encoder_recompute_args,
 )
 from examples.multimodal_dev.forward_step import forward_step, quantized_row_alignment
@@ -90,11 +92,12 @@ def model_provider(
     vision_config.fp16 = language_config.fp16
     vision_config.apply_rope_fusion = language_config.apply_rope_fusion
 
-    encoder_recompute_overrides = encoder_recompute_overrides_from_args(args)
-    if encoder_recompute_overrides:
-        vision_config = dataclasses.replace(
-            vision_config, **encoder_recompute_overrides
-        )
+    encoder_overrides = {
+        **encoder_recompute_overrides_from_args(args),
+        **encoder_fp8_overrides_from_args(args),
+    }
+    if encoder_overrides:
+        vision_config = dataclasses.replace(vision_config, **encoder_overrides)
 
     # --- vision FLOPs metadata ---
     vision_flops_fn = registry.get("vision_flops_fn")
@@ -215,6 +218,7 @@ if __name__ == "__main__":
         args_defaults={},
     )
     validate_encoder_recompute_args(args)
+    validate_encoder_fp8_args(args)
     # Fail fast on a quantization recipe the collate path cannot align, before
     # the model and datasets are built (the result is cached on the argument values).
     quantized_row_alignment(args)

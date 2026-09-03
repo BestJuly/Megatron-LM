@@ -24,6 +24,37 @@ SUPPORTED_CHECKPOINT_MODE = "torch_dist"
 
 ENCODER_RECOMPUTE_GRANULARITIES = (None, "selective", "full", "whole")
 
+# Decoder fp8_recipe values the vision encoder may inherit under --encoder-fp8.
+# "delayed" is excluded on purpose, even though it is a valid
+# TransformerConfig.fp8_recipe value in general, for two independent reasons:
+#
+# 1. TEDelayedScaling keeps a persistent, stateful amax-history ring buffer per
+#    FP8-enabled module that is pushed to on every fp8_autocast forward call
+#    and reduced over that autocast's fp8_group on each depth-0 exit. The MDP
+#    encoder forward does not run once per iteration: runtime.py runs it once
+#    per chunk (split_encoder_layout() from --mdp-encoder-max-payload-rows), and
+#    how many chunks a rank gets depends on the vision segments it was planned
+#    (ranks with none run zero encoder forwards). With
+#    encoder_recompute_granularity == "whole" every chunk runs twice more:
+#    under no_grad in P2 and replayed with autograd in P5 (activation.py
+#    EncoderWholeRecomputeHandle). So an encoder's amax history would be pushed
+#    and reduced a rank-dependent number of times per iteration, and the P5
+#    replay would see a history the P2 forward already advanced. No MDP
+#    checkpoint or eval-boundary path resets it either.
+# 2. TE keeps one process-global amax buffer and all-reduces every entry in it
+#    on each exit from a depth-0 fp8_autocast, without filtering to the
+#    autocast being exited. The encoder opens one autocast per layer, and ranks
+#    holding no vision segment open none -- so the DECODER's own delayed-scaling
+#    buffers, keyed by the decoder's TP x CP x DP group, would see a
+#    rank-dependent number of collectives as soon as the encoder runs FP8.
+#
+# "tensorwise" (Float8CurrentScaling), "blockwise" (Float8BlockScaling) and
+# "mxfp8" (MXFP8BlockScaling) derive scale directly from the current tensor,
+# keep no cross-forward state and register nothing in TE's global amax buffer,
+# so neither mechanism applies. "custom" is excluded as unvalidated: MDP cannot
+# tell from args whether the quantizer factory asks for delayed scaling.
+ENCODER_COMPATIBLE_FP8_RECIPES: frozenset = frozenset({"tensorwise", "blockwise", "mxfp8"})
+
 
 @dataclass(frozen=True)
 class MdpConfig:
@@ -36,6 +67,11 @@ class MdpConfig:
     encoder_recompute_method: Optional[str] = None
     encoder_recompute_num_layers: Optional[int] = None
     encoder_recompute_modules: Optional[tuple[str, ...]] = None
+    # Run the vision encoder under the decoder's --fp8-format / --fp8-recipe
+    # (apply_encoder_fp8_config copies them from MdpCompatibilityOptions). The
+    # encoder has no recipe of its own and never enables FP8 attention. False
+    # keeps the encoder in bf16 whatever the decoder's --fp8 says.
+    encoder_fp8: bool = False
     locality_slack_permille: int = 10
     row_alignment: int = 1
     plan_check_interval: int = 1
@@ -71,9 +107,30 @@ class MdpCompatibilityOptions:
     save_requested: bool
     load_requested: bool
     overlap_moe_expert_parallel_comm: bool = False
+    # The DECODER's --fp8-format (None = decoder in bf16) and fp8_recipe
+    # (args.fp8_recipe). TransformerConfig defaults the recipe to "delayed"
+    # whether or not --fp8-format was passed, so it only says anything about the
+    # run when decoder_fp8 is not None. Under --encoder-fp8 this IS the encoder's
+    # recipe too, and the only reader is that path. Decoder FP8 on its own is
+    # not an MDP incompatibility and is not otherwise gated.
+    decoder_fp8: Optional[str] = None
+    decoder_fp8_recipe: Optional[str] = None
     # args.reuse_grad_buf_for_mxfp8_param_ag. Rejected outright under MDP; see
     # validate_mdp_config for the composite-optimizer mechanism.
     reuse_grad_buf_for_mxfp8_param_ag: bool = False
+
+
+def encoder_fp8_align_size(fp8_recipe: Optional[str]) -> int:
+    """Row/channel alignment the encoder's FP8 GEMMs require under ``fp8_recipe``.
+
+    Delegates to MCore's own table rather than restating the block sizes. The
+    import is function-local so this module keeps the torch-free import surface
+    its own tests rely on.
+    """
+    from megatron.core.enums import Fp8Recipe
+    from megatron.core.fp8_utils import get_fp8_align_size
+
+    return get_fp8_align_size(Fp8Recipe(fp8_recipe))
 
 
 def _reject(option: str, value: Any, condition: str, why: str, suggestion: str = "") -> None:
@@ -157,6 +214,33 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "Module selection applies only to selective recompute.",
             "None",
         )
+    if config.encoder_fp8:
+        if options.decoder_fp8 is None:
+            _reject(
+                "encoder_fp8",
+                config.encoder_fp8,
+                "decoder FP8 enabled (--fp8-format)",
+                "--encoder-fp8 inherits the decoder's --fp8-format/--fp8-recipe; "
+                "enable decoder FP8 first. Encoder-only FP8 is not supported: it "
+                "measured as pure launch overhead on the encoder, and it would need "
+                "its own recipe plumbing.",
+                "False",
+            )
+        if options.decoder_fp8_recipe not in ENCODER_COMPATIBLE_FP8_RECIPES:
+            _reject(
+                "fp8_recipe",
+                options.decoder_fp8_recipe,
+                f"fp8_recipe in {sorted(ENCODER_COMPATIBLE_FP8_RECIPES)} while the "
+                "encoder runs FP8",
+                "The encoder inherits this recipe. 'delayed' scaling keeps a stateful "
+                "amax history that the encoder's per-chunk, rank-dependent forward "
+                "count -- doubled by P2/P5 whole-encoder replay -- would push unevenly, "
+                "and TE all-reduces its global amax buffer on every depth-0 autocast "
+                "exit, so the decoder's own delayed buffers would see rank-dependent "
+                "collective counts (see ENCODER_COMPATIBLE_FP8_RECIPES). 'custom' is "
+                "unvalidated.",
+                "--fp8-recipe tensorwise",
+            )
     if not (0 <= config.locality_slack_permille < 1000):
         _reject(
             "locality_slack_permille",
@@ -394,10 +478,42 @@ def apply_encoder_recompute_config(
     )
 
 
+def apply_encoder_fp8_config(
+    base_config: "TransformerConfig",
+    config: MdpConfig,
+    options: Optional[MdpCompatibilityOptions],
+) -> "TransformerConfig":
+    """Run the encoder under the decoder's FP8 format and recipe when asked.
+
+    The FP8 context itself is opened per layer by ``TransformerBlock.forward``
+    off these fields, so this is the whole of the wiring: both the P2 forward
+    and, under whole-encoder replay, the P5 replay call the same encoder and
+    therefore see the same recipe. FP8 attention is not offered for the encoder,
+    so that field is left at the base config's value (False).
+    """
+    if not config.encoder_fp8:
+        return base_config
+    if options is None or options.decoder_fp8 is None:
+        raise MdpConfigurationError(
+            "MDP: encoder_fp8=True violates: decoder FP8 enabled. The encoder "
+            "inherits the decoder's recipe, and build_encoder_domain was given no "
+            "compatibility snapshot (or one without decoder FP8) to inherit from."
+        )
+    return dataclasses.replace(
+        base_config, fp8=options.decoder_fp8, fp8_recipe=options.decoder_fp8_recipe
+    )
+
+
 def validate_effective_vision_config(
-    config: MdpConfig, effective_config: "TransformerConfig"
+    config: MdpConfig,
+    effective_config: "TransformerConfig",
+    options: Optional[MdpCompatibilityOptions] = None,
 ) -> None:
-    """Reject unsupported combinations visible only after adapter resolution."""
+    """Reject unsupported combinations visible only after adapter resolution.
+
+    ``options`` is the compatibility snapshot the encoder inherits its FP8
+    recipe from; it may be omitted only when ``config.encoder_fp8`` is False.
+    """
     recompute_granularity = getattr(effective_config, "recompute_granularity", None)
     if (
         config.encoder_recompute_granularity == "whole"
@@ -411,17 +527,68 @@ def validate_effective_vision_config(
             "otherwise the vision Transformer is replayed twice in P5.",
             "None",
         )
-    # Decoder FP8 is deliberately not in the compatibility snapshot (the THD
-    # alignment reads args.fp8 directly); encoder FP8 is rejected here instead.
-    encoder_fp8 = getattr(effective_config, "fp8", None)
-    if encoder_fp8 is not None:
+    # Cross-check the built config against what validate_mdp_config saw. The
+    # gates above run on MdpConfig/MdpCompatibilityOptions before the vision
+    # config exists; an adapter or override path that sets fp8 on the vision
+    # config on its own would otherwise train an encoder in a state the support
+    # matrix never validated (or silently miss one it was told to build).
+    expected_fp8 = None
+    expected_recipe = None
+    if config.encoder_fp8:
+        if options is None:
+            raise MdpConfigurationError(
+                "MDP: validate_effective_vision_config needs the compatibility "
+                "snapshot when encoder_fp8=True; the encoder recipe is inherited from it."
+            )
+        if options.decoder_fp8 is None:
+            # Self-sufficient: without this, an off decoder would compare
+            # None == None against a bf16 vision config and pass.
+            _reject(
+                "encoder_fp8",
+                config.encoder_fp8,
+                "decoder FP8 enabled (--fp8-format)",
+                "The encoder inherits the decoder's FP8 format and recipe; with the "
+                "decoder in bf16 there is nothing to inherit.",
+                "False",
+            )
+        expected_fp8 = options.decoder_fp8
+        expected_recipe = options.decoder_fp8_recipe
+    effective_fp8 = getattr(effective_config, "fp8", None)
+    if effective_fp8 != expected_fp8:
         _reject(
             "effective vision fp8",
-            encoder_fp8,
-            "None",
-            "Encoder FP8 is not part of this support matrix: the WORLD-replicated "
-            "encoder's quantized GEMM alignment, its amax reduction domain, and its "
-            "interaction with encoder replay are validated in the follow-up that "
-            "wires encoder FP8; only the decoder's --fp8 flags are supported here.",
-            "None",
+            effective_fp8,
+            f"== {expected_fp8!r} (the decoder's --fp8-format under --encoder-fp8, "
+            "else None)",
+            "The vision TransformerConfig's FP8 state must come from --encoder-fp8 "
+            "alone; the MDP support-matrix gates ran against MdpConfig and the "
+            "compatibility snapshot, not against this config.",
+            repr(expected_fp8),
         )
+    if effective_fp8 is not None:
+        effective_recipe = getattr(effective_config, "fp8_recipe", None)
+        if effective_recipe != expected_recipe:
+            _reject(
+                "effective vision fp8_recipe",
+                effective_recipe,
+                f"== {expected_recipe!r} (the decoder's --fp8-recipe)",
+                "ENCODER_COMPATIBLE_FP8_RECIPES was checked against the decoder's "
+                "recipe; a different recipe on the built config bypasses it.",
+                repr(expected_recipe),
+            )
+        # The width the FFN is actually built at. The shipped Qwen3.5-VL 4304 is
+        # not a multiple of MXFP8's 32, and without this check that configuration
+        # passes every validator and dies inside TE on the first forward.
+        align = encoder_fp8_align_size(effective_recipe)
+        effective_ffn = getattr(effective_config, "ffn_hidden_size", None)
+        if effective_ffn is not None and effective_ffn % align:
+            aligned = (effective_ffn + align - 1) // align * align
+            _reject(
+                "effective vision ffn_hidden_size",
+                effective_ffn,
+                f"ffn_hidden_size % {align} == 0 for encoder fp8_recipe {effective_recipe!r}",
+                "TE quantizes the vision FFN weights on the first encoder forward and "
+                "aborts when a GEMM dimension is not a multiple of the recipe's block "
+                "size.",
+                f"widen the vision ffn_hidden_size to a multiple of {align} ({aligned})",
+            )
