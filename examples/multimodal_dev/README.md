@@ -12,6 +12,8 @@ multimodal_dev/
 ├── arguments.py             # Multimodal CLI arguments
 ├── data/
 │   └── mock.py              # Mock dataset for end-to-end testing
+├── doc/
+│   └── mdp/                 # MDP benchmark results + the recipes that produced them
 ├── models/
 │   ├── __init__.py          # MODEL_REGISTRY — central model registry
 │   ├── base.py              # MultimodalModel base class (vision encoder + GPTModel)

@@ -1,0 +1,197 @@
+# NOTE: site-specific values below are replaced with <PLACEHOLDER>.
+# Replace before use:
+#   <CONTAINER_SQSH>  the training container (TE 2.18 / cuDNN 9.25 / FA4)
+#   <FLA_PREFIX>      fla >= 0.6.0 side prefix (needed for GDN CUDA-graph capture)
+#   <NVRX_PREFIX>     nvidia-resiliency-ext 0.6.0 side prefix (the branch asserts >= 0.6.0)
+# The MEGATRON block is the toolkit's checkout directive; ignore it if you are
+# not using mcore-devtoolkit and just check out the commit named in README.md.
+
+# Qwen3.5-VL 35B-A3B @ 16k -- pp4ep2_base
+#
+# One of 5 cells re-benchmarking 35B-A3B on the fast_pass 0901 branch with
+# partial CUDA graphs ON BY DEFAULT. 8 GPUs / 2 nodes, BF16 only.
+#
+# Topology: PP4 / EP2 / TP1 / CP1  -> dense DP 2
+# GBS 32 = 16 gradient-accumulation steps x DP 2 x MBS 1.
+#   NOTE: with --mdp-greedy-packing, global_batch_size counts BINS, not
+#   samples. Each bin is filled to the 16384-token budget, so at the lognormal
+#   pool's ~1657-token mean this is roughly 2.5 samples per bin.
+#
+# Data: mdp_mock, lognormal min512/max4096/mean2048/sigma1.1. Measured over the
+# 64-scenario pool: total tokens/sample median 1138 (mean 1657, range
+# 512-4096), image tokens/sample median 160, encoder patch rows/sample median
+# 638 (= 4 x image tokens, spatial_merge_size 2), per-frame h*w median 256 /
+# max 1024, 12/64 samples text-only, image = 10.5% of tokens.
+#
+# thd_max_packed_sequences 16: the lognormal floor is 512 tokens, so a 4096
+# budget can hold up to 8 real samples; static packing additionally reserves
+# one cu_seqlens slot for the padding tail (greedy_max_real = cap - 1).
+#
+# Decoder recompute is OFF. On OOM escalate per
+# the recompute ladder
+#   1. selective + moe_act   2. + gdn   3. + moe   4. full/uniform/1
+# Never add mlp (every layer is MoE), core_attn, or shared_experts.
+#
+
+MEGATRON:
+  repo: https://github.com/BestJuly/Megatron-LM.git
+  branch: lit/mdp_fast_pass
+
+ENTRY:
+  script: examples/multimodal_dev/pretrain_multimodal.py
+
+CONTAINER:
+  image: <CONTAINER_SQSH>
+
+ENV_VARS:
+  NVTE_FUSED_ATTN: "1"
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: "1"
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  CUDA_DEVICE_MAX_CONNECTIONS: "8"
+  # HybridEP 128-token chunks. Read by the deep_ep/HybridEP library, NOT by
+  # MCore -- MCore's own HYBRIDEP_TOKEN_ALIGNMENT (fused_a2a.py) is a separate
+  # hard-coded 64 and must not be touched. Measured +8.2% together with the
+  # pre-GDR fusion below on native EP8/PP1
+  # .
+  NUM_OF_TOKENS_PER_CHUNK_DISPATCH_API: "128"
+  NUM_OF_TOKENS_PER_CHUNK_COMBINE_API: "128"
+  NUM_OF_TOKENS_PER_CHUNK_PREPROCESSING_API: "128"
+  # GDN + graph capture: fla memoizes prepare_chunk_offsets on tensor identity
+  # and the static THD path reuses one cu_seqlens object across warmup/capture/
+  # replay, so a cache hit at capture time would freeze chunk_offsets.
+  FLA_DISABLE_TENSOR_CACHE: "1"
+  NCCL_GRAPH_REGISTER: "0"
+  # fla 0.6.0 (chunk_indices param) FIRST, then nvidia-resiliency-ext 0.6.0
+  # (the branch asserts >= 0.6.0; do NOT edit the assert).
+  PYTHONPATH: "<FLA_PREFIX>:<NVRX_PREFIX>"
+
+ARGS:
+  use_mcore_models: true
+  use_flash_attn: true
+  transformer_impl: transformer_engine
+  hf_processor_path: "Qwen/Qwen3.5-35B-A3B"
+  sft: true
+  enable_experimental: true
+
+  # ---- Parallelism ------------------------------------------------------
+  tensor_model_parallel_size: 1
+  pipeline_model_parallel_size: 4
+  expert_model_parallel_size: 2
+  expert_tensor_parallel_size: 1
+  context_parallel_size: 1
+  cp_comm_type: a2a
+  sequence_parallel: true
+
+  # ---- Shape: 16k --------------------------------------------------------
+  micro_batch_size: 1
+  global_batch_size: 32
+  seq_length: 16384
+  total_seq_length: 16384
+  train_iters: 20
+  bf16: true
+  use_packed_sequence: true
+  use_vanilla_collate_fn: true
+
+  mtp_num_layers: 1
+  mtp_loss_scaling_factor: 0.1
+
+  # ---- THD packing, aligned to seq_length so decoder shapes are static ----
+  mdp_greedy_packing: true
+  thd_static_packing: true
+  pad_packed_seq_alignment: max
+  max_seqlen_per_dp_cp_rank: 16384
+  thd_max_packed_sequences: 32
+  mdp_mock_dataset_config_json: '{"mode":"distribution","type":"lognormal","format":"thd","min_seq_len":512,"max_seq_len":4096,"mean_seq_len":2048,"lognormal_sigma":1.1}'
+
+  # ---- Partial CUDA graphs: ON by default --------------------------------
+  cuda_graph_impl: transformer_engine
+  cuda_graph_warmup_steps: 2
+  cuda_graph_modules: [attn, moe_router, moe_preprocess]
+
+  # ---- Native path (MDP OFF) ---------------------------------------------
+  # --recompute-vision is hard-rejected under --mdp-enable, so the two paths
+  # necessarily spell the same thing differently.
+  recompute_vision: true
+  # Greedy packing on the non-MDP path comes from fcfdf4789 "HACK(bench)",
+  # which is what makes this baseline consume the SAME bins as the MDP cells.
+  # KNOWN LIMITATION: consumed_train_samples accounting stays MDP-gated on this
+  # path, so this cell UNDER-REPORTS consumed samples. Fine for throughput and
+  # memory, wrong for anything reading the sample counter.
+
+  # ---- MoE dispatcher ----------------------------------------------------
+  moe_token_dispatcher_type: flex
+  moe_flex_dispatcher_backend: hybridep
+  moe_flex_dispatcher_num_sms: 32
+  moe_grouped_gemm: true
+  moe_permute_fusion: true
+  moe_router_fusion: true
+  moe_router_dtype: fp32
+  # Timing only. MUST be 0 for any convergence run.
+  moe_router_force_load_balancing: true
+
+  # ---- pre-GDR fusion ----------------------------------------------------
+  # linear_attention_freq=4 means 30 of 40 decoder layers are GDN, so this is
+  # the highest-leverage knob on this model. Requires
+  # experimental_attention_variant == gated_delta_net (satisfied) and an
+  # importable fused_streamed_pre_gated_delta_rule + causal-conv1d in the
+  # container; it raises ImportError at runtime if either is missing. Rejected
+  # under deterministic_mode, which these recipes do not set.
+  #
+  # Safe to combine with the CUDA graphs above ONLY on this branch: capture of
+  # the fused kernel needs the searchsorted rewrite of _resolve_packed_seq_idx
+  # (megatron/core/fusions/fused_pre_gated_delta_rule.py:1687) -- the original
+  # repeat_interleave form reads its output length from device data and dies
+  # with "operation not permitted when stream is capturing". Verified present
+  # on lit/mdp_fast_pass.
+  gdn_pre_gated_delta_rule_fusion: true
+
+  # ---- Explicitly off ----------------------------------------------------
+  overlap_moe_expert_parallel_comm: false
+  overlap_dispatch_backward_with_experts_wgrad: false
+  ep_overlap_early_attn_memory_release: false
+
+  # ---- Loss fusion -------------------------------------------------------
+  cross_entropy_loss_fusion: true
+  cross_entropy_fusion_impl: te
+  calculate_per_token_loss: true
+
+  # ---- Optimizer ---------------------------------------------------------
+  optimizer: adam
+  use_distributed_optimizer: true
+  use_precision_aware_optimizer: true
+  main_grads_dtype: fp32
+  main_params_dtype: fp32
+  exp_avg_dtype: bf16
+  exp_avg_sq_dtype: bf16
+
+  lr: 1.2e-4
+  min_lr: 1.2e-5
+  lr_decay_style: cosine
+  lr_warmup_iters: 2
+  weight_decay: 0.1
+  clip_grad: 1.0
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+
+  manual_gc: true
+  manual_gc_interval: 10
+  # gradient_accumulation_fusion is NOT settable on this branch: argparse only
+  # exposes --no-gradient-accumulation-fusion (store_false, default True), so
+  # omitting it IS enabling it. Writing it renders --gradient-accumulation-fusion,
+  # which the entry point rejects with 'unrecognized arguments'.
+
+  eval_iters: 1
+  eval_interval: 100000
+  # No `save`: --mdp-greedy-packing is rejected with --save/--load unless
+  # --mdp-greedy-packing-approximate-resume is passed.
+
+  log_throughput: true
+  log_interval: 1
+  log_device_memory_used: true
+  log_memory_interval: 1
+  distributed_timeout_minutes: 20
+
+SLURM:
+  nnodes: 2
+  gpus_per_node: 4
+  time_limit: "0:40:00"
