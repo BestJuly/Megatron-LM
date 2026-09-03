@@ -38,7 +38,7 @@ from examples.multimodal_dev.arguments import (
     encoder_recompute_overrides_from_args,
     validate_encoder_recompute_args,
 )
-from examples.multimodal_dev.forward_step import forward_step
+from examples.multimodal_dev.forward_step import forward_step, quantized_row_alignment
 from megatron.core.enums import ModelType
 from megatron.training import get_args, pretrain
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
@@ -215,6 +215,10 @@ if __name__ == "__main__":
         args_defaults={},
     )
     validate_encoder_recompute_args(args)
+    # get_batch() re-derives this for every microbatch; calling it here makes a
+    # quantization recipe the collate path cannot align fail before the model
+    # and the datasets are built, instead of on the first microbatch.
+    quantized_row_alignment(args)
     if getattr(args, "mdp_enable", False):
         _setup_mdp(args)
     full_config = pretrain_cfg_container_from_args(args)

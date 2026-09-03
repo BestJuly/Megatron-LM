@@ -76,7 +76,13 @@ Decoder FP8 is supported. The decoder uses the native `--fp8`/`--fp8-recipe`
 flags; the vision `TransformerConfig` is built separately by the model adapter
 and never inherits them, so decoder FP8 leaves the encoder domain untouched
 (`validate_effective_vision_config` re-asserts that against the resolved vision
-config inside `build_encoder_domain`).
+config inside `build_encoder_domain`). Its one requirement falls on the collated
+decoder sequence: quantized GEMMs need the packed row count to be a multiple of
+`get_fp8_align_size(fp8_recipe)` (32 for MXFP8, 16 otherwise), which
+`pack_or_pad_batch` in `examples/multimodal_dev/forward_step.py` supplies by
+extending the last sample's padded region. Alignments that call site cannot
+derive fail loudly instead: with `--use-packed-sequence`, `--fp4-format` and
+`--fp8-recipe custom` raise `NotImplementedError`.
 
 Rejected at startup: FSDP/HSDP, encoder FP8, full-iteration CUDA graphs, CPU
 activation offload, delayed gradient reduction,

@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 from examples.multimodal_dev.observability import nvtx_phase
 from megatron.core import mpu
+from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
@@ -415,7 +416,30 @@ def pack_or_pad_batch(
     else:
         divisible_by = tp_size if has_sp else 1
     if pad_to_multiple is not None:
-        divisible_by = max(divisible_by, pad_to_multiple)
+        # Quantized GEMMs check the tensor as the layer receives it, i.e. the
+        # rank-local one: CP has taken its 1/cp_size slice, and under SP a
+        # column-parallel layer still holds its 1/tp_size shard when TE's
+        # assert_dim_for_fp8_exec runs (transformer_engine/pytorch/module/
+        # layernorm_linear.py checks before the sequence-parallel all-gather and
+        # quantizes that shard; MXFP8's flat_first_dim % 32 sees the same). So
+        # scale the multiple by both factors to lift the per-rank requirement
+        # onto the collated row count.
+        # Full derivation: megatron/core/mdp/knowledge.md, "Decoder packed-row
+        # alignment: derivation".
+        divisible_by = math.lcm(
+            divisible_by, pad_to_multiple * cp_size * (tp_size if has_sp else 1)
+        )
+    # At cp_size == 1 only the total has to be aligned (SP scatters the [T,1,H]
+    # tensor as a unit), so pack the samples back to back and absorb the whole
+    # tail by extending the last sample's padded region ("extend_last" in
+    # megatron/core/packed_seq_params.py). Rounding every sample up instead
+    # opens inter-sample gaps ([a, a, PAD, b, b, b, PAD]) that TE's THD attention
+    # reads as pad_between_seqs=True and answers with the ~72%-slower
+    # UnfusedDotProductAttention fallback. CP > 1 keeps per-sample alignment:
+    # TE partitions each sample on its own, so the alignment must survive the
+    # split whether or not FP8 is on. Full derivation:
+    # megatron/core/mdp/knowledge.md, "Decoder packed-row alignment: derivation".
+    fp8_only_padding = pad_to_multiple is not None and cp_size == 1
 
     if use_packed_sequence:
         packed_batch: Dict[str, Any] = {}
@@ -454,7 +478,12 @@ def pack_or_pad_batch(
                 assert (
                     sample["labels"].shape == sample["input_ids"].shape == sample["loss_mask"].shape
                 ), "labels, input_ids, and loss_mask must have the same shape"
-                target_len = math.ceil(seqlen / divisible_by) * divisible_by
+                if fp8_only_padding:
+                    # Keep every sample at its own real length; the alignment
+                    # tail is absorbed once, after the loop.
+                    target_len = seqlen
+                else:
+                    target_len = math.ceil(seqlen / divisible_by) * divisible_by
                 if not use_pinned:
                     input_ids_list.append(
                         F.pad(sample["input_ids"], (0, target_len - seqlen), value=0)
@@ -473,6 +502,39 @@ def pack_or_pad_batch(
 
             cu_seqlens = list(accumulate(seqlens_list, initial=0))
             cu_seqlens_padded = list(accumulate(seqlens_padded_list, initial=0))
+
+            # fp8_only_padding: every real sample above was packed at its
+            # exact length (no inter-sample gaps), so cu_seqlens_padded
+            # currently equals cu_seqlens exactly. Absorb the FP8 (and, with
+            # SP, the tp_size) alignment requirement by extending only the
+            # last sample's padded region -- this keeps cu_seqlens and
+            # cu_seqlens_padded identical everywhere except the final entry,
+            # which is the layout PackedSeqParams.pad_between_seqs=False
+            # describes below.
+            if fp8_only_padding and cu_seqlens_padded:
+                total_real = cu_seqlens_padded[-1]
+                target_total = math.ceil(total_real / divisible_by) * divisible_by
+                fp8_tail_dummy_len = target_total - total_real
+                if fp8_tail_dummy_len > 0:
+                    cu_seqlens_padded[-1] = target_total
+                    # Keep seqlens_padded_list in sync -- the is_src/use_pinned
+                    # branch below derives max_seqlen_q from this list, not
+                    # from cu_seqlens_padded.
+                    seqlens_padded_list[-1] += fp8_tail_dummy_len
+                    if not use_pinned:
+                        input_ids_list[-1] = F.pad(
+                            input_ids_list[-1], (0, fp8_tail_dummy_len), value=0
+                        )
+                        labels_list[-1] = F.pad(
+                            labels_list[-1], (0, fp8_tail_dummy_len), value=-100
+                        )
+                        loss_mask_list[-1] = F.pad(
+                            loss_mask_list[-1], (0, fp8_tail_dummy_len), value=0
+                        )
+                assert cu_seqlens[:-1] == cu_seqlens_padded[:-1], (
+                    "tail-only padding must leave every sample but the last at its "
+                    "exact real length; pad_between_seqs=False below relies on it"
+                )
 
             # padding_mask: True at collate-padded positions within each packed
             # sample. Real tokens occupy [cu_seqlens_padded[i], +seqlens_list[i]);
@@ -602,6 +664,17 @@ def pack_or_pad_batch(
             max_seqlen_q=max_seqlen_q,
             max_seqlen_kv=max_seqlen_q,
             total_tokens=total_tokens,
+            # Only under fp8_only_padding (every sample but the last at its exact
+            # length, the last carries the whole tail): lets TEDotProductAttention
+            # use cu_seqlens_q_padded as the attention boundary and keeps
+            # FlashAttention/FusedAttention eligible. Deliberately diverges from
+            # pad_sequence_for_thd's conservative True for this "extend_last"
+            # layout. Safe only under a causal decoder mask: the tail rows follow
+            # every real row, so no real query reads them, and their outputs are
+            # dropped by loss_mask=0 / labels=-100 -- a premise owned by
+            # models/qwen35_vl/specs.py (hard-coded causal, no knob). Full
+            # derivation: megatron/core/mdp/knowledge.md, "Decoder packed-row alignment: derivation".
+            pad_between_seqs=(False if fp8_only_padding else None),
         )
         return packed_batch
 
@@ -656,6 +729,42 @@ def pack_or_pad_batch(
 # -------------------------------------------------------------------
 
 
+def quantized_row_alignment(args) -> Optional[int]:
+    """Row multiple the packed (THD) decoder sequence needs for quantized GEMMs.
+
+    ``None`` without ``--use-packed-sequence`` (BSHD collation is untouched: MDP
+    never reaches it) or without quantization. FP8 GEMMs need the leading dim
+    divisible by 8 (TE ``assert_dim_for_fp8_exec``), 16 for the wgrad GEMM
+    (``cublaslt_gemm.cu`` ``CanonicalizeGemmInput``), 32 for MXFP8 (TE
+    ``quantizer.cpp`` ``MXFP8_BLOCK_SIZE``); ``get_fp8_align_size`` owns that
+    table. Raises for recipes whose multiple it cannot derive (NVFP4, custom).
+    """
+    if not getattr(args, "use_packed_sequence", False):
+        # BSHD derives its own common per-batch length and is out of scope here.
+        return None
+    if getattr(args, "fp4", None) is not None:
+        # NVFP4 is mutually exclusive with --fp8-format and has no
+        # get_fp8_align_size() counterpart, so no alignment can be derived.
+        raise NotImplementedError(
+            "--fp4-format is not supported by examples/multimodal_dev together with "
+            "--use-packed-sequence: no row alignment is derived for NVFP4, so the "
+            "first NVFP4 GEMM would see an unaligned leading dimension"
+        )
+    if getattr(args, "fp8", None) is None:
+        return None
+    fp8_recipe = getattr(args, "fp8_recipe", None)
+    if fp8_recipe == "custom":
+        # get_fp8_align_size() reports 16 for "custom", but a custom block-scaled
+        # quantizer may need a coarser alignment (MXFP8 needs 32).
+        raise NotImplementedError(
+            "--fp8-recipe custom is not supported by examples/multimodal_dev "
+            "together with --use-packed-sequence: get_fp8_align_size() reports 16 "
+            "for it, but a custom block-scaled quantizer may need a coarser "
+            "alignment (MXFP8 needs 32)"
+        )
+    return get_fp8_align_size(fp8_recipe)
+
+
 def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
     """Get a batch from *data_iterator* and broadcast across TP ranks."""
     device = "cuda"
@@ -695,6 +804,7 @@ def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
         args.seq_length,
         device=device,
         with_vision_sidecar=getattr(args, "mdp_enable", False),
+        pad_to_multiple=quantized_row_alignment(args),
     )
 
     # Fix shapes produced by default_collate.
