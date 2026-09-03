@@ -410,7 +410,8 @@ class TransformerConfig(ModelParallelConfig):
 
     gdn_kernel_backend: Literal["fla", "cudnn"] = "fla"
     """Gated delta rule kernel backend. The cuDNN backend uses cuDNN Frontend's
-    FLA-compatible GDN adapter and retains its automatic FLA fallback for unsupported cases."""
+    FLA-compatible GDN adapter and retains its automatic FLA fallback for unsupported cases.
+    With context parallelism, the cuDNN backend currently supports only headwise CP."""
 
     gdn_pre_gated_delta_rule_fusion: bool = False
     """Whether to use the streamed Triton fusion for GatedDeltaNet pre-GDR preprocessing."""
@@ -1654,6 +1655,11 @@ class TransformerConfig(ModelParallelConfig):
                     f"linear_cp_mode must be one of 'headwise' or 'chunkwise', "
                     f"got {self.linear_cp_mode!r}."
                 )
+                if self.gdn_kernel_backend == "cudnn" and self.linear_cp_mode != "headwise":
+                    raise ValueError(
+                        "gdn_kernel_backend='cudnn' only supports "
+                        "linear_cp_mode='headwise' when context_parallel_size > 1."
+                    )
                 if self.gdn_conv_pad_alignment is not None:
                     assert self.linear_cp_mode != "chunkwise", (
                         "gdn_conv_pad_alignment is incompatible with "
