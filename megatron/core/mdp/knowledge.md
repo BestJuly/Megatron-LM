@@ -126,6 +126,7 @@ returns to `EMPTY`.
 | `storage.py` | Endpoint embedding leaves and lifecycle checks. |
 | `bridge.py` | Canonical ledger and `all_to_all_single` transport for all three payload phases. |
 | `window.py` | Whole-iteration capture, microbatch replay cursors, pixel ownership context. |
+| `packing.py` | Greedy token-budget bin filling and the cross-iteration sample buffer (`--mdp-greedy-packing`). |
 | `activation.py` | Encoder forward handle, chunk output retention, multi-tensor backward. |
 | `encoder.py` | Encoder process groups, DDP/ZeRO-1 domain, gradient finalization. |
 | `runtime.py` | P0-P5 orchestration, prefetch handoff, per-iteration state and metrics. |
@@ -167,7 +168,21 @@ The collator builds normal decoder tensors plus an MDP vision sidecar:
 - `vision_decoder_positions`: absolute image-token positions in the decoder's
   packed physical layout;
 - `pixel_values`: present only on the owner worker for that microbatch;
-- `image_grid_thw`: present on all workers and used to derive item shapes.
+- `image_grid_thw`: present on all workers and used to derive item shapes;
+- `flops_cu_seqlens`: present only under `--thd-static-packing`; the
+  pre-tail-pad valid `cu_seqlens`, because the static tail is represented as an
+  ordinary dummy sequence and would otherwise inflate the FLOPs accumulator.
+
+Under `--thd-static-packing` the tail policy is always `append_dummy_seq`:
+`ModelParallelConfig` rejects `extend_last` with static packing at every CP
+size, and `build_static_thd_metadata` no longer implements it. `extend_last`
+leaves `cu_seqlens_q` ending at the real token count while the tensors are
+padded to the static target; TE then returns a shorter attention output than
+the padded input. `pad_between_seqs` is derived
+from the collator's row alignment (`divisible_by > 1`), not hardcoded to
+`True`: at TP=CP=1 no sample is ever padded, so there is provably no gap, and
+claiming otherwise makes FlashAttention ineligible and can drop TE onto its
+unfused O(T^2) backend.
 
 `MdpModelAdapter.get_batch` converts the model-specific batch into
 `CapturedMicrobatch`. Core MDP treats `model_payload` as opaque and consumes
@@ -265,6 +280,61 @@ Primary flags:
 - `--mdp-plan-check-interval`
 - `--mdp-overlap-window-capture`
 - `--mdp-debug-plan-payload-check`
+- `--mdp-greedy-packing`
+- `--mdp-greedy-packing-approximate-resume`
+- `--mdp-mock-dataset-config-json`
+
+Packing flags MDP consumes from the core config (all optional, all off by
+default):
+
+- `--max-seqlen-per-dp-cp-rank` -- required by `--mdp-greedy-packing`; the
+  greedy token budget is this times `context_parallel_size`.
+- `--thd-max-packed-sequences` -- caps real sequences per bin, and fixes the
+  `cu_seqlens` entry count under `--thd-static-packing`. The static padding tail
+  occupies one of those slots, so it must exceed the real sequences a microbatch
+  can hold: `greedy_max_real_sequences()` reserves the slot for greedy bins, and
+  `validate_mdp_config` requires
+  `>= max(micro_batch_size, eval_micro_batch_size) + 1` without greedy packing.
+- `--thd-static-packing` -- the data path emits fixed-shape THD batches
+  (`T == max_seqlen_per_dp_cp_rank * cp_size`, `cu_seqlens*` of
+  `thd_max_packed_sequences + 1` entries). Requires
+  `--pad-packed-seq-alignment max` and the `append_dummy_seq` tail policy
+  (`extend_last` is rejected at every CP size). Independent of
+  `--mdp-greedy-packing`: all four corners of the 2x2 are reachable.
+- `--sequence-packing-scheduler` is **rejected** under MDP. It is not merely
+  untested: `training.py` wraps the data iterator whenever it is set, and
+  `DpBalancedScheduler.run` then asserts on GPT-only sample keys, deletes every
+  key outside those six (dropping `pixel_values` / `image_grid_thw`), and
+  reroutes samples across DP with an all-to-all that has no notion of
+  variable-size pixel payloads. MDP owns its packing instead.
+
+`--mdp-greedy-packing` **reinterprets** `--micro-batch-size` and
+`--global-batch-size`: they no longer describe what goes into a microbatch,
+only how many bins an iteration has (`N = GBS / (MBS x DP)`). Two consequences
+to state in any comparison:
+
+- GBS means "N x token budget", so loss curves are not iteration-by-iteration
+  comparable against a fixed-GBS run;
+- DP ranks consume different sample counts, so `consumed_train_samples` is
+  computed from a real all-reduced count
+  (`training._mdp_greedy_consumed_samples`) rather than the closed form. Samples
+  are counted when the window built from them is installed for its iteration,
+  not when they are drained -- under `--mdp-overlap-window-capture` the prefetch
+  thread fills the next iteration's window during the current one, and the final
+  prefetch is dropped unconsumed.
+- Checkpointing is **rejected** with greedy packing unless
+  `--mdp-greedy-packing-approximate-resume` is passed: the cross-iteration
+  sample buffer is not checkpointed, and `MegatronPretrainingSampler` is
+  positioned from one global `consumed_train_samples` that cannot express the
+  per-DP-rank drain counts greedy packing produces, so a resume may skip or
+  repeat samples. Greedy packing is a benchmarking path today.
+
+The stream must be provisioned by **tokens**, not samples: an iteration eats
+about `token_budget / mean_sample_len` samples per bin, so
+`train_iters x GBS` under-provisions whenever the mean sample is shorter than
+`token_budget / MBS`. The mock provider scales its dataset accordingly
+(`mdp_mock._greedy_sample_scale`); a real dataset must be sized by the
+operator.
 
 There is deliberately no pixel-sharding flag. Pixel owner sharding is part of
 the MDP definition in this baseline.
@@ -281,6 +351,7 @@ Current major constraints:
 - synchronous global `torch_dist` checkpointing (exact resume, same world size);
 - no FSDP/HSDP, FP8, full-iteration CUDA graph, CPU activation offload, or
   encoder communication overlap;
+- no `--sequence-packing-scheduler`;
 - native decoder `overlap_grad_reduce` and `overlap_param_gather` are supported,
   while delayed gradient reduction and parameter-gather overlap with the
   optimizer step are rejected by `validate_mdp_config`.

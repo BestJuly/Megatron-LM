@@ -135,6 +135,17 @@ class ModelParallelConfig:
     that value + 1 entries in both eager and CUDA Graph modes.
     """
 
+    thd_static_packing: bool = False
+    """The data path emits THD batches already padded to max_seqlen_per_dp_cp_rank x
+    context_parallel_size tokens with cu_seqlens* padded to thd_max_packed_sequences + 1
+    entries. Set this when packing is done outside --sequence-packing-scheduler (for
+    example by MDP's greedy token-budget packer). It is an explicit statement about the
+    shape contract of the incoming batches; it does not itself perform any packing.
+    Requires max_seqlen_per_dp_cp_rank, thd_max_packed_sequences,
+    pad_packed_seq_alignment='max', and thd_tail_padding_policy='append_dummy_seq',
+    and is mutually exclusive with sequence_packing_scheduler.
+    """
+
     expert_model_parallel_size: int = 1
     """Distributes Moe Experts across sub data parallel dimension."""
 
@@ -549,6 +560,42 @@ class ModelParallelConfig:
                         f"({self.max_seqlen_per_dp_cp_rank}), got "
                         f"{self.pad_packed_seq_alignment}."
                     )
+
+        if self.thd_static_packing:
+            if self.sequence_packing_scheduler is not None:
+                raise ValueError(
+                    "thd_static_packing declares that the data path already emits "
+                    "fixed-shape THD batches, so it is mutually exclusive with "
+                    "sequence_packing_scheduler "
+                    f"(got {self.sequence_packing_scheduler!r})."
+                )
+            if self.max_seqlen_per_dp_cp_rank is None:
+                raise ValueError(
+                    "thd_static_packing requires --max-seqlen-per-dp-cp-rank: it is the "
+                    "per-DPxCP-rank token budget every microbatch is padded to."
+                )
+            if self.pad_packed_seq_alignment not in ("max", self.max_seqlen_per_dp_cp_rank):
+                raise ValueError(
+                    "thd_static_packing requires --pad-packed-seq-alignment='max' (or a "
+                    "value equal to max_seqlen_per_dp_cp_rank="
+                    f"{self.max_seqlen_per_dp_cp_rank}), got "
+                    f"{self.pad_packed_seq_alignment!r}: any other alignment produces "
+                    "variable token counts."
+                )
+            # Rejected at every context-parallel size, unlike the CP-only
+            # restriction on 'extend_last' elsewhere: under static packing it
+            # would leave the valid cu_seqlens ending at the real token count
+            # while the token tensors are padded to the static target, and
+            # TransformerEngine then returns fewer attention rows than its input
+            # (a view mismatch in Attention._apply_output_gate).
+            if (self.thd_tail_padding_policy or "append_dummy_seq") == "extend_last":
+                raise ValueError(
+                    "thd_static_packing requires thd_tail_padding_policy="
+                    "'append_dummy_seq': with 'extend_last' the valid cu_seqlens stops at "
+                    "the real token count while the tensors are padded to the static "
+                    "target, and TransformerEngine returns a shorter attention output "
+                    "than its input."
+                )
 
         if self.sequence_parallel:
             if self.tensor_model_parallel_size <= 1:
