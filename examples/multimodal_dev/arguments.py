@@ -286,8 +286,8 @@ def add_multimodal_args(parser):
             "Build the vision encoder's FFN at this width instead of the "
             "architecture's (e.g. 4320 instead of Qwen3.5-VL's 4304, MXFP8's "
             "32-channel block alignment). On its own this changes the "
-            "architecture; pair it with --mdp-zero-pad-vision-ffn to keep the "
-            "extra channels provably inert."
+            "architecture and official checkpoints no longer load; pair it with "
+            "--mdp-zero-pad-vision-ffn to keep them loadable."
         ),
     )
     group.add_argument(
@@ -301,7 +301,10 @@ def add_multimodal_args(parser):
             "linear_fc1's output rows and linear_fc2's input columns; since the "
             "vision MLP has no normalization between them, GELU(0)=0 and the "
             "chain rule keep those channels at exactly zero forever, so the "
-            "padded model stays numerically identical to the unpadded one. "
+            "padded model stays numerically identical to the unpadded one and "
+            "loadable from official (unpadded) checkpoints. The reverse "
+            "direction is not implemented: a padded model is saved at its "
+            "padded width and cannot be read back by the official architecture. "
             "Requires --mdp-enable and --encoder-ffn-hidden-size."
         ),
     )

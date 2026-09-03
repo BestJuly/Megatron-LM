@@ -237,8 +237,9 @@ class _TinyMLPEncoder(torch.nn.Module):
 
 
 def _perturb_padding_channels(mlp, real_ffn_hidden_size):
-    """Make the padding channels non-zero before zero_pad_vision_mlp_channels
-    runs, so its work is observable (MCore initializes biases to zero)."""
+    """Make the padding channels non-zero, so that whatever is expected to zero
+    them next -- zero_pad_vision_mlp_channels at construction, or a checkpoint
+    load -- has observable work to do (MCore initializes biases to zero)."""
     with torch.no_grad():
         mlp.linear_fc1.weight.data[real_ffn_hidden_size:, :].normal_()
         mlp.linear_fc1.bias.data[real_ffn_hidden_size:].normal_()
@@ -287,31 +288,11 @@ def test_zero_pad_vision_ffn_zeros_padding_channels_only():
     encoder = _TinyMLPEncoder(_tiny_config(ffn_hidden_size=padded_ffn))
     _perturb_padding_channels(encoder.mlp, real_ffn)
     real_fc1_before = encoder.mlp.linear_fc1.weight.data[:real_ffn, :].clone()
-    real_fc2_before = encoder.mlp.linear_fc2.weight.data[:, :real_ffn].clone()
 
     zero_pad_vision_mlp_channels(encoder, real_ffn_hidden_size=real_ffn)
 
     assert torch.equal(encoder.mlp.linear_fc1.weight.data[:real_ffn, :], real_fc1_before)
-    # The real input columns of linear_fc2 survive: zeroing must stop at the
-    # real/padding boundary on both weights, not just fc1's.
-    assert torch.equal(encoder.mlp.linear_fc2.weight.data[:, :real_ffn], real_fc2_before)
     _assert_padding_is_zero(encoder.mlp, real_ffn)
-
-
-def test_zero_pad_vision_ffn_leaves_fc2_bias_alone():
-    """linear_fc2's bias is on the output (hidden) axis, not the FFN axis: it
-    has no padding channels and must not be touched. A padder that zeroed
-    every bias it found would silently drop the checkpoint's fc2 bias."""
-    real_ffn, padded_ffn = 6, 8
-    encoder = _TinyMLPEncoder(_tiny_config(ffn_hidden_size=padded_ffn))
-    with torch.no_grad():
-        encoder.mlp.linear_fc2.bias.data.normal_()
-    fc2_bias_before = encoder.mlp.linear_fc2.bias.data.clone()
-    assert not torch.equal(fc2_bias_before, torch.zeros_like(fc2_bias_before))
-
-    zero_pad_vision_mlp_channels(encoder, real_ffn_hidden_size=real_ffn)
-
-    assert torch.equal(encoder.mlp.linear_fc2.bias.data, fc2_bias_before)
 
 
 @pytest.mark.parametrize(

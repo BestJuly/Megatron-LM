@@ -103,18 +103,30 @@ FP8 is supported on both sides, on one recipe:
   block size (32 for MXFP8, 16 otherwise), which the official Qwen3.5-VL 4304
   is not. `--encoder-ffn-hidden-size 4320` builds the FFN at the aligned width;
   `--mdp-zero-pad-vision-ffn` alongside it keeps that from being an
-  architecture change: the extra channels are zeroed at construction and
-  provably stay at zero (`zero_pad_vision_mlp_channels` in `encoder.py`).
+  architecture change: the extra channels are zeroed at construction, provably
+  stay at zero, and official (unpadded) checkpoints still load
+  (`zero_pad_vision_mlp_channels` in `encoder.py`, `checkpoint.py`).
 
 Rejected at startup: FSDP/HSDP, `--encoder-fp8` without decoder FP8, a
-`delayed`/`custom` recipe alongside an FP8 encoder, an encoder
-`ffn_hidden_size` the recipe cannot quantize, full-iteration CUDA graphs, CPU
+`delayed`/`custom` recipe alongside an FP8 encoder, an `--encoder-ffn-hidden-size`
+the recipe cannot quantize, full-iteration CUDA graphs, CPU
 activation offload, delayed gradient reduction,
 `overlap_param_gather_with_optimizer_step`,
 `reuse_grad_buf_for_mxfp8_param_ag`, multiple distributed-optimizer
 instances, `calculate_per_token_loss=False`, non-`torch_dist` checkpoint
 formats, fully-parallel / asynchronous / non-persistent / constant-structure
 checkpoint modes, invalid rank mappings.
+
+Rejected at encoder-domain build (`validate_effective_vision_config`, on the
+resolved vision config): a built vision `ffn_hidden_size` that is not a multiple
+of the shared recipe's block size -- the base Qwen3.5-VL 4304 under `mxfp8` with
+no `--encoder-ffn-hidden-size` -- and any `fp8`/`fp8_recipe` on the vision
+config that does not match the decoder's.
+
+Rejected at `load_checkpoint` (`assert_zero_pad_vision_ffn_resume`, once the
+checkpoint's args are read and before any tensor is written): resuming a
+zero-padded run from a checkpoint whose padding channels were trained, or from
+one zero-padded to a different width.
 
 ### Checkpoint support matrix
 
@@ -133,6 +145,7 @@ this shape is ~8.6e-2 in grad norm.
 | Checkpoint missing encoder weights (e.g. a non-strict `--dist-ckpt-strictness` dropped them) | **Rejected, loudly** | `load_encoder_state` raises `MdpCheckpointError` instead of resuming from the random initialization |
 | TransformerEngine `_extra_state` drift between the checkpoint and the running TE | **Tolerated** | The delegated load retries non-strictly, matching what `load_model_state_dict` gives every decoder chunk |
 | Cross-TP / cross-EP / cross-CP restart, and changing the world size | **Untested** | Only the pipeline dimension was moved; no claim either way |
+| official (unpadded) vision FFN checkpoint -> `--mdp-zero-pad-vision-ffn` model, weights only | **Supported** (unit-tested torchrun round trip only; not part of the GB300 measurement above) | `allow_shape_mismatch` zero-fills the padding channels and copies the real prefix; the reverse direction (padded -> official width) is not implemented and fails loudly on the global shape check |
 | native (non-MDP) checkpoint -> MDP, or MDP -> native | **Not supported** | Decoder keys line up, but the encoder is saved through its DDP wrapper and carries an extra `module.` level (`vision_model.module.<param>` vs `vision_model.<param>`) |
 | Fully-parallel save/load, asynchronous, non-persistent, constant-structure caching, non-`torch_dist` formats | **Rejected at startup** | `assert_supported_checkpoint_config` and `validate_mdp_config` |
 

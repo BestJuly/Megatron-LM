@@ -1306,7 +1306,11 @@ def generate_state_dict(
 
         mdp_runtime = mdp_integration.get_runtime()
         if mdp_runtime is not None:
-            add_encoder_state(state_dict, mdp_runtime.encoder_domain.encoder_ddp)
+            add_encoder_state(
+                state_dict,
+                mdp_runtime.encoder_domain.encoder_ddp,
+                vision_ffn_may_be_padded=mdp_runtime.config.zero_pad_vision_ffn,
+            )
 
     # Optimizer stuff.
     if not args.no_save_optim:
@@ -2055,6 +2059,15 @@ def load_checkpoint(
         ckpt_args = types.SimpleNamespace()
         if state_dict is not None and "args" in state_dict:
             ckpt_args = state_dict.get("args")
+
+        if getattr(args, "mdp_enable", False):
+            # MDP: the vision encoder's zero-padding invariant is established at
+            # construction and the sharded load writes over it in place, so an
+            # incompatible checkpoint must be rejected before that happens.
+            # No-op unless --mdp-zero-pad-vision-ffn is set.
+            from megatron.core.mdp.checkpoint import assert_zero_pad_vision_ffn_resume
+
+            assert_zero_pad_vision_ffn_resume(args, ckpt_args)
 
         if not hasattr(ckpt_args, "tensor_model_parallel_size"):
             print_rank_0("WARNING: TP size not found in checkpoint args, using 1 as default.")

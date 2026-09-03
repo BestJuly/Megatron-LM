@@ -226,28 +226,6 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "Module selection applies only to selective recompute.",
             "None",
         )
-    if config.encoder_ffn_hidden_size is not None and not _is_positive_int(
-        config.encoder_ffn_hidden_size
-    ):
-        _reject(
-            "encoder_ffn_hidden_size",
-            config.encoder_ffn_hidden_size,
-            "None or a positive integer",
-            "encoder_ffn_hidden_size is the width the encoder FFN is built at (and, "
-            "with zero_pad_vision_ffn, the width the checkpoint architecture is "
-            "zero-padded up to).",
-            "None",
-        )
-    if config.zero_pad_vision_ffn and config.encoder_ffn_hidden_size is None:
-        _reject(
-            "zero_pad_vision_ffn",
-            config.zero_pad_vision_ffn,
-            "encoder_ffn_hidden_size is set",
-            "zero_pad_vision_ffn pads the vision FFN's real (checkpoint) hidden size "
-            "up to encoder_ffn_hidden_size; with no target there is nothing to pad "
-            "to.",
-            "--encoder-ffn-hidden-size <alignment target>",
-        )
     if config.encoder_fp8:
         if options.decoder_fp8 is None:
             _reject(
@@ -287,6 +265,28 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
                 "block size.",
                 str((config.encoder_ffn_hidden_size + align - 1) // align * align),
             )
+    if config.encoder_ffn_hidden_size is not None and not _is_positive_int(
+        config.encoder_ffn_hidden_size
+    ):
+        _reject(
+            "encoder_ffn_hidden_size",
+            config.encoder_ffn_hidden_size,
+            "None or a positive integer",
+            "encoder_ffn_hidden_size is the width the encoder FFN is built at (and, "
+            "with zero_pad_vision_ffn, the width the checkpoint architecture is "
+            "zero-padded up to).",
+            "None",
+        )
+    if config.zero_pad_vision_ffn and config.encoder_ffn_hidden_size is None:
+        _reject(
+            "zero_pad_vision_ffn",
+            config.zero_pad_vision_ffn,
+            "encoder_ffn_hidden_size is set",
+            "zero_pad_vision_ffn pads the vision FFN's real (checkpoint) hidden size "
+            "up to encoder_ffn_hidden_size; with no target there is nothing to pad "
+            "to.",
+            "--encoder-ffn-hidden-size <alignment target>",
+        )
     if not (0 <= config.locality_slack_permille < 1000):
         _reject(
             "locality_slack_permille",

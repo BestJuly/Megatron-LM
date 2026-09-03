@@ -308,7 +308,14 @@ Quantized GEMMs constrain three shapes, each padded by a different owner:
 The FFN padding is inert rather than masked: `linear_fc1`'s padded rows and
 bias and `linear_fc2`'s padded columns are zeroed, and the vision MLP has no
 normalization between them, so `GELU(0)=0` and the chain rule keep both those
-activations and their gradients at exactly zero.
+activations and their gradients at exactly zero. `checkpoint.py` marks the
+padded tensors `allow_shape_mismatch` when the flag is on, so an official
+(unpadded) checkpoint loads with the new channels zero-filled, and rejects two
+resumes: a checkpoint written at a widened FFN by a run that did *not* pass the
+flag (its padding channels were trained and would be restored non-zero), and a
+zero-padded checkpoint at a *different* padded width than the live model (both
+sides are shape-mismatch tolerant, so DCP would silently truncate or
+zero-extend across a different real/padding boundary).
 
 ### Decoder packed-row alignment: derivation
 
@@ -489,7 +496,8 @@ python -m pytest -q \
   tests/unit_tests/mdp/test_planner.py \
   tests/unit_tests/mdp/test_window.py \
   tests/unit_tests/mdp/test_quantized_alignment.py \
-  tests/unit_tests/mdp/test_pinned_collate.py
+  tests/unit_tests/mdp/test_pinned_collate.py \
+  tests/unit_tests/mdp/test_encoder_payload_padding.py
 ```
 
 Distributed MDP transport/runtime tests:
@@ -499,8 +507,13 @@ torchrun --nproc_per_node=8 -m pytest -q \
   tests/unit_tests/mdp/test_groups.py \
   tests/unit_tests/mdp/test_bridge.py \
   tests/unit_tests/mdp/test_pixel_owner_shard.py \
-  tests/unit_tests/mdp/test_runtime.py
+  tests/unit_tests/mdp/test_runtime.py \
+  tests/unit_tests/mdp/test_encoder_domain.py \
+  tests/unit_tests/mdp/test_checkpoint.py
 ```
+
+`test_encoder_domain.py` also owns the vision FFN zero-padding equivalence
+tests, including the MXFP8 one, which skips itself off Blackwell.
 
 Model-side contract and parity tests:
 
