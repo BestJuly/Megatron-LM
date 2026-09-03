@@ -124,6 +124,75 @@ def test_install_process_groups_and_registry_dedup():
 
 
 @pytest.mark.skipif(not _DISTRIBUTED, reason="needs torchrun world")
+def test_encoder_cp_group_is_the_worker_not_the_decoder_cp_group():
+    """The encoder must ring over ITS OWN group, at a topology that can tell.
+
+    This deliberately uses cp=1/pp=2/encoder_cp=2, where a logical worker is a
+    PP pair (e.g. ranks {0, 4}) while the decoder CP group is a singleton ({0}).
+    It must match the module fixture's MPU (tp=1, pp=2): the rank map is
+    cross-checked against live MPU state, so a topology the fixture never
+    initialised is rejected -- which is how the first version of this test, at
+    pp=4, was caught. The obvious topology --
+    cp=2/encoder_cp=2 -- cannot catch the bug this test exists for: there
+    worker_ranks(d, 0) and decoder_endpoint_ranks(d) are numerically the SAME
+    set, so an encoder that wrongly attended over the decoder's CP group would
+    pass. That is exactly the state the code was in before pg_collection was
+    threaded through the adapter.
+    """
+    world = torch.distributed.get_world_size()
+    if world != 8:
+        pytest.skip(f"needs a world of 8 to build cp=1/pp=2/encoder_cp=2 (got {world})")
+    rank_map = build_rank_map(
+        MdpRankSpec(world_size=world, tp=1, pp=2, cp=1, ep=1, encoder_cp=2)
+    )
+    registry = MdpGroupRegistry()
+    groups = install_mdp_process_groups(rank_map, group_registry=registry)
+
+    my_rank = torch.distributed.get_rank()
+    view = rank_map.view(my_rank)
+    mine = rank_map.worker_ranks(view.outer_dp_rank, view.my_worker_id)
+
+    assert groups.encoder_cp_group is not None
+    assert torch.distributed.get_world_size(group=groups.encoder_cp_group) == 2
+    # The group's ordering must agree with the coordinate the shard math uses.
+    assert (
+        torch.distributed.get_rank(group=groups.encoder_cp_group)
+        == view.my_encoder_cp_rank
+    )
+    assert mine[view.my_encoder_cp_rank] == my_rank
+
+    # The distinguishing assertion: at cp=1 the decoder endpoint set is a single
+    # rank, so a worker of 2 ranks can NOT be it.
+    assert len(view.decoder_endpoint_ranks) == 1
+    assert set(mine) != set(view.decoder_endpoint_ranks), (
+        "this topology must separate the worker from the decoder CP group, or "
+        "it cannot catch an encoder attending over the wrong one"
+    )
+
+    # The reduce/ZeRO domain must stay WORLD regardless of encoder_cp.
+    assert groups.encoder_reduction_group is torch.distributed.group.WORLD
+    registry.assert_no_leak()
+
+
+@pytest.mark.skipif(not _DISTRIBUTED, reason="needs torchrun world")
+def test_encoder_cp_groups_are_created_by_every_rank_in_one_order():
+    """new_group is a WORLD collective; a divergent order hangs silently."""
+    world = torch.distributed.get_world_size()
+    if world != 8:
+        pytest.skip(f"needs a world of 8 (got {world})")
+    rank_map = build_rank_map(
+        MdpRankSpec(world_size=world, tp=1, pp=2, cp=1, ep=1, encoder_cp=2)
+    )
+    registry = MdpGroupRegistry()
+    install_mdp_process_groups(rank_map, group_registry=registry)
+    keys = [k for k in registry.created_keys() if k[0] == "encoder_cp"]
+    # world_size / encoder_cp workers overall, and every rank created all of
+    # them -- including the ones it does not belong to.
+    assert len(keys) == world // 2
+    assert keys == sorted(keys), "creation order must be deterministic"
+
+
+@pytest.mark.skipif(not _DISTRIBUTED, reason="needs torchrun world")
 def test_broadcast_descriptors_from_endpoint():
     world = torch.distributed.get_world_size()
     rank_map = build_rank_map(
