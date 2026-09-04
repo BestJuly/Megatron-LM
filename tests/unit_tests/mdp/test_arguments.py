@@ -1,22 +1,30 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""CLI contract tests for multimodal encoder recompute."""
+"""CLI contract tests for the multimodal encoder recompute and FP8 arguments."""
 
 from types import SimpleNamespace
 
 import pytest
 
 from examples.multimodal_dev.arguments import (
+    encoder_ffn_overrides_from_args,
+    encoder_fp8_overrides_from_args,
     encoder_recompute_overrides_from_args,
+    validate_encoder_ffn_args,
+    validate_encoder_fp8_args,
     validate_encoder_recompute_args,
 )
-
 
 _DEFAULTS = {
     "encoder_recompute_granularity": None,
     "encoder_recompute_method": None,
     "encoder_recompute_num_layers": None,
     "encoder_recompute_modules": None,
+    "encoder_fp8": False,
+    "fp8": None,
+    "fp8_recipe": "delayed",
+    "encoder_ffn_hidden_size": None,
+    "mdp_zero_pad_vision_ffn": False,
 }
 
 
@@ -122,3 +130,52 @@ def test_non_native_recompute_modes_do_not_override_transformer_config(granulari
         )
         == {}
     )
+
+
+@pytest.mark.parametrize(
+    "mdp_enable, options, match",
+    [
+        # Nothing to inherit: encoder-only FP8 is not supported.
+        (True, {"encoder_fp8": True}, "requires --fp8-format"),
+        # Payload-row alignment lives in the MDP adapter; the native path would
+        # abort inside TE on the first unaligned vision batch.
+        (False, {"encoder_fp8": True, "fp8": "hybrid"}, "requires --mdp-enable"),
+        (True, {"encoder_fp8": True, "fp8": "hybrid", "fp8_recipe": "mxfp8"}, None),
+        (False, {}, None),
+    ],
+)
+def test_encoder_fp8_args_matrix(mdp_enable, options, match):
+    args = _args(mdp_enable=mdp_enable, **options)
+    if match is None:
+        validate_encoder_fp8_args(args)
+        overrides = encoder_fp8_overrides_from_args(args)
+        # The decoder's format and recipe, nothing else -- no FP8 attention.
+        assert overrides == ({"fp8": "hybrid", "fp8_recipe": "mxfp8"} if options else {})
+    else:
+        with pytest.raises(RuntimeError, match=match):
+            validate_encoder_fp8_args(args)
+
+
+@pytest.mark.parametrize(
+    "mdp_enable, options, match",
+    [
+        (True, {"mdp_zero_pad_vision_ffn": True}, "requires --encoder-ffn-hidden-size"),
+        (
+            False,
+            {"mdp_zero_pad_vision_ffn": True, "encoder_ffn_hidden_size": 4320},
+            "requires --mdp-enable",
+        ),
+        (True, {"encoder_ffn_hidden_size": 0}, "must be positive"),
+        # The width alone is an ordinary architecture change, allowed natively.
+        (False, {"encoder_ffn_hidden_size": 4320}, None),
+        (True, {"mdp_zero_pad_vision_ffn": True, "encoder_ffn_hidden_size": 4320}, None),
+    ],
+)
+def test_encoder_ffn_args_matrix(mdp_enable, options, match):
+    args = _args(mdp_enable=mdp_enable, **options)
+    if match is None:
+        validate_encoder_ffn_args(args)
+        assert encoder_ffn_overrides_from_args(args) == {"ffn_hidden_size": 4320}
+    else:
+        with pytest.raises(RuntimeError, match=match):
+            validate_encoder_ffn_args(args)

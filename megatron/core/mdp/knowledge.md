@@ -127,7 +127,7 @@ returns to `EMPTY`.
 | `bridge.py` | Canonical ledger and `all_to_all_single` transport for all three payload phases. |
 | `window.py` | Whole-iteration capture, microbatch replay cursors, pixel ownership context. |
 | `activation.py` | Retained-graph and complete-replay encoder handles, RNG recipes, chunk backward. |
-| `encoder.py` | Encoder process groups, DDP/ZeRO-1 domain, gradient finalization. |
+| `encoder.py` | Encoder process groups, DDP/ZeRO-1 domain, vision FFN zero-padding, gradient finalization. |
 | `runtime.py` | P0-P5 orchestration, prefetch handoff, per-iteration state and metrics. |
 | `schedule.py` | Native schedule and `finalize_model_grads_func` wrappers. |
 | `optimizer.py` | Decoder/encoder composite optimizer and shared overflow/norm semantics. |
@@ -251,6 +251,131 @@ The current checkpoint support is intentionally narrow:
 Decoder and WORLD encoder optimizers do not share a DP sharding group; never
 key or reshard them as if they did.
 
+## FP8 and quantized-GEMM alignment
+
+FP8 runs on one recipe for both sides. `args.fp8`/`args.fp8_recipe` configure
+the decoder; `--encoder-fp8` (`MdpConfig.encoder_fp8`) makes the vision encoder
+inherit them, copied onto the vision `TransformerConfig` by
+`apply_encoder_fp8_config` from the compatibility snapshot
+(`MdpCompatibilityOptions.decoder_fp8` / `decoder_fp8_recipe`), next to
+`apply_encoder_recompute_config`. The encoder has no recipe of its own and FP8
+attention is not offered for it.
+
+`validate_mdp_config` leaves decoder-only FP8 alone. Once the encoder runs FP8
+it requires decoder FP8 to be on (encoder-only FP8 is not supported: pure launch
+overhead in measurement, and it would need its own recipe plumbing), requires
+the shared recipe to be in `ENCODER_COMPATIBLE_FP8_RECIPES` (`delayed`: the
+encoder's per-chunk, rank-dependent forward count -- doubled by P2/P5
+whole-encoder replay -- would push the amax history unevenly, and TE all-reduces
+its global amax buffer on every depth-0 `fp8_autocast` exit so the decoder's own
+delayed buffers would see rank-dependent collective counts; `custom`:
+unvalidated), and requires `--encoder-ffn-hidden-size`, when given, to be
+aligned to the recipe's block size. Those gates run before the vision config
+exists, so `validate_effective_vision_config` re-checks the built config
+against the snapshot inside `build_encoder_domain`: an adapter that set `fp8`
+on its own, or lost it, fails loudly rather than training an encoder the gates
+never saw, and the built `ffn_hidden_size` -- whichever config it came from --
+must be a multiple of the recipe's block size (Qwen3.5-VL's 4304 is not, for
+MXFP8).
+
+The FP8 context is opened per layer inside `TransformerBlock.forward` off the
+config fields, so the wiring is complete once the fields are set: the P2
+forward and, with `--encoder-recompute-granularity whole`, the P5 replay call
+the same encoder and see the same recipe. Every compatible recipe derives its
+scale from the current tensor and keeps no cross-forward state, which is what
+makes the replay numerically equivalent.
+
+Quantized GEMMs constrain three shapes, each padded by a different owner:
+
+- decoder packed-sequence rows: `pack_or_pad_batch` extends the last sample's
+  padded region until the packed total is a multiple of
+  `get_fp8_align_size(fp8_recipe)` (32 for MXFP8, 16 otherwise). Every other
+  sample keeps its exact length, which is what lets that call site declare
+  `pad_between_seqs=False` and keep FlashAttention/FusedAttention eligible for
+  THD. Alignments it cannot derive fail loudly instead: with
+  `--use-packed-sequence`, `--fp4-format` and `--fp8-recipe custom` raise
+  `NotImplementedError`. Without `--use-packed-sequence` it contributes nothing:
+  BSHD collation is untouched by FP8. Under MDP that branch is unreachable (MDP
+  requires packed sequences); natively it is reachable and, exactly as on base,
+  unguarded -- a BSHD + FP8 run outside MDP gets no alignment from this stack;
+- encoder chunk payload rows: `Qwen35VLMdpAdapter.encode` appends one synthetic
+  all-zero grid item before the encoder call and strips its output rows after
+  (`tests/unit_tests/mdp/test_encoder_payload_padding.py`);
+- vision `ffn_hidden_size`: `--encoder-ffn-hidden-size` builds the aligned
+  width and `--mdp-zero-pad-vision-ffn` keeps it checkpoint-compatible, applied
+  by `zero_pad_vision_mlp_channels`.
+
+The FFN padding is inert rather than masked: `linear_fc1`'s padded rows and
+bias and `linear_fc2`'s padded columns are zeroed, and the vision MLP has no
+normalization between them, so `GELU(0)=0` and the chain rule keep both those
+activations and their gradients at exactly zero. `checkpoint.py` marks the
+padded tensors `allow_shape_mismatch` when the flag is on, so an official
+(unpadded) checkpoint loads with the new channels zero-filled, and rejects two
+resumes: a checkpoint written at a widened FFN by a run that did *not* pass the
+flag (its padding channels were trained and would be restored non-zero), and a
+zero-padded checkpoint at a *different* padded width than the live model (both
+sides are shape-mismatch tolerant, so DCP would silently truncate or
+zero-extend across a different real/padding boundary).
+
+### Decoder packed-row alignment: derivation
+
+Where the requirement lands. Quantized GEMMs check the tensor as the layer
+receives it, which is the rank-local one. CP has already taken its `1/cp_size`
+slice. Under sequence parallelism a column-parallel layer is still holding its
+`1/tp_size` shard when the check runs: `transformer_engine/pytorch/module/
+layernorm_linear.py` calls `assert_dim_for_fp8_exec` on the input before the
+sequence-parallel `gather_along_first_dim`, and quantizes that same shard
+(MXFP8's `flat_first_dim % 32` check in `csrc/quantizer.cpp` sees it too). So
+the collated multiple is `lcm(divisible_by, pad_to_multiple * cp_size *
+(tp_size if SP else 1))`, where `divisible_by` is the parallelism-only
+requirement (`tp_size` under SP, `cp_size * 2` under CP, their product with
+both). The 8/16/32 sources: `assert_dim_for_fp8_exec` needs the leading dim
+divisible by 8, the backward wgrad GEMM (`cublaslt_gemm.cu`
+`CanonicalizeGemmInput`) needs 16, and MXFP8's `create_tensor` needs 32;
+`megatron.core.fp8_utils.get_fp8_align_size` returns 32 for MXFP8 and 16
+otherwise.
+
+Why tail-only at `cp_size == 1`. Without CP the total is the only thing that
+has to be aligned: SP scatters the `[T, 1, H]` tensor as a unit
+(`scatter_to_sequence_parallel_region` in `models/base.py`), and the `tp_size`
+factor above already lifted the quantized-GEMM requirement onto that same total.
+Neither constrains per-sample boundaries. Rounding every sample up would open
+literal inter-sample gaps (`[a, a, PAD, b, b, b, PAD, c, PAD]`) that TE's THD
+attention detects as `pad_between_seqs=True` and answers by disabling
+FlashAttention/FusedAttention in favour of `UnfusedDotProductAttention` -- a
+~72% throughput regression measured on decoder FP8. So the samples are packed
+back to back and the whole tail is absorbed once by extending the last sample's
+padded region, the shape `megatron/core/packed_seq_params.py` calls
+"extend_last". `cu_seqlens[:-1] == cu_seqlens_padded[:-1]` is asserted.
+
+Why CP keeps per-sample alignment. TE partitions each sample on its own, so
+per-sample alignment is mandatory under CP whether or not FP8 is on, and the
+same `divisible_by` is applied to every sample. That is the tightest *uniform*
+per-sample rule that forces every rank's local row count to be a multiple of
+`pad_to_multiple` (a microbatch can hold a single sample). It is strict --
+up to `divisible_by - 1` padded rows per sample, 256 at `cp_size=8` with MXFP8
+and no SP. A total-only variant would be tighter and is not written because
+MDP rejects CP > 1 outright.
+
+Why `pad_between_seqs=False` is declared, and when it would be wrong. Declaring
+it lets `TEDotProductAttention.forward()`
+(`megatron/core/extensions/transformer_engine.py`) pass `cu_seqlens_q_padded`
+as the effective attention boundary while `cu_seqlens_q` and `padding_mask`
+stay exact for loss and routing. This deliberately diverges from
+`pad_sequence_for_thd` in `packed_seq_params.py`, which reports `True` for the
+identical "extend_last" layout -- the conservative answer a helper that cannot
+see how its input was built has to give, and one the call site that built the
+layout does not have to inherit. It is safe only because the decoder mask is
+causal: the tail rows follow every real row of the last sequence, so no real
+query reads them, and their own outputs are discarded by `loss_mask=0` /
+`labels=-100`. The collate function never sees an `attn_mask_type`, so the
+premise is owned by the decoder spec: `models/qwen35_vl/specs.py` delegates to
+`get_transformer_block_with_experimental_attention_variant_spec`, whose
+full-attention layers come from `get_gpt_layer_with_transformer_engine_spec`
+with a hard-coded `attn_mask_type=AttnMaskType.causal` and whose
+gated-delta-net layers are a causal recurrence; neither exposes a knob. Whoever
+adds a non-causal decoder spec owns dropping the flag (or padding every sample).
+
 ## Configuration quick reference
 
 Primary flags:
@@ -262,6 +387,11 @@ Primary flags:
 - `--encoder-recompute-method uniform|block`
 - `--encoder-recompute-num-layers`
 - `--encoder-recompute-modules MODULE [MODULE ...]`
+- `--encoder-fp8` (inherits the decoder's `--fp8-format`/`--fp8-recipe`;
+  requires `--mdp-enable` and decoder FP8; recipe must be
+  tensorwise|blockwise|mxfp8)
+- `--encoder-ffn-hidden-size N` (with `--mdp-zero-pad-vision-ffn` to stay
+  checkpoint-compatible)
 - `--mdp-locality-slack-permille`
 - `--mdp-pixel-locality`
 - `--mdp-row-alignment`
@@ -324,11 +454,14 @@ Current major constraints:
 - per-token loss enabled;
 - bf16/fp16 mixed precision;
 - synchronous global `torch_dist` checkpointing (exact resume, same world size);
-- no FSDP/HSDP, FP8, full-iteration CUDA graph, CPU activation offload, or
-  encoder communication overlap;
+- decoder FP8 unrestricted on its own; with `--encoder-fp8` the shared recipe
+  must be in `ENCODER_COMPATIBLE_FP8_RECIPES` (no `delayed`/`custom`);
+- no FSDP/HSDP, full-iteration CUDA graph, CPU activation offload, or encoder
+  communication overlap;
 - native decoder `overlap_grad_reduce` and `overlap_param_gather` are supported,
-  while delayed gradient reduction and parameter-gather overlap with the
-  optimizer step are rejected by `validate_mdp_config`.
+  while delayed gradient reduction, parameter-gather overlap with the optimizer
+  step, and MXFP8 grad-buffer reuse for the parameter all-gather are rejected by
+  `validate_mdp_config`.
 
 Always read `validate_mdp_config` before relaxing a constraint. A validation
 change without corresponding runtime/test support is not an implementation.
@@ -361,7 +494,10 @@ python -m pytest -q \
   tests/unit_tests/mdp/test_rank_mapping.py \
   tests/unit_tests/mdp/test_plan.py \
   tests/unit_tests/mdp/test_planner.py \
-  tests/unit_tests/mdp/test_window.py
+  tests/unit_tests/mdp/test_window.py \
+  tests/unit_tests/mdp/test_quantized_alignment.py \
+  tests/unit_tests/mdp/test_pinned_collate.py \
+  tests/unit_tests/mdp/test_encoder_payload_padding.py
 ```
 
 Distributed MDP transport/runtime tests:
@@ -371,13 +507,21 @@ torchrun --nproc_per_node=8 -m pytest -q \
   tests/unit_tests/mdp/test_groups.py \
   tests/unit_tests/mdp/test_bridge.py \
   tests/unit_tests/mdp/test_pixel_owner_shard.py \
-  tests/unit_tests/mdp/test_runtime.py
+  tests/unit_tests/mdp/test_runtime.py \
+  tests/unit_tests/mdp/test_encoder_domain.py \
+  tests/unit_tests/mdp/test_checkpoint.py
 ```
+
+`test_encoder_domain.py` also owns the vision FFN zero-padding equivalence
+tests, including the MXFP8 one, which skips itself off Blackwell.
 
 Model-side contract and parity tests:
 
 ```bash
 python -m pytest -q examples/multimodal_dev/tests/test_mdp_dataset.py
+# pack_or_pad_batch ends in a TP broadcast, so this one needs a rank:
+torchrun --nproc_per_node=1 -m pytest -q \
+  examples/multimodal_dev/tests/test_thd_e2e.py
 torchrun --nproc_per_node=8 -m pytest -q \
   examples/multimodal_dev/tests/test_mdp_parity.py
 ```

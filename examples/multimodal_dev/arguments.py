@@ -57,6 +57,75 @@ def encoder_recompute_overrides_from_args(args) -> dict:
     }
 
 
+def validate_encoder_fp8_args(args) -> None:
+    """Validate ``--encoder-fp8``.
+
+    The flag runs the vision encoder under the decoder's ``--fp8-format`` /
+    ``--fp8-recipe``; it carries no format or recipe of its own. It rides on
+    MDP: the payload-row alignment quantized GEMMs need is supplied by the MDP
+    adapter's ``encode`` (see ``mdp_adapter.py``), and the native path has no
+    equivalent, so it would abort inside TE on the first unaligned vision
+    batch. It also needs decoder FP8 to be on -- there is nothing to inherit
+    otherwise, and encoder-only FP8 is not supported (measured as pure launch
+    overhead on the encoder, and it would need its own recipe plumbing).
+    """
+    if not getattr(args, "encoder_fp8", False):
+        return
+    if not getattr(args, "mdp_enable", False):
+        raise RuntimeError(
+            "--encoder-fp8 requires --mdp-enable: quantized vision GEMMs need the "
+            "encoder payload rows padded to the recipe's alignment, which only the "
+            "MDP adapter's encode() supplies"
+        )
+    if getattr(args, "fp8", None) is None:
+        raise RuntimeError(
+            "--encoder-fp8 requires --fp8-format: the encoder inherits the decoder's "
+            "FP8 format and recipe; enable decoder FP8 first (encoder-only FP8 is "
+            "not supported)"
+        )
+
+
+def encoder_fp8_overrides_from_args(args) -> dict:
+    """Return native TransformerConfig overrides for encoder FP8 (the decoder's)."""
+    validate_encoder_fp8_args(args)
+    if not getattr(args, "encoder_fp8", False):
+        return {}
+    return {"fp8": args.fp8, "fp8_recipe": getattr(args, "fp8_recipe", None)}
+
+
+def validate_encoder_ffn_args(args) -> None:
+    """Validate the vision-FFN width override and its zero-padding flag.
+
+    ``--mdp-zero-pad-vision-ffn`` pads the checkpoint architecture's FFN up to
+    ``--encoder-ffn-hidden-size``; with no target there is nothing to pad to.
+    The zeroing itself runs in ``build_encoder_domain``, so the flag needs MDP.
+    The width override alone is an ordinary architecture change (Approach A,
+    checkpoint-incompatible) and is allowed on both paths.
+    """
+    ffn = getattr(args, "encoder_ffn_hidden_size", None)
+    if ffn is not None and ffn <= 0:
+        raise RuntimeError(f"--encoder-ffn-hidden-size must be positive, got {ffn}")
+    if not getattr(args, "mdp_zero_pad_vision_ffn", False):
+        return
+    if not getattr(args, "mdp_enable", False):
+        raise RuntimeError(
+            "--mdp-zero-pad-vision-ffn requires --mdp-enable: the padding channels "
+            "are zeroed in build_encoder_domain"
+        )
+    if ffn is None:
+        raise RuntimeError(
+            "--mdp-zero-pad-vision-ffn requires --encoder-ffn-hidden-size: it pads "
+            "the checkpoint architecture's vision FFN up to that width"
+        )
+
+
+def encoder_ffn_overrides_from_args(args) -> dict:
+    """Return the native TransformerConfig override for the vision FFN width."""
+    validate_encoder_ffn_args(args)
+    ffn = getattr(args, "encoder_ffn_hidden_size", None)
+    return {} if ffn is None else {"ffn_hidden_size": ffn}
+
+
 def add_multimodal_args(parser):
     """Add multimodal-specific arguments to the Megatron argument parser."""
     group = parser.add_argument_group(
@@ -194,6 +263,49 @@ def add_multimodal_args(parser):
         help=(
             "Vision Transformer submodules to checkpoint when "
             "--encoder-recompute-granularity selective is enabled."
+        ),
+    )
+    group.add_argument(
+        "--encoder-fp8",
+        action="store_true",
+        default=False,
+        help=(
+            "Run the vision encoder's GEMMs in FP8 with the decoder's "
+            "--fp8-format and --fp8-recipe (the encoder has no recipe of its "
+            "own; FP8 attention is not enabled for it). Requires --mdp-enable "
+            "and decoder FP8; the decoder recipe must be one of tensorwise, "
+            "blockwise, mxfp8 -- delayed scaling is rejected (see "
+            "megatron/core/mdp/config.py ENCODER_COMPATIBLE_FP8_RECIPES)."
+        ),
+    )
+    group.add_argument(
+        "--encoder-ffn-hidden-size",
+        type=int,
+        default=None,
+        help=(
+            "Build the vision encoder's FFN at this width instead of the "
+            "architecture's (e.g. 4320 instead of Qwen3.5-VL's 4304, MXFP8's "
+            "32-channel block alignment). On its own this changes the "
+            "architecture and official checkpoints no longer load; pair it with "
+            "--mdp-zero-pad-vision-ffn to keep them loadable."
+        ),
+    )
+    group.add_argument(
+        "--mdp-zero-pad-vision-ffn",
+        action="store_true",
+        default=False,
+        help=(
+            "Zero-pad the vision FFN's real (checkpoint) ffn_hidden_size up to "
+            "--encoder-ffn-hidden-size instead of changing the architecture "
+            "outright. The padding channels are zero-initialized on both "
+            "linear_fc1's output rows and linear_fc2's input columns; since the "
+            "vision MLP has no normalization between them, GELU(0)=0 and the "
+            "chain rule keep those channels at exactly zero forever, so the "
+            "padded model stays numerically identical to the unpadded one and "
+            "loadable from official (unpadded) checkpoints. The reverse "
+            "direction is not implemented: a padded model is saved at its "
+            "padded width and cannot be read back by the official architecture. "
+            "Requires --mdp-enable and --encoder-ffn-hidden-size."
         ),
     )
     group.add_argument(

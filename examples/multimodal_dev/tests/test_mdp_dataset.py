@@ -105,26 +105,27 @@ def test_sidecar_metadata_and_sentinels():
     assert positions.unique().numel() == positions.numel()
 
 
-def test_true_and_padded_cu_seqlens_differ_under_alignment():
+def test_sidecar_positions_follow_the_alignment_tail():
+    # build_vision_sidecar is handed cu_seqlens_padded, so its decoder
+    # positions index the *padded* pack: a quantized-GEMM tail appended after
+    # the last sample must leave them on the same image tokens. The tail's own
+    # metadata and payload are pinned with literals by test_thd_e2e.py's
+    # TestPackOrPadBatchQuantizedTailPadding; only the real scenario pool can
+    # exercise the sidecar sitting on top of one.
+    align = 16
     batch = _batch([0, 1, 3])
     packed = pack_or_pad_batch(
         [dict(s) for s in batch],
         use_packed_sequence=True,
-        pad_to_multiple=16,
+        pad_to_multiple=align,
         with_vision_sidecar=True,
     )
     params = packed["packed_seq_params"]
-    true_cu = params.cu_seqlens_q.cpu()
-    padded_cu = params.cu_seqlens_q_padded.cpu()
-    assert not torch.equal(true_cu, padded_cu)
-    # padding_mask marks exactly the collate-padded tail positions.
-    mask = packed["padding_mask"][0].cpu()
-    expected_padding = int(padded_cu[-1]) - int(
-        sum(true_cu[i + 1] - true_cu[i] for i in range(len(true_cu) - 1))
-    )
-    assert int(mask.sum()) == expected_padding
-    # Sidecar decoder positions must follow the padded physical layout.
-    meta = packed["vision_item_meta"].cpu()
+    # A tail has to exist, or this says nothing test_sidecar_metadata_and_sentinels
+    # does not already say on an unpadded pack.
+    assert int(params.cu_seqlens_q_padded[-1]) > int(params.cu_seqlens_q[-1])
+    assert int(params.cu_seqlens_q_padded[-1]) % align == 0
+
     positions = packed["vision_decoder_positions"].cpu()
     input_ids = packed["input_ids"][0].cpu()
     assert (input_ids[positions] == IMAGE_TOKEN_ID).all()

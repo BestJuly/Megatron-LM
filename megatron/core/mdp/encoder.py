@@ -18,6 +18,8 @@ import torch
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.mdp.config import (
     MdpConfig,
+    apply_encoder_ffn_config,
+    apply_encoder_fp8_config,
     apply_encoder_recompute_config,
     validate_effective_vision_config,
 )
@@ -47,12 +49,31 @@ def build_encoder_ddp_config(
     Decoder gradient-reduce and parameter-gather overlap is owned by the native
     decoder schedule. The encoder has a separate backward/finalization lifecycle in
     P5/P6, so it must not inherit those schedule-driven hooks.
+
+    The two MXFP8 parameter-gather fields are projected for the same reason.
+    ``reuse_grad_buf_for_mxfp8_param_ag`` aliases the parameter all-gather
+    receive buffer onto the gradient buffer, which is only safe under the
+    decoder's staging order: the training loop stages main params into the
+    shared buffer before the forward, and the decoder's parameter-gather
+    forward pre-hook then all-gathers and zeroes it before backward writes any
+    gradient into it. Forcing ``overlap_param_gather=False`` leaves the encoder
+    without that pre-hook, so the staged parameters would still be in the shared
+    buffer when P5 accumulates encoder gradients into it. ``fp8_param_gather``
+    is projected with it because ``DistributedDataParallelConfig.__post_init__``
+    couples the two (``reuse_grad_buf_for_mxfp8_param_ag`` asserts it), and that
+    assert is the only reader of the field outside Megatron-FSDP, which MDP
+    rejects. It does not change what the encoder holds: DDP dispatches on the
+    parameter's actual storage, and the encoder's parameters are never
+    quantized, because ``apply_encoder_fp8_config`` copies ``fp8``/``fp8_recipe``
+    only, never ``fp8_param``.
     """
     return replace(
         decoder_ddp_config,
         overlap_grad_reduce=False,
         overlap_param_gather=False,
         align_param_gather=False,
+        fp8_param_gather=False,
+        reuse_grad_buf_for_mxfp8_param_ag=False,
     )
 
 
@@ -98,6 +119,95 @@ def build_encoder_pg_collection(
     return pgs
 
 
+def zero_pad_vision_mlp_channels(encoder: torch.nn.Module, *, real_ffn_hidden_size: int) -> None:
+    """Zero-init the FFN alignment-padding channels on every vision MLP layer.
+
+    ``effective_config.ffn_hidden_size`` (the model actually built) may be larger
+    than ``real_ffn_hidden_size`` (the official/checkpoint architecture) when
+    ``--encoder-ffn-hidden-size N`` requests a hardware
+    alignment target (e.g. MXFP8's 32-token block size: 4304 -> 4320). Every
+    :class:`~megatron.core.transformer.mlp.MLP` in the encoder gets its extra
+    rows/columns -- ``linear_fc1``'s output rows ``[real_ffn_hidden_size:]`` and
+    ``linear_fc2``'s input columns ``[:, real_ffn_hidden_size:]``, plus
+    ``linear_fc1``'s bias if present -- zeroed here, once, at construction time.
+
+    No gradient masking or parameter freezing is needed after this: the vision
+    MLP is ``linear_fc1 -> activation -> linear_fc2`` with no intermediate
+    normalization, so an activation that maps zero to zero keeps the padding
+    channels at exactly zero and, by the chain rule, gives them exactly-zero
+    gradient on every subsequent backward pass -- a self-stabilizing invariant.
+    The two premises that argument rests on -- the activation passes through
+    the origin, and the FFN axis is not gated (``linear_fc1`` emits one
+    ``ffn_hidden_size``-wide tensor rather than a gate/up pair whose halves the
+    padding slice would straddle) -- are checked per layer below, so a later
+    vision architecture cannot silently invalidate them.
+
+    TP=1 is assumed for the encoder (true for every current MDP topology, see
+    ``build_encoder_pg_collection``), so ``linear_fc1``/``linear_fc2`` weights
+    are the full, unsharded ``[ffn_hidden_size, hidden_size]`` /
+    ``[hidden_size, ffn_hidden_size]`` tensors on every rank -- no TP shard
+    offset accounting is required.
+    """
+    from megatron.core.transformer.mlp import MLP
+
+    padded = 0
+    with torch.no_grad():
+        for module in encoder.modules():
+            if not isinstance(module, MLP):
+                continue
+            if module.config.gated_linear_unit:
+                raise MdpConfigurationError(
+                    "MDP: vision MLP gated_linear_unit=True violates: an ungated "
+                    "FFN axis. linear_fc1 would emit a concatenated gate/up pair, "
+                    "so the padding slice would straddle both halves instead of "
+                    "the alignment channels."
+                )
+            probe = torch.zeros(1, dtype=torch.float32)
+            if not torch.equal(module.config.activation_func(probe), probe):
+                raise MdpConfigurationError(
+                    f"MDP: vision MLP activation {module.config.activation_func} "
+                    "violates: activation(0) == 0. The padding channels stay inert "
+                    "only if the activation passes through the origin."
+                )
+            fc1_out = module.linear_fc1.weight.shape[0]
+            fc2_in = module.linear_fc2.weight.shape[1]
+            if fc1_out != fc2_in:
+                raise MdpConfigurationError(
+                    f"MDP: vision MLP linear_fc1 output width {fc1_out} != "
+                    f"linear_fc2 input width {fc2_in} violates: the two must "
+                    "agree on ffn_hidden_size for zero_pad_vision_ffn to locate "
+                    "the padding channels consistently."
+                )
+            if fc1_out < real_ffn_hidden_size:
+                raise MdpConfigurationError(
+                    f"MDP: vision MLP ffn_hidden_size {fc1_out} violates: "
+                    f">= real_ffn_hidden_size ({real_ffn_hidden_size}). "
+                    "zero_pad_vision_ffn only pads up, never down; check the "
+                    "--encoder-ffn-hidden-size value."
+                )
+            if fc1_out == real_ffn_hidden_size:
+                continue  # no padding requested for this layer; nothing to zero
+            module.linear_fc1.weight.data[real_ffn_hidden_size:, :].zero_()
+            if module.linear_fc1.bias is not None:
+                module.linear_fc1.bias.data[real_ffn_hidden_size:].zero_()
+            module.linear_fc2.weight.data[:, real_ffn_hidden_size:].zero_()
+            padded += 1
+    if padded == 0:
+        raise MdpConfigurationError(
+            "MDP: zero_pad_vision_ffn=True found no vision MLP layer whose "
+            f"ffn_hidden_size exceeds real_ffn_hidden_size ({real_ffn_hidden_size}) "
+            "violates: at least one layer to pad. Check that "
+            "--encoder-ffn-hidden-size is actually larger "
+            "than the base vision config's ffn_hidden_size."
+        )
+    logger.info(
+        "MDP: zero-padded %d vision MLP layer(s) from real ffn_hidden_size=%d up "
+        "to the checkpoint-compatible alignment target.",
+        padded,
+        real_ffn_hidden_size,
+    )
+
+
 def build_encoder_domain(
     *,
     adapter: MdpModelAdapter,
@@ -107,10 +217,11 @@ def build_encoder_domain(
     optimizer_config,
     encoder_pgs: ProcessGroupCollection,
     wrap_mixed_precision: bool = True,
+    compat_options=None,
 ) -> EncoderDomain:
     """Assemble the encoder domain (API design 14.2).
 
-    Order: typed encoder recompute config; encoder via the adapter's shared
+    Order: typed encoder recompute, FP8 and FFN-width config; encoder via the adapter's shared
     factory; the same mixed-precision wrapper depth as the decoder;
     DDP over the encoder process groups; DistributedOptimizer from the DDP
     buffers.
@@ -135,12 +246,20 @@ def build_encoder_domain(
             )
 
     effective_config = apply_encoder_recompute_config(model_config, mdp_config)
-    validate_effective_vision_config(mdp_config, effective_config)
+    effective_config = apply_encoder_fp8_config(effective_config, mdp_config, compat_options)
+    effective_config = apply_encoder_ffn_config(effective_config, mdp_config)
+    validate_effective_vision_config(mdp_config, effective_config, compat_options)
     logger.info(
-        "MDP: effective encoder recompute granularity: %s",
+        "MDP: effective encoder recompute granularity: %s, fp8: %s (recipe %s)",
         mdp_config.encoder_recompute_granularity,
+        getattr(effective_config, "fp8", None),
+        getattr(effective_config, "fp8_recipe", None) if mdp_config.encoder_fp8 else None,
     )
     encoder = adapter.build_encoder(effective_config, pg_collection=encoder_pgs)
+    if mdp_config.zero_pad_vision_ffn:
+        zero_pad_vision_mlp_channels(
+            encoder, real_ffn_hidden_size=model_config.ffn_hidden_size
+        )
     if wrap_mixed_precision and (
         getattr(effective_config, "fp16", False) or getattr(effective_config, "bf16", False)
     ):

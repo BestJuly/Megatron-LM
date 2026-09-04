@@ -86,12 +86,15 @@ def mdp_config_from_args(args) -> MdpConfig:
             args, "encoder_recompute_num_layers", None
         ),
         encoder_recompute_modules=tuple(modules) if modules is not None else None,
+        encoder_fp8=bool(getattr(args, "encoder_fp8", False)),
         locality_slack_permille=getattr(args, "mdp_locality_slack_permille", 10),
         row_alignment=getattr(args, "mdp_row_alignment", 1),
         plan_check_interval=getattr(args, "mdp_plan_check_interval", 1),
         debug_plan_payload_check=getattr(args, "mdp_debug_plan_payload_check", False),
         pixel_locality=getattr(args, "mdp_pixel_locality", False),
         overlap_window_capture=getattr(args, "mdp_overlap_window_capture", False),
+        encoder_ffn_hidden_size=getattr(args, "encoder_ffn_hidden_size", None),
+        zero_pad_vision_ffn=getattr(args, "mdp_zero_pad_vision_ffn", False),
     )
 
 
@@ -136,13 +139,17 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
         fp16=bool(args.fp16),
         bf16=bool(args.bf16),
         fsdp_enabled=fsdp,
-        fp8_enabled=getattr(args, "fp8", None) is not None,
+        decoder_fp8=getattr(args, "fp8", None),
+        decoder_fp8_recipe=getattr(args, "fp8_recipe", None),
         cuda_graph_enabled=cuda_graph,
         activation_offload_enabled=offload,
         overlap_grad_reduce=getattr(args, "overlap_grad_reduce", False),
         overlap_param_gather=getattr(args, "overlap_param_gather", False),
         overlap_param_gather_with_optimizer_step=bool(
             getattr(args, "overlap_param_gather_with_optimizer_step", False)
+        ),
+        reuse_grad_buf_for_mxfp8_param_ag=bool(
+            getattr(args, "reuse_grad_buf_for_mxfp8_param_ag", False)
         ),
         delay_grad_reduce=bool(getattr(args, "delay_grad_reduce", False)),
         overlap_moe_expert_parallel_comm=bool(
@@ -177,7 +184,8 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
         )
 
     mdp_config = mdp_config_from_args(args)
-    validate_mdp_config(mdp_config, compatibility_options_from_args(args))
+    compat_options = compatibility_options_from_args(args)
+    validate_mdp_config(mdp_config, compat_options)
 
     rank_map = build_rank_map(
         MdpRankSpec(
@@ -205,6 +213,7 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
         ddp_config=ddp_config,
         optimizer_config=optimizer_config,
         encoder_pgs=encoder_pgs,
+        compat_options=compat_options,
     )
     assert_parameter_disjointness(encoder_domain.encoder_ddp, model)
 

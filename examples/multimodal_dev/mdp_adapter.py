@@ -17,6 +17,7 @@ import torch
 from examples.multimodal_dev.models.qwen35_vl.configuration import VISION_KWARGS
 from examples.multimodal_dev.models.qwen35_vl.specs import get_qwen35_vl_vision_spec
 from examples.multimodal_dev.models.qwen35_vl.vision_encoder import Qwen35VLVisionEncoder
+from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.mdp.protocols import CapturedMicrobatch, CapturedVisionItem
 
 
@@ -145,10 +146,95 @@ class Qwen35VLMdpAdapter:
         # (~2.4 ms/iter measured) followed by D2H readbacks inside the
         # encoder. The encoder moves it to the device itself on the uncached
         # (QWEN35_VL_GRID_CACHE=0) fallback paths that do tensor math on it.
-        grid_thw = torch.tensor(
-            [segment.grid_thw for segment in layout.segments], dtype=torch.long
-        )
-        return encoder(payload, grid_thw)
+        grids = [segment.grid_thw for segment in layout.segments]
+
+        # TE's forward-pass assert_dim_for_fp8_exec requires the packed leading
+        # dim (payload.shape[0]) divisible by 8, but the backward wgrad GEMM
+        # (cublaslt_gemm.cu CanonicalizeGemmInput) is stricter: it requires the
+        # leading dim divisible by 16 ("Caller must pad", observed empirically
+        # via a training-time crash, not just the forward-only assert). MXFP8 is
+        # stricter still: TE's quantizer.cpp create_tensor asserts
+        # flat_first_dim % MXFP8_BLOCK_SIZE == 0 (MXFP8_BLOCK_SIZE=32, the
+        # native OCP microscaling block granularity) — observed empirically as
+        # a training-time crash with 16-aligned padding ("MXFP8 requires
+        # tensor dims that are divisible by 32"). get_fp8_align_size encodes
+        # exactly that split (32 for mxfp8, 16 for every other recipe) and is
+        # what the decoder side pads to as well (forward_step.py's
+        # quantized_row_alignment). Its 16 fallback would be too small for a
+        # block-scaled 'custom' quantizer, but ENCODER_COMPATIBLE_FP8_RECIPES
+        # rejects 'custom' before any encoder is built.
+        #
+        # Every real grid entry's row count t*h*w is a multiple of
+        # spatial_merge_size**2 (h and w are always even, being patch-grid
+        # units of an even-merge image), so payload.shape[0] itself is already
+        # a multiple of merge**2 (4 for this model). Only one extra synthetic
+        # all-zero grid item is ever needed to reach the next multiple of
+        # ALIGN: pad by at most (ALIGN - merge**2) rows, never more. This
+        # padding is entirely local to this call — MDP core's
+        # `chunk.total_payload_rows` and everything in bridge.py/storage.py
+        # are unaware of it: we strip the padding item's output rows before
+        # returning, so the returned tensor has exactly the same shape core
+        # already expects (sum of each real segment's merged output rows).
+        #
+        # The strip is exact in shape and in gradient — the synthetic item is
+        # its own THD sub-sequence so attention never mixes it with real
+        # tokens, the merger is per-token, and the stripped rows never reach
+        # the loss, so they contribute no gradient. It is not numerically
+        # identical to an unpadded run, though: the synthetic rows are all-zero
+        # only in the input payload (the encoder's bias terms make them
+        # non-zero downstream) and they are quantized in the same tensors as
+        # the real rows, so they enter the per-tensor amax under 'tensorwise'
+        # and share the E8M0 scale of the final 32-row block under columnwise
+        # MXFP8.
+        encoder_config = self._unwrap_config(encoder)
+        fp8_enabled = getattr(encoder_config, "fp8", None) is not None
+        fp8_recipe = getattr(encoder_config, "fp8_recipe", None)
+        pad_grid = None
+        ALIGN = get_fp8_align_size(fp8_recipe)
+        if fp8_enabled and payload.shape[0] % ALIGN != 0:
+            merge = self.spatial_merge_size
+            pad_rows = (ALIGN - payload.shape[0] % ALIGN) % ALIGN
+            unit = merge * merge
+            if pad_rows % unit != 0:
+                raise RuntimeError(
+                    "MDP encoder FP8 padding: payload.shape[0]="
+                    f"{payload.shape[0]} needs {pad_rows} more rows to reach a "
+                    f"multiple of {ALIGN}, but {pad_rows} is not a multiple of "
+                    f"spatial_merge_size**2 ({unit}); the 'every real grid "
+                    "row-count is a multiple of merge**2' assumption this padding "
+                    "relies on does not hold for this vision config — pad_grid "
+                    "needs a general solution, not just a single (k, merge, merge) "
+                    "item."
+                )
+            pad_grid = (pad_rows // unit, merge, merge)
+            payload = torch.cat(
+                [payload, payload.new_zeros(pad_rows, payload.shape[1])], dim=0
+            )
+            grids = grids + [pad_grid]
+
+        grid_thw = torch.tensor(grids, dtype=torch.long)
+        output = encoder(payload, grid_thw)
+        if pad_grid is not None:
+            merge = self.spatial_merge_size
+            pad_output_rows = pad_grid[0] * (pad_grid[1] // merge) * (pad_grid[2] // merge)
+            if pad_output_rows:
+                output = output[:-pad_output_rows]
+        return output
+
+    @staticmethod
+    def _unwrap_config(encoder: torch.nn.Module):
+        """The effective vision config from the outermost wrapper that has one.
+
+        ``build_encoder_domain`` hands ``DistributedDataParallel`` the effective
+        vision config -- the one ``apply_encoder_fp8_config`` wrote ``fp8`` /
+        ``fp8_recipe`` onto -- so DDP's own ``.config`` is exactly the object
+        wanted here, and the walk stops there. The fallback through ``.module``
+        only matters for a bare encoder handed in without a wrapper (tests).
+        """
+        module = encoder
+        while not hasattr(module, "config") and hasattr(module, "module"):
+            module = module.module
+        return getattr(module, "config", None)
 
 
 def build_mdp_adapter(args, language_config) -> Qwen35VLMdpAdapter:

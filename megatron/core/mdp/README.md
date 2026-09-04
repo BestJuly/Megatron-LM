@@ -72,12 +72,61 @@ in P5/P6. Decoder-only EP A2A overlap via
 the native MCore requirements (`EP>1`, and VPP when `PP>1`); the vision encoder
 remains outside that schedule.
 
-Rejected at startup: FSDP/HSDP, FP8/MXFP8, full-iteration CUDA graphs, CPU
+FP8 is supported on both sides, on one recipe:
+
+- The decoder uses the native `--fp8`/`--fp8-recipe` flags. The vision
+  `TransformerConfig` is built separately and never inherits them on its own,
+  so decoder-only FP8 is unrestricted and leaves the encoder domain untouched.
+  Its one shape requirement falls on the collated sequence: quantized GEMMs
+  need the packed row count to be a multiple of `get_fp8_align_size(fp8_recipe)`,
+  which `pack_or_pad_batch` in `examples/multimodal_dev/forward_step.py`
+  supplies by extending the last sample's padded region. Alignments that call
+  site cannot derive fail loudly instead: with `--use-packed-sequence`,
+  `--fp4-format` and `--fp8-recipe custom` raise `NotImplementedError`.
+- `--encoder-fp8` runs the vision encoder under the **decoder's** `--fp8-format`
+  and `--fp8-recipe`; the encoder has no recipe of its own and FP8 attention is
+  not offered for it. `apply_encoder_fp8_config` copies the two fields from the
+  compatibility snapshot onto the vision `TransformerConfig`, next to
+  `apply_encoder_recompute_config`. It requires decoder FP8 (encoder-only FP8 is
+  not supported: it measured as pure launch overhead and would need its own
+  recipe plumbing) and `--mdp-enable` (the payload-row alignment lives in the
+  MDP adapter). With the encoder on, the shared recipe must be one of
+  `ENCODER_COMPATIBLE_FP8_RECIPES` = `{tensorwise, blockwise, mxfp8}`
+  (`config.py`): `delayed` is rejected because its amax history is
+  cross-iteration state that the per-chunk, rank-dependent encoder forwards and
+  the P2/P5 whole-encoder replay would push unevenly, and because TE all-reduces
+  the global amax buffer on every depth-0 `fp8_autocast` exit, so the decoder's
+  own delayed buffers would see rank-dependent collective counts; `custom` is
+  unvalidated. `validate_effective_vision_config` cross-checks the built config
+  against the snapshot, so FP8 cannot reach the encoder by any other route.
+- An FP8 encoder needs its vision `ffn_hidden_size` aligned to the recipe's
+  block size (32 for MXFP8, 16 otherwise), which the official Qwen3.5-VL 4304
+  is not. `--encoder-ffn-hidden-size 4320` builds the FFN at the aligned width;
+  `--mdp-zero-pad-vision-ffn` alongside it keeps that from being an
+  architecture change: the extra channels are zeroed at construction, provably
+  stay at zero, and official (unpadded) checkpoints still load
+  (`zero_pad_vision_mlp_channels` in `encoder.py`, `checkpoint.py`).
+
+Rejected at startup: FSDP/HSDP, `--encoder-fp8` without decoder FP8, a
+`delayed`/`custom` recipe alongside an FP8 encoder, an `--encoder-ffn-hidden-size`
+the recipe cannot quantize, full-iteration CUDA graphs, CPU
 activation offload, delayed gradient reduction,
-`overlap_param_gather_with_optimizer_step`, multiple distributed-optimizer
+`overlap_param_gather_with_optimizer_step`,
+`reuse_grad_buf_for_mxfp8_param_ag`, multiple distributed-optimizer
 instances, `calculate_per_token_loss=False`, non-`torch_dist` checkpoint
 formats, fully-parallel / asynchronous / non-persistent / constant-structure
 checkpoint modes, invalid rank mappings.
+
+Rejected at encoder-domain build (`validate_effective_vision_config`, on the
+resolved vision config): a built vision `ffn_hidden_size` that is not a multiple
+of the shared recipe's block size -- the base Qwen3.5-VL 4304 under `mxfp8` with
+no `--encoder-ffn-hidden-size` -- and any `fp8`/`fp8_recipe` on the vision
+config that does not match the decoder's.
+
+Rejected at `load_checkpoint` (`assert_zero_pad_vision_ffn_resume`, once the
+checkpoint's args are read and before any tensor is written): resuming a
+zero-padded run from a checkpoint whose padding channels were trained, or from
+one zero-padded to a different width.
 
 ### Checkpoint support matrix
 
@@ -96,6 +145,7 @@ this shape is ~8.6e-2 in grad norm.
 | Checkpoint missing encoder weights (e.g. a non-strict `--dist-ckpt-strictness` dropped them) | **Rejected, loudly** | `load_encoder_state` raises `MdpCheckpointError` instead of resuming from the random initialization |
 | TransformerEngine `_extra_state` drift between the checkpoint and the running TE | **Tolerated** | The delegated load retries non-strictly, matching what `load_model_state_dict` gives every decoder chunk |
 | Cross-TP / cross-EP / cross-CP restart, and changing the world size | **Untested** | Only the pipeline dimension was moved; no claim either way |
+| official (unpadded) vision FFN checkpoint -> `--mdp-zero-pad-vision-ffn` model, weights only | **Supported** (unit-tested torchrun round trip only; not part of the GB300 measurement above) | `allow_shape_mismatch` zero-fills the padding channels and copies the real prefix; the reverse direction (padded -> official width) is not implemented and fails loudly on the global shape check |
 | native (non-MDP) checkpoint -> MDP, or MDP -> native | **Not supported** | Decoder keys line up, but the encoder is saved through its DDP wrapper and carries an extra `module.` level (`vision_model.module.<param>` vs `vision_model.<param>`) |
 | Fully-parallel save/load, asynchronous, non-persistent, constant-structure caching, non-`torch_dist` formats | **Rejected at startup** | `assert_supported_checkpoint_config` and `validate_mdp_config` |
 
@@ -118,7 +168,7 @@ activations justifies the extra complete forward.
 
 Registered extension hooks (each exercised by a test at a non-degenerate
 value): logical workers + `worker_ranks()` for encoder CP, single-valued
-endpoints + multi-slice routes for decoder CP, typed encoder recompute
-configuration + row-capacity policy for FP8, and the unified buffer allocator
+endpoints + multi-slice routes for decoder CP, the plan-level row-capacity
+policy (`--mdp-row-alignment`), and the unified buffer allocator
 for full-iteration CUDA graphs. The hooks guarantee no breaking schema change is
 needed later; they do not mean the capability is implemented.
