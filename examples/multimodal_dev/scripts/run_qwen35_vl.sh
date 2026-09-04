@@ -164,7 +164,7 @@ case "$MODEL_VARIANT" in
         ;;
     35b_a3b_light)
         NUM_LAYERS=${NUM_LAYERS:-12}
-        NUM_EXPERTS=${NUM_EXPERTS:-128}
+        NUM_EXPERTS=${NUM_EXPERTS:-64}
         HIDDEN_SIZE=2048
         FFN_HIDDEN_SIZE=4096
         NUM_ATTN_HEADS=16

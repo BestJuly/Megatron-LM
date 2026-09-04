@@ -237,7 +237,7 @@ _VARIANT_CONFIGS = {
         "num_query_groups": 2,
         "kv_channels": 256,
         "linear_num_value_heads": 32,
-        "num_moe_experts": 128,
+        "num_moe_experts": 64,
         "moe_router_topk": 8,
         "moe_ffn_hidden_size": 512,
         "moe_shared_expert_intermediate_size": 512,
