@@ -251,6 +251,92 @@ The current checkpoint support is intentionally narrow:
 Decoder and WORLD encoder optimizers do not share a DP sharding group; never
 key or reshard them as if they did.
 
+## FP8 and quantized-GEMM alignment
+
+Decoder and encoder FP8 are configured separately. `args.fp8` reaches only the
+decoder; the vision `TransformerConfig` is built by the adapter and never reads
+it, and the typed encoder arguments (`--encoder-recompute-*`) carry no FP8
+field. Decoder FP8 is not an MDP incompatibility, so `MdpCompatibilityOptions`
+carries no field for it at all; the one thing it asks of MDP, the THD row
+alignment, reads `args.fp8` directly in `forward_step.py`.
+
+Encoder FP8 is rejected where it becomes observable rather than inferred from
+args: `validate_effective_vision_config` runs on the resolved vision config
+inside `build_encoder_domain` and refuses `fp8 is not None`. A future adapter
+that wires FP8 into the vision config trips that check instead of silently
+training an FP8 encoder the support matrix never validated.
+
+Quantized GEMMs constrain the decoder's packed row count: `pack_or_pad_batch`
+extends the last sample's padded region until the packed total is a multiple of
+`get_fp8_align_size(fp8_recipe)` (32 for MXFP8, 16 otherwise). Every other
+sample keeps its exact length, which is what lets that call site declare
+`pad_between_seqs=False` and keep FlashAttention/FusedAttention eligible for
+THD. Alignments it cannot derive fail loudly instead: with
+`--use-packed-sequence`, `--fp4-format` and `--fp8-recipe custom` raise
+`NotImplementedError`. Without `--use-packed-sequence` it contributes nothing:
+BSHD collation is untouched by FP8. Under MDP that branch is unreachable (MDP
+requires packed sequences); natively it is reachable and, exactly as on base,
+unguarded -- a BSHD + FP8 run outside MDP gets no alignment from this stack.
+
+### Decoder packed-row alignment: derivation
+
+Where the requirement lands. Quantized GEMMs check the tensor as the layer
+receives it, which is the rank-local one. CP has already taken its `1/cp_size`
+slice. Under sequence parallelism a column-parallel layer is still holding its
+`1/tp_size` shard when the check runs: `transformer_engine/pytorch/module/
+layernorm_linear.py` calls `assert_dim_for_fp8_exec` on the input before the
+sequence-parallel `gather_along_first_dim`, and quantizes that same shard
+(MXFP8's `flat_first_dim % 32` check in `csrc/quantizer.cpp` sees it too). So
+the collated multiple is `lcm(divisible_by, pad_to_multiple * cp_size *
+(tp_size if SP else 1))`, where `divisible_by` is the parallelism-only
+requirement (`tp_size` under SP, `cp_size * 2` under CP, their product with
+both). The 8/16/32 sources: `assert_dim_for_fp8_exec` needs the leading dim
+divisible by 8, the backward wgrad GEMM (`cublaslt_gemm.cu`
+`CanonicalizeGemmInput`) needs 16, and MXFP8's `create_tensor` needs 32;
+`megatron.core.fp8_utils.get_fp8_align_size` returns 32 for MXFP8 and 16
+otherwise.
+
+Why tail-only at `cp_size == 1`. Without CP the total is the only thing that
+has to be aligned: SP scatters the `[T, 1, H]` tensor as a unit
+(`scatter_to_sequence_parallel_region` in `models/base.py`), and the `tp_size`
+factor above already lifted the quantized-GEMM requirement onto that same total.
+Neither constrains per-sample boundaries. Rounding every sample up would open
+literal inter-sample gaps (`[a, a, PAD, b, b, b, PAD, c, PAD]`) that TE's THD
+attention detects as `pad_between_seqs=True` and answers by disabling
+FlashAttention/FusedAttention in favour of `UnfusedDotProductAttention` -- a
+~72% throughput regression measured on decoder FP8. So the samples are packed
+back to back and the whole tail is absorbed once by extending the last sample's
+padded region, the shape `megatron/core/packed_seq_params.py` calls
+"extend_last". `cu_seqlens[:-1] == cu_seqlens_padded[:-1]` is asserted.
+
+Why CP keeps per-sample alignment. TE partitions each sample on its own, so
+per-sample alignment is mandatory under CP whether or not FP8 is on, and the
+same `divisible_by` is applied to every sample. That is the tightest *uniform*
+per-sample rule that forces every rank's local row count to be a multiple of
+`pad_to_multiple` (a microbatch can hold a single sample). It is strict --
+up to `divisible_by - 1` padded rows per sample, 256 at `cp_size=8` with MXFP8
+and no SP. A total-only variant would be tighter and is not written because
+MDP rejects CP > 1 outright.
+
+Why `pad_between_seqs=False` is declared, and when it would be wrong. Declaring
+it lets `TEDotProductAttention.forward()`
+(`megatron/core/extensions/transformer_engine.py`) pass `cu_seqlens_q_padded`
+as the effective attention boundary while `cu_seqlens_q` and `padding_mask`
+stay exact for loss and routing. This deliberately diverges from
+`pad_sequence_for_thd` in `packed_seq_params.py`, which reports `True` for the
+identical "extend_last" layout -- the conservative answer a helper that cannot
+see how its input was built has to give, and one the call site that built the
+layout does not have to inherit. It is safe only because the decoder mask is
+causal: the tail rows follow every real row of the last sequence, so no real
+query reads them, and their own outputs are discarded by `loss_mask=0` /
+`labels=-100`. The collate function never sees an `attn_mask_type`, so the
+premise is owned by the decoder spec: `models/qwen35_vl/specs.py` delegates to
+`get_transformer_block_with_experimental_attention_variant_spec`, whose
+full-attention layers come from `get_gpt_layer_with_transformer_engine_spec`
+with a hard-coded `attn_mask_type=AttnMaskType.causal` and whose
+gated-delta-net layers are a causal recurrence; neither exposes a knob. Whoever
+adds a non-causal decoder spec owns dropping the flag (or padding every sample).
+
 ## Configuration quick reference
 
 Primary flags:
@@ -324,11 +410,13 @@ Current major constraints:
 - per-token loss enabled;
 - bf16/fp16 mixed precision;
 - synchronous global `torch_dist` checkpointing (exact resume, same world size);
-- no FSDP/HSDP, FP8, full-iteration CUDA graph, CPU activation offload, or
-  encoder communication overlap;
+- decoder FP8 supported, encoder FP8 rejected;
+- no FSDP/HSDP, full-iteration CUDA graph, CPU activation offload, or encoder
+  communication overlap;
 - native decoder `overlap_grad_reduce` and `overlap_param_gather` are supported,
-  while delayed gradient reduction and parameter-gather overlap with the
-  optimizer step are rejected by `validate_mdp_config`.
+  while delayed gradient reduction, parameter-gather overlap with the optimizer
+  step, and MXFP8 grad-buffer reuse for the parameter all-gather are rejected by
+  `validate_mdp_config`.
 
 Always read `validate_mdp_config` before relaxing a constraint. A validation
 change without corresponding runtime/test support is not an implementation.
@@ -361,7 +449,9 @@ python -m pytest -q \
   tests/unit_tests/mdp/test_rank_mapping.py \
   tests/unit_tests/mdp/test_plan.py \
   tests/unit_tests/mdp/test_planner.py \
-  tests/unit_tests/mdp/test_window.py
+  tests/unit_tests/mdp/test_window.py \
+  tests/unit_tests/mdp/test_quantized_alignment.py \
+  tests/unit_tests/mdp/test_pinned_collate.py
 ```
 
 Distributed MDP transport/runtime tests:
@@ -378,6 +468,9 @@ Model-side contract and parity tests:
 
 ```bash
 python -m pytest -q examples/multimodal_dev/tests/test_mdp_dataset.py
+# pack_or_pad_batch ends in a TP broadcast, so this one needs a rank:
+torchrun --nproc_per_node=1 -m pytest -q \
+  examples/multimodal_dev/tests/test_thd_e2e.py
 torchrun --nproc_per_node=8 -m pytest -q \
   examples/multimodal_dev/tests/test_mdp_parity.py
 ```

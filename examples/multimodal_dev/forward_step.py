@@ -3,7 +3,7 @@
 """Forward step, TP broadcast, and loss for multimodal_dev training."""
 
 import math
-from functools import partial
+from functools import lru_cache, partial
 from itertools import accumulate
 from typing import Any, Dict, Iterator, Optional
 
@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 from examples.multimodal_dev.observability import nvtx_phase
 from megatron.core import mpu
+from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
@@ -415,7 +416,16 @@ def pack_or_pad_batch(
     else:
         divisible_by = tp_size if has_sp else 1
     if pad_to_multiple is not None:
-        divisible_by = max(divisible_by, pad_to_multiple)
+        # Quantized GEMMs check the rank-local tensor (after the CP slice and,
+        # under SP, before the all-gather), so lift the multiple by both factors.
+        # See knowledge.md, "Decoder packed-row alignment: derivation".
+        divisible_by = math.lcm(
+            divisible_by, pad_to_multiple * cp_size * (tp_size if has_sp else 1)
+        )
+    # cp_size == 1: only the total has to be aligned, so pack samples back to back
+    # and put the whole tail on the last sample (keeps TE on fused attention).
+    # CP > 1 keeps per-sample alignment. Derivation in knowledge.md.
+    use_tail_only_alignment_padding = pad_to_multiple is not None and cp_size == 1
 
     if use_packed_sequence:
         packed_batch: Dict[str, Any] = {}
@@ -454,7 +464,12 @@ def pack_or_pad_batch(
                 assert (
                     sample["labels"].shape == sample["input_ids"].shape == sample["loss_mask"].shape
                 ), "labels, input_ids, and loss_mask must have the same shape"
-                target_len = math.ceil(seqlen / divisible_by) * divisible_by
+                if use_tail_only_alignment_padding:
+                    # Keep every sample at its own real length; the alignment
+                    # tail is absorbed once, after the loop.
+                    target_len = seqlen
+                else:
+                    target_len = math.ceil(seqlen / divisible_by) * divisible_by
                 if not use_pinned:
                     input_ids_list.append(
                         F.pad(sample["input_ids"], (0, target_len - seqlen), value=0)
@@ -473,6 +488,34 @@ def pack_or_pad_batch(
 
             cu_seqlens = list(accumulate(seqlens_list, initial=0))
             cu_seqlens_padded = list(accumulate(seqlens_padded_list, initial=0))
+
+            # Samples were packed at their exact lengths, so extend only the last
+            # sample's padded region; cu_seqlens[:-1] stays equal to
+            # cu_seqlens_padded[:-1], which pad_between_seqs=False below relies on.
+            if use_tail_only_alignment_padding and cu_seqlens_padded:
+                total_real = cu_seqlens_padded[-1]
+                target_total = math.ceil(total_real / divisible_by) * divisible_by
+                fp8_tail_dummy_len = target_total - total_real
+                if fp8_tail_dummy_len > 0:
+                    cu_seqlens_padded[-1] = target_total
+                    # Keep seqlens_padded_list in sync -- the is_src/use_pinned
+                    # branch below derives max_seqlen_q from this list, not
+                    # from cu_seqlens_padded.
+                    seqlens_padded_list[-1] += fp8_tail_dummy_len
+                    if not use_pinned:
+                        input_ids_list[-1] = F.pad(
+                            input_ids_list[-1], (0, fp8_tail_dummy_len), value=0
+                        )
+                        labels_list[-1] = F.pad(
+                            labels_list[-1], (0, fp8_tail_dummy_len), value=-100
+                        )
+                        loss_mask_list[-1] = F.pad(
+                            loss_mask_list[-1], (0, fp8_tail_dummy_len), value=0
+                        )
+                assert cu_seqlens[:-1] == cu_seqlens_padded[:-1], (
+                    "tail-only padding must leave every sample but the last at its "
+                    "exact real length; pad_between_seqs=False below relies on it"
+                )
 
             # padding_mask: True at collate-padded positions within each packed
             # sample. Real tokens occupy [cu_seqlens_padded[i], +seqlens_list[i]);
@@ -602,6 +645,10 @@ def pack_or_pad_batch(
             max_seqlen_q=max_seqlen_q,
             max_seqlen_kv=max_seqlen_q,
             total_tokens=total_tokens,
+            # Tail-only layout: TE may use cu_seqlens_q_padded as the attention
+            # boundary. Safe only under the causal decoder mask (tail rows follow
+            # every real row and are loss-masked); see knowledge.md.
+            pad_between_seqs=(False if use_tail_only_alignment_padding else None),
         )
         return packed_batch
 
@@ -656,6 +703,51 @@ def pack_or_pad_batch(
 # -------------------------------------------------------------------
 
 
+@lru_cache(maxsize=None)
+def _row_alignment(packed: bool, fp4, fp8, fp8_recipe) -> Optional[int]:
+    """Row multiple the packed (THD) decoder sequence needs for quantized GEMMs.
+
+    ``None`` for BSHD collation or without quantization; otherwise
+    ``get_fp8_align_size(recipe)``. Raises for recipes it cannot align (NVFP4,
+    custom). Sources of the 8/16/32 requirements: knowledge.md. Cached on the
+    argument values: get_batch() asks once per microbatch and the answer only
+    depends on static launch arguments.
+    """
+    if not packed:
+        # BSHD derives its own common per-batch length and is out of scope here.
+        return None
+    if fp4 is not None:
+        # NVFP4 is mutually exclusive with --fp8-format and has no
+        # get_fp8_align_size() counterpart, so no alignment can be derived.
+        raise NotImplementedError(
+            "--fp4-format is not supported by examples/multimodal_dev together with "
+            "--use-packed-sequence: no row alignment is derived for NVFP4, so the "
+            "first NVFP4 GEMM would see an unaligned leading dimension"
+        )
+    if fp8 is None:
+        return None
+    if fp8_recipe == "custom":
+        # get_fp8_align_size() reports 16 for "custom", but a custom block-scaled
+        # quantizer may need a coarser alignment (MXFP8 needs 32).
+        raise NotImplementedError(
+            "--fp8-recipe custom is not supported by examples/multimodal_dev "
+            "together with --use-packed-sequence: get_fp8_align_size() reports 16 "
+            "for it, but a custom block-scaled quantizer may need a coarser "
+            "alignment (MXFP8 needs 32)"
+        )
+    return get_fp8_align_size(fp8_recipe)
+
+
+def quantized_row_alignment(args) -> Optional[int]:
+    """``_row_alignment`` read off the launch arguments (see its docstring)."""
+    return _row_alignment(
+        bool(getattr(args, "use_packed_sequence", False)),
+        getattr(args, "fp4", None),
+        getattr(args, "fp8", None),
+        getattr(args, "fp8_recipe", None),
+    )
+
+
 def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
     """Get a batch from *data_iterator* and broadcast across TP ranks."""
     device = "cuda"
@@ -695,6 +787,7 @@ def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
         args.seq_length,
         device=device,
         with_vision_sidecar=getattr(args, "mdp_enable", False),
+        pad_to_multiple=quantized_row_alignment(args),
     )
 
     # Fix shapes produced by default_collate.

@@ -61,7 +61,6 @@ class MdpCompatibilityOptions:
     fp16: bool
     bf16: bool
     fsdp_enabled: bool
-    fp8_enabled: bool
     cuda_graph_enabled: bool
     activation_offload_enabled: bool
     overlap_grad_reduce: bool
@@ -72,6 +71,9 @@ class MdpCompatibilityOptions:
     save_requested: bool
     load_requested: bool
     overlap_moe_expert_parallel_comm: bool = False
+    # args.reuse_grad_buf_for_mxfp8_param_ag. Rejected outright under MDP; see
+    # validate_mdp_config for the composite-optimizer mechanism.
+    reuse_grad_buf_for_mxfp8_param_ag: bool = False
 
 
 def _reject(option: str, value: Any, condition: str, why: str, suggestion: str = "") -> None:
@@ -300,15 +302,6 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "MDP requires the standard DistributedDataParallel gradient-buffer path.",
             "False",
         )
-    if options.fp8_enabled:
-        _reject(
-            "fp8_enabled",
-            options.fp8_enabled,
-            "FP8 disabled",
-            "FP8/MXFP8 gradient-buffer reuse is not validated with MDP; row-aligned "
-            "allocation is only a future-facing hook, not an FP8 recipe.",
-            "False",
-        )
     if options.cuda_graph_enabled:
         _reject(
             "cuda_graph_enabled",
@@ -342,6 +335,17 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "The MDP composite optimizer appends the encoder optimizer after the "
             "decoder optimizers. Dispatching a decoder parameter gather while later "
             "members are still stepping crosses the decoder/encoder domain boundary.",
+            "False",
+        )
+    if options.reuse_grad_buf_for_mxfp8_param_ag:
+        _reject(
+            "reuse_grad_buf_for_mxfp8_param_ag",
+            options.reuse_grad_buf_for_mxfp8_param_ag,
+            "reuse_grad_buf_for_mxfp8_param_ag == False",
+            "ChainedOptimizer._should_defer_mxfp8_param_sync() answers True as soon "
+            "as any chained member has overlap_param_gather=False; MDP's encoder "
+            "member always does (build_encoder_ddp_config), so the DECODER would be "
+            "moved onto the deferred MXFP8 param-sync path whatever its own setting.",
             "False",
         )
     if options.delay_grad_reduce:
@@ -405,5 +409,19 @@ def validate_effective_vision_config(
             "None when encoder_recompute_granularity == 'whole'",
             "Whole-encoder replay cannot wrap native Transformer recompute; "
             "otherwise the vision Transformer is replayed twice in P5.",
+            "None",
+        )
+    # Decoder FP8 is deliberately not in the compatibility snapshot (the THD
+    # alignment reads args.fp8 directly); encoder FP8 is rejected here instead.
+    encoder_fp8 = getattr(effective_config, "fp8", None)
+    if encoder_fp8 is not None:
+        _reject(
+            "effective vision fp8",
+            encoder_fp8,
+            "None",
+            "Encoder FP8 is not part of this support matrix: the WORLD-replicated "
+            "encoder's quantized GEMM alignment, its amax reduction domain, and its "
+            "interaction with encoder replay are validated in the follow-up that "
+            "wires encoder FP8; only the decoder's --fp8 flags are supported here.",
             "None",
         )
