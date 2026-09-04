@@ -215,9 +215,8 @@ if __name__ == "__main__":
         args_defaults={},
     )
     validate_encoder_recompute_args(args)
-    # get_batch() re-derives this for every microbatch; calling it here makes a
-    # quantization recipe the collate path cannot align fail before the model
-    # and the datasets are built, instead of on the first microbatch.
+    # Fail fast on a quantization recipe the collate path cannot align, before
+    # the model and datasets are built (the result is cached on the argument values).
     quantized_row_alignment(args)
     if getattr(args, "mdp_enable", False):
         _setup_mdp(args)

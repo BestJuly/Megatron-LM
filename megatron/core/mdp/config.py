@@ -411,10 +411,8 @@ def validate_effective_vision_config(
             "otherwise the vision Transformer is replayed twice in P5.",
             "None",
         )
-    # Decoder FP8 is invisible to MDP's compatibility snapshot on purpose: it is
-    # not an MDP incompatibility, and the one thing it asks of MDP -- the THD
-    # row alignment -- reads args.fp8 directly in forward_step.py. Encoder FP8
-    # is rejected here, where it is observable on the resolved vision config.
+    # Decoder FP8 is deliberately not in the compatibility snapshot (the THD
+    # alignment reads args.fp8 directly); encoder FP8 is rejected here instead.
     encoder_fp8 = getattr(effective_config, "fp8", None)
     if encoder_fp8 is not None:
         _reject(

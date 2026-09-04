@@ -15,7 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from examples.multimodal_dev.forward_step import quantized_row_alignment
+from examples.multimodal_dev.forward_step import _row_alignment, quantized_row_alignment
 
 # Recipes with no derivable row multiple, each with the substring its rejection
 # must name: --fp4-format is mutually exclusive with --fp8-format and has no
@@ -73,3 +73,12 @@ class TestQuantizedRowAlignment:
         on the packed path. MDP requires packed sequences and never reaches
         BSHD; the native path is out of scope."""
         assert quantized_row_alignment(_alignment_args(packed=False, **overrides)) is None
+
+    def test_computed_once_per_argument_set(self):
+        """get_batch asks per microbatch; equal launch args must not recompute."""
+        _row_alignment.cache_clear()
+        args = _alignment_args(fp8="hybrid", fp8_recipe="mxfp8")
+        assert quantized_row_alignment(args) == 32
+        assert quantized_row_alignment(args) == 32
+        assert _row_alignment.cache_info().misses == 1
+        assert _row_alignment.cache_info().hits == 1
