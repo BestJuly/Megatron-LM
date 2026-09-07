@@ -313,6 +313,17 @@ to state in any comparison:
   positioned from one global `consumed_train_samples` that cannot express the
   per-DP-rank drain counts greedy packing produces, so a resume may skip or
   repeat samples. Greedy packing is a benchmarking path today.
+- `--train-samples` and `--rampup-batch-size` are **rejected** with greedy
+  packing, because both read samples-per-iteration as a constant exchange rate.
+  `train_iters = train_samples // GBS` (`training.py`) would silently train on
+  about `train_samples x k / MBS` real samples for a data-dependent `k`, and
+  `update_num_microbatches(consumed_train_samples)` now consumes the real count
+  while the rampup thresholds stay nominal, so the batch size would ramp
+  `k / MBS` times too fast. `--lr-decay-samples` / `--lr-warmup-samples` are
+  covered by the `--train-samples` rejection (`validate_args` only admits them
+  in that branch); the LR/WD schedules themselves are unaffected, since
+  `opt_param_scheduler` still steps by the nominal GBS, so the same bad rate
+  divides and multiplies back out.
 
 The stream must be provisioned by **tokens**, not samples: an iteration eats
 about `token_budget / mean_sample_len` samples per bin, so

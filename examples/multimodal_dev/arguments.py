@@ -184,7 +184,10 @@ def add_multimodal_args(parser):
             "not iteration-by-iteration comparable against a fixed-GBS run. "
             "Requires --max-seqlen-per-dp-cp-rank. Independent of "
             "--thd-static-packing. Rejected together with --save / --load "
-            "unless --mdp-greedy-packing-approximate-resume is passed."
+            "unless --mdp-greedy-packing-approximate-resume is passed, and "
+            "rejected outright with --train-samples (and therefore "
+            "--lr-decay-samples / --lr-warmup-samples) and --rampup-batch-size, "
+            "which all assume a fixed samples-per-iteration rate."
         ),
     )
     group.add_argument(

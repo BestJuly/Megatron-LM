@@ -395,3 +395,43 @@ def test_checkpointing_without_greedy_packing_is_unaffected():
     validate_mdp_config(
         MdpConfig(enable=True), _options(save_requested=True, load_requested=True)
     )
+
+
+def test_greedy_packing_is_rejected_with_sample_based_training():
+    # train_iters = train_samples // global_batch_size reads GBS as the
+    # samples-per-iteration rate; a greedy bin holds a data-dependent number of
+    # samples instead, so the run would train on the wrong data volume with
+    # nothing to notice it. --lr-decay-samples / --lr-warmup-samples ride along:
+    # validate_args only admits them in the --train-samples branch.
+    options = _options(
+        max_seqlen_per_dp_cp_rank=8192, thd_max_packed_sequences=8, train_samples=1000000
+    )
+    with pytest.raises(MdpConfigurationError, match="train_samples"):
+        validate_mdp_config(MdpConfig(enable=True, greedy_packing=True), options)
+    validate_mdp_config(
+        MdpConfig(enable=True, greedy_packing=True),
+        dataclasses.replace(options, train_samples=None),
+    )
+
+
+def test_greedy_packing_is_rejected_with_batch_size_rampup():
+    # update_num_microbatches() consumes the real all-reduced sample count while
+    # the rampup schedule stays in nominal samples. Reachable from the
+    # --train-iters path too, so it is rejected independently of train_samples.
+    options = _options(
+        max_seqlen_per_dp_cp_rank=8192,
+        thd_max_packed_sequences=8,
+        rampup_batch_size=[32, 32, 1000000],
+    )
+    with pytest.raises(MdpConfigurationError, match="rampup_batch_size"):
+        validate_mdp_config(MdpConfig(enable=True, greedy_packing=True), options)
+    validate_mdp_config(
+        MdpConfig(enable=True, greedy_packing=True),
+        dataclasses.replace(options, rampup_batch_size=None),
+    )
+
+
+def test_sample_based_training_without_greedy_packing_is_unaffected():
+    validate_mdp_config(
+        MdpConfig(enable=True), _options(train_samples=1000000, rampup_batch_size=[32, 32, 1000000])
+    )

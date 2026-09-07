@@ -169,12 +169,29 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
             int(getattr(args, "micro_batch_size", 1) or 1),
             int(getattr(args, "eval_micro_batch_size", None) or 0),
         ),
+        train_samples=getattr(args, "train_samples", None),
+        rampup_batch_size=getattr(args, "rampup_batch_size", None),
     )
 
 
 def validate_from_args(args) -> None:
     """Run the full support-matrix validation from the parsed args."""
-    validate_mdp_config(mdp_config_from_args(args), compatibility_options_from_args(args))
+    config = mdp_config_from_args(args)
+    validate_mdp_config(config, compatibility_options_from_args(args))
+    if config.greedy_packing:
+        # get_train_valid_test_num_samples() sizes the datasets from
+        # train_iters * global_batch_size, i.e. micro_batch_size samples per bin.
+        # Greedy bins hold as many samples as the token budget takes, so a real
+        # (non-mock) dataset built to that target can be exhausted before
+        # train_iters is reached. Sizing is the caller's blend/epoch decision, so
+        # this is a warning rather than a rejection.
+        logger.warning(
+            "MDP: --mdp-greedy-packing consumes more samples per iteration than "
+            "train_iters x global_batch_size, the target size the dataset blend is "
+            "built from. Provision the training data for up to "
+            "train_iters x global_batch_size x (thd_max_packed_sequences / "
+            "micro_batch_size) samples, or the loader can run dry mid-training."
+        )
 
 
 def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_config):

@@ -86,6 +86,11 @@ class MdpCompatibilityOptions:
     # max(micro_batch_size, eval_micro_batch_size): the largest number of samples
     # the collator can be handed in one microbatch without greedy packing.
     max_samples_per_microbatch: int = 1
+    # Sample-based training budget (--train-samples) and batch-size rampup
+    # (--rampup-batch-size). Both read samples-per-iteration as a constant
+    # exchange rate, which greedy packing invalidates; see _validate_packing.
+    train_samples: Optional[int] = None
+    rampup_batch_size: Optional[Sequence] = None
 
 
 def thd_row_alignment(options: "MdpCompatibilityOptions") -> int:
@@ -360,10 +365,12 @@ def _validate_packing(config: MdpConfig, options: MdpCompatibilityOptions) -> No
     variable-size pixel payloads. Without this rejection the run dies deep inside
     an assert about a missing ``tokens`` key.
 
-    Also enforces the two properties the static/greedy packing paths depend on:
-    the ``cu_seqlens`` capacity leaves a slot for the static padding tail, and
-    greedy packing is not silently combined with checkpointing (its sample
-    buffer is not checkpointed).
+    Also enforces the properties the static/greedy packing paths depend on: the
+    ``cu_seqlens`` capacity leaves a slot for the static padding tail, greedy
+    packing is not silently combined with checkpointing (its sample buffer is
+    not checkpointed), and greedy packing is not combined with the two knobs
+    that treat samples-per-iteration as a constant exchange rate
+    (``--train-samples``, ``--rampup-batch-size``).
     """
     if options.sequence_packing_scheduler is not None:
         _reject(
@@ -417,6 +424,43 @@ def _validate_packing(config: MdpConfig, options: MdpCompatibilityOptions) -> No
             "--mdp-greedy-packing-approximate-resume to accept that, or drop "
             "--mdp-greedy-packing for runs that checkpoint.",
             "False",
+        )
+    if options.train_samples is not None:
+        # train_iters = train_samples // global_batch_size (training.py) treats
+        # GBS as the samples-per-iteration exchange rate. Under greedy packing an
+        # iteration still runs GBS / MBS bins, but each bin holds however many
+        # samples the token budget takes, so it really consumes (GBS / MBS) * k
+        # samples for a data-dependent k. --train-samples N would train on
+        # roughly N * k / micro_batch_size real samples, and nothing in the loop
+        # (which counts iterations) ever notices. The LR/WD schedules survive --
+        # opt_param_scheduler still steps by the nominal GBS, so the same bad
+        # rate divides and multiplies back out -- but the data volume does not.
+        # --lr-decay-samples / --lr-warmup-samples are covered by this rejection:
+        # validate_args only admits them in the --train-samples branch.
+        _reject(
+            "train_samples",
+            options.train_samples,
+            "--train-samples is not combined with --mdp-greedy-packing",
+            "train_iters = train_samples // global_batch_size assumes a fixed "
+            "samples-per-iteration rate; greedy packing fills bins to a token "
+            "budget instead, so the real sample count per iteration is data "
+            "dependent and the run would silently train on the wrong data volume.",
+            "--train-iters",
+        )
+    if options.rampup_batch_size is not None:
+        # update_num_microbatches(args.consumed_train_samples) drives rampup off
+        # the now-real all-reduced sample count while the rampup schedule is
+        # still expressed in nominal samples, so the batch size would ramp
+        # k / micro_batch_size times too fast. Unlike --train-samples this is
+        # reachable from the --train-iters path too, so it is rejected on its own.
+        _reject(
+            "rampup_batch_size",
+            options.rampup_batch_size,
+            "--rampup-batch-size is not combined with --mdp-greedy-packing",
+            "Rampup thresholds are nominal sample counts, but greedy packing "
+            "reports the real consumed-sample count, so the batch size would ramp "
+            "faster than requested by a data-dependent factor.",
+            "None",
         )
     if options.max_seqlen_per_dp_cp_rank is None:
         _reject(
