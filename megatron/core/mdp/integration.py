@@ -29,6 +29,8 @@ from megatron.core.mdp.config import (
     SUPPORTED_RANK_ORDER,
     MdpCompatibilityOptions,
     MdpConfig,
+    greedy_max_real_sequences,
+    thd_row_alignment,
     validate_mdp_config,
 )
 from megatron.core.mdp.encoder import (
@@ -92,6 +94,10 @@ def mdp_config_from_args(args) -> MdpConfig:
         debug_plan_payload_check=getattr(args, "mdp_debug_plan_payload_check", False),
         pixel_locality=getattr(args, "mdp_pixel_locality", False),
         overlap_window_capture=getattr(args, "mdp_overlap_window_capture", False),
+        greedy_packing=getattr(args, "mdp_greedy_packing", False),
+        greedy_packing_approximate_resume=getattr(
+            args, "mdp_greedy_packing_approximate_resume", False
+        ),
     )
 
 
@@ -153,12 +159,38 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
         checkpoint_mode=getattr(args, "ckpt_format", "torch_dist"),
         save_requested=getattr(args, "save", None) is not None,
         load_requested=getattr(args, "load", None) is not None,
+        sequence_parallel=bool(getattr(args, "sequence_parallel", False)),
+        sequence_packing_scheduler=getattr(args, "sequence_packing_scheduler", None),
+        thd_static_packing=bool(getattr(args, "thd_static_packing", False)),
+        max_seqlen_per_dp_cp_rank=getattr(args, "max_seqlen_per_dp_cp_rank", None),
+        thd_max_packed_sequences=getattr(args, "thd_max_packed_sequences", None),
+        max_samples_per_microbatch=max(
+            int(getattr(args, "micro_batch_size", 1) or 1),
+            int(getattr(args, "eval_micro_batch_size", None) or 0),
+        ),
+        train_samples=getattr(args, "train_samples", None),
+        rampup_batch_size=getattr(args, "rampup_batch_size", None),
     )
 
 
 def validate_from_args(args) -> None:
     """Run the full support-matrix validation from the parsed args."""
-    validate_mdp_config(mdp_config_from_args(args), compatibility_options_from_args(args))
+    config = mdp_config_from_args(args)
+    validate_mdp_config(config, compatibility_options_from_args(args))
+    if config.greedy_packing:
+        # get_train_valid_test_num_samples() sizes the datasets from
+        # train_iters * global_batch_size, i.e. micro_batch_size samples per bin.
+        # Greedy bins hold as many samples as the token budget takes, so a real
+        # (non-mock) dataset built to that target can be exhausted before
+        # train_iters is reached. Sizing is the caller's blend/epoch decision, so
+        # this is a warning rather than a rejection.
+        logger.warning(
+            "MDP: --mdp-greedy-packing consumes more samples per iteration than "
+            "train_iters x global_batch_size, the target size the dataset blend is "
+            "built from. Provision the training data for up to "
+            "train_iters x global_batch_size x (thd_max_packed_sequences / "
+            "micro_batch_size) samples, or the loader can run dry mid-training."
+        )
 
 
 def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_config):
@@ -225,6 +257,13 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
     else:
         params_dtype = torch.float32
     allocator = DirectBufferAllocator()
+    compat = compatibility_options_from_args(args)
+    greedy_token_budget = (
+        args.max_seqlen_per_dp_cp_rank * args.context_parallel_size
+        if mdp_config.greedy_packing
+        else None
+    )
+    greedy_max_num_seqs = greedy_max_real_sequences(compat)
     _RUNTIME = MdpRuntime(
         config=mdp_config,
         rank_map=rank_map,
@@ -244,6 +283,9 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
         hidden_size=args.hidden_size,
         params_dtype=params_dtype,
         num_vpp_chunks=len(model),
+        greedy_token_budget=greedy_token_budget,
+        greedy_max_num_seqs=greedy_max_num_seqs,
+        greedy_row_alignment=thd_row_alignment(compat),
     )
     logger.info(
         "MDP: runtime installed (outer_dp_rank=%d, worker_id=%s, endpoint=%d, "

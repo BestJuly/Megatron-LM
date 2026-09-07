@@ -3464,6 +3464,13 @@ class TransformerConfig(ModelParallelConfig):
                 f"({self.max_seqlen_per_dp_cp_rank}), got {self.pad_packed_seq_alignment}."
             )
 
+        if self.thd_static_packing and self.thd_max_packed_sequences is None:
+            raise ValueError(
+                "thd_static_packing requires --thd-max-packed-sequences: it fixes the "
+                "cu_seqlens entry count (thd_max_packed_sequences + 1) that makes the "
+                "THD metadata shape static."
+            )
+
         # 'extend_last' THD tail padding with context parallelism requires the
         # global metadata to be extended before CP slicing, which only the
         # sequence-packing scheduler path performs. Restrict this combination.
