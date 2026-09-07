@@ -381,12 +381,11 @@ def combined_forward_backward_step(
             unwrapped_model = get_attr_wrapped_model(
                 f_model, "build_schedule_plan", return_model_obj=True
             )
-            from megatron.core.models.gpt.gpt_model import GPTModel
-
-            assert isinstance(unwrapped_model, GPTModel), (
-                "The final unwrapped model must be a GPTModel instance "
-                "since only GPTModel is supported for EP A2A overlapping."
-            )
+            # Keep the scheduler model-agnostic: GPTModel is the canonical
+            # implementation, while composite models may expose the same
+            # decoder-only plan contract. get_attr_wrapped_model verifies the
+            # entry point and the AbstractSchedulePlan assertion below verifies
+            # the returned scheduling interface.
             f_schedule_plan, loss_func = forward_step_func(
                 data_iterator, unwrapped_model, return_schedule_plan=True
             )

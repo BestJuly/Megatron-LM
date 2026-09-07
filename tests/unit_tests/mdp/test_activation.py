@@ -1,12 +1,19 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Encoder forward-handle and encoder THD params tests (CPU only)."""
+
+from contextlib import contextmanager
 
 import pytest
 import torch
 
+from megatron.core.mdp.activation import (
+    EncoderForwardHandle,
+    EncoderOutputMetadata,
+    EncoderWholeRecomputeHandle,
+    build_encoder_packed_seq_params,
+)
 from megatron.core.mdp.allocator import DirectBufferAllocator
-from megatron.core.mdp.activation import EncoderForwardHandle, build_encoder_packed_seq_params
 from megatron.core.mdp.errors import MdpStateError
 from megatron.core.mdp.plan import EncoderThdLayout, EncoderThdSegment, split_encoder_layout
 
@@ -141,4 +148,59 @@ def test_forward_only_release_needs_no_backward():
         chunk_layouts=(layout,),
     )
     handle.release_forward_only()
+    assert handle.consumed
+
+
+def test_whole_recompute_handle_replays_and_releases(monkeypatch):
+    layout = _layout()
+    chunks = split_encoder_layout(layout, max_payload_rows=80)
+    assert len(chunks) == 2
+    payloads = [torch.randn(chunk.total_payload_rows, 4) for chunk in chunks]
+    grads = [torch.randn(chunk.total_output_rows, 4) for chunk in chunks]
+
+    reference = torch.nn.Linear(4, 4, bias=False)
+    replay = torch.nn.Linear(4, 4, bias=False)
+    replay.load_state_dict(reference.state_dict())
+
+    def encode(module, pixels, chunk_layout):
+        return module(pixels[: chunk_layout.total_output_rows])
+
+    reference_outputs = tuple(
+        encode(reference, payload, chunk)
+        for payload, chunk in zip(payloads, chunks)
+    )
+    torch.autograd.backward(reference_outputs, grads)
+    with torch.no_grad():
+        p2_outputs = tuple(
+            encode(replay, payload, chunk)
+            for payload, chunk in zip(payloads, chunks)
+        )
+
+    @contextmanager
+    def _noop_fork_rng():
+        yield
+
+    from megatron.core.tensor_parallel import random
+
+    monkeypatch.setattr(random, "_fork_rng", _noop_fork_rng)
+    monkeypatch.setattr(random, "_set_all_rng_states", lambda *unused: None)
+
+    handle = EncoderWholeRecomputeHandle(
+        iteration=0,
+        producer_worker_id=0,
+        chunk_payloads=payloads,
+        chunk_layouts=chunks,
+        output_metadata=tuple(
+            EncoderOutputMetadata.from_tensor(output) for output in p2_outputs
+        ),
+        chunk_rng_states=((), ()),
+    )
+    assert handle.output_dtype(0) == p2_outputs[0].dtype
+    with pytest.raises(MdpStateError, match="release only after backward"):
+        handle.release()
+    handle.backward(grads, encoder=replay, encode=encode)
+    assert torch.equal(replay.weight.grad, reference.weight.grad)
+    assert handle.chunk_payloads == [None, None]
+    assert grads == [None, None]
+    handle.release()
     assert handle.consumed

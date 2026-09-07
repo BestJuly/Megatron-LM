@@ -16,6 +16,7 @@ require ``torch.distributed`` to be initialised.  Run via::
 
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -322,3 +323,116 @@ class TestPackOrPadBatchDivisibleBy4:
             [False, False, False, False, False, True, True, True],
             [False, False, False, True, True, True, True, True],
         ]
+
+
+# ===================================================================
+# pack_or_pad_batch — quantized-GEMM tail padding
+# ===================================================================
+
+
+def _pack_with_row_alignment(pad_to_multiple, *, lens=(5, 3)):
+    """Pack ``lens`` back to back under a quantized-GEMM row multiple."""
+    batch = [_make_sample(length, base=100 * i) for i, length in enumerate(lens)]
+    return pack_or_pad_batch(
+        batch, use_packed_sequence=True, pad_to_multiple=pad_to_multiple, device="cuda"
+    )
+
+
+class TestPackOrPadBatchQuantizedTailPadding:
+    """``pad_to_multiple`` at CP=1: the whole alignment requirement is absorbed
+    by extending the last sample's padded region, so every earlier sample keeps
+    its exact real length and ``pad_between_seqs`` can be declared False.
+
+    ``pad_to_multiple`` itself is what ``quantized_row_alignment`` derives from
+    the FP8 recipe, covered on CPU in tests/unit_tests/mdp/test_quantized_alignment.py.
+    """
+
+    @pytest.mark.parametrize(
+        "pad_to_multiple, total, max_seqlen", [(16, 16, 11), (32, 32, 27)], ids=["fp8", "mxfp8"]
+    )
+    def test_tail_absorbs_the_whole_alignment(self, pad_to_multiple, total, max_seqlen):
+        # lens=[5, 3] → real total 8, rounded up to the row multiple with every
+        # pad slot at the end.
+        packed = _pack_with_row_alignment(pad_to_multiple)
+
+        assert packed["input_ids"].shape == (1, total)
+        psp = packed["packed_seq_params"]
+        assert psp.cu_seqlens_q.tolist() == [0, 5, 8]
+        # Identical to cu_seqlens except for the final entry.
+        assert psp.cu_seqlens_q_padded.tolist() == [0, 5, total]
+        assert psp.total_tokens == total
+        # max_seqlen comes from the padded lengths: the last sample carries its
+        # own 3 real tokens plus the whole tail.
+        assert psp.max_seqlen_q == max_seqlen
+        assert psp.pad_between_seqs is False
+
+        # The tail is materialised, not just declared, and every slot in it
+        # reads as ignore: the 8 real tokens are followed by pad values only.
+        tail = total - 8
+        assert packed["input_ids"][0].tolist() == [0, 1, 2, 3, 4, 100, 101, 102] + [0] * tail
+        assert packed["labels"][0].tolist() == (
+            [100, 101, 102, 103, 104, 200, 201, 202] + [-100] * tail
+        )
+        assert packed["loss_mask"][0].tolist() == [1.0] * 8 + [0.0] * tail
+        assert packed["padding_mask"][0].tolist() == [False] * 8 + [True] * tail
+
+    def test_single_sample_batch_carries_the_whole_tail(self):
+        """A microbatch of one sample: cu_seqlens has one segment, the padded
+        boundary is that sample rounded up, and the tail follows its real
+        tokens. The assertion that every sample but the last keeps its exact
+        length is vacuous here, so this pins the last-sample half on its own."""
+        packed = _pack_with_row_alignment(16, lens=(5,))
+        psp = packed["packed_seq_params"]
+        assert psp.cu_seqlens_q.tolist() == [0, 5]
+        assert psp.cu_seqlens_q_padded.tolist() == [0, 16]
+        assert psp.max_seqlen_q == 16
+        assert psp.pad_between_seqs is False
+        assert packed["input_ids"][0].tolist() == [0, 1, 2, 3, 4] + [0] * 11
+        assert packed["labels"][0].tolist() == [100, 101, 102, 103, 104] + [-100] * 11
+        assert packed["loss_mask"][0].tolist() == [1.0] * 5 + [0.0] * 11
+        assert packed["padding_mask"][0].tolist() == [False] * 5 + [True] * 11
+
+    def test_already_aligned_total_is_left_alone(self):
+        # lens=[8, 8] → total 16, already a multiple of 16: no tail at all.
+        packed = _pack_with_row_alignment(16, lens=(8, 8))
+        psp = packed["packed_seq_params"]
+        assert psp.cu_seqlens_q.tolist() == [0, 8, 16]
+        assert psp.cu_seqlens_q_padded.tolist() == psp.cu_seqlens_q.tolist()
+        assert psp.pad_between_seqs is False
+        assert not packed["padding_mask"].any().item()
+
+    def test_context_parallel_keeps_the_per_sample_path(self, monkeypatch):
+        """CP hands each rank ``padded_len / cp_size`` rows of every sample, so
+        the alignment has to survive the split and the tail-only layout does not
+        apply. ``pad_between_seqs`` stays unset for TE to classify itself."""
+        from examples.multimodal_dev import forward_step
+
+        monkeypatch.setattr(forward_step.mpu, "get_context_parallel_world_size", lambda: 2)
+        # divisible_by = lcm(cp_size * 2, pad_to_multiple * cp_size) = lcm(4, 32) = 32.
+        psp = _pack_with_row_alignment(16)["packed_seq_params"]
+        assert psp.cu_seqlens_q.tolist() == [0, 5, 8]
+        assert psp.cu_seqlens_q_padded.tolist() == [0, 32, 64]
+        assert psp.pad_between_seqs is None
+
+    def test_sequence_parallel_scales_the_alignment(self, monkeypatch):
+        """Under SP a column-parallel layer quantizes its ``total / tp_size``
+        shard, so aligning the total alone would leave that shard unaligned."""
+        from examples.multimodal_dev import forward_step
+
+        monkeypatch.setattr(
+            forward_step.mpu, "get_tensor_model_parallel_world_size", lambda: 4
+        )
+        monkeypatch.setattr(
+            forward_step,
+            "get_args",
+            lambda: SimpleNamespace(sequence_parallel=True, mdp_enable=False),
+        )
+        # divisible_by = lcm(tp_size, pad_to_multiple * tp_size) = lcm(4, 64) = 64.
+        packed = _pack_with_row_alignment(16)
+        psp = packed["packed_seq_params"]
+        assert psp.cu_seqlens_q.tolist() == [0, 5, 8]
+        assert psp.cu_seqlens_q_padded.tolist() == [0, 5, 64]
+        # The tail is materialised, not just declared: each of the 4 SP ranks
+        # scatters 16 of these rows, the multiple FP8 asked for.
+        assert packed["input_ids"].shape == (1, 64)
+        assert psp.pad_between_seqs is False

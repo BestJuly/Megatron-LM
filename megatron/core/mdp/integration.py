@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """MDP installation seams for the Megatron training loop.
 
@@ -74,29 +74,20 @@ def mdp_enabled(args) -> bool:
 
 
 def mdp_config_from_args(args) -> MdpConfig:
-    """Build the frozen MdpConfig from the entry point's ``--mdp-*`` flags."""
-    overrides = []
-    for entry in getattr(args, "mdp_vision_config_override", []) or []:
-        key, _, raw = entry.partition("=")
-        if not _:
-            raise MdpConfigurationError(
-                f"MDP: --mdp-vision-config-override entry {entry!r} violates: "
-                "KEY=VALUE format."
-            )
-        value: object = raw
-        if raw in ("None", "null"):
-            value = None
-        elif raw.lstrip("-").isdigit():
-            value = int(raw)
-        elif "," in raw:
-            value = [part for part in raw.split(",") if part]
-        overrides.append((key.strip(), value))
-    overrides.sort(key=lambda item: item[0])
+    """Build the frozen MdpConfig from the entry point's MDP and encoder flags."""
+    modules = getattr(args, "encoder_recompute_modules", None)
     return MdpConfig(
         enable=mdp_enabled(args),
         encoder_cp=getattr(args, "mdp_encoder_cp", 1),
         encoder_max_payload_rows=getattr(args, "mdp_encoder_max_payload_rows", None),
-        vision_config_overrides=tuple(overrides),
+        encoder_recompute_granularity=getattr(
+            args, "encoder_recompute_granularity", None
+        ),
+        encoder_recompute_method=getattr(args, "encoder_recompute_method", None),
+        encoder_recompute_num_layers=getattr(
+            args, "encoder_recompute_num_layers", None
+        ),
+        encoder_recompute_modules=tuple(modules) if modules is not None else None,
         locality_slack_permille=getattr(args, "mdp_locality_slack_permille", 10),
         row_alignment=getattr(args, "mdp_row_alignment", 1),
         plan_check_interval=getattr(args, "mdp_plan_check_interval", 1),
@@ -151,12 +142,20 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
         fp16=bool(args.fp16),
         bf16=bool(args.bf16),
         fsdp_enabled=fsdp,
-        fp8_enabled=getattr(args, "fp8", None) is not None,
         cuda_graph_enabled=cuda_graph,
         activation_offload_enabled=offload,
         overlap_grad_reduce=getattr(args, "overlap_grad_reduce", False),
         overlap_param_gather=getattr(args, "overlap_param_gather", False),
+        overlap_param_gather_with_optimizer_step=bool(
+            getattr(args, "overlap_param_gather_with_optimizer_step", False)
+        ),
+        reuse_grad_buf_for_mxfp8_param_ag=bool(
+            getattr(args, "reuse_grad_buf_for_mxfp8_param_ag", False)
+        ),
         delay_grad_reduce=bool(getattr(args, "delay_grad_reduce", False)),
+        overlap_moe_expert_parallel_comm=bool(
+            getattr(args, "overlap_moe_expert_parallel_comm", False)
+        ),
         checkpoint_mode=getattr(args, "ckpt_format", "torch_dist"),
         save_requested=getattr(args, "save", None) is not None,
         load_requested=getattr(args, "load", None) is not None,
@@ -290,12 +289,12 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
     )
     logger.info(
         "MDP: runtime installed (outer_dp_rank=%d, worker_id=%s, endpoint=%d, "
-        "workers=%d, overrides=%s)",
+        "workers=%d, encoder_recompute_granularity=%s)",
         rank_view.outer_dp_rank,
         rank_view.my_worker_id,
         rank_view.endpoint_rank,
         len(rank_view.worker_ids),
-        list(mdp_config.vision_config_overrides),
+        mdp_config.encoder_recompute_granularity,
     )
 
     from megatron.core.mdp.optimizer import build_mdp_composite_optimizer

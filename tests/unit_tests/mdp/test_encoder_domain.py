@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Encoder DDP domain tests: WORLD reduction with prescale 1, ZeRO-1 optimizer,
 parameter disjointness, and 1/T_global finalization.
@@ -62,7 +62,7 @@ class _TinyAdapter:
         return _TinyEncoder(model_config)
 
 
-def _build_domain():
+def _build_domain(*, decoder_overlap=False):
     world = torch.distributed.get_world_size()
     rank_map = build_rank_map(
         MdpRankSpec(world_size=world, tp=1, pp=2, cp=1, ep=1, encoder_cp=1)
@@ -80,8 +80,9 @@ def _build_domain():
     )
     ddp_config = DistributedDataParallelConfig(
         use_distributed_optimizer=True,
-        overlap_grad_reduce=False,
-        overlap_param_gather=False,
+        overlap_grad_reduce=decoder_overlap,
+        overlap_param_gather=decoder_overlap,
+        align_param_gather=decoder_overlap,
     )
     optimizer_config = OptimizerConfig(
         optimizer="adam", lr=1e-3, use_distributed_optimizer=True, clip_grad=1.0
@@ -96,6 +97,15 @@ def _build_domain():
         wrap_mixed_precision=False,
     )
     return domain
+
+
+def test_decoder_overlap_is_isolated_from_encoder_domain():
+    domain = _build_domain(decoder_overlap=True)
+
+    encoder_config = domain.encoder_ddp.ddp_config
+    assert not encoder_config.overlap_grad_reduce
+    assert not encoder_config.overlap_param_gather
+    assert not encoder_config.align_param_gather
 
 
 def _build_allreduce_ddp():

@@ -1,18 +1,20 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Pure-compute tests for MdpConfig validation and the vision config override
-channel. No distributed state, no CUDA."""
+"""Pure-compute tests for MDP and encoder recompute configuration.
+
+No distributed state or CUDA.
+"""
 
 import dataclasses
 
 import pytest
 
 from megatron.core.mdp.config import (
-    VISION_CONFIG_OVERRIDE_ALLOWLIST,
     MdpCompatibilityOptions,
     MdpConfig,
-    apply_vision_config_overrides,
+    apply_encoder_recompute_config,
     greedy_max_real_sequences,
+    validate_effective_vision_config,
     validate_mdp_config,
 )
 from megatron.core.mdp.errors import MdpConfigurationError
@@ -33,12 +35,13 @@ def _options(**overrides):
         fp16=False,
         bf16=True,
         fsdp_enabled=False,
-        fp8_enabled=False,
         cuda_graph_enabled=False,
         activation_offload_enabled=False,
         overlap_grad_reduce=False,
         overlap_param_gather=False,
+        overlap_param_gather_with_optimizer_step=False,
         delay_grad_reduce=False,
+        overlap_moe_expert_parallel_comm=False,
         checkpoint_mode="torch_dist",
         save_requested=False,
         load_requested=False,
@@ -52,6 +55,33 @@ def test_valid_configuration_passes():
     validate_mdp_config(MdpConfig(enable=True), _options())
 
 
+def test_decoder_ep_overlap_configuration_passes_with_vpp():
+    validate_mdp_config(
+        MdpConfig(enable=True),
+        _options(
+            expert_parallel_size=2,
+            pipeline_parallel_size=4,
+            virtual_pipeline_parallel_size=2,
+            overlap_moe_expert_parallel_comm=True,
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "option_kwargs",
+    [
+        dict(expert_parallel_size=1, virtual_pipeline_parallel_size=2),
+        dict(expert_parallel_size=2, virtual_pipeline_parallel_size=None),
+    ],
+)
+def test_decoder_ep_overlap_rejects_missing_native_parallelism(option_kwargs):
+    with pytest.raises(MdpConfigurationError, match="overlap_moe_expert_parallel_comm"):
+        validate_mdp_config(
+            MdpConfig(enable=True),
+            _options(overlap_moe_expert_parallel_comm=True, **option_kwargs),
+        )
+
+
 def test_disabled_mdp_skips_all_checks():
     validate_mdp_config(MdpConfig(enable=False), _options(fsdp_enabled=True, bf16=False))
 
@@ -61,29 +91,45 @@ def test_disabled_mdp_skips_all_checks():
     [
         (dict(encoder_cp=2), "encoder_cp"),
         (dict(encoder_max_payload_rows=0), "encoder_max_payload_rows"),
+        (
+            dict(encoder_recompute_granularity="partial"),
+            "encoder_recompute_granularity",
+        ),
+        (dict(encoder_recompute_method="uniform"), "encoder_recompute_method"),
+        (dict(encoder_recompute_num_layers=1), "encoder_recompute_num_layers"),
+        (dict(encoder_recompute_modules=("mlp",)), "encoder_recompute_modules"),
+        (
+            dict(
+                encoder_recompute_granularity="whole",
+                encoder_recompute_method="uniform",
+            ),
+            "encoder_recompute_method",
+        ),
+        (
+            dict(
+                encoder_recompute_granularity="selective",
+                encoder_recompute_method="uniform",
+            ),
+            "encoder_recompute_method",
+        ),
+        (
+            dict(
+                encoder_recompute_granularity="selective",
+                encoder_recompute_num_layers=1,
+            ),
+            "encoder_recompute_num_layers",
+        ),
+        (
+            dict(
+                encoder_recompute_granularity="full",
+                encoder_recompute_modules=("mlp",),
+            ),
+            "encoder_recompute_modules",
+        ),
         (dict(locality_slack_permille=1000), "locality_slack_permille"),
         (dict(locality_slack_permille=-1), "locality_slack_permille"),
         (dict(row_alignment=0), "row_alignment"),
         (dict(plan_check_interval=0), "plan_check_interval"),
-        (dict(vision_config_overrides=(("nonexistent_key", 1),)), "allowlist"),
-        (
-            dict(
-                vision_config_overrides=(
-                    ("recompute_granularity", "full"),
-                    ("recompute_granularity", "full"),
-                )
-            ),
-            "unique",
-        ),
-        (
-            dict(
-                vision_config_overrides=(
-                    ("recompute_num_layers", 1),
-                    ("recompute_granularity", "full"),
-                )
-            ),
-            "sorted",
-        ),
     ],
 )
 def test_invalid_mdp_config_fields_rejected(config_kwargs, match):
@@ -103,11 +149,17 @@ def test_invalid_mdp_config_fields_rejected(config_kwargs, match):
         (dict(distributed_optimizer_instances=2), "distributed_optimizer_instances"),
         (dict(bf16=False), "fp16/bf16"),
         (dict(fsdp_enabled=True), "fsdp"),
-        (dict(fp8_enabled=True), "fp8"),
         (dict(cuda_graph_enabled=True), "cuda_graph"),
         (dict(activation_offload_enabled=True), "activation_offload"),
-        (dict(overlap_grad_reduce=True), "overlap_grad_reduce"),
         (dict(overlap_param_gather=True), "overlap_param_gather"),
+        (
+            dict(
+                overlap_grad_reduce=True,
+                overlap_param_gather=True,
+                overlap_param_gather_with_optimizer_step=True,
+            ),
+            "overlap_param_gather_with_optimizer_step",
+        ),
         (dict(delay_grad_reduce=True), "delay_grad_reduce"),
         (
             dict(checkpoint_mode="fully_parallel", save_requested=True),
@@ -132,6 +184,20 @@ def test_fp16_configuration_accepted_for_overflow_tests():
     validate_mdp_config(MdpConfig(enable=True), _options(bf16=False, fp16=True))
 
 
+@pytest.mark.parametrize(
+    "option_kwargs",
+    [dict(overlap_grad_reduce=True), dict(overlap_grad_reduce=True, overlap_param_gather=True)],
+)
+def test_native_decoder_ddp_overlap_is_supported(option_kwargs):
+    validate_mdp_config(MdpConfig(enable=True), _options(**option_kwargs))
+
+
+def test_whole_encoder_recompute_without_native_options_is_valid():
+    validate_mdp_config(
+        MdpConfig(enable=True, encoder_recompute_granularity="whole"), _options()
+    )
+
+
 def test_error_messages_carry_option_value_and_suggestion():
     try:
         validate_mdp_config(
@@ -145,7 +211,7 @@ def test_error_messages_carry_option_value_and_suggestion():
         pytest.fail("expected MdpConfigurationError")
 
 
-# ---------------------- vision config overrides ----------------------
+# ---------------------- encoder recompute config ----------------------
 
 
 @dataclasses.dataclass
@@ -155,40 +221,70 @@ class _FakeTransformerConfig:
     recompute_num_layers: object = None
     recompute_modules: object = None
     hidden_size: int = 64
+    fp8: object = None
 
     def __post_init__(self):
         if self.recompute_granularity not in (None, "selective", "full"):
             raise ValueError(f"bad recompute_granularity {self.recompute_granularity}")
 
 
-def test_apply_overrides_uses_dataclasses_replace():
+def test_apply_full_encoder_recompute_uses_dataclasses_replace():
     base = _FakeTransformerConfig()
-    result = apply_vision_config_overrides(
+    result = apply_encoder_recompute_config(
         base,
-        (("recompute_granularity", "full"), ("recompute_num_layers", 1)),
+        MdpConfig(
+            enable=True,
+            encoder_recompute_granularity="full",
+            encoder_recompute_method="uniform",
+            encoder_recompute_num_layers=1,
+        ),
     )
     assert result is not base
     assert result.recompute_granularity == "full"
+    assert result.recompute_method == "uniform"
     assert result.recompute_num_layers == 1
     assert base.recompute_granularity is None
 
 
-def test_apply_overrides_empty_returns_base():
+def test_apply_selective_encoder_recompute_copies_modules_to_a_list():
+    result = apply_encoder_recompute_config(
+        _FakeTransformerConfig(),
+        MdpConfig(
+            enable=True,
+            encoder_recompute_granularity="selective",
+            encoder_recompute_modules=("core_attn", "mlp"),
+        ),
+    )
+    assert result.recompute_granularity == "selective"
+    assert result.recompute_modules == ["core_attn", "mlp"]
+
+
+@pytest.mark.parametrize("granularity", [None, "whole"])
+def test_disabled_and_whole_recompute_leave_transformer_config_unchanged(granularity):
     base = _FakeTransformerConfig()
-    assert apply_vision_config_overrides(base, ()) is base
+    config = MdpConfig(enable=True, encoder_recompute_granularity=granularity)
+    assert apply_encoder_recompute_config(base, config) is base
 
 
-def test_apply_overrides_delegates_field_validation_to_post_init():
-    with pytest.raises(ValueError, match="bad recompute_granularity"):
-        apply_vision_config_overrides(
-            _FakeTransformerConfig(), (("recompute_granularity", "everything"),)
+@pytest.mark.parametrize("recompute_granularity", ["full", "selective"])
+def test_whole_encoder_recompute_rejects_effective_vision_recompute(
+    recompute_granularity,
+):
+    with pytest.raises(
+        MdpConfigurationError, match="effective vision recompute_granularity"
+    ):
+        validate_effective_vision_config(
+            MdpConfig(enable=True, encoder_recompute_granularity="whole"),
+            _FakeTransformerConfig(recompute_granularity=recompute_granularity),
         )
 
 
-def test_apply_overrides_rejects_keys_outside_allowlist():
-    assert "hidden_size" not in VISION_CONFIG_OVERRIDE_ALLOWLIST
-    with pytest.raises(MdpConfigurationError, match="allowlist"):
-        apply_vision_config_overrides(_FakeTransformerConfig(), (("hidden_size", 128),))
+def test_apply_encoder_recompute_delegates_field_validation_to_post_init():
+    with pytest.raises(ValueError, match="bad recompute_granularity"):
+        apply_encoder_recompute_config(
+            _FakeTransformerConfig(),
+            MdpConfig(enable=True, encoder_recompute_granularity="everything"),
+        )
 
 
 # ---------------------- args snapshot (integration) ----------------------
@@ -220,7 +316,10 @@ def _fake_args(**overrides):
         offload_optimizer_states=False,
         overlap_grad_reduce=False,
         overlap_param_gather=False,
+        overlap_param_gather_with_optimizer_step=False,
         delay_grad_reduce=False,
+        overlap_moe_expert_parallel_comm=False,
+        reuse_grad_buf_for_mxfp8_param_ag=False,
         ckpt_format="torch_dist",
         save=None,
         load=None,
@@ -435,3 +534,107 @@ def test_sample_based_training_without_greedy_packing_is_unaffected():
     validate_mdp_config(
         MdpConfig(enable=True), _options(train_samples=1000000, rampup_batch_size=[32, 32, 1000000])
     )
+
+
+@pytest.mark.parametrize(
+    "arg_name, value", [("train_samples", 1000000), ("rampup_batch_size", [32, 32, 1000000])]
+)
+def test_snapshot_carries_the_sample_based_training_args(arg_name, value):
+    # Both fields default to None, so a key read under the wrong name leaves the
+    # rejection permanently inert while the suite stays green.
+    from megatron.core.mdp.integration import compatibility_options_from_args
+
+    options = compatibility_options_from_args(_fake_args(**{arg_name: value}))
+    assert getattr(options, arg_name) == value
+
+
+def test_snapshot_reports_decoder_ep_overlap():
+    from megatron.core.mdp.integration import compatibility_options_from_args
+
+    options = compatibility_options_from_args(
+        _fake_args(overlap_moe_expert_parallel_comm=True)
+    )
+    assert options.overlap_moe_expert_parallel_comm is True
+
+
+@pytest.mark.parametrize(
+    "flag", ["overlap_param_gather_with_optimizer_step", "reuse_grad_buf_for_mxfp8_param_ag"]
+)
+def test_snapshot_carries_the_flags_the_rejections_read(flag):
+    """compatibility_options_from_args() is the only place these args become
+    MdpCompatibilityOptions state, and every field below defaults to False, so
+    a key read under the wrong name leaves validate_mdp_config's rejection
+    permanently inert -- and the suite green."""
+    from megatron.core.mdp.integration import compatibility_options_from_args
+
+    options = compatibility_options_from_args(_fake_args(**{flag: True}))
+    assert getattr(options, flag), (
+        f"compatibility_options_from_args() must snapshot args.{flag}, or "
+        "validate_mdp_config's rejection of it can never fire on a real run"
+    )
+    with pytest.raises(MdpConfigurationError, match=flag):
+        validate_mdp_config(MdpConfig(enable=True), options)
+
+
+def test_decoder_fp8_is_accepted_by_the_support_matrix():
+    # --fp8 configures the decoder only; the vision TransformerConfig is built
+    # by the adapter builder and never reads it. The compatibility snapshot
+    # carries no decoder-FP8 field at all, so validate_mdp_config cannot reject
+    # it -- encoder FP8 is refused on the resolved vision config instead (see
+    # the test below).
+    from megatron.core.mdp.integration import compatibility_options_from_args
+
+    options = compatibility_options_from_args(_fake_args(fp8="hybrid"))
+    # The only fp8-named field is the mxfp8 grad-buffer-reuse reject, which is
+    # an MDP incompatibility in its own right, not a decoder-FP8 switch.
+    assert [field.name for field in dataclasses.fields(options) if "fp8" in field.name] == [
+        "reuse_grad_buf_for_mxfp8_param_ag"
+    ]
+    validate_mdp_config(MdpConfig(enable=True), options)
+
+
+def test_effective_vision_config_with_fp8_is_rejected():
+    # The reject lives on the resolved vision config, where encoder FP8 is
+    # observable, not on an args-derived flag that no wired path can set. An
+    # adapter that wires fp8 into the vision config must trip this.
+    with pytest.raises(MdpConfigurationError, match="effective vision fp8"):
+        validate_effective_vision_config(
+            MdpConfig(enable=True), _FakeTransformerConfig(fp8="hybrid")
+        )
+
+
+@pytest.mark.parametrize(
+    "arg_overrides, expected",
+    [
+        (
+            dict(
+                encoder_recompute_granularity="selective",
+                encoder_recompute_modules=["core_attn", "mlp"],
+            ),
+            ("selective", None, None, ("core_attn", "mlp")),
+        ),
+        (
+            dict(
+                encoder_recompute_granularity="full",
+                encoder_recompute_method="uniform",
+                encoder_recompute_num_layers=1,
+            ),
+            ("full", "uniform", 1, None),
+        ),
+        (
+            dict(encoder_recompute_granularity="whole"),
+            ("whole", None, None, None),
+        ),
+    ],
+)
+def test_encoder_recompute_options_are_snapshotted_from_args(arg_overrides, expected):
+    from megatron.core.mdp.integration import mdp_config_from_args
+
+    config = mdp_config_from_args(_fake_args(mdp_enable=True, **arg_overrides))
+    actual = (
+        config.encoder_recompute_granularity,
+        config.encoder_recompute_method,
+        config.encoder_recompute_num_layers,
+        config.encoder_recompute_modules,
+    )
+    assert actual == expected

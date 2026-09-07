@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """G1/G2 parity: the MDP phase machine must reproduce the native pixel path.
 
@@ -40,7 +40,7 @@ from examples.multimodal_dev.models.qwen35_vl.vision_encoder import Qwen35VLVisi
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.mdp.allocator import DirectBufferAllocator
 from megatron.core.mdp.bridge import ModalityBridge
-from megatron.core.mdp.config import MdpConfig, apply_vision_config_overrides
+from megatron.core.mdp.config import MdpConfig, apply_encoder_recompute_config
 from megatron.core.mdp.encoder import (
     EncoderDomain,
     build_encoder_pg_collection,
@@ -244,7 +244,7 @@ def _captured_microbatch(pixel_values, slots):
     )
 
 
-def _build_runtime(vision_config, microbatches):
+def _build_runtime(vision_config, microbatches, *, mdp_config=None):
     world = torch.distributed.get_world_size()
     rank_map = build_rank_map(
         MdpRankSpec(world_size=world, tp=1, pp=1, cp=1, ep=1, encoder_cp=1)
@@ -269,7 +269,7 @@ def _build_runtime(vision_config, microbatches):
         pg_collection=encoder_pgs,
     )
     allocator = DirectBufferAllocator()
-    config = MdpConfig(enable=True)
+    config = mdp_config or MdpConfig(enable=True)
     runtime = MdpRuntime(
         config=config,
         rank_map=rank_map,
@@ -312,7 +312,15 @@ def _run_native(vision_config, batch):
     return model, total_loss
 
 
-def _run_mdp(vision_config, batch, *, native_model, corrupt_leaf_grad=False):
+def _run_mdp(
+    vision_config,
+    batch,
+    *,
+    native_model,
+    corrupt_leaf_grad=False,
+    mdp_config=None,
+    num_iterations=1,
+):
     input_ids, labels, loss_mask, position_ids, pixel_values, _grid, slots = batch
     model = _build_language_model(with_encoder=False, vision_config=vision_config)
     # Identical language weights by construction (same seeds); assert one.
@@ -320,8 +328,12 @@ def _run_mdp(vision_config, batch, *, native_model, corrupt_leaf_grad=False):
     mdp_emb = model.language_model.embedding.word_embeddings.weight
     assert torch.equal(native_emb, mdp_emb)
 
+    config = mdp_config or MdpConfig(enable=True)
+    num_windows = num_iterations + int(config.overlap_window_capture)
     runtime, encoder_ddp = _build_runtime(
-        vision_config, [_captured_microbatch(pixel_values, slots)]
+        vision_config,
+        [_captured_microbatch(pixel_values, slots) for _ in range(num_windows)],
+        mdp_config=config,
     )
     # Transplant the native encoder weights so both paths run the same model.
     encoder_ddp.module.load_state_dict(native_model.vision_model.state_dict())
@@ -331,42 +343,47 @@ def _run_mdp(vision_config, batch, *, native_model, corrupt_leaf_grad=False):
     # both paths run encoder forward from the same seeded stream.
     torch.manual_seed(99)
     model_parallel_cuda_manual_seed(99)
-    replay = runtime.begin_iteration(iter(range(1)), num_microbatches=1, forward_only=False)
-    next(replay[0])
-    leaf = runtime.storage.get_leaf(0)
-    assert leaf is not None and leaf.shape[0] == sum(len(s) for s in slots)
+    data_iterator = iter(range(num_windows))
+    total_loss = None
+    for _ in range(num_iterations):
+        replay = runtime.begin_iteration(
+            data_iterator, num_microbatches=1, forward_only=False
+        )
+        next(replay[0])
+        leaf = runtime.storage.get_leaf(0)
+        assert leaf is not None and leaf.shape[0] == sum(len(s) for s in slots)
 
-    losses = model(
-        input_ids=input_ids,
-        position_ids=position_ids,
-        attention_mask=None,
-        labels=labels,
-        pixel_values=None,
-        image_grid_thw=None,
-        vision_embeddings=leaf,
-    )
-    total_loss = (losses.float() * loss_mask).sum()
-    total_loss.backward()
-    if corrupt_leaf_grad:
-        leaf.grad.mul_(-1.0)
+        losses = model(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=None,
+            labels=labels,
+            pixel_values=None,
+            image_grid_thw=None,
+            vision_embeddings=leaf,
+        )
+        total_loss = (losses.float() * loss_mask).sum()
+        total_loss.backward()
+        if corrupt_leaf_grad:
+            leaf.grad.mul_(-1.0)
 
-    rng_before_p5 = torch.cuda.get_rng_state()
-    tracker_before_p5 = {
-        name: state.clone()
-        for name, state in get_cuda_rng_tracker().get_states().items()
-    }
-    tokens = torch.tensor(float(torch.distributed.get_world_size()), device="cuda")
-    runtime.capture_global_num_tokens(tokens)
-    runtime.mark_decoder_complete()
-    runtime.end_iteration()
-    rng_after_p5 = torch.cuda.get_rng_state()
-    tracker_after_p5 = get_cuda_rng_tracker().get_states()
+        rng_before_p5 = torch.cuda.get_rng_state()
+        tracker_before_p5 = {
+            name: state.clone()
+            for name, state in get_cuda_rng_tracker().get_states().items()
+        }
+        tokens = torch.tensor(float(torch.distributed.get_world_size()), device="cuda")
+        runtime.capture_global_num_tokens(tokens)
+        runtime.mark_decoder_complete()
+        runtime.end_iteration()
+        rng_after_p5 = torch.cuda.get_rng_state()
+        tracker_after_p5 = get_cuda_rng_tracker().get_states()
 
-    assert torch.equal(rng_before_p5, rng_after_p5), (
-        "P5 backward (checkpoint replay) must not perturb the global RNG stream"
-    )
-    for name, state in tracker_before_p5.items():
-        assert torch.equal(state, tracker_after_p5[name]), name
+        assert torch.equal(rng_before_p5, rng_after_p5), (
+            "P5 backward (checkpoint replay) must not perturb the global RNG stream"
+        )
+        for name, state in tracker_before_p5.items():
+            assert torch.equal(state, tracker_after_p5[name]), name
 
     return model, total_loss, encoder_ddp
 
@@ -459,18 +476,19 @@ def test_g1_fault_injection_detects_broken_reverse_routing():
 
 
 @pytest.mark.parametrize(
-    "overrides",
+    "mdp_config",
     [
-        (("recompute_granularity", "selective"),),
-        (
-            ("recompute_granularity", "full"),
-            ("recompute_method", "uniform"),
-            ("recompute_num_layers", 1),
+        MdpConfig(enable=True, encoder_recompute_granularity="selective"),
+        MdpConfig(
+            enable=True,
+            encoder_recompute_granularity="full",
+            encoder_recompute_method="uniform",
+            encoder_recompute_num_layers=1,
         ),
     ],
     ids=["selective", "full"],
 )
-def test_g1_recompute_modes_match_reference(overrides):
+def test_g1_recompute_modes_match_reference(mdp_config):
     """Stochastic encoder (dropout>0): every recompute mode must reproduce the
     no-recompute reference **bitwise** through the one shared P2/P5 path.
 
@@ -494,14 +512,86 @@ def test_g1_recompute_modes_match_reference(overrides):
         for name, param in reference_ddp.module.named_parameters()
     }
 
-    mode_config = apply_vision_config_overrides(_vision_config(dropout=0.1), overrides)
-    _, mode_loss, mode_ddp = _run_mdp(mode_config, batch, native_model=native_model)
+    mode_config = apply_encoder_recompute_config(
+        _vision_config(dropout=0.1), mdp_config
+    )
+    _, mode_loss, mode_ddp = _run_mdp(
+        mode_config, batch, native_model=native_model, mdp_config=mdp_config
+    )
     assert torch.equal(reference_loss, mode_loss), (
         float(reference_loss),
         float(mode_loss),
     )
     for name, param in mode_ddp.module.named_parameters():
         assert torch.equal(param.main_grad.float(), reference_grads[name]), name
+
+
+@pytest.mark.parametrize(
+    "overlap_window_capture,num_iterations",
+    [(False, 1), (True, 2)],
+    ids=["sync-window-capture", "overlap-window-capture"],
+)
+def test_g1_whole_encoder_recompute_matches_reference(
+    overlap_window_capture, num_iterations
+):
+    """The Design-Doc P2-no-grad/P5-full-replay path must preserve stochastic
+    encoder outputs and the ambient RNG stream bitwise.
+
+    ``_run_mdp`` already asserts the P5 RNG fork. The overlap case runs two
+    iterations so the second one consumes the window captured concurrently
+    with the first decoder schedule. Using dropout and forcing two encoder
+    chunks ensures that neither a missing RNG restore nor a
+    single-recipe-for-all-chunks implementation can pass. Encoder gradients
+    use the same BF16-ULP tolerance as native-vs-MDP parity: the retained-graph
+    reference performs one multi-tensor backward, while complete replay must
+    backward and release one chunk at a time, so weight-gradient accumulation
+    order is intentionally different.
+    """
+    batch = _make_batch()
+    native_model, _ = _seeded(_run_native, _vision_config(dropout=0.0), batch)
+
+    reference_config = _vision_config(dropout=0.1)
+    reference_mdp_config = MdpConfig(
+        enable=True,
+        encoder_max_payload_rows=64,
+        overlap_window_capture=overlap_window_capture,
+    )
+    _, reference_loss, reference_ddp = _run_mdp(
+        reference_config,
+        batch,
+        native_model=native_model,
+        mdp_config=reference_mdp_config,
+        num_iterations=num_iterations,
+    )
+    reference_grads = {
+        name: param.main_grad.float().clone()
+        for name, param in reference_ddp.module.named_parameters()
+    }
+
+    _, mode_loss, mode_ddp = _run_mdp(
+        _vision_config(dropout=0.1),
+        batch,
+        native_model=native_model,
+        mdp_config=MdpConfig(
+            enable=True,
+            encoder_max_payload_rows=64,
+            encoder_recompute_granularity="whole",
+            overlap_window_capture=overlap_window_capture,
+        ),
+        num_iterations=num_iterations,
+    )
+    assert torch.equal(reference_loss, mode_loss), (
+        float(reference_loss),
+        float(mode_loss),
+    )
+    for name, param in mode_ddp.module.named_parameters():
+        grad = param.main_grad.float()
+        reference = reference_grads[name]
+        atol = max(1e-5, 2e-3 * float(reference.abs().max()))
+        assert torch.allclose(grad, reference, rtol=8e-3, atol=atol), (
+            name,
+            float((grad - reference).abs().max()),
+        )
 
 
 def test_g1_one_step_update_parity():

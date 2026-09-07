@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Standalone entry point for multimodal_dev model training (FSDP + EP).
 
@@ -23,6 +23,7 @@ Usage::
         ... (other megatron args)
 """
 
+import dataclasses
 import importlib
 import os
 import sys
@@ -32,8 +33,12 @@ sys.path.insert(
     os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")),
 )
 
-from examples.multimodal_dev.arguments import add_multimodal_args
-from examples.multimodal_dev.forward_step import forward_step
+from examples.multimodal_dev.arguments import (
+    add_multimodal_args,
+    encoder_recompute_overrides_from_args,
+    validate_encoder_recompute_args,
+)
+from examples.multimodal_dev.forward_step import forward_step, quantized_row_alignment
 from megatron.core.enums import ModelType
 from megatron.training import get_args, pretrain
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
@@ -85,10 +90,11 @@ def model_provider(
     vision_config.fp16 = language_config.fp16
     vision_config.apply_rope_fusion = language_config.apply_rope_fusion
 
-    if getattr(args, "recompute_vision", False):
-        vision_config.recompute_granularity = "full"
-        vision_config.recompute_method = "uniform"
-        vision_config.recompute_num_layers = 1
+    encoder_recompute_overrides = encoder_recompute_overrides_from_args(args)
+    if encoder_recompute_overrides:
+        vision_config = dataclasses.replace(
+            vision_config, **encoder_recompute_overrides
+        )
 
     # --- vision FLOPs metadata ---
     vision_flops_fn = registry.get("vision_flops_fn")
@@ -194,16 +200,10 @@ def _setup_mdp(args):
             "--mdp-enable requires --use-vanilla-collate-fn: pack_or_pad_batch "
             "consumes the per-sample dict list only the identity collate produces"
         )
-    if getattr(args, "recompute_vision", False):
-        raise RuntimeError(
-            "--recompute-vision is the native-path switch; with --mdp-enable use "
-            "--mdp-vision-config-override recompute_granularity=full (and friends) "
-            "so the vision config flows through the MDP override channel"
-        )
     mdp_integration.validate_from_args(args)
-    from megatron.core.mdp.checkpoint import assert_weight_only_checkpoint
+    from megatron.core.mdp.checkpoint import assert_supported_checkpoint_config
 
-    assert_weight_only_checkpoint(args)
+    assert_supported_checkpoint_config(args)
     mdp_integration.set_adapter_builder(_mdp_adapter_builder)
 
 
@@ -214,6 +214,10 @@ if __name__ == "__main__":
         extra_args_provider=add_multimodal_args,
         args_defaults={},
     )
+    validate_encoder_recompute_args(args)
+    # Fail fast on a quantization recipe the collate path cannot align, before
+    # the model and datasets are built (the result is cached on the argument values).
+    quantized_row_alignment(args)
     if getattr(args, "mdp_enable", False):
         _setup_mdp(args)
     full_config = pretrain_cfg_container_from_args(args)

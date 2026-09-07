@@ -1,6 +1,60 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Extra CLI arguments for multimodal_dev standalone training."""
+
+
+def validate_encoder_recompute_args(args) -> None:
+    """Validate the shared native/MDP encoder recompute argument matrix."""
+    granularity = getattr(args, "encoder_recompute_granularity", None)
+    method = getattr(args, "encoder_recompute_method", None)
+    num_layers = getattr(args, "encoder_recompute_num_layers", None)
+    modules = getattr(args, "encoder_recompute_modules", None)
+
+    if granularity == "whole" and not getattr(args, "mdp_enable", False):
+        raise RuntimeError(
+            "--encoder-recompute-granularity whole requires --mdp-enable"
+        )
+
+    if granularity in (None, "whole"):
+        incompatible = {
+            "encoder_recompute_method": method,
+            "encoder_recompute_num_layers": num_layers,
+            "encoder_recompute_modules": modules,
+        }
+    elif granularity == "selective":
+        incompatible = {
+            "encoder_recompute_method": method,
+            "encoder_recompute_num_layers": num_layers,
+        }
+    else:  # full
+        incompatible = {"encoder_recompute_modules": modules}
+
+    invalid = [
+        f"--{name.replace('_', '-')}"
+        for name, value in incompatible.items()
+        if value is not None
+    ]
+    if invalid:
+        raise RuntimeError(
+            f"{', '.join(invalid)} cannot be used with "
+            f"--encoder-recompute-granularity {granularity}"
+        )
+
+
+def encoder_recompute_overrides_from_args(args) -> dict:
+    """Return native TransformerConfig overrides for encoder recompute."""
+    validate_encoder_recompute_args(args)
+    granularity = getattr(args, "encoder_recompute_granularity", None)
+    if granularity in (None, "whole"):
+        return {}
+
+    modules = getattr(args, "encoder_recompute_modules", None)
+    return {
+        "recompute_granularity": granularity,
+        "recompute_method": getattr(args, "encoder_recompute_method", None),
+        "recompute_num_layers": getattr(args, "encoder_recompute_num_layers", None),
+        "recompute_modules": list(modules) if modules is not None else None,
+    }
 
 
 def add_multimodal_args(parser):
@@ -70,16 +124,6 @@ def add_multimodal_args(parser):
         ),
     )
     group.add_argument(
-        "--recompute-vision",
-        action="store_true",
-        default=False,
-        help=(
-            "Enable full activation recomputation for vision encoder layers. "
-            "Uses uniform method and recomputes every layer. "
-            "Independent of the decoder --recompute-* flags."
-        ),
-    )
-    group.add_argument(
         "--use-packed-sequence",
         action="store_true",
         default=False,
@@ -115,14 +159,41 @@ def add_multimodal_args(parser):
         ),
     )
     group.add_argument(
-        "--mdp-vision-config-override",
-        action="append",
-        default=[],
-        metavar="KEY=VALUE",
+        "--encoder-recompute-granularity",
+        choices=("selective", "full", "whole"),
+        default=None,
         help=(
-            "Vision TransformerConfig override entry (repeatable). Keys "
-            "are restricted to the MDP allowlist (recompute_granularity, "
-            "recompute_method, recompute_num_layers, recompute_modules)."
+            "Vision-encoder recompute granularity. 'selective' and 'full' use "
+            "native MCore Transformer recompute in both native and MDP paths; "
+            "'whole' runs the complete encoder under no_grad in P2 and replays "
+            "it in P5, and therefore requires --mdp-enable."
+        ),
+    )
+    group.add_argument(
+        "--encoder-recompute-method",
+        choices=("uniform", "block"),
+        default=None,
+        help=(
+            "Layer partitioning method for --encoder-recompute-granularity full."
+        ),
+    )
+    group.add_argument(
+        "--encoder-recompute-num-layers",
+        type=int,
+        default=None,
+        help=(
+            "Number of vision Transformer layers per recompute unit for full "
+            "Transformer recompute."
+        ),
+    )
+    group.add_argument(
+        "--encoder-recompute-modules",
+        nargs="+",
+        default=None,
+        metavar="MODULE",
+        help=(
+            "Vision Transformer submodules to checkpoint when "
+            "--encoder-recompute-granularity selective is enabled."
         ),
     )
     group.add_argument(

@@ -12,6 +12,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import get_comm_stream, get_comp_stream, set_streams
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.a2a_overlap.utils import (
@@ -122,6 +123,7 @@ def run_mtp_layer_ref_with_capture(
     rotary_pos_cos,
     rotary_pos_sin,
     microbatches,
+    packed_seq_params=None,
 ):
     """
     Runs the model in reference mode and captures outputs and gradients.
@@ -146,6 +148,7 @@ def run_mtp_layer_ref_with_capture(
             rotary_pos_emb=rotary_pos_emb,
             rotary_pos_cos=rotary_pos_cos,
             rotary_pos_sin=rotary_pos_sin,
+            packed_seq_params=packed_seq_params,
             embedding=model.embedding,
         )
         output_tensors.append(output)
@@ -169,6 +172,7 @@ def run_mtp_layer_a2a_overlap_with_capture(
     rotary_pos_cos,
     rotary_pos_sin,
     microbatches,
+    packed_seq_params=None,
 ):
     """
     Runs the model with all-to-all overlap optimization and captures outputs and gradients.
@@ -195,6 +199,7 @@ def run_mtp_layer_a2a_overlap_with_capture(
         state.rotary_pos_emb = rotary_pos_emb
         state.rotary_pos_cos = rotary_pos_cos
         state.rotary_pos_sin = rotary_pos_sin
+        state.packed_seq_params = packed_seq_params
         state.model = model
         state.is_mtp = True
         event = torch.cuda.Event()
@@ -523,6 +528,91 @@ class TestA2AOverlap:
                 rotary_pos_cos=rotary_pos_cos,
                 rotary_pos_sin=rotary_pos_sin,
                 microbatches=microbatches,
+            )
+            comp_res = compare_captures(capture_ref, capture_a2a_overlap, True, True)
+            assert comp_res[0], f"[rank {torch.distributed.get_rank()}] {comp_res[1]}"
+
+    @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
+    def test_mtp_layer_overlap_packed_sequence(self):
+        """Verify MTP overlap parity for a THD pack containing two sequences."""
+        extra_kwargs = {
+            "mtp_num_layers": 1,
+            "mtp_loss_scaling_factor": 1.1,
+            "moe_token_dispatcher_type": "alltoall",
+        }
+        config = get_test_config(extra_kwargs=extra_kwargs)
+        seq_len = 32
+        with deterministic_mode():
+            transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                num_experts=16,
+                moe_grouped_gemm=True,
+                qk_layernorm=True,
+                multi_latent_attention=True,
+            )
+            mtp_block_spec = get_gpt_mtp_block_spec(config, transformer_layer_spec, True)
+            if mtp_block_spec is None:
+                return
+            gpt_model = GPTModel(
+                config=config,
+                transformer_layer_spec=transformer_layer_spec,
+                mtp_block_spec=mtp_block_spec,
+                vocab_size=100,
+                pre_process=True,
+                post_process=True,
+                max_sequence_length=300,
+            )
+            gpt_model.decoder.final_layernorm = None
+            gpt_model.cuda()
+            params = reset_model(gpt_model)
+
+            data = list(range(seq_len))
+            hidden_states = [build_data(seq_len)]
+            input_ids = torch.tensor(data, dtype=torch.int64).unsqueeze(0).cuda()
+            labels = input_ids.clone()
+            position_ids = input_ids.clone()
+            cu_seqlens = torch.tensor([0, 13, seq_len], dtype=torch.int32).cuda()
+            packed_seq_params = PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                max_seqlen_q=19,
+                max_seqlen_kv=19,
+                total_tokens=seq_len,
+            )
+            _, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, _, _padding_mask = (
+                gpt_model._preprocess(
+                    input_ids,
+                    position_ids,
+                    packed_seq_params=packed_seq_params,
+                )
+            )
+
+            capture_ref = run_mtp_layer_ref_with_capture(
+                model=gpt_model,
+                hidden_states=hidden_states,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                labels=labels,
+                attention_mask=None,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                microbatches=1,
+                packed_seq_params=packed_seq_params,
+            )
+            reset_model(gpt_model, params)
+            capture_a2a_overlap = run_mtp_layer_a2a_overlap_with_capture(
+                model=gpt_model,
+                hidden_states=hidden_states,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                labels=labels,
+                attention_mask=None,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                microbatches=1,
+                packed_seq_params=packed_seq_params,
             )
             comp_res = compare_captures(capture_ref, capture_a2a_overlap, True, True)
             assert comp_res[0], f"[rank {torch.distributed.get_rank()}] {comp_res[1]}"
