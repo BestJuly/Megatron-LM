@@ -50,9 +50,33 @@ except ImportError:
 
     HAVE_FLA = False
 
+
+@lru_cache(maxsize=1)
+def _get_cudnn_gated_delta_rule():
+    """Enable and return cuDNN Frontend's FLA-compatible GDR implementation.
+
+    ``cudnn.fla.accelerate_fla`` patches FLA's public GDR entry point while preserving
+    its signature and fallback behavior. Resolve it lazily so importing Megatron does
+    not require cudnn-frontend unless this backend is selected.
+    """
+    try:
+        import cudnn.fla as cudnn_fla
+        from fla.ops import gated_delta_rule as fla_gated_delta_rule
+
+        cudnn_fla.accelerate_fla(verbose=False, targets="gdn")
+    except (AttributeError, ImportError) as error:
+        raise ImportError(
+            "gdn_kernel_backend='cudnn' requires a cuDNN Frontend build with "
+            "cudnn.fla GDN support."
+        ) from error
+
+    return fla_gated_delta_rule.chunk_gated_delta_rule
+
+
 __all__ = [
     "HAVE_FLA",
     "GatedDeltaNetSubmodules",
+    "_get_cudnn_gated_delta_rule",
     "_GDNBase",
     "_build_head_perm_for_split_sections",
     "_build_thd_cp_a2a_perm",
