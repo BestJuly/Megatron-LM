@@ -19,6 +19,7 @@ from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net.common import (
     _GDNBase,
+    _get_cudnn_gated_delta_rule,
     a2a_cp_to_hp,
     a2a_hp_to_cp,
     build_cp_context,
@@ -62,6 +63,8 @@ class GatedDeltaNet(_GDNBase):
 
         if self.config.deterministic_mode:
             self.gated_delta_rule = torch_chunk_gated_delta_rule
+        elif self.config.gdn_kernel_backend == "cudnn":
+            self.gated_delta_rule = _get_cudnn_gated_delta_rule()
         else:
             self.gated_delta_rule = chunk_gated_delta_rule
 
