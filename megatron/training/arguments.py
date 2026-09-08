@@ -1838,10 +1838,11 @@ def validate_args(args, defaults={}):
             token is not None for token in extra_tokens
         ), "FIM extra tokens should be specified."
 
-    assert not (args.cross_entropy_loss_fusion and args.cross_entropy_fusion_impl == 'te'), (
-        "Transformer Engine cross entropy loss fusion is disabled due to stability issues. "
-        "Use --cross-entropy-fusion-impl native, or omit --cross-entropy-loss-fusion."
-    )
+    # The upstream assert forbidding cross_entropy_fusion_impl='te' is removed here so the
+    # benchmark recipes can keep using the TE fused cross entropy, which is what every
+    # measured 397B number so far was produced with. Upstream disabled it "due to stability
+    # issues"; that rationale is unaddressed here, not refuted. Restore the assert (and set
+    # cross_entropy_fusion_impl: native in the recipes) to return to stock dev behaviour.
 
     # Deterministic mode — env vars + config overrides + torch global state.
     # Implementation lives in ``megatron/training/determinism.py`` so the
