@@ -16,6 +16,7 @@ import torch
 
 from megatron.core.mdp.errors import MdpBridgeError
 from megatron.core.mdp.groups import (
+    DESCRIPTOR_SLOTS,
     MdpGroupRegistry,
     broadcast_descriptors,
     descriptors_to_records,
@@ -26,7 +27,18 @@ from megatron.core.mdp.protocols import VisionDescriptor
 from megatron.core.mdp.rank_mapping import MdpRankSpec, build_rank_map
 
 
-def _descriptor(item_id, mb=0, sample=0, ordinal=0, lane=0, cost=7, grid=(1, 4, 4)):
+def _descriptor(
+    item_id,
+    mb=0,
+    sample=0,
+    ordinal=0,
+    lane=0,
+    cost=7,
+    grid=(1, 4, 4),
+    sample_padded_start=0,
+    sample_padded_len=0,
+    decoder_offset_in_sample=0,
+):
     t, h, w = grid
     return VisionDescriptor(
         global_item_id=item_id,
@@ -39,6 +51,9 @@ def _descriptor(item_id, mb=0, sample=0, ordinal=0, lane=0, cost=7, grid=(1, 4, 
         output_rows=t * (h // 2) * (w // 2),
         grid_thw=grid,
         owner_worker_id=0,
+        sample_padded_start=sample_padded_start,
+        sample_padded_len=sample_padded_len,
+        decoder_offset_in_sample=decoder_offset_in_sample,
     )
 
 
@@ -46,8 +61,27 @@ def test_record_round_trip_is_lossless():
     descriptors = (
         _descriptor(0, grid=(2, 6, 8)),
         _descriptor(1, mb=1, sample=3, ordinal=2, cost=123, grid=(1, 4, 4)),
+        # The decoder-CP span columns must survive the wire: every planning
+        # group member derives its slice table from them, and a member that
+        # deserializes them wrong builds a different plan.
+        _descriptor(
+            2,
+            mb=2,
+            sample=1,
+            sample_padded_start=4096,
+            sample_padded_len=2048,
+            decoder_offset_in_sample=137,
+        ),
     )
     assert records_to_descriptors(descriptors_to_records(descriptors)) == descriptors
+
+
+def test_record_width_matches_the_declared_slot_count():
+    # The broadcast allocates int64[count, DESCRIPTOR_SLOTS]; if the serializer
+    # and the constant drift apart the payload is silently truncated or padded
+    # on every non-source rank.
+    records = descriptors_to_records((_descriptor(0),))
+    assert len(records[0]) == DESCRIPTOR_SLOTS
 
 
 _DISTRIBUTED = int(os.environ.get("WORLD_SIZE", "1")) > 1
