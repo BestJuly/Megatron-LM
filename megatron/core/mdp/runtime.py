@@ -29,22 +29,18 @@ from megatron.core.mdp.activation import (
     capture_encoder_rng_state,
 )
 from megatron.core.mdp.allocator import MdpBufferAllocator
-from megatron.core.mdp.bridge import (
-    BridgeBufferKey,
-    BridgePhase,
-    BridgeTensorSpec,
-    ModalityBridge,
-)
+from megatron.core.mdp.bridge import BridgeBufferKey, BridgePhase, BridgeTensorSpec, ModalityBridge
 from megatron.core.mdp.config import MdpConfig
 from megatron.core.mdp.encoder import EncoderDomain, finalize_encoder_grads
-from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
+from megatron.core.mdp.errors import MdpConfigurationError, MdpPlanError, MdpStateError
 from megatron.core.mdp.groups import MdpProcessGroups, broadcast_descriptors
-from megatron.core.mdp.packing import GreedySampleStream, decoder_sample_length
 from megatron.core.mdp.observability import (
     MdpIterationMetrics,
     nvtx_phase,
+    rank_loads_from_worker_loads,
     worker_loads_from_plan,
 )
+from megatron.core.mdp.packing import GreedySampleStream, decoder_sample_length
 from megatron.core.mdp.plan import MdpBatchPlan, split_encoder_layout
 from megatron.core.mdp.planner import MdpPlanner, assert_consistent_plan
 from megatron.core.mdp.protocols import MdpModelAdapter
@@ -90,6 +86,12 @@ class MdpRuntime:
         self.config = config
         self.rank_map = rank_map
         self.rank_view = rank_view
+        # Ranks per logical worker IS encoder_cp: the PIXEL shard axis, the
+        # per-shard payload sizing and the per-rank chunk buffers all key off it.
+        self._encoder_cp = len(rank_view.planning_group_ranks) // max(
+            1, len(rank_view.worker_ids)
+        )
+        self._shard_index_cache: dict = {}
         self.process_groups = process_groups
         self.adapter = adapter
         self.encoder_domain = encoder_domain
@@ -255,10 +257,18 @@ class MdpRuntime:
         self._chunk_of_item = {}
         chunk_payloads = []
         pixel_dest = {}
+        e = self._encoder_cp
+        my_shard = self.rank_view.my_encoder_cp_rank
         with nvtx_phase("p2_pack_payload"):
             for chunk_index, chunk in enumerate(self._chunk_layouts):
+                # This rank holds only its zigzag shard of the chunk: 1/e of
+                # the payload rows, laid out frame-by-frame in chunk order,
+                # which is exactly the order shard_rows(chunk frames, e, r)
+                # produces and the encoder consumes with pixels_are_sharded.
                 payload = self.allocator.acquire(
-                    rows=plan.capacity_policy.capacity_of(chunk.total_payload_rows),
+                    rows=plan.capacity_policy.capacity_of(
+                        self._shard_rows_of(chunk.total_payload_rows)
+                    ),
                     width=self.adapter.payload_width,
                     dtype=self.params_dtype,
                     device=self.device,
@@ -266,19 +276,29 @@ class MdpRuntime:
                 )
                 chunk_payloads.append(payload)
                 for segment in chunk.segments:
-                    pixel_dest[BridgeBufferKey(segment.global_item_id)] = payload[
-                        segment.payload_row_start : segment.payload_row_start
-                        + segment.payload_rows
-                    ]
+                    start = self._shard_rows_of(segment.payload_row_start)
+                    rows = self._shard_rows_of(segment.payload_rows)
+                    pixel_dest[
+                        BridgeBufferKey(segment.global_item_id, 0, my_shard)
+                    ] = payload[start : start + rows]
                     self._chunk_of_item[segment.global_item_id] = (chunk_index, segment)
 
         with nvtx_phase("p1_pixel_dispatch"):
             pixel_specs = self._iter_specs[BridgePhase.PIXEL]
             sidecar = window.payload_sidecar()
-            pixel_local = {
-                BridgeBufferKey(item_id): tensor.to(self.params_dtype)
-                for item_id, tensor in sidecar.items()
-            }
+            # The owner sends each producing rank only the rows it will
+            # encode. index_select on the zigzag row set costs one extra copy
+            # of the item in total (e shards of 1/e each) and replaces sending
+            # the whole item e times.
+            pixel_local = {}
+            for item_id, tensor in sidecar.items():
+                tensor = tensor.to(self.params_dtype)
+                segment = plan.segment_for_item(item_id)
+                for shard_id in range(e):
+                    index = self._pixel_shard_index(segment.grid_thw, shard_id, tensor.device)
+                    pixel_local[BridgeBufferKey(item_id, 0, shard_id)] = (
+                        tensor if index is None else tensor.index_select(0, index)
+                    )
             pixel_ledger = self._iter_ledgers[BridgePhase.PIXEL]
             # Owners -> producers in one collective; every group member
             # participates (with zero splits when it has nothing to move).
@@ -294,6 +314,18 @@ class MdpRuntime:
                 dest_views=pixel_dest,
             )
             window.release_pixels()
+            # Drop the dispatch staging before P2. `pixel_local` holds, across
+            # all shards, one more full copy of this owner's pixels, and
+            # `sidecar` still holds the originals; both are local names, so
+            # without this they would stay alive through encoder forward and
+            # the embedding exchange and overlap with encoder activations --
+            # exactly when encoder CP is being used to fit a larger vision
+            # input. `exchange_all_to_all` has already copied into
+            # `pixel_dest`, so nothing below reads either of them.
+            # Rebound rather than `del`: an owner with no items never enters
+            # the loop above, and `del` on an unbound name raises.
+            pixel_local.clear()
+            sidecar = tensor = index = None
 
         # P2: retain the normal autograd graph, or whole-encoder recompute
         # run under no_grad and retain only the replay recipe. Evaluation also
@@ -308,7 +340,7 @@ class MdpRuntime:
         forward_start = time.monotonic()
         for chunk_index, chunk in enumerate(self._chunk_layouts):
             payload = chunk_payloads[chunk_index]
-            payload_valid = payload[: chunk.total_payload_rows]
+            payload_valid = payload[: self._shard_rows_of(chunk.total_payload_rows)]
             if forward_only or whole_recompute:
                 if whole_recompute:
                     chunk_rng_states.append(capture_encoder_rng_state())
@@ -332,7 +364,7 @@ class MdpRuntime:
                     iteration=self._iteration,
                     producer_worker_id=self.rank_view.my_worker_id,
                     chunk_payloads=[
-                        payload[: chunk.total_payload_rows]
+                        payload[: self._shard_rows_of(chunk.total_payload_rows)]
                         for payload, chunk in zip(chunk_payloads, self._chunk_layouts)
                     ],
                     chunk_layouts=tuple(self._chunk_layouts),
@@ -341,6 +373,7 @@ class MdpRuntime:
                         for output in chunk_outputs
                     ),
                     chunk_rng_states=tuple(chunk_rng_states),
+                    encoder_cp=self._encoder_cp,
                 )
                 detached = tuple(output.detach() for output in chunk_outputs)
             else:
@@ -359,9 +392,12 @@ class MdpRuntime:
         # P3: embedding exchange straight into the endpoint leaves.
         emb_dest = {}
         leaves = []  # (microbatch_id, valid leaf view)
-        if self.rank_view.lane_id is not None:
+        if self.rank_view.is_decoder_endpoint:
             with nvtx_phase("p3_leaf_assembly"):
-                for layout in plan.layouts:
+                # Only this endpoint's layouts: at CP>1 the plan also carries
+                # every CP peer's leaf layout, and building those here would
+                # allocate cp leaves per microbatch on every endpoint.
+                for layout in plan.layouts_for_endpoint(self.rank_view.global_rank):
                     if layout.text_only:
                         continue
                     leaf = self.allocator.acquire(
@@ -372,7 +408,9 @@ class MdpRuntime:
                         tag="leaf",
                     )
                     for segment in layout.segments:
-                        emb_dest[BridgeBufferKey(segment.global_item_id)] = leaf[
+                        emb_dest[
+                            BridgeBufferKey(segment.global_item_id, segment.slice_id)
+                        ] = leaf[
                             segment.leaf_row_start : segment.leaf_row_start
                             + segment.output_rows
                         ]
@@ -380,10 +418,21 @@ class MdpRuntime:
         with nvtx_phase("p3_embedding_exchange"):
             emb_specs = self._iter_specs[BridgePhase.EMBEDDING]
             emb_local = {}
-            for item_id, (chunk_index, segment) in self._chunk_of_item.items():
-                emb_local[BridgeBufferKey(item_id)] = detached[chunk_index][
-                    segment.output_row_start : segment.output_row_start + segment.output_rows
-                ]
+            # Only the worker's lead rank sources EMBEDDING. Every rank of the
+            # worker holds an identical chunk output after the encoder's
+            # pre-merger gather, so without this gate each of them would claim
+            # every route and post duplicate sends for the same key.
+            is_worker_lead = self.rank_view.my_encoder_cp_rank == 0
+            for route in (
+                plan.routes_for_producer(self.rank_view.my_worker_id)
+                if is_worker_lead
+                else ()
+            ):
+                chunk_index, segment = self._chunk_of_item[route.global_item_id]
+                start = segment.output_row_start + route.item_row_start
+                emb_local[BridgeBufferKey(route.global_item_id, route.slice_id)] = detached[
+                    chunk_index
+                ][start : start + route.item_rows]
             # One alltoall instead of batched P2P: same ledger and payload,
             # but no per-edge kernel pairs and no torch.cuda.synchronize
             # workaround (all_to_all_single stream-orders its receive buffer).
@@ -409,6 +458,64 @@ class MdpRuntime:
         self._state = MdpRuntimeState.DECODER_READY
         self._decoder_start = time.monotonic()
         return window.replay_iterators()
+
+    def _assert_gradient_partition(self, plan: MdpBatchPlan) -> None:
+        """Every routed slice's gradient must reach exactly one physical rank.
+
+        ``finalize_encoder_grads`` is an undefended SUM over WORLD with prescale
+        1 and no encoder_cp argument. Delivering one slice's gradient to two
+        ranks makes the encoder gradient exactly that many times too large: it
+        stays finite, no shape check fires, and the composite optimizer's shared
+        norm clipping absorbs the magnitude, so it reads as a converging run
+        with a wrong effective learning rate. Delivering it to none is equally
+        quiet -- build_ledger drops zero-element entries.
+
+        Checked against the ledger rather than inside the reduce, once per
+        iteration, in integer arithmetic.
+        """
+        ledger = self._iter_ledgers.get(BridgePhase.GRADIENT)
+        if ledger is None:
+            return
+        destinations = {}
+        for entry in ledger.entries:
+            destinations.setdefault(entry.key, set()).add(entry.dst_global_rank)
+        for key, ranks in destinations.items():
+            if len(ranks) != 1:
+                raise MdpStateError(
+                    f"MDP: gradient for {key} is delivered to {len(ranks)} ranks "
+                    f"{sorted(ranks)} violates: exactly one. The encoder gradient "
+                    "would be scaled by that factor with no other symptom."
+                )
+        routed = {
+            BridgeBufferKey(route.global_item_id, route.slice_id)
+            for route in plan.routes
+        }
+        missing = routed - set(destinations)
+        if missing:
+            raise MdpStateError(
+                f"MDP: {len(missing)} routed slices have no gradient destination "
+                f"(e.g. {sorted(missing)[:3]}) violates: every routed slice's "
+                "gradient returns to exactly one producing rank."
+            )
+
+    def expects_leaf(self, microbatch_id: int) -> bool:
+        """Whether this rank should hold an embedding leaf for a microbatch.
+
+        ``MdpMicrobatchRecord.text_only`` is a property of the whole microbatch,
+        but leaf presence is a property of ``(microbatch, this endpoint)``: under
+        decoder CP an endpoint legitimately receives no vision rows from a
+        microbatch that has them globally, because the zigzag split put all of
+        that microbatch's image tokens on its peers. The plan is the authority.
+        """
+        if not self.rank_view.is_decoder_endpoint or self._plan is None:
+            return False
+        try:
+            layout = self._plan.layout_for_microbatch(
+                microbatch_id, self.rank_view.global_rank
+            )
+        except MdpPlanError:
+            return False
+        return not layout.text_only
 
     def capture_global_num_tokens(self, token_tensor: Optional[torch.Tensor]) -> None:
         """Store a reference to the in-place reduced global token tensor.
@@ -473,11 +580,27 @@ class MdpRuntime:
                             device=self.device,
                             tag="grad_regroup",
                         )
-                        for segment in chunk.segments:
-                            grad_dest[BridgeBufferKey(segment.global_item_id)] = grad_buffer[
-                                segment.output_row_start : segment.output_row_start
-                                + segment.output_rows
-                            ]
+                        if self.rank_view.my_encoder_cp_rank == 0:
+                            for segment in chunk.segments:
+                                for route in plan.routes_for_item(segment.global_item_id):
+                                    start = segment.output_row_start + route.item_row_start
+                                    grad_dest[
+                                        BridgeBufferKey(
+                                            segment.global_item_id, route.slice_id
+                                        )
+                                    ] = grad_buffer[start : start + route.item_rows]
+                        else:
+                            # Non-lead ranks of a worker receive no gradient:
+                            # the endpoint sends to the lead only. They still
+                            # run backward, so their buffer must be a real zero
+                            # rather than whatever the allocator handed back --
+                            # DirectBufferAllocator.acquire returns torch.empty,
+                            # and backward on uninitialised memory produces
+                            # plausible finite garbage. The zeros are also what
+                            # makes the encoder's gather backward correct: its
+                            # reduce-scatter sums (lead's real grad + zeros) and
+                            # hands each rank its own block.
+                            grad_buffer.zero_()
                         chunk_grads.append(grad_buffer[: chunk.total_output_rows])
                     # Drop only the loop-local base-tensor reference; this does not
                     # release its storage. The grad_dest and chunk_grads views
@@ -487,13 +610,15 @@ class MdpRuntime:
             with nvtx_phase("p5_grad_exchange"):
                 grad_specs = self._iter_specs[BridgePhase.GRADIENT]
                 grad_local = {}
-                if self.rank_view.lane_id is not None:
-                    for layout in plan.layouts:
+                if self.rank_view.is_decoder_endpoint:
+                    for layout in plan.layouts_for_endpoint(self.rank_view.global_rank):
                         if layout.text_only:
                             continue
                         grad = self.storage.pop_grad(layout.microbatch_id)
                         for segment in layout.segments:
-                            grad_local[BridgeBufferKey(segment.global_item_id)] = grad[
+                            grad_local[
+                                BridgeBufferKey(segment.global_item_id, segment.slice_id)
+                            ] = grad[
                                 segment.leaf_row_start : segment.leaf_row_start
                                 + segment.output_rows
                             ]
@@ -511,6 +636,7 @@ class MdpRuntime:
                 # The chunk views remain in chunk_grads; segment views are no
                 # longer needed after the collective has populated them.
                 grad_dest.clear()
+            self._assert_gradient_partition(plan)
             if self._handle is not None:
                 with nvtx_phase("p5_encoder_backward"):
                     if isinstance(self._handle, EncoderWholeRecomputeHandle):
@@ -533,6 +659,7 @@ class MdpRuntime:
             0.0 if self._forward_only else (time.monotonic() - backward_start) * 1000.0
         )
         worker_loads = worker_loads_from_plan(plan, len(self.rank_view.worker_ids))
+        rank_loads = rank_loads_from_worker_loads(worker_loads, self._encoder_cp)
         self._last_metrics = MdpIterationMetrics(
             iteration=self._iteration,
             outer_dp_rank=self.rank_view.outer_dp_rank,
@@ -541,6 +668,7 @@ class MdpRuntime:
             decoder_schedule_ms=self._decoder_schedule_ms,
             encoder_backward_ms=encoder_backward_ms,
             worker_loads=worker_loads,
+            rank_loads=rank_loads,
             empty_workers=sum(1 for load in worker_loads if load == 0),
             bridge_stats=self.bridge.last_stats(),
             allocator_reuse=self.allocator.reuse_stats(),
@@ -660,6 +788,7 @@ class MdpRuntime:
             lane_id=self.rank_view.lane_id,
             my_worker_id=self.rank_view.my_worker_id,
             num_workers=len(self.rank_view.worker_ids),
+            my_encoder_cp_rank=self.rank_view.my_encoder_cp_rank,
         )
 
     @staticmethod
@@ -762,16 +891,79 @@ class MdpRuntime:
                 f"(current: {self._state.name})."
             )
 
+    def _shard_rows_of(self, rows: int) -> int:
+        """Rows of a payload span that land on ONE rank of the producing worker.
+
+        Every frame is divisible by ``2*encoder_cp`` (validated at plan time),
+        so every item and every prefix of items divides exactly; a remainder
+        here means the plan and the partition disagree and must not be rounded.
+        """
+        e = self._encoder_cp
+        if rows % e:
+            raise MdpStateError(
+                f"MDP: payload span of {rows} rows violates: divisible by "
+                f"encoder_cp={e}. The plan admitted a frame the partition cannot split."
+            )
+        return rows // e
+
+    def _pixel_shard_index(self, grid_thw, shard_id: int, device):
+        """Row index of ``shard_id``'s zigzag rows inside one item's payload.
+
+        ``None`` at ``encoder_cp=1`` (the shard is the item). Cached per
+        ``(grid, shard)``: the row set is a pure function of the geometry.
+        """
+        if self._encoder_cp == 1:
+            return None
+        from megatron.core.mdp.encoder_cp_partition import shard_rows
+
+        # Keyed by device too: the same geometry may be asked for a CPU sidecar
+        # in one call and a CUDA one in another, and index_select needs the
+        # index on the tensor's device.
+        cache_key = (tuple(grid_thw), shard_id, str(device))
+        index = self._shard_index_cache.get(cache_key)
+        if index is None:
+            t, h, w = (int(v) for v in grid_thw)
+            rows = []
+            for run in shard_rows([h * w] * t, self._encoder_cp, shard_id):
+                rows.extend(range(run.start, run.start + run.rows))
+            index = torch.tensor(rows, dtype=torch.long, device=device)
+            self._shard_index_cache[cache_key] = index
+        return index
+
     def _tensor_specs(self, plan: MdpBatchPlan, *, pixels: bool) -> dict:
+        """Buffer sizing per transported key.
+
+        PIXEL is keyed by ``(item, shard_id)`` and sized by that shard's rows,
+        ``payload_rows // encoder_cp``: one payload shard per producing rank,
+        regardless of how many decoder endpoints the item's rows reach. This is
+        the single place PIXEL sizing is derived; ``build_ledger`` reads it, so
+        the shard axis and the sizing cannot disagree.
+        EMBEDDING/GRADIENT are keyed by ``(item, slice_id)`` and sized by that
+        slice's rows, which sum to the item's ``output_rows``.
+        """
         specs = {}
         for route in plan.routes:
             segment = plan.segment_for_item(route.global_item_id)
-            valid = segment.payload_rows if pixels else segment.output_rows
-            width = self.adapter.payload_width if pixels else self.hidden_size
-            specs[BridgeBufferKey(route.global_item_id)] = BridgeTensorSpec(
+            if pixels:
+                if route.slice_id != 0:
+                    continue
+                valid = self._shard_rows_of(segment.payload_rows)
+                for shard_id in range(self._encoder_cp):
+                    key = BridgeBufferKey(route.global_item_id, 0, shard_id)
+                    specs[key] = BridgeTensorSpec(
+                        valid_rows=valid,
+                        capacity_rows=plan.capacity_policy.capacity_of(valid),
+                        width=self.adapter.payload_width,
+                        dtype=self.params_dtype,
+                        device=self.device,
+                    )
+                continue
+            key = BridgeBufferKey(route.global_item_id, route.slice_id)
+            valid = route.item_rows
+            specs[key] = BridgeTensorSpec(
                 valid_rows=valid,
                 capacity_rows=plan.capacity_policy.capacity_of(valid),
-                width=width,
+                width=self.hidden_size,
                 dtype=self.params_dtype,
                 device=self.device,
             )

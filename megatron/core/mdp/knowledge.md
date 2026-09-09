@@ -51,6 +51,12 @@ EMBEDDING: encoder producer -> decoder endpoint
 GRADIENT:  decoder endpoint -> encoder producer
 ```
 
+A *decoder endpoint* is a rank that runs `pre_process` and therefore consumes
+vision rows: every pipeline-stage-0 rank of the planning group. At CP=1 that is
+one rank; at CP>1 it is `cp` ranks, one per `cp_rank`. Do not confuse it with the
+*descriptor source*, which is always exactly one rank (`group[0]`) because it
+assigns `global_item_id` values and broadcasts the records.
+
 Local routes are copied directly; remote routes are packed into collective
 buffers. Every planning-group member enters every collective, including ranks
 with zero-length splits.
@@ -167,6 +173,9 @@ The collator builds normal decoder tensors plus an MDP vision sidecar:
 - `vision_item_meta`: per-item sample, ordinal, `(t,h,w)`, and payload start;
 - `vision_decoder_positions`: absolute image-token positions in the decoder's
   packed physical layout;
+- `vision_item_meta` also carries each item's enclosing sample span
+  (`sample_padded_start`, `sample_padded_len`) so the decoder-CP owner of every
+  row is derivable in integer host arithmetic without touching the device;
 - `pixel_values`: present only on the owner worker for that microbatch;
 - `image_grid_thw`: present on all workers and used to derive item shapes;
 - `flops_cu_seqlens`: present only under `--thd-static-packing`; the
@@ -230,6 +239,162 @@ pending training window. Any change to captured tensor ownership must update the
 The collator also uses a pinned single-buffer path, and bridge receives can land
 directly in final consumer views. Preserve those destination-view contracts
 when changing payload shapes.
+
+## Decoder context parallelism
+
+At CP>1 the decoder shards its packed sequence with TransformerEngine's
+per-sample zigzag: a sample's padded length `L` is cut into `2*cp` chunks of
+`C = L // (2*cp)`, and `cp_rank r` takes chunk `r` followed by chunk
+`2*cp-1-r`. The collator already pads every sample to a multiple of `2*cp`
+(`pack_or_pad_batch`'s `divisible_by`, mirrored by `thd_row_alignment`).
+
+A vision item owns a contiguous run of decoder positions, so chunk boundaries
+cut that run into per-rank runs. `megatron/core/mdp/cp_partition.py` is the
+integer inverse of TE's `thd_get_partitioned_indices` and produces the coarsest
+legal decomposition:
+
+- at most `2*cp - 1` runs per item (the `cp-1`/`cp` chunk pair is adjacent,
+  same-rank and locally contiguous, so it fuses);
+- at most **2** runs of one item on one rank (chunks `r` and `2*cp-1-r`) — this
+  is why the routed unit is a slice with a `slice_id`, not an item;
+- at `cp=1` the identity, so the CP=1 plan is bit-identical to the pre-CP one.
+
+Consequences that are easy to get wrong:
+
+- **Nothing is replicated and nothing is reduced.** Each vision row lands on
+  exactly one endpoint, so its gradient exists on exactly one rank and the
+  bridge's `copy_` stays correct. An accumulate mode would be wrong, and no
+  CP-scoped process group is needed: slices ride the existing planning-group
+  `all_to_all_single`.
+- **PIXEL is per item, not per slice.** Pixels are CP-invariant; routing them
+  per slice multiplies pixel traffic by up to `2*cp-1`.
+- **An endpoint with zero rows for a vision-bearing microbatch is normal.**
+  Roughly 5% of `(microbatch, cp_rank)` pairs are empty in the mock workload.
+  No leaf is created for an empty shard, and `mdp_forward_step` decides whether
+  to expect one from the plan, never from the microbatch-global `text_only`.
+- **The scatter moves after the CP split.** The native path scatters the full
+  vision output into the full sequence and then splits; an MDP endpoint holds
+  only its own rows, so it splits first and scatters into the rank-local stream
+  using the rank-local image-token mask. `masked_scatter` is pure data movement,
+  so the reordering is bitwise neutral, and the leaf's rows are ordered by
+  rank-local position, which is the order that mask enumerates.
+- **The split is in the plan digest**, along with `cp_size`. Each member derives
+  its slice table locally, so a divergence would otherwise produce identical
+  digests and then a mismatched `all_to_all_single`.
+- `install_mdp_process_groups` cross-checks the derived `(cp_rank, pp_rank)`
+  against live MPU state once per job, because a rank map that is
+  self-consistent but names the wrong physical ranks fails as a hang.
+
+`cp_partition_mode` must be `zigzag`. Under `contiguous` the decoder would slice
+its sequence differently from the plan and every embedding would land on the
+wrong rank with no shape error.
+
+## Encoder context parallelism
+
+`--mdp-encoder-cp e` makes one **logical worker** span `e` physical ranks, so a
+single vision chunk is encoded collaboratively. It is a different axis from
+decoder CP and several of that feature's rules **invert**:
+
+| | decoder CP | encoder CP |
+|---|---|---|
+| what is split | the decoder's packed text sequence | the encoder's packed vision sequence |
+| split by | destination (which endpoint holds a row) | source (which rank computes a row) |
+| effect on workers | `num_workers_per_group = cp*pp/e` grows | it *shrinks*; producer ids change, so the plan CONTENT changes |
+| PIXEL phase | per item, CP-invariant | per (item, encoder shard): rank `r` of the producing worker receives only `shard_rows(frames, e, r)` of the item, keyed `BridgeBufferKey(item, 0, shard_id=r)` |
+| gradient reduction | none needed; each row lives on one rank | still none, but only because exactly one rank per worker is the GRADIENT destination |
+
+Geometry, pinned:
+
+- each frame of the chunk (`h*w` rows, one sub-sequence per temporal frame) is
+  **zigzag**-sharded across the worker's `e` ranks, matching TE's own chunking;
+  contiguous is not an option because TE implements only zigzag.
+- the transformer-block output is **all-gathered and un-zigzagged inside the
+  encoder, before the patch merger**, so `adapter.encode`'s return contract is
+  byte-identical to `e=1` and the plan, routes and bridge layouts are untouched.
+  This is not a convenience: `Qwen35VLPatchMerger` folds
+  `merge**2 = 4` *consecutive* rows, so a rank-local merger needs
+  `h*w % (8*e) == 0`; 28 of the 137 frames in the shipped mock pool violate that
+  at `e=2`, and `view(-1, merge_dim)` **succeeds anyway**, silently merging
+  patches from different 2x2 spatial blocks. Gathering first reduces the
+  requirement to `h*w % (2*e) == 0`, which every frame satisfies at `e=2`
+  because `h` and `w` are always multiples of the merge size.
+- the gather is an autograd-aware op; its backward is the reduce-scatter that
+  re-partitions the incoming gradient.
+
+Non-negotiable invariants specific to this feature:
+
+- **`pgs.dp_cp`, `pgs.intra_dp_cp` and `pgs.intra_dist_opt` stay WORLD.** Only
+  the inert `pgs.dp` may narrow. `setup_process_groups_for_ddp` overwrites
+  `intra_dp_cp := dp_cp` at one optimizer instance, so `dp_cp` alone is both the
+  SUM-reduce group and the ZeRO-1 shard count; shrinking it drops the cross-CP
+  partial sum and the encoder silently trains on `1/e` of its own gradient.
+- **Exactly one rank per worker is the EMBEDDING source and the GRADIENT
+  destination.** `finalize_encoder_grads` is an undefended WORLD SUM with
+  prescale 1: delivering a row's gradient to more than one of the worker's ranks
+  multiplies the encoder gradient by exactly `e`, stays finite, trips no check,
+  and is absorbed by the composite optimizer's shared-norm clipping. It presents
+  as a converging run with a wrong effective learning rate.
+- The non-designated ranks must have their gradient regroup buffers **explicitly
+  zeroed**; `DirectBufferAllocator.acquire` returns `torch.empty`, and those
+  ranks have no `dest_view` to fill it.
+- The encoder must attend over **its own** CP group. The adapter used to
+  `del pg_collection`, which made attention fall back to the MPU's *decoder* CP
+  group. At `e == cp` the two rank sets numerically coincide, so that bug is
+  invisible at `world=16/pp=2/cp=2/e=2` — test any new plumbing at a topology
+  where they differ.
+- TE aborts for `qkv_format="thd"` with CP unless `cu_seqlens_*_padded` is
+  supplied. The vision pack has no padding, so the **same tensor object** is
+  passed as the padded variant; TE special-cases that identity and keeps
+  `pad_between_seqs=False`, preserving FlashAttention eligibility.
+
+**PIXEL is delivered per shard.** `patch_embed` is per patch row
+(`pixel_values` is already `[rows, 3*T*P*P]`), so sending rank `r` exactly the
+rows it will encode is exact, not an approximation. The owner builds one
+`index_select` per shard (one extra copy of the item in total, replacing `e`
+whole-item sends); each producing rank allocates `1/e` of the chunk payload and
+receives its shards at `payload_row_start/e`; the adapter calls the encoder
+with `pixels_are_sharded=True`, which skips the encoder's own slice and instead
+asserts the delivered row count equals `shard_rows(...)` for this rank. Every
+frame is divisible by `2*e` (plan-time check), so every item and every prefix
+divides exactly; a remainder is an error, never rounded.
+
+Invariant: **the PIXEL key's shard axis and the per-shard sizing come from one
+place** (`runtime._tensor_specs`), and `build_ledger` only reads it. Splitting
+the key without splitting the spec would hand every rank the item's FIRST rows
+at full size with matching sizes on both ends of the wire -- a silently wrong
+loss. `test_pixel_shard_routing.py` checks the ledger row-for-row against
+`shard_rows` and that a per-item spec is refused for per-shard keys.
+
+Measured cost of encoder CP (oci-hsg GB200, `qwen35_vl_mdp_light`, uniform
+2048-token samples, 20 iters, 2026-09-02, **before** per-shard delivery):
+peak memory +15-31% and vision encoder +52% wall time at `e=2`. The time is
+the ring attention's per-layer P2P exchange, which the vision pack's short
+per-frame sub-sequences cannot amortise (NVTX attributes 101% of the delta to
+`AttnFuncWithCPAndKVP2P`, MLP unchanged); per-shard delivery does not touch
+it. **The memory is the same thing, measured.** Same-commit arms with per-shard
+delivery in place leave the peak where it was -- e=1 18,701 MB, e=2 21,459 MB
+(cp=1) and 21,242 MB (cp=2), against 18,707 / 21,502 / 21,282 with whole-item
+fan-out -- so the earlier attribution to fan-out and full-chunk `patch_embed`
+was wrong. CUDA allocator snapshots of rank 7 (`record_memory_history`,
+`mem-profile peak summary/diff`) show the e=2 peak is set by **TE's
+context-parallel fused-attention backward workspace**: at e=1 the vision
+attention's `fused_attn_bwd` (`backends.py:1798:backward`) allocates a
+transient 4.56 GB workspace per layer; at e=2 the same call is reached through
+`context_parallel.py:1253:cp_p2p_bwd_fused_attn` (`AttnFuncWithCPAndKVP2P.
+backward`) and allocates **9.13 GB** -- 2x, because the worker's vision
+sequence doubles when `num_workers_per_group` halves and the CP backward sizes
+its workspace by the full sequence, not the local shard. Activations meanwhile
+DROP (11.0 -> 4.1 GB at the peak moment), which is the sharding doing its job;
+the workspace eats the saving and then some. So encoder CP's time and memory
+costs have one cause -- TE's ring attention on the encoder -- and nothing in
+MDP's own data path moves either. Encoder CP still exists for long vision
+sequences and single items too large for one rank, not as a general speed-up.
+
+Current scope: `encoder_cp in (1, 2)`, `cp_comm_type="p2p"`, and either `e | cp`
+or `cp | e` so a worker's rank block is uniform. `e >= 4` additionally requires
+every frame to satisfy `h*w % (2*e) == 0`, which real grids violate
+data-dependently (14 of 137 mock frames at `e=4`), and the vision encoder has no
+frame-padding path to fix it — that is separate, explicitly scoped work.
 
 ## Optimizer and checkpoint semantics
 
@@ -357,7 +522,7 @@ adds a non-causal decoder spec owns dropping the flag (or padding every sample).
 Primary flags:
 
 - `--mdp-enable`
-- `--mdp-encoder-cp` (currently must be 1)
+- `--mdp-encoder-cp` (1 or 2)
 - `--mdp-encoder-max-payload-rows`
 - `--encoder-recompute-granularity selective|full|whole`
 - `--encoder-recompute-method uniform|block`
@@ -485,8 +650,8 @@ Current major constraints:
 
 - Qwen3.5-VL adapter;
 - TP=1;
-- decoder CP=1;
-- encoder CP=1;
+- decoder CP>=1 with `cp_partition_mode=zigzag` (`contiguous` is rejected);
+- encoder CP in {1, 2} (`--mdp-encoder-cp`), zigzag, gathered before the merger;
 - distributed optimizer enabled;
 - per-token loss enabled;
 - bf16/fp16 mixed precision;
@@ -533,6 +698,8 @@ python -m pytest -q \
   tests/unit_tests/mdp/test_rank_mapping.py \
   tests/unit_tests/mdp/test_plan.py \
   tests/unit_tests/mdp/test_planner.py \
+  tests/unit_tests/mdp/test_planner_cp.py \
+  tests/unit_tests/mdp/test_cp_partition.py \
   tests/unit_tests/mdp/test_window.py \
   tests/unit_tests/mdp/test_quantized_alignment.py \
   tests/unit_tests/mdp/test_pinned_collate.py

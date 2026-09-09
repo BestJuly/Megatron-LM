@@ -29,8 +29,18 @@ class CapturedVisionItem:
     ``payload_row_start/payload_rows`` index rows of the microbatch's
     ``flat_pixel_payload``. ``decoder_positions`` are absolute token offsets in the
     current decoder microbatch THD ``[1, T_dec]`` (following the physical layout in
-    ``cu_seqlens_q_padded`` when alignment padding exists); they stay endpoint-local
-    and never enter descriptors, routes, or the plan.
+    ``cu_seqlens_q_padded`` when alignment padding exists); the per-row tuple stays
+    endpoint-local and never enters descriptors, routes, or the plan — only the
+    derived span below does.
+
+    ``sample_padded_start/sample_padded_len`` are the enclosing sample's span in
+    ``cu_seqlens_q_padded``. Unlike ``decoder_positions`` these DO enter the
+    descriptor, because the decoder-CP owner of a row is a function of the row's
+    offset inside its sample and that sample's padded length, and every planning
+    group member must derive the same split from the broadcast records alone
+    (see :mod:`megatron.core.mdp.cp_partition`). One item's slots are contiguous,
+    so its start offset plus ``output_rows`` is the whole span — the per-row
+    ``decoder_positions`` tuple stays out of the wire format.
     """
 
     sample_id: int
@@ -39,6 +49,8 @@ class CapturedVisionItem:
     payload_row_start: int
     payload_rows: int
     decoder_positions: tuple
+    sample_padded_start: int = 0
+    sample_padded_len: int = 0
 
 
 @dataclass(frozen=True)
@@ -71,6 +83,14 @@ class VisionDescriptor:
 
     ``owner_worker_id`` is the logical worker holding this item's pixels at
     dispatch time: ``microbatch_id % num_workers``.
+
+    ``sample_padded_start``, ``sample_padded_len`` and ``decoder_offset_in_sample``
+    locate the item's contiguous run of decoder rows inside its packed sample.
+    They are the only position data on the wire, and they are here because the
+    decoder-CP row owner is a function of exactly these three integers plus
+    ``output_rows`` (:mod:`megatron.core.mdp.cp_partition`); every planning-group
+    member must reach the same split from the broadcast records alone. At CP=1
+    they are inert: the split is the identity.
     """
 
     global_item_id: int
@@ -83,6 +103,9 @@ class VisionDescriptor:
     output_rows: int
     grid_thw: tuple
     owner_worker_id: int
+    sample_padded_start: int = 0
+    sample_padded_len: int = 0
+    decoder_offset_in_sample: int = 0
 
 
 class MdpModelAdapter(Protocol):
@@ -109,6 +132,13 @@ class MdpModelAdapter(Protocol):
         self, encoder: "Module", payload: "Tensor", layout: "EncoderThdLayout"
     ) -> "Tensor":
         """Run encoder forward on one already-rebased chunk sub-layout.
+
+        Under ``--mdp-encoder-cp e > 1`` ``payload`` holds only THIS rank's
+        zigzag shard of the chunk -- ``1/e`` of the patch rows, frame by frame
+        in chunk order, exactly ``shard_rows(frame_lengths(layout.segments), e,
+        my_encoder_cp_rank)`` -- while ``layout`` still describes the whole
+        chunk. The encoder must consume it as pre-sharded input and not shard
+        again.
 
         The adapter reads the ordered ``grid_thw`` from ``layout.segments`` and
         constructs a vision-only ``PackedSeqParams(qkv_format="thd")``; it must

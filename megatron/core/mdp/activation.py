@@ -180,6 +180,13 @@ class EncoderWholeRecomputeHandle:
     chunk_layouts: tuple[EncoderThdLayout, ...]
     output_metadata: tuple[EncoderOutputMetadata, ...]
     chunk_rng_states: tuple[tuple, ...]
+    #: Encoder-CP width of the worker that produced these payloads. Under
+    #: ``--mdp-encoder-cp e`` each rank retains only its own zigzag shard of the
+    #: chunk, so the payload holds ``total_payload_rows / e`` rows while the
+    #: layout keeps describing the whole chunk. The output rows are NOT divided:
+    #: the encoder all-gathers before the patch merger, so replay returns the
+    #: full chunk output on every rank.
+    encoder_cp: int = 1
 
     def __post_init__(self) -> None:
         lengths = {
@@ -196,11 +203,18 @@ class EncoderWholeRecomputeHandle:
         for index, (payload, layout, metadata) in enumerate(
             zip(self.chunk_payloads, self.chunk_layouts, self.output_metadata)
         ):
-            if payload.shape[0] != layout.total_payload_rows:
+            if layout.total_payload_rows % self.encoder_cp:
+                raise MdpStateError(
+                    f"MDP: whole-recompute chunk {index} violates: "
+                    f"layout.total_payload_rows ({layout.total_payload_rows}) must "
+                    f"divide by encoder_cp ({self.encoder_cp})."
+                )
+            expected_payload_rows = layout.total_payload_rows // self.encoder_cp
+            if payload.shape[0] != expected_payload_rows:
                 raise MdpStateError(
                     f"MDP: whole-recompute chunk {index} violates: payload rows == "
-                    f"layout.total_payload_rows ({payload.shape[0]} != "
-                    f"{layout.total_payload_rows})."
+                    f"layout.total_payload_rows / encoder_cp ({payload.shape[0]} != "
+                    f"{expected_payload_rows})."
                 )
             if metadata.shape[0] != layout.total_output_rows:
                 raise MdpStateError(

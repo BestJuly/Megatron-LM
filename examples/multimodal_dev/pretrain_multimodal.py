@@ -44,6 +44,30 @@ from megatron.training import get_args, pretrain
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 
+_MEMORY_HISTORY_STARTED = False
+
+
+def _maybe_start_memory_history(args) -> None:
+    """Honour ``--record-memory-history`` on this legacy (argparse) entry point.
+
+    ``megatron.training.training`` starts the CUDA allocator trace only on the
+    config-container build path; ``pretrain_gpt.py``-style entry points never
+    call it, so ``--record-memory-history`` here dumped snapshots whose
+    ``device_traces`` were all empty (15 KB pickles, nothing for
+    ``mem-profile peak`` to replay). The vendor helper only needs the three
+    fields it reads -- ``record_memory_history``, ``profile_ranks``,
+    ``memory_snapshot_path`` -- and ``args`` carries exactly those, so reuse it
+    rather than re-implement the OOM observer. Idempotent: the provider runs
+    once per virtual-pipeline stage.
+    """
+    global _MEMORY_HISTORY_STARTED
+    if _MEMORY_HISTORY_STARTED or not getattr(args, "record_memory_history", False):
+        return
+    from megatron.training.utils import start_memory_history_recording
+
+    start_memory_history_recording(args)
+    _MEMORY_HISTORY_STARTED = True
+
 
 def model_provider(
     pre_process: bool = True,
@@ -58,6 +82,7 @@ def model_provider(
     registry factory functions.
     """
     args = get_args()
+    _maybe_start_memory_history(args)
     model_arch = getattr(args, "model_arch", "qwen35_vl")
 
     from examples.multimodal_dev.models import MODEL_REGISTRY

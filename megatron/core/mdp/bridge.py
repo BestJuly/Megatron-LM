@@ -36,11 +36,22 @@ class BridgePhase(Enum):
 
 @dataclass(frozen=True)
 class BridgeBufferKey:
-    """Identifies one transported buffer. ``slice_id`` is always 0 in v1 and
-    distinguishes multiple slices of one item once decoder CP lands."""
+    """Identifies one transported buffer.
+
+    ``slice_id`` distinguishes the per-endpoint runs a vision item's decoder
+    rows break into under decoder context parallelism. It is 0 for every buffer
+    at CP=1 and always 0 in the PIXEL phase.
+
+    ``shard_id`` distinguishes the per-rank zigzag shards of a vision item's
+    PIXEL payload under encoder context parallelism: rank ``r`` of the producing
+    worker receives only the patch rows it will encode. It is 0 at
+    ``encoder_cp=1`` and always 0 for EMBEDDING/GRADIENT, whose rows are owned
+    by the worker lead after the encoder's pre-merger gather.
+    """
 
     global_item_id: int
     slice_id: int = 0
+    shard_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -94,12 +105,28 @@ class BridgePhaseStats:
     small_message_count: int
 
 
+def _worker_lead(worker_ranks: tuple) -> int:
+    """The one rank of a logical worker that talks to the endpoint.
+
+    Index 0 by definition. The rule only has to be deterministic and identical
+    on every rank -- ``worker_ranks`` is a pure function of the rank map, so it
+    is.
+    """
+    if not worker_ranks:
+        raise MdpBridgeError(
+            "MDP: worker resolves to zero ranks violates: every logical worker "
+            "has at least one physical rank."
+        )
+    return worker_ranks[0]
+
+
 def _entry_sort_key(entry: BridgeLedgerEntry):
     return (
         entry.src_global_rank,
         entry.dst_global_rank,
         entry.key.global_item_id,
         entry.key.slice_id,
+        entry.key.shard_id,
         entry.plan_offset,
     )
 
@@ -127,51 +154,69 @@ class ModalityBridge:
         never a linear scan).
         """
         entries = []
-        for route in plan.routes:
+        # Pixels belong to the item, not to a decoder-CP slice of it: an item
+        # split across endpoints still has exactly one pixel payload and one
+        # owner. Routing per slice here would post the same payload cp times.
+        routes = (
+            tuple(route for route in plan.routes if route.slice_id == 0)
+            if phase is BridgePhase.PIXEL
+            else plan.routes
+        )
+        for route in routes:
             producer_ranks = rank_map.worker_ranks(plan.outer_dp_rank, route.producer_worker_id)
-            if len(producer_ranks) != 1:
-                raise MdpBridgeError(
-                    f"MDP: producer_worker_id={route.producer_worker_id} resolves to "
-                    f"{len(producer_ranks)} ranks; the encoder-CP physical expansion is "
-                    "not implemented in this version."
-                )
-            producer_rank = producer_ranks[0]
+            # Under encoder CP a logical worker is `encoder_cp` physical ranks.
+            # EMBEDDING and GRADIENT use exactly ONE of them, and they use the
+            # SAME one so the two phases cannot drift apart: after the encoder's
+            # pre-merger gather every rank of the worker holds an identical
+            # chunk output, so sending from more than one is pure duplication --
+            # and naming more than one as the GRADIENT destination would make
+            # finalize_encoder_grads' undefended WORLD SUM exactly encoder_cp
+            # times too large, finite and unchecked.
+            producer_rank = _worker_lead(producer_ranks)
+            # (key, src, dst) triples for this route.
             if phase is BridgePhase.EMBEDDING:
-                src, dst = producer_rank, route.endpoint_rank
-            elif phase is BridgePhase.PIXEL:
+                key = BridgeBufferKey(route.global_item_id, route.slice_id)
+                transfers = ((key, producer_rank, route.endpoint_rank),)
+            elif phase is BridgePhase.GRADIENT:
+                # The literal reversal of the EMBEDDING edge.
+                key = BridgeBufferKey(route.global_item_id, route.slice_id)
+                transfers = ((key, route.endpoint_rank, producer_rank),)
+            else:
+                # PIXEL flows owner -> each rank of the producing worker, and
+                # each rank receives ONLY the zigzag shard it will encode:
+                # key (item, shard_id=r) for producer_ranks[r]. The shard's row
+                # count comes from the same tensor_specs the runtime built, so
+                # the key axis and the sizing cannot drift apart -- splitting
+                # the key without splitting the spec would hand every rank the
+                # item's FIRST rows at full size, silently.
                 owner_ranks = rank_map.worker_ranks(
                     plan.outer_dp_rank, route.owner_worker_id
                 )
-                if len(owner_ranks) != 1:
+                owner_rank = _worker_lead(owner_ranks)
+                transfers = tuple(
+                    (BridgeBufferKey(route.global_item_id, 0, shard_id), owner_rank, rank)
+                    for shard_id, rank in enumerate(producer_ranks)
+                )
+            for key, src, dst in transfers:
+                spec = tensor_specs.get(key)
+                if spec is None:
                     raise MdpBridgeError(
-                        f"MDP: owner_worker_id={route.owner_worker_id} resolves to "
-                        f"{len(owner_ranks)} ranks; the encoder-CP physical "
-                        "expansion is not implemented in this version."
+                        f"MDP: key {key} violates: every routed item has a tensor spec."
                     )
-                owner_rank = owner_ranks[0]
-                src, dst = owner_rank, producer_rank
-            else:  # GRADIENT flows owner endpoint -> producer
-                src, dst = route.endpoint_rank, producer_rank
-            key = BridgeBufferKey(global_item_id=route.global_item_id)
-            spec = tensor_specs.get(key)
-            if spec is None:
-                raise MdpBridgeError(
-                    f"MDP: key {key} violates: every routed item has a tensor spec."
+                element_count = spec.valid_rows * max(1, spec.width)
+                if element_count == 0:
+                    continue  # empty edges are omitted
+                entries.append(
+                    BridgeLedgerEntry(
+                        phase=phase,
+                        src_global_rank=src,
+                        dst_global_rank=dst,
+                        dtype=spec.dtype,
+                        element_count=element_count,
+                        plan_offset=0,  # assigned below in canonical order
+                        key=key,
+                    )
                 )
-            element_count = spec.valid_rows * max(1, spec.width)
-            if element_count == 0:
-                continue  # empty edges are omitted
-            entries.append(
-                BridgeLedgerEntry(
-                    phase=phase,
-                    src_global_rank=src,
-                    dst_global_rank=dst,
-                    dtype=spec.dtype,
-                    element_count=element_count,
-                    plan_offset=0,  # assigned below in canonical order
-                    key=key,
-                )
-            )
 
         entries.sort(key=_entry_sort_key)
         # Assign each entry its element offset inside the coalesced (src, dst)
@@ -376,6 +421,17 @@ class ModalityBridge:
                 f"MDP: key {entry.key} violates: one received buffer per key."
             )
         dest = dest_views.get(entry.key) if dest_views is not None else None
+        if dest is None and dest_views is not None:
+            # Partial coverage is always a bug: the runtime derives its
+            # destination views from the same plan the ledger came from, so a
+            # missing key means the two disagree. Falling through to the
+            # allocator below would land the payload in a buffer nobody reads —
+            # a silent data loss, which is exactly the shape a decoder-CP
+            # slicing mistake takes.
+            raise MdpBridgeError(
+                f"MDP: key {entry.key} violates: when destination views are "
+                "supplied they cover every entry this rank receives."
+            )
         if dest is not None:
             if dest.numel() != entry.element_count:
                 raise MdpBridgeError(
