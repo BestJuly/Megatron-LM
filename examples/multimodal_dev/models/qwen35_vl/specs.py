@@ -166,6 +166,10 @@ def get_qwen35_vl_language_spec(
 # allocation peak. FlashAttention is not an escape hatch -- at head_dim 72 it
 # fails outright with "ICE IR Verification Failed".
 #
+# Pad to 128 rather than the smaller 80: with this workload cuDNN 9.25 selects
+# the specialized compute_dot_do_o_ragged kernel at 128, while 80 falls back to
+# a generic backward kernel whose launch geometry and runtime are pathological.
+#
 # This is an EMPIRICAL table, not an exhaustive one: only 64/72/80/96/128/144
 # were measured, and 72 was the sole outlier. Revisit when TE or cuDNN moves.
 #
@@ -176,7 +180,7 @@ def get_qwen35_vl_language_spec(
 # forward + backward, and read torch.cuda.max_memory_allocated(). Sweeping
 # head_dim over 64/72/80/96/128 reproduces the table above; even a uniform
 # 60x1024 pack is enough to trigger it, so no captured data is required.
-_PADDED_ATTENTION_HEAD_DIMS = {72: 80}
+_PADDED_ATTENTION_HEAD_DIMS = {72: 128}
 
 
 class PaddedHeadDimDotProductAttention(TEDotProductAttention):
@@ -235,8 +239,9 @@ def get_qwen35_vl_vision_spec() -> ModuleSpec:
     """
     spec = get_vit_layer_with_transformer_engine_spec()
     spec.submodules.self_attention.module = Qwen35VLVisionSelfAttention
-    # Works around an oversized cuDNN THD backward workspace at head_dim 72;
-    # inert for every other head_dim. See _PADDED_ATTENTION_HEAD_DIMS.
+    # Works around an oversized cuDNN THD backward workspace at head_dim 72 and
+    # selects a specialized cuDNN backward kernel; inert for every other
+    # head_dim. See _PADDED_ATTENTION_HEAD_DIMS.
     spec.submodules.self_attention.submodules.core_attention = (
         PaddedHeadDimDotProductAttention
     )
