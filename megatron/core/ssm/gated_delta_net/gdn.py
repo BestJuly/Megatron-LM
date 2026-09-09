@@ -30,6 +30,12 @@ from megatron.core.ssm.gated_delta_net.common import (
 )
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
 
+te_checkpoint = None
+try:
+    from megatron.core.extensions.transformer_engine import te_checkpoint
+except ImportError:
+    pass
+
 
 class GatedDeltaNet(_GDNBase):
     """Gated DeltaNet with a head-wise scalar memory-decay gate."""
@@ -275,7 +281,32 @@ class GatedDeltaNet(_GDNBase):
                     chunkwise_cp_context,
                 )
 
-            out, out_bias = tensor_parallel.checkpoint(_checkpointed_compute, False, hidden_states)
+            # Mirror TransformerBlock.checkpoint_handler: under an fp8/fp4 recipe the
+            # recompute has to run inside the quantization autocast, so it needs TE's
+            # checkpoint rather than tensor_parallel's.
+            #
+            # tensor_parallel.checkpoint (CheckpointFunction) restores RNG state but
+            # not the fp8 autocast state, so the recompute forward runs with
+            # FP8GlobalStateManager.is_fp8_enabled() == False. With fp8_param_gather
+            # the weights are QuantizedTensors, and TE's Linear._get_weight_tensors
+            # then takes its "quantized weights without quantized compute" branch and
+            # hands the GEMM a dequantized plain tensor. That tensor has no
+            # .main_grad, so _linear_setup_ctx's `lambda: weight.main_grad` raises
+            # AttributeError in backward. Running the replay under the same
+            # quantization state as the original forward is also what makes the
+            # recompute numerically equivalent to it.
+            if (self.config.fp8 or self.config.fp4) and te_checkpoint is not None:
+                out, out_bias = te_checkpoint(
+                    _checkpointed_compute,
+                    False,
+                    tensor_parallel.random.get_cuda_rng_tracker,
+                    self.pg_collection.tp,
+                    hidden_states,
+                )
+            else:
+                out, out_bias = tensor_parallel.checkpoint(
+                    _checkpointed_compute, False, hidden_states
+                )
         else:
             out, out_bias = self._forward_compute(
                 hidden_states,
