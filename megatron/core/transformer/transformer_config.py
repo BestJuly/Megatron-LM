@@ -3643,9 +3643,13 @@ class TransformerConfig(ModelParallelConfig):
             and (not self.cuda_graph_modules or CudaGraphModule.attn in self.cuda_graph_modules)
         )
 
+        # Only a real layout edge is unsupported. GDN-family models convert when the
+        # linear layers run chunkwise CP (they need the contiguous layout) or when the
+        # block-level layout is not the zigzag one the softmax-attention layers ask for.
+        # headwise linear CP on a zigzag block layout has no conversion edge at all.
         cp_layout_conversion_required = is_gated_delta_net_variant(
             self.experimental_attention_variant
-        )
+        ) and (self.cp_partition_mode != "zigzag" or self.linear_cp_mode == "chunkwise")
         if (
             (self.context_parallel_size > 1 or self.dynamic_context_parallel)
             and self.sequence_packing_scheduler is not None

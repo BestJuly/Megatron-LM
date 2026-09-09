@@ -2041,11 +2041,17 @@ class TECudaGraphHelper:
                     rotary_seq_len = transformer_module.rotary_pos_emb.get_rotary_seq_len(
                         None, transformer_module.decoder, transformer_input, self.config, None
                     )
-                    if rotary_seq_len not in rotary_pos_emb_cache:
-                        rotary_pos_emb_cache[rotary_seq_len] = transformer_module.rotary_pos_emb(
-                            rotary_seq_len
+                    # THD packed sequences keep the full (un-CP-sliced) rotary table:
+                    # GPTModel.forward passes packed_seq=True there, so the captured
+                    # static input must be built the same way or replay sees a table
+                    # cp_size times longer than the captured one.
+                    packed_seq = hasattr(layer, "_is_thd_cuda_graph") and layer._is_thd_cuda_graph()
+                    cache_key = (rotary_seq_len, packed_seq)
+                    if cache_key not in rotary_pos_emb_cache:
+                        rotary_pos_emb_cache[cache_key] = transformer_module.rotary_pos_emb(
+                            rotary_seq_len, packed_seq=packed_seq
                         )
-                    return rotary_pos_emb_cache[rotary_seq_len]
+                    return rotary_pos_emb_cache[cache_key]
                 else:
                     return None
 
