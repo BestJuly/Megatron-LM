@@ -147,6 +147,11 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
         bf16=bool(args.bf16),
         fsdp_enabled=fsdp,
         fp8_enabled=getattr(args, "fp8", None) is not None,
+        fp8_recipe=getattr(args, "fp8_recipe", None),
+        fp8_param_gather=bool(getattr(args, "fp8_param_gather", False)),
+        reuse_grad_buf_for_mxfp8_param_ag=bool(
+            getattr(args, "reuse_grad_buf_for_mxfp8_param_ag", False)
+        ),
         cuda_graph_impl=cuda_graph_impl,
         activation_offload_enabled=offload,
         overlap_grad_reduce=getattr(args, "overlap_grad_reduce", False),

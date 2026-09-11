@@ -18,7 +18,13 @@ import pytest
 import torch
 
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.mdp.optimizer import MdpChainedOptimizer, build_mdp_composite_optimizer
+from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor
+from megatron.core.mdp.encoder import build_encoder_ddp_config
+from megatron.core.mdp.optimizer import (
+    MdpChainedOptimizer,
+    build_encoder_optimizer_config,
+    build_mdp_composite_optimizer,
+)
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.optimizer import ChainedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -107,10 +113,7 @@ def _member(config, optimizer_config, data_group, seed):
     )
     module = Float16Module(model_config, _Tiny(model_config, seed).cuda())
     ddp = DistributedDataParallel(
-        config=model_config,
-        ddp_config=config,
-        module=module,
-        pg_collection=_pgs(data_group),
+        config=model_config, ddp_config=config, module=module, pg_collection=_pgs(data_group)
     )
     optimizer = get_megatron_optimizer(
         config=optimizer_config,
@@ -123,9 +126,7 @@ def _member(config, optimizer_config, data_group, seed):
 
 def _build(composite_cls):
     ddp_config = DistributedDataParallelConfig(
-        use_distributed_optimizer=True,
-        overlap_grad_reduce=False,
-        overlap_param_gather=False,
+        use_distributed_optimizer=True, overlap_grad_reduce=False, overlap_param_gather=False
     )
     optimizer_config = OptimizerConfig(
         optimizer="adam",
@@ -228,8 +229,112 @@ def test_member_order_is_flat_dense_expert_encoder():
     _, _, composite = _build(MdpChainedOptimizer)
     assert isinstance(composite, MdpChainedOptimizer)
     assert len(composite.chained_optimizers) == 2
-    assert not any(
-        isinstance(member, ChainedOptimizer) for member in composite.chained_optimizers
-    )
+    assert not any(isinstance(member, ChainedOptimizer) for member in composite.chained_optimizers)
     # get_loss_scale asserts the members agree before returning member 0's.
     assert float(composite.get_loss_scale()) == 2.0**16
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_mxfp8_decoder_does_not_corrupt_bf16_encoder_updates(overlap):
+    """Exercise real MXFP8 storage; encoder updates must match independent BF16 Adam."""
+    import transformer_engine.pytorch as te
+
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("MXFP8 requires Blackwell")
+
+    decoder_config = OptimizerConfig(
+        optimizer="adam",
+        lr=1e-3,
+        clip_grad=0.0,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        use_distributed_optimizer=True,
+        use_precision_aware_optimizer=True,
+        fp8_recipe="mxfp8",
+        reuse_grad_buf_for_mxfp8_param_ag=True,
+        overlap_param_gather=overlap,
+        exp_avg_dtype=torch.bfloat16,
+        exp_avg_sq_dtype=torch.bfloat16,
+    )
+    decoder_ddp_config = DistributedDataParallelConfig(
+        use_distributed_optimizer=True,
+        grad_reduce_in_fp32=True,
+        fp8_param_gather=True,
+        reuse_grad_buf_for_mxfp8_param_ag=True,
+        overlap_grad_reduce=overlap,
+        overlap_param_gather=overlap,
+    )
+
+    class Linear(torch.nn.Module):
+        def __init__(self, fp8):
+            super().__init__()
+            self.config = TransformerConfig(
+                num_layers=1,
+                hidden_size=128,
+                num_attention_heads=1,
+                bf16=True,
+                params_dtype=torch.bfloat16,
+                calculate_per_token_loss=True,
+                fp8="e4m3" if fp8 else None,
+                fp8_recipe="mxfp8",
+                fp8_param=fp8,
+            )
+            torch.manual_seed(1234)
+            torch.cuda.manual_seed(1234)
+            with get_fp8_context(self.config, is_init=True):
+                self.proj = te.Linear(128, 128, bias=False, params_dtype=torch.bfloat16)
+
+        def forward(self, x):
+            with get_fp8_context(self.config):
+                return self.proj(x)
+
+    def build(fp8):
+        model = Linear(fp8).cuda()
+        config = decoder_config if fp8 else build_encoder_optimizer_config(decoder_config)
+        ddp_config = decoder_ddp_config if fp8 else build_encoder_ddp_config(decoder_ddp_config)
+        pgs = _pgs(_subgroup() if fp8 else torch.distributed.group.WORLD)
+        ddp = DistributedDataParallel(
+            config=model.config, ddp_config=ddp_config, module=model, pg_collection=pgs
+        )
+        optimizer = get_megatron_optimizer(
+            config, [ddp], pg_collection=pgs, use_gloo_process_groups=False
+        )
+        return ddp, optimizer
+
+    decoder, decoder_opt = build(True)
+    encoder, encoder_opt = build(False)
+    reference, reference_opt = build(False)
+    assert is_mxfp8tensor(decoder.module.proj.weight)
+    assert not is_mxfp8tensor(encoder.module.proj.weight)
+    assert encoder.module.proj.weight.dtype == torch.bfloat16
+    initial_encoder = encoder.module.proj.weight.detach().clone()
+    composite = build_mdp_composite_optimizer(decoder_opt, encoder_opt)
+    inputs = torch.full(
+        (128, 128), (torch.distributed.get_rank() + 1) / 128, device="cuda", dtype=torch.bfloat16
+    )
+    for iteration in range(3):
+        for ddp, opt in (
+            (decoder, decoder_opt),
+            (encoder, encoder_opt),
+            (reference, reference_opt),
+        ):
+            ddp.zero_grad_buffer()
+            opt.zero_grad()
+        if overlap:
+            decoder_opt.prepare_model_params_for_param_sync()
+        for ddp in (decoder, encoder, reference):
+            ddp(inputs).float().square().mean().backward()
+            ddp.finish_grad_sync()
+        success, norm, _ = composite.step()
+        reference_opt.step()
+        assert success and torch.isfinite(torch.tensor(norm))
+        torch.testing.assert_close(
+            encoder.module.proj.weight, reference.module.proj.weight, rtol=0, atol=0
+        )
+        replicas = [
+            torch.empty_like(initial_encoder) for _ in range(torch.distributed.get_world_size())
+        ]
+        torch.distributed.all_gather(replicas, encoder.module.proj.weight.detach())
+        assert all(torch.equal(replicas[0], replica) for replica in replicas[1:])
+    assert not torch.equal(initial_encoder, encoder.module.proj.weight)
+    composite.prepare_model_params_for_param_sync()

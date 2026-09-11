@@ -99,6 +99,9 @@ class MdpCompatibilityOptions:
     # max(micro_batch_size, eval_micro_batch_size): the largest number of samples
     # the collator can be handed in one microbatch without greedy packing.
     max_samples_per_microbatch: int = 1
+    fp8_recipe: Optional[str] = None
+    fp8_param_gather: bool = False
+    reuse_grad_buf_for_mxfp8_param_ag: bool = False
 
 
 def thd_row_alignment(options: "MdpCompatibilityOptions") -> int:
@@ -344,14 +347,22 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "MDP requires the standard DistributedDataParallel gradient-buffer path.",
             "False",
         )
-    if options.fp8_enabled:
+    if options.fp8_enabled and not (
+        options.bf16
+        and not options.fp16
+        and options.fp8_recipe == "mxfp8"
+        and options.fp8_param_gather
+        and options.reuse_grad_buf_for_mxfp8_param_ag
+        and not options.save_requested
+        and not options.load_requested
+    ):
         _reject(
             "fp8_enabled",
             options.fp8_enabled,
-            "FP8 disabled",
-            "FP8/MXFP8 gradient-buffer reuse is not validated with MDP; row-aligned "
-            "allocation is only a future-facing hook, not an FP8 recipe.",
-            "False",
+            "BF16 + decoder MXFP8 parameter gather and gradient-buffer reuse, without checkpoints",
+            "The encoder stays BF16. Other FP8 recipes and MXFP8 checkpoint resume "
+            "are not validated with MDP.",
+            "use the decoder MXFP8 benchmark recipe or disable FP8",
         )
     _validate_cuda_graph_options(config, options)
     if options.activation_offload_enabled:

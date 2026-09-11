@@ -3410,7 +3410,11 @@ def train_step(
             full_cg_captured = FullCudaGraphWrapper.cuda_graph.get("training") is not None
             if forward_pre_hook_enabled or full_cg_captured:
                 for optim_instance in optimizer.chained_optimizers:
-                    if isinstance(optim_instance, DistributedOptimizer):
+                    if (
+                        isinstance(optim_instance, DistributedOptimizer)
+                        and optim_instance.config.reuse_grad_buf_for_mxfp8_param_ag
+                        and optim_instance.config.overlap_param_gather
+                    ):
                         # Only this DistOpt sibling consumes masters in the MXFP8 param-buffer
                         # staging pass. The staging entry restores its own offloaded masters;
                         # do not perturb the LayerWise/Muon master lifecycle here.

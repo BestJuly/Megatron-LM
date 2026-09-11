@@ -76,7 +76,12 @@ remains outside that schedule. Per-layer ("partial") CUDA graphs
 `--thd-static-packing`; they live entirely inside P4's native schedule and are
 still rejected together with `--mdp-overlap-window-capture`.
 
-Rejected at startup: FSDP/HSDP, FP8/MXFP8, full-iteration CUDA graphs, CPU
+Experimental benchmark path: decoder MXFP8 with BF16 base precision,
+`fp8_param_gather` and `reuse_grad_buf_for_mxfp8_param_ag`. The encoder remains
+BF16 with separate synchronous DDP/optimizer settings; decoder buffer staging
+does not touch encoder buffers. MXFP8 checkpoint save/load is not enabled.
+
+Rejected at startup: FSDP/HSDP, other FP8 recipes, full-iteration CUDA graphs, CPU
 activation offload, delayed gradient reduction,
 `overlap_param_gather_with_optimizer_step`, multiple distributed-optimizer
 instances, `calculate_per_token_loss=False`, non-`torch_dist` checkpoint

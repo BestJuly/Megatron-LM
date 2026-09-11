@@ -53,6 +53,9 @@ def build_encoder_ddp_config(
         overlap_grad_reduce=False,
         overlap_param_gather=False,
         align_param_gather=False,
+        fp8_param_gather=False,
+        fp4_param_gather=False,
+        reuse_grad_buf_for_mxfp8_param_ag=False,
     )
 
 
@@ -136,6 +139,8 @@ def build_encoder_domain(
 
     effective_config = apply_encoder_recompute_config(model_config, mdp_config)
     validate_effective_vision_config(mdp_config, effective_config)
+    if getattr(effective_config, "fp8", None) or getattr(effective_config, "fp4", None):
+        raise MdpConfigurationError("MDP: encoder FP8/FP4 is not supported; keep the encoder BF16.")
     logger.info(
         "MDP: effective encoder recompute granularity: %s",
         mdp_config.encoder_recompute_granularity,
@@ -158,10 +163,11 @@ def build_encoder_domain(
     )
     assert_encoder_prescale_is_one(encoder_ddp)
 
+    from megatron.core.mdp.optimizer import build_encoder_optimizer_config
     from megatron.core.optimizer import get_megatron_optimizer
 
     encoder_optimizer = get_megatron_optimizer(
-        config=optimizer_config,
+        config=build_encoder_optimizer_config(optimizer_config),
         model_chunks=[encoder_ddp],
         pg_collection=encoder_pgs,
         # Megatron cannot derive matching Gloo groups for a caller-built

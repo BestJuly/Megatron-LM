@@ -57,6 +57,37 @@ def test_valid_configuration_passes():
     validate_mdp_config(MdpConfig(enable=True), _options())
 
 
+@pytest.mark.parametrize(
+    "overrides, passes",
+    [
+        ({}, True),
+        ({"fp8_recipe": "delayed"}, False),
+        ({"fp8_param_gather": False}, False),
+        ({"reuse_grad_buf_for_mxfp8_param_ag": False}, False),
+        ({"save_requested": True}, False),
+        ({"load_requested": True}, False),
+        ({"bf16": False, "fp16": True}, False),
+    ],
+)
+def test_decoder_mxfp8_support_matrix(overrides, passes):
+    options = _options(
+        **dict(
+            dict(
+                fp8_enabled=True,
+                fp8_recipe="mxfp8",
+                fp8_param_gather=True,
+                reuse_grad_buf_for_mxfp8_param_ag=True,
+            ),
+            **overrides,
+        )
+    )
+    if passes:
+        validate_mdp_config(MdpConfig(enable=True), options)
+    else:
+        with pytest.raises(MdpConfigurationError, match="fp8"):
+            validate_mdp_config(MdpConfig(enable=True), options)
+
+
 def test_decoder_ep_overlap_configuration_passes_with_vpp():
     validate_mdp_config(
         MdpConfig(enable=True),
@@ -79,8 +110,7 @@ def test_decoder_ep_overlap_configuration_passes_with_vpp():
 def test_decoder_ep_overlap_rejects_missing_native_parallelism(option_kwargs):
     with pytest.raises(MdpConfigurationError, match="overlap_moe_expert_parallel_comm"):
         validate_mdp_config(
-            MdpConfig(enable=True),
-            _options(overlap_moe_expert_parallel_comm=True, **option_kwargs),
+            MdpConfig(enable=True), _options(overlap_moe_expert_parallel_comm=True, **option_kwargs)
         )
 
 
@@ -93,39 +123,24 @@ def test_disabled_mdp_skips_all_checks():
     [
         (dict(encoder_cp=2), "encoder_cp"),
         (dict(encoder_max_payload_rows=0), "encoder_max_payload_rows"),
-        (
-            dict(encoder_recompute_granularity="partial"),
-            "encoder_recompute_granularity",
-        ),
+        (dict(encoder_recompute_granularity="partial"), "encoder_recompute_granularity"),
         (dict(encoder_recompute_method="uniform"), "encoder_recompute_method"),
         (dict(encoder_recompute_num_layers=1), "encoder_recompute_num_layers"),
         (dict(encoder_recompute_modules=("mlp",)), "encoder_recompute_modules"),
         (
-            dict(
-                encoder_recompute_granularity="whole",
-                encoder_recompute_method="uniform",
-            ),
+            dict(encoder_recompute_granularity="whole", encoder_recompute_method="uniform"),
             "encoder_recompute_method",
         ),
         (
-            dict(
-                encoder_recompute_granularity="selective",
-                encoder_recompute_method="uniform",
-            ),
+            dict(encoder_recompute_granularity="selective", encoder_recompute_method="uniform"),
             "encoder_recompute_method",
         ),
         (
-            dict(
-                encoder_recompute_granularity="selective",
-                encoder_recompute_num_layers=1,
-            ),
+            dict(encoder_recompute_granularity="selective", encoder_recompute_num_layers=1),
             "encoder_recompute_num_layers",
         ),
         (
-            dict(
-                encoder_recompute_granularity="full",
-                encoder_recompute_modules=("mlp",),
-            ),
+            dict(encoder_recompute_granularity="full", encoder_recompute_modules=("mlp",)),
             "encoder_recompute_modules",
         ),
         (dict(locality_slack_permille=1000), "locality_slack_permille"),
@@ -164,14 +179,8 @@ def test_invalid_mdp_config_fields_rejected(config_kwargs, match):
             "overlap_param_gather_with_optimizer_step",
         ),
         (dict(delay_grad_reduce=True), "delay_grad_reduce"),
-        (
-            dict(checkpoint_mode="fully_parallel", save_requested=True),
-            "checkpoint_mode",
-        ),
-        (
-            dict(checkpoint_mode="local", load_requested=True),
-            "checkpoint_mode",
-        ),
+        (dict(checkpoint_mode="fully_parallel", save_requested=True), "checkpoint_mode"),
+        (dict(checkpoint_mode="local", load_requested=True), "checkpoint_mode"),
     ],
 )
 def test_rejection_list(option_kwargs, match):
@@ -196,16 +205,12 @@ def test_native_decoder_ddp_overlap_is_supported(option_kwargs):
 
 
 def test_whole_encoder_recompute_without_native_options_is_valid():
-    validate_mdp_config(
-        MdpConfig(enable=True, encoder_recompute_granularity="whole"), _options()
-    )
+    validate_mdp_config(MdpConfig(enable=True, encoder_recompute_granularity="whole"), _options())
 
 
 def test_error_messages_carry_option_value_and_suggestion():
     try:
-        validate_mdp_config(
-            MdpConfig(enable=True), _options(calculate_per_token_loss=False)
-        )
+        validate_mdp_config(MdpConfig(enable=True), _options(calculate_per_token_loss=False))
     except MdpConfigurationError as error:
         message = str(error)
         assert "calculate_per_token_loss=False" in message
@@ -269,12 +274,8 @@ def test_disabled_and_whole_recompute_leave_transformer_config_unchanged(granula
 
 
 @pytest.mark.parametrize("recompute_granularity", ["full", "selective"])
-def test_whole_encoder_recompute_rejects_effective_vision_recompute(
-    recompute_granularity,
-):
-    with pytest.raises(
-        MdpConfigurationError, match="effective vision recompute_granularity"
-    ):
+def test_whole_encoder_recompute_rejects_effective_vision_recompute(recompute_granularity):
+    with pytest.raises(MdpConfigurationError, match="effective vision recompute_granularity"):
         validate_effective_vision_config(
             MdpConfig(enable=True, encoder_recompute_granularity="whole"),
             _FakeTransformerConfig(recompute_granularity=recompute_granularity),
@@ -340,9 +341,7 @@ def test_snapshot_reports_the_real_rank_order():
     assert default_options.rank_order == "tp-cp-ep-dp-pp"
     validate_mdp_config(MdpConfig(enable=True), default_options)
 
-    remapped_options = compatibility_options_from_args(
-        _fake_args(use_tp_pp_dp_mapping=True)
-    )
+    remapped_options = compatibility_options_from_args(_fake_args(use_tp_pp_dp_mapping=True))
     assert remapped_options.rank_order == "tp-cp-ep-pp-dp"
     with pytest.raises(MdpConfigurationError, match="rank_order"):
         validate_mdp_config(MdpConfig(enable=True), remapped_options)
@@ -351,9 +350,7 @@ def test_snapshot_reports_the_real_rank_order():
 def test_snapshot_reports_decoder_ep_overlap():
     from megatron.core.mdp.integration import compatibility_options_from_args
 
-    options = compatibility_options_from_args(
-        _fake_args(overlap_moe_expert_parallel_comm=True)
-    )
+    options = compatibility_options_from_args(_fake_args(overlap_moe_expert_parallel_comm=True))
     assert options.overlap_moe_expert_parallel_comm is True
 
 
@@ -412,9 +409,7 @@ def test_greedy_budget_must_match_the_collator_row_alignment():
         validate_mdp_config(
             MdpConfig(enable=True, greedy_packing=True),
             _options(
-                tensor_parallel_size=4,
-                sequence_parallel=True,
-                max_seqlen_per_dp_cp_rank=8190,
+                tensor_parallel_size=4, sequence_parallel=True, max_seqlen_per_dp_cp_rank=8190
             ),
         )
 
@@ -460,9 +455,7 @@ def test_static_packing_needs_room_for_a_real_sequence_and_the_dummy():
         validate_mdp_config(
             MdpConfig(enable=True, greedy_packing=True),
             _options(
-                max_seqlen_per_dp_cp_rank=8192,
-                thd_max_packed_sequences=1,
-                thd_static_packing=True,
+                max_seqlen_per_dp_cp_rank=8192, thd_max_packed_sequences=1, thd_static_packing=True
             ),
         )
 
@@ -489,14 +482,14 @@ def test_static_only_packing_slot_check_does_not_apply_without_static_packing():
     validate_mdp_config(
         MdpConfig(enable=True),
         _options(
-            max_samples_per_microbatch=8,
-            max_seqlen_per_dp_cp_rank=8192,
-            thd_max_packed_sequences=8,
+            max_samples_per_microbatch=8, max_seqlen_per_dp_cp_rank=8192, thd_max_packed_sequences=8
         ),
     )
 
 
-@pytest.mark.parametrize("checkpoint_kwargs", [dict(save_requested=True), dict(load_requested=True)])
+@pytest.mark.parametrize(
+    "checkpoint_kwargs", [dict(save_requested=True), dict(load_requested=True)]
+)
 def test_greedy_packing_is_rejected_with_checkpointing(checkpoint_kwargs):
     # The greedy sample buffer carries across iterations and is not
     # checkpointed, and the sampler cannot be repositioned per DP rank.
@@ -506,15 +499,12 @@ def test_greedy_packing_is_rejected_with_checkpointing(checkpoint_kwargs):
     with pytest.raises(MdpConfigurationError, match="greedy_packing"):
         validate_mdp_config(MdpConfig(enable=True, greedy_packing=True), options)
     validate_mdp_config(
-        MdpConfig(enable=True, greedy_packing=True, greedy_packing_approximate_resume=True),
-        options,
+        MdpConfig(enable=True, greedy_packing=True, greedy_packing_approximate_resume=True), options
     )
 
 
 def test_checkpointing_without_greedy_packing_is_unaffected():
-    validate_mdp_config(
-        MdpConfig(enable=True), _options(save_requested=True, load_requested=True)
-    )
+    validate_mdp_config(MdpConfig(enable=True), _options(save_requested=True, load_requested=True))
 
 
 # ---------------------------------------------------------------------------
@@ -563,9 +553,7 @@ def test_per_layer_graphs_require_static_thd_shapes():
 def test_per_layer_graphs_reject_overlap_window_capture(monkeypatch):
     monkeypatch.delenv("MDP_ALLOW_OVERLAP_WITH_CUDA_GRAPHS", raising=False)
     with pytest.raises(MdpConfigurationError, match="overlap_window_capture"):
-        validate_mdp_config(
-            MdpConfig(enable=True, overlap_window_capture=True), _graph_options()
-        )
+        validate_mdp_config(MdpConfig(enable=True, overlap_window_capture=True), _graph_options())
 
 
 def test_graph_gate_is_inert_without_graphs():
@@ -602,10 +590,7 @@ def test_mcore_scheduler_still_rejected_with_graphs():
             ),
             ("full", "uniform", 1, None),
         ),
-        (
-            dict(encoder_recompute_granularity="whole"),
-            ("whole", None, None, None),
-        ),
+        (dict(encoder_recompute_granularity="whole"), ("whole", None, None, None)),
     ],
 )
 def test_encoder_recompute_options_are_snapshotted_from_args(arg_overrides, expected):

@@ -7,6 +7,14 @@ code ownership, invariants, control flow, and safe extension points.
 
 ## Current baseline
 
+The experimental MXFP8 benchmark path preserves native decoder parameter gather
+and gradient-buffer reuse while the encoder stays BF16. Encoder DDP disables
+quantized parameter gather/reuse, and its optimizer config clears the MXFP8
+recipe, reuse flag and parameter-gather overlap. The composite validates this
+exact projection, shares overflow/clipping across all members, then delegates
+parameter staging/steps to separate decoder and encoder domains. Checkpoint
+save/load and other FP8 recipes remain rejected pending validation.
+
 On the 397B-rebench integration branch, keep the refactored GDN package and
 its native fixed-shape chunk metadata implementation. MDP's
 `thd_static_packing` must also trigger the FLA tensor-cache safety check,
@@ -434,7 +442,8 @@ Current major constraints:
 - per-token loss enabled;
 - bf16/fp16 mixed precision;
 - synchronous global `torch_dist` checkpointing (exact resume, same world size);
-- no FSDP/HSDP, FP8, full-iteration CUDA graph, CPU activation offload, or
+- no FSDP/HSDP, FP8 other than the decoder-only MXFP8 benchmark path above,
+  full-iteration CUDA graph, CPU activation offload, or
   encoder communication overlap;
 - native decoder `overlap_grad_reduce` and `overlap_param_gather` are supported,
   while delayed gradient reduction and parameter-gather overlap with the
