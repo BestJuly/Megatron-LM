@@ -211,6 +211,8 @@ def accumulate_vision_flops_stats_from_grids(grid_thw) -> None:
     kernels, no ``.item()``.
     """
     if grid_thw is None or grid_thw.numel() == 0:
+        # A text-only DP rank must still enter the global stats reduction.
+        _update_vision_stats(0.0, 0.0)
         return
     t, h, w = grid_thw[:, 0], grid_thw[:, 1], grid_thw[:, 2]
     frame = (h * w).to(torch.float64)
@@ -233,8 +235,7 @@ def accumulate_vision_flops_stats_from_items(vision_items) -> None:
         frame = h * w
         rows += t * frame
         attn_sq += t * frame * frame
-    if rows:
-        _update_vision_stats(float(rows), float(attn_sq))
+    _update_vision_stats(float(rows), float(attn_sq))
 
 
 def _accumulate_workload_stats(
