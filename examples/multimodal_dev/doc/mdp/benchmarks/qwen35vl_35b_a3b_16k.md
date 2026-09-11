@@ -954,3 +954,63 @@ python pretrain_multimodal.py \
     --distributed-timeout-minutes 20 ============================================================
 ```
 
+
+---
+
+## 2026-09-10 更新
+
+**当前最佳：424.0 TFLOP/s/GPU，6,597.7 ms/iter。**
+以下是在上述 MDP PP2/EP4 配置上的四项成功优化，硬件仍为 OCI-AGA 的
+8× GB300（2 节点），BF16、16k THD。原有拓扑测试结果不作改写。
+
+### 性能演进
+
+| 阶段 | 成功调整 | TFLOP/s/GPU | 记录增益 |
+|---|---|---|---|
+| 复现基线 | PP 20/20，cuDNN 9.24，vision Pad80 | 316.7 | — |
+| OPT1 | PP stage 改为 23/17 | 343.3 | +8.4% |
+| OPT2 | cuBLAS device-init grouped GEMM | 362.6 | +5.6% |
+| OPT3 | cuDNN 9.25 + vision Pad128 | 408.7 | +12.56% |
+| OPT4 | MTP THD shift 向量化；后续采用 upstream 实现 | 421.3 → **424.0** | 初次 +3.08% |
+
+各次均运行 20 步、不开 profiler；复现基线与 OPT1 取第 6–20 步中位数，
+后续取第 4–20 步中位数，保留周期性 GC 的慢步。
+OPT3 的增益基于升级前同环境复测的 363.1；OPT4 的 +3.08% 对应首次
+408.7 → 421.3，不把后续小幅波动列为另一项优化。
+
+### 四项优化解决了什么
+
+1. **调整 PP stage。** 长 PP 等待暴露出 stage 负载不均：从
+   `embedding + 20 层 / 20 层 + MTP + loss` 改为
+   `embedding + 23 层 / 17 层 + MTP + loss`，减轻末级负载。
+2. **cuBLAS grouped GEMM。** 针对 MoE 中大量 GEMM launch 的 CPU 开销，
+   启用 device-init grouped GEMM。该路径支持 BF16，不依赖 FusedMLP，
+   也不要求把 expert GEMM 纳入 CUDA graph。
+3. **cuDNN 与 Pad128。** cuDNN 9.24 → 9.25 改善 decoder D256 attention backward；
+   vision 则从 Pad80 改为 Pad128，让 `compute_dot_do_o` 命中专用实现。
+   实际模型 head_dim 仍为 72，softmax scale 保持 `1/sqrt(72)`；投影与权重形状不变。
+4. **MTP THD shift。** 消除 CP1 下逐序列读取 GPU 标量边界、slice/roll/copy 的同步，
+   改为整段滚动与设备端边界填充。这是通用 MTP 优化，不是 MDP 专属修复。
+   后续采用 [upstream PR #6246](https://github.com/NVIDIA/Megatron-LM/pull/6246)，
+   包括多字段处理与 MTP 统计开销优化，最新复测为 **424.0**。
+
+### 当前保留配置与最新复测
+
+代码为 `a62c6c7cd`，已包含 Pad128 和 upstream MTP 实现。基于上方
+`s16k_pp2ep4_mdp_cg_ovlp` 配置，使用该代码版本而非原 recipe 的旧 checkout；
+PP layout 改为 `Et*23|t*17mL`，环境使用 `dsv3-gb300-torch2607-te218`
+（PyTorch 2.13 开发版 / TE 2.18），并增加：
+
+```bash
+export NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM=1
+export LD_LIBRARY_PATH=<CUDNN_9_25_0_15_ROOT>/lib:${LD_LIBRARY_PATH:-}
+```
+
+其余保持 TP1 / CP1、GBS64 / MBS1 / GA16，decoder 重算关闭，encoder whole 重算，
+partial CUDA graph `[attn, moe_router, moe_preprocess]` 与 window overlap 开启。
+
+最新作业 `696527` 完成 20/20，NaN 与 skipped 均为 0；第 4–20 步均值为
+421.9 TFLOP/s/GPU，中位数为 **424.0**。`maxAlloc / devUsed` 峰值分别为
+rank 0 **183.1 / 235.6 GiB**、rank 4 **140.3 / 176.4 GiB**，与原 OPT4 复测相同。
+相比原实现最近一次 422.7 仅高 0.31%，不同节点的单次复测应视为基本持平，
+不作为已确认的额外收益。本节未重跑 native，不能据此计算新的 MDP 对 native 增益。

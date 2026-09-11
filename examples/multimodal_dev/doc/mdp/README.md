@@ -125,3 +125,12 @@ export FLA_DISABLE_TENSOR_CACHE=1   # fla 按 tensor 身份对 prepare_chunk_off
                                     # cu_seqlens 对象，capture 时若命中缓存会把 chunk_offsets 冻住
 export NCCL_GRAPH_REGISTER=0        # 与 expandable_segments 共存时 Megatron 会断言此项
 ```
+
+---
+
+## 2026-09-10 更新
+
+35B-A3B @ 16k 的 MDP PP2/EP4 配置经四项优化后，当前最佳实测为
+**424.0 TFLOP/s/GPU，6,597.7 ms/iter**（8× GB300，BF16）。
+成功优化过程与最新配置见测试页末尾的
+[增量更新](benchmarks/qwen35vl_35b_a3b_16k.md#2026-09-10-更新)；原有拓扑测试与测量记录保留不变。

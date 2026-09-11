@@ -5,6 +5,7 @@ import sys
 import pytest
 
 from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import parse_args, validate_args
 
 
@@ -53,6 +54,20 @@ def test_static_packing_accepts_the_default_and_explicit_dummy_tail():
     for policy in (None, "append_dummy_seq"):
         config = _static_packing_config(thd_tail_padding_policy=policy)
         assert config.thd_static_packing
+
+
+def test_contiguous_context_parallel_rejects_bshd_inputs():
+    with pytest.raises(
+        ValueError,
+        match="cp_partition_mode='contiguous'.*requires THD.*BSHD inputs are not supported",
+    ):
+        TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            context_parallel_size=2,
+            cp_partition_mode="contiguous",
+        )
 
 
 def test_te_cross_entropy_loss_fusion_is_disabled_by_training_args(monkeypatch):
