@@ -13,6 +13,9 @@ its native fixed-shape chunk metadata implementation. MDP's
 even though it does not use `sequence_packing_scheduler`. The native MTP
 implementation already includes upstream PR #6246; do not replace it with
 the older fast-pass source when adding the MDP runtime.
+The mock scenario length sampler forwards the MDP dataset vocabulary to
+the shared SFT dataset, preserving its vocabulary validation. Only sequence
+lengths are consumed there; actual token IDs still come from MdpThdMockDataset.
 
 - Development branch: `dev/mdp`.
 - History baseline: `e0df73690`.

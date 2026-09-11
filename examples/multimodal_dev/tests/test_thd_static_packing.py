@@ -311,6 +311,13 @@ class TestMockLengthDistribution:
         # Wider than the built-in [1000, 2000] window, which is the point.
         assert max(totals) - min(totals) > 1000
 
+    def test_length_distribution_is_independent_of_vocabulary(self):
+        small = mdp_scenarios.draw_total_token_lengths(LOGNORMAL, 64, vocab_size=1024)
+        large = mdp_scenarios.draw_total_token_lengths(LOGNORMAL, 64, vocab_size=248320)
+        assert small == large
+        with pytest.raises(ValueError, match="vocab_size >= 2"):
+            mdp_scenarios.draw_total_token_lengths(LOGNORMAL, 64, vocab_size=1)
+
     def test_degenerate_distribution_is_constant(self):
         pool = mdp_scenarios.build_scenarios(length_config=DEGENERATE)
         totals = {mdp_scenarios.scenario_totals(s)[0] for s in pool}

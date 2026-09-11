@@ -10,9 +10,9 @@ import dataclasses
 import pytest
 
 from megatron.core.mdp.config import (
+    SUPPORTED_CUDA_GRAPH_IMPLS,
     MdpCompatibilityOptions,
     MdpConfig,
-    SUPPORTED_CUDA_GRAPH_IMPLS,
     apply_encoder_recompute_config,
     greedy_max_real_sequences,
     validate_effective_vision_config,
@@ -560,7 +560,8 @@ def test_per_layer_graphs_require_static_thd_shapes():
         validate_mdp_config(MdpConfig(enable=True), _graph_options(thd_static_packing=False))
 
 
-def test_per_layer_graphs_reject_overlap_window_capture():
+def test_per_layer_graphs_reject_overlap_window_capture(monkeypatch):
+    monkeypatch.delenv("MDP_ALLOW_OVERLAP_WITH_CUDA_GRAPHS", raising=False)
     with pytest.raises(MdpConfigurationError, match="overlap_window_capture"):
         validate_mdp_config(
             MdpConfig(enable=True, overlap_window_capture=True), _graph_options()

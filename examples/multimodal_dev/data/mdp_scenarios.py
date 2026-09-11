@@ -29,6 +29,7 @@ import random
 
 GENERATOR_SEED = 2026
 POOL_SIZE = 64
+DEFAULT_VOCAB_SIZE = 1024
 SPATIAL_MERGE_SIZE = 2
 
 TOTAL_TOKENS_RANGE = (1000, 2000)
@@ -38,7 +39,13 @@ MIN_TOTAL_TOKENS = 64  # floor for externally supplied length distributions
 MAX_GRID_DRAWS = 200  # rejection-sampling cap; see _multimodal_scenario
 
 
-def draw_total_token_lengths(length_config, count, seed=GENERATOR_SEED):
+def draw_total_token_lengths(
+    length_config: dict,
+    count: int,
+    seed: int = GENERATOR_SEED,
+    *,
+    vocab_size: int = DEFAULT_VOCAB_SIZE,
+) -> list[int]:
     """``count`` per-sample total token lengths from a length distribution.
 
     ``length_config`` is the ``--mdp-mock-dataset-config-json`` payload, the same
@@ -60,7 +67,11 @@ def draw_total_token_lengths(length_config, count, seed=GENERATOR_SEED):
 
     state = np.random.get_state()
     try:
-        low_level = MockSFTLowLevelDataset(**dict(length_config))
+        config = dict(length_config)
+        # The shared dataset validates its token vocabulary even when we only
+        # consume sequence_lengths. Forward the MDP dataset's vocabulary.
+        config["vocab_size"] = vocab_size
+        low_level = MockSFTLowLevelDataset(**config)
     finally:
         np.random.set_state(state)
     lengths = low_level.sequence_lengths
@@ -164,7 +175,13 @@ def scenario_totals(scenario, merge=SPATIAL_MERGE_SIZE):
     return total, image_tokens
 
 
-def build_scenarios(pool_size=POOL_SIZE, seed=GENERATOR_SEED, length_config=None):
+def build_scenarios(
+    pool_size: int = POOL_SIZE,
+    seed: int = GENERATOR_SEED,
+    length_config: dict | None = None,
+    *,
+    vocab_size: int = DEFAULT_VOCAB_SIZE,
+) -> tuple:
     """Deterministic pool of ``pool_size`` scenarios.
 
     The first five entries deliberately cover every structural case the
@@ -173,6 +190,7 @@ def build_scenarios(pool_size=POOL_SIZE, seed=GENERATOR_SEED, length_config=None
     still sees all of them.
 
     Args:
+        vocab_size: MDP token vocabulary, forwarded to the shared length sampler.
         pool_size: Number of scenarios.
         seed: Drives the private ``random.Random``; the pool is byte-identical
             across processes and ranks for a given seed.
@@ -186,7 +204,7 @@ def build_scenarios(pool_size=POOL_SIZE, seed=GENERATOR_SEED, length_config=None
     totals = (
         None
         if length_config is None
-        else draw_total_token_lengths(length_config, pool_size, seed=seed)
+        else draw_total_token_lengths(length_config, pool_size, seed=seed, vocab_size=vocab_size)
     )
     pool = []
     for i in range(pool_size):

@@ -23,7 +23,11 @@ from typing import Optional, Sequence
 import torch
 from torch.utils.data import Dataset
 
-from examples.multimodal_dev.data.mdp_scenarios import build_scenarios, scenario_totals
+from examples.multimodal_dev.data.mdp_scenarios import (
+    DEFAULT_VOCAB_SIZE,
+    build_scenarios,
+    scenario_totals,
+)
 from examples.multimodal_dev.models.qwen35_vl.configuration import (
     QWEN35_VL_IMAGE_TOKEN_ID,
     QWEN35_VL_VISION_START_TOKEN_ID,
@@ -73,7 +77,7 @@ class MdpThdMockDataset(Dataset):
     def __init__(
         self,
         num_samples: int = 64,
-        vocab_size: int = 1024,
+        vocab_size: int = DEFAULT_VOCAB_SIZE,
         image_token_id: int = QWEN35_VL_IMAGE_TOKEN_ID,
         vision_start_token_id: int = QWEN35_VL_VISION_START_TOKEN_ID,
         patch_size: int = 16,
@@ -96,7 +100,7 @@ class MdpThdMockDataset(Dataset):
         elif length_config is not None:
             # Rebuilt independently on every rank; build_scenarios is seeded
             # from the fixed GENERATOR_SEED so the pools stay identical.
-            self.scenarios = build_scenarios(length_config=length_config)
+            self.scenarios = build_scenarios(length_config=length_config, vocab_size=vocab_size)
         else:
             self.scenarios = _SCENARIOS
         self.pixel_dim = 3 * temporal_patch_size * patch_size * patch_size
@@ -220,9 +224,10 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         length_config = load_json_arg(length_config)
     # Built once and shared: the pool is a deterministic function of the length
     # config, and drawing it re-samples a million lognormal lengths.
-    scenarios = build_scenarios(length_config=length_config)
+    vocab_size = getattr(args, "padded_vocab_size", DEFAULT_VOCAB_SIZE)
+    scenarios = build_scenarios(length_config=length_config, vocab_size=vocab_size)
     kwargs = dict(
-        vocab_size=getattr(args, "padded_vocab_size", 1024),
+        vocab_size=vocab_size,
         image_token_id=getattr(args, "image_token_id", QWEN35_VL_IMAGE_TOKEN_ID),
         scenarios=scenarios,
     )
