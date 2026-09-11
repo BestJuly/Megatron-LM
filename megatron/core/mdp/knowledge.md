@@ -7,6 +7,13 @@ code ownership, invariants, control flow, and safe extension points.
 
 ## Current baseline
 
+On the 397B-rebench integration branch, keep the refactored GDN package and
+its native fixed-shape chunk metadata implementation. MDP's
+`thd_static_packing` must also trigger the FLA tensor-cache safety check,
+even though it does not use `sequence_packing_scheduler`. The native MTP
+implementation already includes upstream PR #6246; do not replace it with
+the older fast-pass source when adding the MDP runtime.
+
 - Development branch: `dev/mdp`.
 - History baseline: `e0df73690`.
 - The initial MDP implementation is reconstructed as eight cohesive commits.
