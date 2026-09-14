@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Pretrain utilities."""
 
@@ -2947,6 +2947,17 @@ def dummy_train_step(data_iterator):
             )
 
 
+def _stage_mxfp8_params_for_forward(optimizer) -> None:
+    """Stage only buffer-reusing, overlapped DistOpts after gradients are zeroed."""
+    for optim_instance in optimizer.chained_optimizers:
+        if (
+            isinstance(optim_instance, DistributedOptimizer)
+            and optim_instance.config.reuse_grad_buf_for_mxfp8_param_ag
+            and optim_instance.config.overlap_param_gather
+        ):
+            optim_instance._copy_main_params_to_param_buffer()
+
+
 def train_step(
     forward_step_func,
     data_iterator,
@@ -3060,9 +3071,7 @@ def train_step(
             forward_pre_hook_enabled = len(model[0].remove_forward_pre_hook_handles) > 0
             full_cg_captured = FullCudaGraphWrapper.cuda_graph.get("training") is not None
             if forward_pre_hook_enabled or full_cg_captured:
-                for optim_instance in optimizer.chained_optimizers:
-                    if isinstance(optim_instance, DistributedOptimizer):
-                        optim_instance._copy_main_params_to_param_buffer()
+                _stage_mxfp8_params_for_forward(optimizer)
 
         # Master weights must remain resident until any main-param copy above is
         # complete. Releasing here keeps optimizer memory out of forward/backward.

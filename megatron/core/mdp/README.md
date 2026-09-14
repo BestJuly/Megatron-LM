@@ -85,12 +85,18 @@ extending the last sample's padded region. Alignments that call site cannot
 derive fail loudly instead: with `--use-packed-sequence`, `--fp4-format` and
 `--fp8-recipe custom` raise `NotImplementedError`.
 
+Decoder MXFP8 parameter gather may reuse its gradient buffer with BF16 training.
+The encoder keeps independent BF16 buffers and synchronous optimizer updates;
+only decoder members participate in MXFP8 parameter staging. Both decoder
+parameter-gather overlap modes are supported. Checkpoint save/load with this
+new buffer-reuse combination is not yet validated and is rejected; existing
+FP8 configurations without buffer reuse retain their checkpoint behavior.
+
 Rejected at startup: FSDP/HSDP, encoder FP8, full-iteration CUDA graphs, CPU
 activation offload, delayed gradient reduction,
 `overlap_param_gather_with_optimizer_step`,
-`reuse_grad_buf_for_mxfp8_param_ag`, multiple distributed-optimizer
-instances, `calculate_per_token_loss=False`, non-`torch_dist` checkpoint
-formats, fully-parallel / asynchronous / non-persistent / constant-structure
+multiple distributed-optimizer instances, `calculate_per_token_loss=False`,
+non-`torch_dist` checkpoint formats, fully-parallel / asynchronous / non-persistent / constant-structure
 checkpoint modes, invalid rank mappings.
 
 ### Checkpoint support matrix

@@ -73,9 +73,11 @@ class MdpCompatibilityOptions:
     save_requested: bool
     load_requested: bool
     overlap_moe_expert_parallel_comm: bool = False
-    # args.reuse_grad_buf_for_mxfp8_param_ag. Rejected outright under MDP; see
-    # validate_mdp_config for the composite-optimizer mechanism.
+    # Decoder-only MXFP8 staging; the encoder keeps independent BF16 buffers.
     reuse_grad_buf_for_mxfp8_param_ag: bool = False
+    decoder_fp8_enabled: bool = False
+    fp8_recipe: Optional[str] = None
+    fp8_param_gather: bool = False
     sequence_parallel: bool = False
     sequence_packing_scheduler: Optional[str] = None
     thd_static_packing: bool = False
@@ -370,16 +372,28 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "False",
         )
     if options.reuse_grad_buf_for_mxfp8_param_ag:
-        _reject(
-            "reuse_grad_buf_for_mxfp8_param_ag",
-            options.reuse_grad_buf_for_mxfp8_param_ag,
-            "reuse_grad_buf_for_mxfp8_param_ag == False",
-            "ChainedOptimizer._should_defer_mxfp8_param_sync() answers True as soon "
-            "as any chained member has overlap_param_gather=False; MDP's encoder "
-            "member always does (build_encoder_ddp_config), so the DECODER would be "
-            "moved onto the deferred MXFP8 param-sync path whatever its own setting.",
-            "False",
-        )
+        if not (
+            options.bf16
+            and not options.fp16
+            and options.decoder_fp8_enabled
+            and options.fp8_recipe == "mxfp8"
+            and options.fp8_param_gather
+        ):
+            _reject(
+                "reuse_grad_buf_for_mxfp8_param_ag",
+                True,
+                "BF16 + decoder MXFP8 + fp8_param_gather",
+                "Only the decoder may reuse its gradient buffer for MXFP8 parameter gather.",
+                "enable decoder MXFP8 parameter gather or disable buffer reuse",
+            )
+        if options.save_requested or options.load_requested:
+            _reject(
+                "reuse_grad_buf_for_mxfp8_param_ag",
+                True,
+                "checkpoint save/load disabled with MXFP8 buffer reuse",
+                "Checkpoint round trips with the isolated encoder optimizer are not validated.",
+                "disable buffer reuse when saving or loading checkpoints",
+            )
     if options.delay_grad_reduce:
         _reject(
             "delay_grad_reduce",

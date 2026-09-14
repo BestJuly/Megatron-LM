@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """MDP composite optimizer: ``[decoder_dense, decoder_expert?, encoder]``.
 
@@ -30,6 +30,7 @@ position after sorting the keys, which no longer reproduces the member order.
 
 import logging
 from contextlib import contextmanager
+from dataclasses import replace
 from typing import List, Optional
 
 import torch
@@ -43,6 +44,20 @@ logger = logging.getLogger(__name__)
 #: Fixed checkpoint key and sharding prefix for the encoder member. Published
 #: keys are a compatibility contract — do not rename.
 ENCODER_MEMBER_KEY = "mdp_encoder_optimizer"
+
+
+def build_encoder_optimizer_config(decoder_config):
+    """Project decoder MXFP8 buffer reuse out of the synchronous BF16 encoder."""
+    if not getattr(decoder_config, "reuse_grad_buf_for_mxfp8_param_ag", False):
+        return decoder_config
+    if decoder_config.fp8_recipe != "mxfp8":
+        raise MdpConfigurationError("MDP: gradient-buffer reuse requires decoder MXFP8.")
+    return replace(
+        decoder_config,
+        fp8_recipe=None,
+        reuse_grad_buf_for_mxfp8_param_ag=False,
+        overlap_param_gather=False,
+    )
 
 
 class MdpChainedOptimizer(ChainedOptimizer):
@@ -109,8 +124,6 @@ class MdpChainedOptimizer(ChainedOptimizer):
         chained_optimizers: List[MegatronOptimizer],
         encoder_member_index: Optional[int] = None,
     ):
-        super().__init__(chained_optimizers)
-        self._loss_scale_calls = 0
         if encoder_member_index is not None and not 0 <= encoder_member_index < len(
             chained_optimizers
         ):
@@ -119,6 +132,45 @@ class MdpChainedOptimizer(ChainedOptimizer):
                 f"{len(chained_optimizers)} members."
             )
         self._encoder_member_index = encoder_member_index
+        self._encoder_member = (
+            chained_optimizers[encoder_member_index] if encoder_member_index is not None else None
+        )
+        super().__init__(chained_optimizers)
+        self._loss_scale_calls = 0
+        self._decoder_chain = None
+        if self._encoder_member is not None and self._encoder_member.config != self.config:
+            # Reuse the same members, not their states. The outer flat chain still owns
+            # overflow detection, global clipping, and checkpoint member identities.
+            self._decoder_chain = ChainedOptimizer(
+                [member for member in chained_optimizers if member is not self._encoder_member]
+            )
+
+    def _validate_optimizer_config(self, optimizer) -> None:
+        expected = self.config
+        if optimizer is self._encoder_member:
+            expected = build_encoder_optimizer_config(expected)
+        if getattr(optimizer, "config", None) != expected:
+            raise MdpConfigurationError(
+                "MDP optimizer members must share hyperparameters; only the encoder's "
+                "MXFP8 recipe, gradient-buffer reuse and parameter-gather overlap may differ."
+            )
+
+    @torch.no_grad()
+    def step_with_ready_grads(self) -> bool:
+        """Keep encoder synchronization out of the decoder's MXFP8 staging decision."""
+        if self._decoder_chain is None:
+            return super().step_with_ready_grads()
+        success = self._decoder_chain.step_with_ready_grads()
+        success &= self._encoder_member.step_with_ready_grads()
+        return success
+
+    @torch.no_grad()
+    def prepare_model_params_for_param_sync(self) -> None:
+        """Prepare each synchronization domain without mixing their buffer lifetimes."""
+        if self._decoder_chain is None:
+            return super().prepare_model_params_for_param_sync()
+        self._decoder_chain.prepare_model_params_for_param_sync()
+        self._encoder_member.prepare_model_params_for_param_sync()
 
     # ------------------------------------------------------------------
     # Checkpointing
@@ -238,9 +290,8 @@ def build_mdp_composite_optimizer(
 
     The decoder side may already be a ChainedOptimizer (dense + expert); it is
     flattened rather than nested so the member order is the checkpoint-visible
-    sequence the design specifies. ``ChainedOptimizer.__init__`` asserts equal
-    member configs, so both sides must be built from the same
-    ``OptimizerConfig``.
+    sequence the design specifies. Optimizer hyperparameters stay shared; only
+    the encoder's decoder-specific MXFP8 staging options may differ.
     """
     members: List[MegatronOptimizer] = list(_flatten(decoder_optimizer))
     encoder_members = list(_flatten(encoder_optimizer))

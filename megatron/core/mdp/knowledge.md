@@ -271,9 +271,18 @@ key or reshard them as if they did.
 Decoder and encoder FP8 are configured separately. `args.fp8` reaches only the
 decoder; the vision `TransformerConfig` is built by the adapter and never reads
 it, and the typed encoder arguments (`--encoder-recompute-*`) carry no FP8
-field. Decoder FP8 is not an MDP incompatibility, so `MdpCompatibilityOptions`
-carries no field for it at all; the one thing it asks of MDP, the THD row
-alignment, reads `args.fp8` directly in `forward_step.py`.
+field. Decoder FP8 without buffer reuse remains accepted. The compatibility
+snapshot reads decoder FP8 settings only to validate MXFP8 gradient-buffer
+reuse; packed-row alignment still reads `args.fp8` in `forward_step.py`.
+
+With decoder MXFP8 buffer reuse, project the encoder DDP and optimizer configs
+onto independent BF16 buffers with synchronous parameter gather. The outer
+composite stays flat for shared overflow detection, global gradient clipping,
+and member identities. A decoder-only chain referencing the same optimizers
+owns native MXFP8 staging/deferred synchronization; it must not see the
+encoder's synchronous gather policy. Forward-time staging filters each member
+by its own reuse and overlap settings. Checkpoint save/load remains rejected
+for this new combination until round-trip validation is available.
 
 Encoder FP8 is rejected where it becomes observable rather than inferred from
 args: `validate_effective_vision_config` runs on the resolved vision config

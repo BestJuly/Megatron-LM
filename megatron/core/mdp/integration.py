@@ -152,6 +152,9 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
         reuse_grad_buf_for_mxfp8_param_ag=bool(
             getattr(args, "reuse_grad_buf_for_mxfp8_param_ag", False)
         ),
+        decoder_fp8_enabled=bool(getattr(args, "fp8", None)),
+        fp8_recipe=getattr(args, "fp8_recipe", None),
+        fp8_param_gather=bool(getattr(args, "fp8_param_gather", False)),
         delay_grad_reduce=bool(getattr(args, "delay_grad_reduce", False)),
         overlap_moe_expert_parallel_comm=bool(
             getattr(args, "overlap_moe_expert_parallel_comm", False)
