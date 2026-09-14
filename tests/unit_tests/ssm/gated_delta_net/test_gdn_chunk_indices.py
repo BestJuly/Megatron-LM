@@ -200,12 +200,18 @@ def test_cpu_mirror_cache_holds_a_reference_to_its_source():
 
 class _CGConfig:
     def __init__(
-        self, impl="none", modules=None, packing_scheduler="dp_balanced", dynamic_cp=False
+        self,
+        impl="none",
+        modules=None,
+        packing_scheduler="dp_balanced",
+        dynamic_cp=False,
+        static_packing=False,
     ):
         self.cuda_graph_impl = impl
         self.cuda_graph_modules = modules
         self.sequence_packing_scheduler = packing_scheduler
         self.dynamic_context_parallel = dynamic_cp
+        self.thd_static_packing = static_packing
 
 
 @pytest.mark.parametrize(
@@ -257,10 +263,17 @@ def test_sbhd_capture_does_not_need_the_env_var(monkeypatch, impl):
 
 
 @pytest.mark.parametrize(
-    "packing_scheduler,dynamic_cp",
-    [("dp_balanced", False), ("default_dynamic_cp", False), (None, True)],
+    "packing_scheduler,dynamic_cp,static_packing",
+    [
+        ("dp_balanced", False, False),
+        ("default_dynamic_cp", False, False),
+        (None, True, False),
+        (None, False, True),
+    ],
 )
-def test_thd_is_detected_by_either_packing_signal(monkeypatch, packing_scheduler, dynamic_cp):
+def test_thd_is_detected_by_any_packing_signal(
+    monkeypatch, packing_scheduler, dynamic_cp, static_packing
+):
     """Mirrors TransformerConfig.__post_init__'s THD-CUDA-graph predicate."""
     monkeypatch.setattr(common, "FLA_DISABLE_TENSOR_CACHE", False)
     config = _CGConfig(
@@ -268,6 +281,7 @@ def test_thd_is_detected_by_either_packing_signal(monkeypatch, packing_scheduler
         [CudaGraphModule.attn],
         packing_scheduler=packing_scheduler,
         dynamic_cp=dynamic_cp,
+        static_packing=static_packing,
     )
     with pytest.raises(RuntimeError, match="FLA_DISABLE_TENSOR_CACHE"):
         _GDNBase._check_fla_tensor_cache_disabled(config)
