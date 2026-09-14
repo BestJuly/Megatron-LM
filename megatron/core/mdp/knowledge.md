@@ -515,6 +515,10 @@ assembly.
 FLOP accounting is intentionally generic multimodal functionality, not MDP
 functionality:
 
+- Text-only microbatches report zero vision statistics, not an absent report.
+  Otherwise a DP replica with no vision work skips the WORLD stats collective
+  while other replicas enter it. The 64-scenario mock pool at DP64 exposes this
+  on the first iteration because some replicas repeatedly receive text-only data.
 - real THD `cu_seqlens` supply packed token statistics;
 - vision patch, attention, MLP, and merger FLOPs are added from replicated grid
   metadata;
