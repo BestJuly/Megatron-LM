@@ -1,3 +1,9 @@
+> 前文是历史 fast-pass 测试；当前约 474 TFLOP/s 的 rebench milestone 见 [增量更新](#2026-09-13-rebench-更新)。旧命令对应旧代码/环境，不作为当前分支默认 recipe。
+
+> 历史原文勘误：40 层模型的初始 PP2/PP4 均分应为 20/20、10/10/10/10；
+> 16384² 与约 10×1657² 的比值约为 10（不是 100），且仅指 attention 长度平方项。
+> 旧命令末尾的 `====...` 是日志分隔符，不是 CLI 参数；本次新增完整命令不含该分隔符。
+
 # Qwen3.5-VL 35B-A3B @ 16k —— native 与 MDP 对比
 
 8× GB300（2 个 tray，同一 NVL72 机架），TP1 / CP1，MBS 1，**梯度累积 16**，
@@ -1014,3 +1020,52 @@ partial CUDA graph `[attn, moe_router, moe_preprocess]` 与 window overlap 开�
 rank 0 **183.1 / 235.6 GiB**、rank 4 **140.3 / 176.4 GiB**，与原 OPT4 复测相同。
 相比原实现最近一次 422.7 仅高 0.31%，不同节点的单次复测应视为基本持平，
 不作为已确认的额外收益。本节未重跑 native，不能据此计算新的 MDP 对 native 增益。
+
+---
+
+## 2026-09-13 rebench 更新
+
+**在 397B-rebench 基础上集成 MDP 后，35B-A3B @ 16K 达到约 474 TFLOP/s/GPU。**
+仍是 8× GB300、BF16、TP1/PP2/EP4/CP1、GBS64/MBS1；使用 PP23/17，
+encoder whole recompute，decoder 不重算。保留 cuBLAS device-init grouped GEMM、
+vision Pad128、MTP THD shift、partial CUDA graph 与 window overlap，并使用
+该 rebench 分支的 **cuDNN GDN backend**。不是给 35B 开 MXFP8 后得到的数字。
+
+### 已验证结果
+
+| 验证点 | Job | 实测 SHA | 第 4–20 步 TFLOP/s/GPU | 第 4–20 步 ms/step |
+|---|---:|---|---:|---:|
+| 历史 fast-pass 优化里程碑 | 696527 | 见上一节 | 424.0 | 6,597.7 |
+| **Rebench + MDP + cuDNN GDN** | **710926** | `6ab656d82` | **474.0** | **5,908.0** |
+| 加入 encoder/decoder 精度隔离后的 BF16 回归 | 711351 | `447689542` | 472.3 | 5,909.9 |
+
+两次 rebench 均完成 20/20，无 NaN、skipped 或 OOM。初验的均值为 472.42，
+中位数为 474.0；后续回归 step time 与初验基本持平。
+为了与 397B 的窗口对照，同时记录回归第 **9–20** 步：**474.1 TFLOP/s/GPU，
+5,904.75 ms/step**；不能拿不同窗口间的小幅差值再声称一次优化。
+
+这里证明的是 MDP 接入这条 rebench 分支后，35B 性能没有明显回退、达到约 474 的
+里程碑。新旧栈包含 TE/cuDNN 与 GDN backend 差异，不能把 424 → 474 全部归为
+某一个 MDP commit 的独立收益。本节没有重新测试 35B Native，不计算新的 Native 对比。
+
+### 代码与复现
+
+本分支的训练代码快照 `6a975c1aab` 在回归快照后增加 text-only rank 的 vision FLOPs
+collective 修复；本节保留实测 SHA，不把旧数据改写为在新的文档 HEAD 上重新测得。
+本次整理不重放 feature commits，也不重写提交历史。
+
+- [镜像、CPU/NUMA、启动与测量说明](rebench_environment.md)。本轮使用 TE 2.20 开发版、
+  cuDNN 9.25.1.1，不沿用旧节的 TE 2.18 侧安装说明。
+- [完整 YAML](../recipes/qwen35_vl_35b_a3b/s16k_pp2ep4_mdp_rebench_cudnn_gdn.yaml)
+  与 [完整命令](../recipes/qwen35_vl_35b_a3b/s16k_pp2ep4_mdp_rebench_cudnn_gdn.sh)
+  从 job 711351 的原始参数整理；该回归保持初验的模型/性能开关。
+- [变长数据 JSON](../recipes/data/mock_lognormal.json)：`min512/max4096/mean2048/sigma1.1`，
+  16K pack、static capacity 32。原始样本长度不是 16K。
+
+在每个已分配的 GPU 容器节点执行一次，并按统一说明配置 CPU/NUMA：
+
+```bash
+bash "$MCORE_ROOT/examples/multimodal_dev/doc/mdp/recipes/qwen35_vl_35b_a3b/s16k_pp2ep4_mdp_rebench_cudnn_gdn.sh" \
+  torchrun --nnodes=2 --nproc_per_node=4 --node_rank="$NODE_RANK" \
+  --master_addr="$MASTER_ADDR" --master_port="$MASTER_PORT"
+```

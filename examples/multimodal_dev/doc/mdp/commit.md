@@ -1,3 +1,5 @@
+> 本页前半部为 fast-pass 历史快照；当前分支来源及实测 SHA 见 [rebench 分支说明](#2026-09-13rebench-分支说明)。
+
 # MDP 提交历史
 
 按时间顺序记录本分支上与 MDP 相关的每一次提交。面向了解 Megatron-Core 与多模态
@@ -308,3 +310,33 @@ per-layer CUDA graph 同时开启；而拒绝信息自己写明该冲突「时�
 **默认行为完全不变**：不设该变量时抛出的仍是同样的 `MdpConfigurationError`；设置后
 改为打印一条醒目的 warning。这不是移除该 guard 的第一步——被拦的是竞态，干净的运行
 无法为其定界。相关结论见 `benchmarks/mdp_feature_ablations.md`。
+
+---
+
+## 2026-09-13：rebench 分支说明
+
+当前分支为 `qizhang/mdp-qwen35vl-35b/397b-benchmark`：从 Li 的
+[`lit/qwen35-397b-rebench`](https://github.com/BestJuly/Megatron-LM/tree/lit/qwen35-397b-rebench)
+checkout，再 cherry-pick [`lit/mdp_fast_pass`](https://github.com/BestJuly/Megatron-LM/tree/lit/mdp_fast_pass)
+的 MDP 相关代码形成。
+
+以上历史文档从 `lit/mdp_fast_pass@5885d65a9` 原样带入，描述的是原分支的
+commit；cherry-pick 后的 SHA 不必与原文相同。下表保留实测代码快照，方便复现。
+
+| 当前分支验证点 | 说明 |
+|---|---|
+| `18bb5b1cd6174785904f0f4f3ab35c2c5d05add2` | Li 的 397B-rebench 基础，保留其中 GDN、THD/CG 等新能力 |
+| `6ab656d82b013cbca720aae6f12c3b688f039cdb` | MDP feature 集成及接口适配后的 35B 验证点；cuDNN GDN 配置 474.0 TFLOP/s/GPU |
+| `4476895424269ad168e181cfd69beaec0701c71a` | 隔离 BF16 encoder 的 DDP/optimizer 更新与 decoder MXFP8 参数 staging；后续 BF16 35B 回归保持性能 |
+| `6a975c1aab457ae88b16247582674c3dc81a1300` | text-only rank 同样参加 vision FLOPs reduction，避免部分 rank 跳过 collective；397B 成功实验的代码快照 |
+
+MDP feature 集成覆盖 planner/bridge、phased runtime、optimizer、THD packing、
+decoder overlap、partial CUDA graph、encoder recompute 与 buffer pool 等，并保留
+vision Pad128。MTP 通用优化已在 rebench 基础代码中，不再重复移植旧实现。
+
+其中精度隔离与 text-only collective 修复可作为后续独立 PR 的整理对象；此处只说明
+已测代码来源，不代表已向 dev_mdp 或上游 dev 合入。MXFP8 验证限定在本文无
+checkpoint 保存/加载的 benchmark 路径，不扩大为所有精度/恢复方式均受支持。
+
+本次 milestone 文档直接维护在已验证的分支上；不为对齐分支名字再 pick、解冲突、
+重写历史。复现时优先使用 [当前索引](README.md) 的新 recipe 与各页实测 SHA。

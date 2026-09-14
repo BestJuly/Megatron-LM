@@ -1,3 +1,58 @@
+# MDP 性能测试 — Qwen3.5-VL rebench milestone
+
+本分支从 Li 的 [`lit/qwen35-397b-rebench`](https://github.com/BestJuly/Megatron-LM/tree/lit/qwen35-397b-rebench)
+checkout 出来，再 cherry-pick [`lit/mdp_fast_pass`](https://github.com/BestJuly/Megatron-LM/tree/lit/mdp_fast_pass)
+的 MDP 相关代码形成。
+
+本目录沿用 fast-pass 的 **测试页 + 完整 recipe** 组织方式，记录集成后的已验证结果。
+测试完成于 2026-09-11，文档更新于 2026-09-14。
+
+## 当前 milestone
+
+| 场景 | 实测结果 | 说明与复现 |
+|---|---|---|
+| 35B-A3B，16K 变长 THD，8× GB300，BF16 | **约 474 TFLOP/s/GPU** | [35B rebench 更新](benchmarks/qwen35vl_35b_a3b_16k.md#2026-09-13-rebench-更新) |
+| 397B-A17B，单条 4096，128× GB300，decoder MXFP8 + encoder BF16 | **625.35 TFLOP/s/GPU**；保留约 **96.2%** 的 Decoder-only 吞吐 | [单条 4096 对照](benchmarks/qwen35vl_397b_a17b_4k.md#单条-4096加上-vl-的整体开销) |
+| 397B-A17B，4K 变长 THD，128× GB300 | Native **310.55** → MDP **501.05 TFLOP/s/GPU**，约 **+61.3%** | [变长 4K 对照](benchmarks/qwen35vl_397b_a17b_4k.md#变长-4kmdp-与-native-vl) |
+
+单条 4096 对照的 step time 增加约 **4.5%**，说明在该视觉负载下使用 MDP
+加入 encoder 的整体开销有限，**不是完全零开销，也不是 MDP 调度本身的独立开销**。
+变长 4K 只比较 Native VL 与 MDP；不拿它与单条 4096 的 Decoder-only 横比。
+
+## 从这里开始
+
+1. 阅读 [rebench 环境与运行方式](benchmarks/rebench_environment.md)，准备同版本镜像和正确 CPU/NUMA 绑定。
+2. 在对应测试页选择 cell；相邻 `.sh` 包含完整环境变量与训练参数，`.yaml` 是完整 recipe。
+   无需原作者的 toolkit 目录，也无需重新拼接外部 model/data YAML。
+3. 数据 JSON 已随仓库提供；在已分配的 GPU 容器里运行，不在登录节点执行训练。
+4. 记录实际 `git rev-parse HEAD`。表中的实测 SHA 属于当前分支历史的不同验证点，
+   不应把历史结果改写为在新的文档 HEAD 上重新测得。
+
+```text
+doc/mdp/
+├── README.md
+├── commit.md                             fast-pass 历史 + 本分支集成说明
+├── benchmarks/
+│   ├── qwen35vl_35b_a3b_16k.md           历史 35B 结果 + 474 milestone
+│   ├── qwen35vl_397b_a17b_4k.md          单条 4096 与变长 4K，分开比较
+│   ├── rebench_environment.md            统一环境、运行与测量约定
+│   └── mdp_feature_ablations.md          历史 fast-pass 消融
+└── recipes/
+    ├── data/                             定长 / 变长 mock 配置
+    ├── qwen35_vl_35b_a3b/                历史 recipe + rebench YAML / SH
+    ├── qwen35_vl_397b_a17b/               4 个完整 rebench cell
+    └── proxy/                            历史 fast-pass proxy recipe
+```
+
+[分支来源与新增修改](commit.md#2026-09-13rebench-分支说明)。
+以下历史快照来自 `lit/mdp_fast_pass@5885d65a9`；其旧镜像、旧 SHA、测量窗口和
+支持边界只属于各自记录，不覆盖上面的 rebench milestone。
+旧页的近似计算和命令日志分隔符见 [35B 页的历史勘误](benchmarks/qwen35vl_35b_a3b_16k.md)；
+复现当前 milestone 请使用上方新 recipe，而不是直接执行历史命令快照。
+
+<details>
+<summary>原 fast-pass README（历史快照，原文保留）</summary>
+
 # MDP 性能测试 — Qwen3.5-VL 35B-A3B on GB300
 
 本目录记录 **MDP（Modality Decoupled Parallelism，模态解耦并行）** 在
@@ -134,3 +189,5 @@ export NCCL_GRAPH_REGISTER=0        # 与 expandable_segments 共存时 Megatron
 **424.0 TFLOP/s/GPU，6,597.7 ms/iter**（8× GB300，BF16）。
 成功优化过程与最新配置见测试页末尾的
 [增量更新](benchmarks/qwen35vl_35b_a3b_16k.md#2026-09-10-更新)；原有拓扑测试与测量记录保留不变。
+
+</details>

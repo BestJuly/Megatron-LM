@@ -1,3 +1,5 @@
+> 历史 fast-pass 消融快照；不代表 rebench 分支的新测量。当前 milestone 见 [目录首页](../README.md)。
+
 # CUDA graph 与 window overlap 在 MDP 下各值多少
 
 对两个 MDP 侧开关做了单独与组合测量：

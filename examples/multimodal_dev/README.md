@@ -3,6 +3,13 @@
 Standalone, model-agnostic training entry point for multimodal
 vision-language models built on Megatron-Core (FSDP + EP).
 
+## MDP rebench milestones (this branch)
+
+See [MDP benchmark results and complete recipes](doc/mdp/README.md): approximately
+474 TFLOP/s/GPU for 35B, 625 TFLOP/s/GPU for 397B-VL with one 4096-token sequence
+per pack, and the separate variable-length THD Native-VL versus MDP comparison.
+Measured source revisions, environment requirements and comparison limits are included.
+
 ## Directory Structure
 
 ```
