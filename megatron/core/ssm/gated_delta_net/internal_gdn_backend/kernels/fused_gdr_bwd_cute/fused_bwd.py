@@ -71,8 +71,15 @@ def _check_sm100(tensor: torch.Tensor) -> None:
     if not tensor.is_cuda:
         raise ValueError("fused_gdr_bwd requires CUDA tensors")
     capability = torch.cuda.get_device_capability(tensor.device)
-    if capability != (10, 0):
-        raise ValueError(f"fused_gdr_bwd requires SM100, got capability {capability}")
+    # Major-version test, matching the forward kernel's own gate
+    # (fused_gdr_fwd_cute/fused_fwd.py::_check_cuda_sm100) and the backend-level
+    # check in implementation.py. An exact (10, 0) here rejected GB300, which
+    # reports (10, 3): same datacenter-Blackwell generation as B200's (10, 0),
+    # running the same sm_100a cubin. The asymmetry was an oversight - forward
+    # admitted the device and backward then refused it, so every GB300 step died
+    # in backward after a successful forward.
+    if capability[0] != 10:
+        raise ValueError(f"fused_gdr_bwd requires SM100-family, got capability {capability}")
 
 
 def _validate_chunk_offsets(
