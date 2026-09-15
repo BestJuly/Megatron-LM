@@ -67,6 +67,7 @@ class HybridStackSubmodules:
     csa_layer: Union[ModuleSpec, type] = IdentityOp
     hca_layer: Union[ModuleSpec, type] = IdentityOp
     window_layer: Union[ModuleSpec, type] = IdentityOp
+    qsa_layer: Union[ModuleSpec, type] = IdentityOp
     mlp_layer: Union[ModuleSpec, type] = IdentityOp
     moe_layer: Union[ModuleSpec, type] = IdentityOp
     mtp_block_spec: Optional[ModuleSpec] = None
@@ -934,6 +935,17 @@ class HybridStack(MegatronModule):
                     # no compressor / no top-k indexer — attends only within csa_window_size).
                     layer = build_module(
                         submodules.window_layer,
+                        config=self.config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
+                        add_layer_offset=False,
+                        pp_layer_offset=pp_layer_offset,
+                    )
+                elif layer_type == LayerSymbols.QSA:
+                    # Qwen Sparse Attention (GQA + block-sparse indexer mask).
+                    layer = build_module(
+                        submodules.qsa_layer,
                         config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,

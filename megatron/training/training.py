@@ -3668,7 +3668,15 @@ def training_log(
         )
 
     # Track sparse attention indexer loss.
-    if args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0:
+    dsa_loss_on = args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0
+    qsa_loss_on = (getattr(args, "qsa_indexer_loss_coeff", None) or 0) > 0
+    if dsa_loss_on or qsa_loss_on:
+        if qsa_loss_on and args.hybrid_layer_pattern is not None:
+            num_indexer_layers = args.hybrid_layer_pattern.count("Q") or None
+        elif args.csa_compress_ratios is not None:
+            num_indexer_layers = sum(ratio == 4 for ratio in args.csa_compress_ratios)
+        else:
+            num_indexer_layers = None
         indexer_loss_scale = 1 / get_num_microbatches()
         DSAIndexerLossLoggingHelper.track_indexer_metrics(
             loss_scale=indexer_loss_scale,
@@ -3677,11 +3685,7 @@ def training_log(
             wandb_writer=wandb_writer,
             total_loss_dict=total_loss_dict,
             num_layers=args.num_layers + (args.mtp_num_layers or 0),
-            num_indexer_layers=(
-                sum(ratio == 4 for ratio in args.csa_compress_ratios)
-                if args.csa_compress_ratios is not None
-                else None
-            ),
+            num_indexer_layers=num_indexer_layers,
             preserve_groups=args.cuda_graph_impl != "none",
         )
 
