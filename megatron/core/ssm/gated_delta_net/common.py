@@ -833,13 +833,8 @@ class _GDNBase(MegatronModule):
         # count never exceeds ceil(total_t / chunk_size) + num_sequences.
         nt_max = (total_t + chunk_size - 1) // chunk_size + int(max_num_seqs)
 
-        lens = cu_seqlens[1:] - cu_seqlens[:-1]
-        n_seq = lens.shape[0]
-        n_chunks = (lens + (chunk_size - 1)).div(chunk_size, rounding_mode='floor').to(torch.int64)
-        # offsets[i] = first chunk slot owned by sequence i; offsets[-1] = total.
-        # Bit-identical to fla's prepare_chunk_offsets, which the h/dh writer kernels
-        # index with - this is what keeps `row == chunk_offsets[seq] + intra` true.
-        offsets = torch.nn.functional.pad(n_chunks.cumsum(0), (1, 0))
+        n_seq = cu_seqlens.shape[0] - 1
+        offsets = self._chunk_offsets_device(cu_seqlens, chunk_size=chunk_size)
         slot = self._chunk_slot_arange(nt_max, cu_seqlens.device)
         # searchsorted over offsets[1:] maps a slot to its owning sequence; slots
         # past the last boundary come back as n_seq, which flags them unused.
@@ -852,6 +847,68 @@ class _GDNBase(MegatronModule):
         seg_id = torch.where(valid, seg_id, zero)
         intra = torch.where(valid, intra, beyond)
         return torch.stack([seg_id, intra], 1).to(cu_seqlens)
+
+    @staticmethod
+    def _chunk_offsets_device(
+        cu_seqlens: torch.Tensor, chunk_size: int = _FLA_CHUNK_SIZE
+    ) -> torch.Tensor:
+        """Device-only ``chunk_offsets``: first chunk slot owned by each sequence.
+
+        ``offsets[i]`` is the first chunk slot owned by sequence ``i`` and ``offsets[-1]``
+        the total chunk count. Bit-identical to fla's ``prepare_chunk_offsets``, which the
+        ``h``/``dh`` writer kernels index with - this is what keeps fla's
+        ``row == chunk_offsets[seq] + intra`` invariant true for a caller-supplied
+        ``chunk_indices`` table.
+
+        Built entirely with device ops so it is safe inside a CUDA graph capture and is
+        recomputed from the live ``cu_seqlens`` buffer on every replay. Returned in
+        ``torch.int64``; callers that must match ``cu_seqlens``'s dtype cast it themselves.
+        """
+        lens = cu_seqlens[1:] - cu_seqlens[:-1]
+        n_chunks = (lens + (chunk_size - 1)).div(chunk_size, rounding_mode='floor').to(torch.int64)
+        return torch.nn.functional.pad(n_chunks.cumsum(0), (1, 0))
+
+    def _internal_gdr_varlen_kwargs(
+        self, cu_seqlens: Optional[torch.Tensor], cp_context=None
+    ) -> dict:
+        """Capture-safe ``validated_chunk_{indices,offsets}`` for the internal GDR backend.
+
+        The internal backend's own metadata helper (``prepare_validated_chunk_metadata``
+        -> ``_packed_chunk_metadata``) calls fla's host-side ``prepare_chunk_indices``,
+        the same ``.tolist()`` round trip :meth:`_fla_varlen_kwargs` exists to avoid. Its
+        memo cannot rescue it under capture either: the key includes the raw stream
+        pointer, and TE captures on its own side stream, so a warmup-populated entry is
+        never reused at capture time.
+
+        Supplying both tables here bypasses it entirely - ``ChunkGatedDeltaRuleFunction``
+        only calls ``_packed_chunk_metadata`` when ``validated_chunk_indices is None``,
+        and backward reads both back out of ``ctx.saved_tensors`` rather than rebuilding
+        them. The internal backend forwards ``chunk_indices`` only to fla primitives
+        (``chunk_local_cumsum``, ``chunk_fwd_o``, ``chunk_bwd_dqkwg``, ...) and never to
+        its CuTe launchers, so the fixed-shape table's padding contract - trailing slots
+        aimed past every sequence end, masked off by fla's ``o_t < T`` guards - is the
+        same one :meth:`_fixed_shape_chunk_indices` was written against.
+
+        Returns an empty dict when no capture-safe table can be built, which leaves the
+        internal backend on its original (eager-only) host path.
+        """
+        if cu_seqlens is None:
+            return {}
+
+        # Chunkwise CP: same limitation as _fla_varlen_kwargs. fla overrides cu_seqlens
+        # with the rank-local partition but consumes a caller-supplied chunk_indices
+        # verbatim, so a table built from the global cu_seqlens would describe the wrong
+        # tensor. Hand the job back to the internal backend's own host build.
+        if cp_context is not None:
+            return {}
+
+        chunk_indices = self._fixed_shape_chunk_indices(cu_seqlens)
+        if chunk_indices is None:
+            return {}
+        return {
+            "validated_chunk_indices": chunk_indices,
+            "validated_chunk_offsets": self._chunk_offsets_device(cu_seqlens).to(cu_seqlens),
+        }
 
     def _chunk_slot_arange(self, nt_max: int, device: torch.device) -> torch.Tensor:
         """Cached ``arange(nt_max)`` used as the chunk-slot axis.

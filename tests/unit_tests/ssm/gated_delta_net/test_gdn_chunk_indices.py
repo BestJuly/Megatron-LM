@@ -37,6 +37,8 @@ class _Stub:
 
     _fixed_shape_chunk_indices = _GDNBase._fixed_shape_chunk_indices
     _chunk_slot_arange = _GDNBase._chunk_slot_arange
+    _chunk_offsets_device = _GDNBase._chunk_offsets_device
+    _internal_gdr_varlen_kwargs = _GDNBase._internal_gdr_varlen_kwargs
 
     def __init__(self):
         self.config = _Config()
@@ -271,3 +273,86 @@ def test_thd_is_detected_by_either_packing_signal(monkeypatch, packing_scheduler
     )
     with pytest.raises(RuntimeError, match="FLA_DISABLE_TENSOR_CACHE"):
         _GDNBase._check_fla_tensor_cache_disabled(config)
+
+
+# ---------------------------------------------------------------------------
+# Internal GDR backend: the same fixed-shape table, handed over as
+# validated_chunk_{indices,offsets} so the backend never reaches fla's
+# host-side prepare_chunk_indices (which CUDA graph capture forbids).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not HAVE_FLA, reason="fla is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    "lens", [[4096], [2048, 2048], [1024, 512, 1536, 1024], [100, 200, 300, 3496], [512] * 8]
+)
+def test_chunk_offsets_device_matches_fla(lens):
+    """The device-only builder must equal fla's host prepare_chunk_offsets exactly.
+
+    The internal backend hands these offsets to fla's h/dh writer kernels, which index
+    with ``chunk_offsets[seq] + intra``; any disagreement with the chunk_indices table
+    silently corrupts the chunk-state buffer rather than raising.
+    """
+    cu_seqlens = _make_cu_seqlens(lens)
+    got = _GDNBase._chunk_offsets_device(cu_seqlens).to(cu_seqlens)
+    expected = prepare_chunk_offsets(cu_seqlens, _FLA_CHUNK_SIZE)
+    assert torch.equal(got, expected.to(cu_seqlens))
+    # The internal backend validates shape/dtype/device/contiguity of what it is given.
+    assert got.shape == cu_seqlens.shape
+    assert got.dtype == cu_seqlens.dtype
+    assert got.device == cu_seqlens.device
+    assert got.is_contiguous()
+
+
+@pytest.mark.skipif(not HAVE_FLA, reason="fla is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_internal_gdr_kwargs_supply_both_tables():
+    """Both tables must be present, or the backend falls back to its host build."""
+    stub = _Stub()
+    cu_seqlens = _make_cu_seqlens([1024, 512, 1536, 1024])
+    kwargs = stub._internal_gdr_varlen_kwargs(cu_seqlens)
+    assert set(kwargs) == {"validated_chunk_indices", "validated_chunk_offsets"}
+
+    indices = kwargs["validated_chunk_indices"]
+    offsets = kwargs["validated_chunk_offsets"]
+    # _validate_validated_chunk_indices in the internal backend asserts exactly this.
+    assert indices.ndim == 2 and indices.shape[1] == 2
+    assert indices.dtype == cu_seqlens.dtype
+    assert indices.device == cu_seqlens.device
+    assert indices.is_contiguous()
+
+    # The two tables must describe the same decomposition.
+    num_real = prepare_chunk_indices(cu_seqlens, _FLA_CHUNK_SIZE).shape[0]
+    rows = torch.arange(num_real, device=cu_seqlens.device, dtype=torch.int64)
+    assert torch.equal(
+        offsets.long()[indices[:num_real, 0].long()] + indices[:num_real, 1].long(), rows
+    )
+
+
+@pytest.mark.skipif(not HAVE_FLA, reason="fla is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_internal_gdr_kwargs_shape_is_constant_across_packings():
+    """Capture requires a shape that does not move when the packing changes."""
+    stub = _Stub()
+    shapes = {
+        tuple(t.shape for t in stub._internal_gdr_varlen_kwargs(_make_cu_seqlens(lens)).values())
+        for lens in ([4096], [2048, 2048], [100, 200, 300, 3496], [512] * 8)
+    }
+    assert len(shapes) == 1
+
+
+@pytest.mark.skipif(not HAVE_FLA, reason="fla is not installed")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_internal_gdr_kwargs_bail_out_cases():
+    """Empty dict means "let the internal backend host-build it" (eager only)."""
+    stub = _Stub()
+    cu_seqlens = _make_cu_seqlens([2048, 2048])
+
+    assert stub._internal_gdr_varlen_kwargs(None) == {}
+    # Chunkwise CP: fla overrides cu_seqlens with the rank-local partition but consumes
+    # a caller-supplied table verbatim, so a globally-derived table would be wrong.
+    assert stub._internal_gdr_varlen_kwargs(cu_seqlens, cp_context=object()) == {}
+
+    stub.config.thd_max_packed_sequences = None
+    assert stub._internal_gdr_varlen_kwargs(cu_seqlens) == {}

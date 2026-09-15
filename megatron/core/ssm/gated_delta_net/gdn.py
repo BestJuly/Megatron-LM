@@ -466,38 +466,62 @@ class GatedDeltaNet(_GDNBase):
             nvtx_range_pop(suffix="pre_gated_delta_rule")
 
         if self.config.gdn_gdr_backend == "internal":
-            metadata_cu_seqlens = cu_seqlens_q
-            include_chunk_indices = True
-            if chunkwise_cp_context is not None:
-                metadata_cu_seqlens = getattr(chunkwise_cp_context, "cu_seqlens", None)
-                # [REMOVE BEFORE MERGE] Current CP experiments rely on the temporary
-                # 64-token-chunk internal backend contract. For the single-local-sequence
-                # CP layout, FLA's local chunk primitives can run dense and only fused
-                # backward needs device chunk offsets prepared before the profiled GDR
-                # scope. Drop this shape-only shortcut when the internal backend grows
-                # full tail/layout support.
-                include_chunk_indices = not (
-                    metadata_cu_seqlens is not None and metadata_cu_seqlens.numel() == 2
+            # Preferred path: a device-built, fixed-shape table, the same mechanism the
+            # fla path uses. The internal backend's own helper below host-builds the table
+            # through fla's prepare_chunk_indices, which CUDA graph capture forbids;
+            # supplying both tables here means it is never reached.
+            internal_varlen_kwargs = self._internal_gdr_varlen_kwargs(
+                cu_seqlens_q, cp_context=chunkwise_cp_context
+            )
+            if internal_varlen_kwargs:
+                kernel_inputs.update(internal_varlen_kwargs)
+            elif torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "GDN: the internal GDR backend cannot be captured into a CUDA graph "
+                    "in this configuration. Its chunk metadata would fall back to fla's "
+                    "host-side prepare_chunk_indices, which capture forbids. GDN "
+                    "chunkwise context parallelism is not capturable; otherwise set "
+                    "--thd-max-packed-sequences and --max-seqlen-per-dp-cp-rank so a "
+                    "fixed-shape table can be built, or drop attn from "
+                    "--cuda-graph-modules."
                 )
-            if metadata_cu_seqlens is not None:
-                validated_chunk_indices, validated_chunk_offsets = (
-                    prepare_internal_gdr_chunk_metadata(
-                        metadata_cu_seqlens, include_chunk_indices=include_chunk_indices
+            else:
+                # Eager fallback: no static THD bounds, or chunkwise CP.
+                metadata_cu_seqlens = cu_seqlens_q
+                include_chunk_indices = True
+                if chunkwise_cp_context is not None:
+                    metadata_cu_seqlens = getattr(chunkwise_cp_context, "cu_seqlens", None)
+                    # [REMOVE BEFORE MERGE] Current CP experiments rely on the temporary
+                    # 64-token-chunk internal backend contract. For the single-local-
+                    # sequence CP layout, FLA's local chunk primitives can run dense and
+                    # only fused backward needs device chunk offsets prepared before the
+                    # profiled GDR scope. Drop this shape-only shortcut when the internal
+                    # backend grows full tail/layout support.
+                    include_chunk_indices = not (
+                        metadata_cu_seqlens is not None and metadata_cu_seqlens.numel() == 2
                     )
-                )
-                if validated_chunk_indices is not None:
-                    kernel_inputs["validated_chunk_indices"] = validated_chunk_indices
-                if validated_chunk_offsets is not None:
-                    kernel_inputs["validated_chunk_offsets"] = validated_chunk_offsets
+                if metadata_cu_seqlens is not None:
+                    validated_chunk_indices, validated_chunk_offsets = (
+                        prepare_internal_gdr_chunk_metadata(
+                            metadata_cu_seqlens, include_chunk_indices=include_chunk_indices
+                        )
+                    )
+                    if validated_chunk_indices is not None:
+                        kernel_inputs["validated_chunk_indices"] = validated_chunk_indices
+                    if validated_chunk_offsets is not None:
+                        kernel_inputs["validated_chunk_offsets"] = validated_chunk_offsets
 
         nvtx_range_push(suffix="gated_delta_rule")
-        # torch_chunk_gated_delta_rule (the deterministic_mode path) accepts neither
-        # chunk_indices nor cu_seqlens_cpu, and asserts cu_seqlens is None outright,
-        # so the capture-safe varlen metadata is only threaded on the fla path.
+        # chunk_indices / cu_seqlens_cpu are fla's escape hatches and only apply to the
+        # fla-signature backends. torch_chunk_gated_delta_rule (deterministic_mode)
+        # accepts neither and asserts cu_seqlens is None outright; the internal backend
+        # takes the equivalent metadata as validated_chunk_{indices,offsets}, threaded
+        # into kernel_inputs above.
         gdr_varlen_kwargs = (
-            {}
-            if self.config.deterministic_mode
-            else self._fla_varlen_kwargs(cu_seqlens_q, cp_context=chunkwise_cp_context)
+            self._fla_varlen_kwargs(cu_seqlens_q, cp_context=chunkwise_cp_context)
+            if not self.config.deterministic_mode
+            and self.config.gdn_gdr_backend in ("fla", "cudnn")
+            else {}
         )
         core_attn_out, _ = self.gated_delta_rule(
             **kernel_inputs,
