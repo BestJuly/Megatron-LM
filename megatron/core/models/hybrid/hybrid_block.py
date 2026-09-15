@@ -30,6 +30,7 @@ from megatron.core.tensor_parallel.random import MHCCheckpointManager
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.gated_residual import GatedResidualModule
 from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
     learned_output_contract,
@@ -152,7 +153,14 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         self.inner_layer = layer
         self.layer_number = layer.layer_number
         self._offload_module_in_cuda_graph_cached: Optional[bool] = None
-        self.hyper_connection = HyperConnectionModule(config=config, layer_number=self.layer_number)
+        if config.hyper_connection_variant == "gated_residual":
+            self.hyper_connection = GatedResidualModule(
+                config=config, layer_number=self.layer_number
+            )
+        else:
+            self.hyper_connection = HyperConnectionModule(
+                config=config, layer_number=self.layer_number
+            )
         # This wrapper is the TE graph callable, so it owns the captured offload event
         # boundary. Reuse the inner Transformer's interface instead of reaching across
         # modules for its private factory. Only TransformerLayer-backed wrappers can
@@ -1006,7 +1014,7 @@ class HybridStack(MegatronModule):
         # Required for activation recomputation
         self.num_layers_per_pipeline_rank = len(self.layers)
 
-        if self.post_process and self.post_layer_norm:
+        if self.post_process and self.post_layer_norm and not self._gated_residual_exit():
             # Final layer norm before output.
             self.final_norm = TENorm(
                 config=self.config,
@@ -1019,16 +1027,40 @@ class HybridStack(MegatronModule):
         # params would be orphaned and break DDP's per-param grad-ready accounting
         # with a `len(per_param_grad_ready_counts) != len(params)` AssertionError.
         if self.config.enable_hyper_connections and self.post_process and not self.is_mtp_layer:
-            hc_mult = self.config.num_residual_streams
-            hc_dim = self.config.hidden_size * hc_mult
-            self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
-            self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
-            self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
-            nn.init.xavier_uniform_(self.hc_head_fn)
-            if self.config.sequence_parallel:
-                setattr(self.hc_head_fn, 'sequence_parallel', True)
-                setattr(self.hc_head_base, 'sequence_parallel', True)
-                setattr(self.hc_head_scale, 'sequence_parallel', True)
+            if self.config.hyper_connection_variant == "gated_residual":
+                # Qwen4-Exp exit contract: same low-rank per-channel read gate +
+                # mean as the per-layer modules (use_combine=False).
+                self.hc_exit_contract = GatedResidualModule(
+                    self.config, layer_number=0, use_combine=False
+                )
+                if self.config.params_dtype is not None:
+                    convert_module_to_dtype_except_fp32_marked(
+                        self.hc_exit_contract, self.config.params_dtype
+                    )
+            else:
+                hc_mult = self.config.num_residual_streams
+                hc_dim = self.config.hidden_size * hc_mult
+                self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
+                self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
+                self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
+                nn.init.xavier_uniform_(self.hc_head_fn)
+                if self.config.sequence_parallel:
+                    setattr(self.hc_head_fn, 'sequence_parallel', True)
+                    setattr(self.hc_head_base, 'sequence_parallel', True)
+                    setattr(self.hc_head_scale, 'sequence_parallel', True)
+
+    def _gated_residual_exit(self) -> bool:
+        """Whether the stack ends with the gated-residual exit contract instead of a final norm.
+
+        Qwen4-Exp (HF ``Qwen4ExpTextModel``) has no final RMSNorm: ``hyper_connection_mixer``
+        (whose group norm already normalizes every stream) feeds ``lm_head`` directly, and the
+        released checkpoint carries no ``norm.weight``. Building a ``final_norm`` here would add
+        a layer the reference model does not have.
+        """
+        return bool(
+            self.config.enable_hyper_connections
+            and self.config.hyper_connection_variant == "gated_residual"
+        )
 
     def _fuse_mla_down_proj(self, submodules: HybridStackSubmodules) -> HybridStackSubmodules:
         # Avoid modifying the original object so users don't get surprised about their `submodules`
@@ -1334,17 +1366,21 @@ class HybridStack(MegatronModule):
         if self.config.enable_hyper_connections and self.post_process and not self.is_mtp_layer:
             if (self.config.mtp_num_layers or 0) > 0:
                 mhc_multistream = hidden_states
-            hidden_states = learned_output_contract(
-                hidden_states,
-                self.hc_head_fn,
-                self.hc_head_base,
-                self.hc_head_scale,
-                self.config.num_residual_streams,
-                self.config.layernorm_epsilon,
-            )
+            if self.config.hyper_connection_variant == "gated_residual":
+                hidden_states = self.hc_exit_contract(hidden_states)
+            else:
+                hidden_states = learned_output_contract(
+                    hidden_states,
+                    self.hc_head_fn,
+                    self.hc_head_base,
+                    self.hc_head_scale,
+                    self.config.num_residual_streams,
+                    self.config.layernorm_epsilon,
+                )
 
-        # Final layer norm.
-        if self.post_process and self.post_layer_norm:
+        # Final layer norm (absent for the gated-residual variant: the exit contract's group
+        # norm is the last normalization, as in HF Qwen4-Exp).
+        if self.post_process and self.post_layer_norm and not self._gated_residual_exit():
             hidden_states = self.final_norm(hidden_states)
 
         # Ensure that the tensor passed between pipeline parallel stages is

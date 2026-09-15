@@ -1384,6 +1384,23 @@ class TransformerConfig(ModelParallelConfig):
     num_residual_streams: int = 4
     """Number of residual streams (n in paper)."""
 
+    hyper_connection_variant: str = "mhc"
+    """Which hyper-connection mathematics to use when enable_hyper_connections=True.
+
+    "mhc": Manifold-Constrained Hyper-Connections (Sinkhorn doubly-stochastic
+    cross-stream mixing + per-stream scalar read gate). The default; existing
+    behaviour is unchanged.
+    "gated_residual": the Qwen4-Exp variant — low-rank per-channel read gate
+    over group-RMS-normalized streams, per-stream scalar write gate, identity
+    residual (no cross-stream mixing). Removes the per-sublayer pre-norms
+    (the gated-residual group norm takes over that role).
+    """
+
+    hc_lowrank: int = 320
+    """Bottleneck width of the gated-residual read gate's two projections
+    ((n*C) -> hc_lowrank -> (n*C)). Only used with
+    hyper_connection_variant="gated_residual"."""
+
     mhc_sinkhorn_iterations: int = 20
     """Number of Sinkhorn-Knopp iterations for doubly stochastic projection."""
 
@@ -2933,6 +2950,62 @@ class TransformerConfig(ModelParallelConfig):
         if self.use_fused_mhc:
             if not self.enable_hyper_connections:
                 raise ValueError("use_fused_mhc requires enable_hyper_connections=True.")
+
+        # Validation for hyper_connection_variant
+        if self.hyper_connection_variant not in ("mhc", "gated_residual"):
+            raise ValueError(
+                f"hyper_connection_variant must be 'mhc' or 'gated_residual', got "
+                f"{self.hyper_connection_variant!r}."
+            )
+        if self.hyper_connection_variant != "mhc" and not self.enable_hyper_connections:
+            warnings.warn(
+                f"hyper_connection_variant={self.hyper_connection_variant!r} has no "
+                "effect without enable_hyper_connections=True.",
+                UserWarning,
+                stacklevel=2,
+            )
+        if self.enable_hyper_connections and self.hyper_connection_variant == "gated_residual":
+            if not isinstance(self.hc_lowrank, int) or isinstance(self.hc_lowrank, bool) or (
+                self.hc_lowrank < 1
+            ):
+                raise ValueError("hc_lowrank must be a positive integer for gated_residual.")
+            if self.transformer_impl != "transformer_engine":
+                raise ValueError(
+                    "hyper_connection_variant='gated_residual' requires "
+                    "transformer_impl='transformer_engine': the norm-free layer specs are "
+                    "only built for the TE backend."
+                )
+            if self.use_fused_mhc:
+                raise ValueError(
+                    "use_fused_mhc applies only to hyper_connection_variant='mhc'; the "
+                    "gated-residual variant uses its own native kernels."
+                )
+            if self.mhc_recompute_attn_cuda_graph_split:
+                raise ValueError(
+                    "mhc_recompute_attn_cuda_graph_split is mHC-only; the gated-residual "
+                    "variant does not implement the attention-only split."
+                )
+            if (
+                self.cuda_graph_impl != "none"
+                or self.enable_cuda_graph
+                or self.external_cuda_graph
+            ):
+                raise ValueError(
+                    "CUDA graphs are not supported with "
+                    "hyper_connection_variant='gated_residual' yet: the partial-MoE "
+                    "capture paths pack the 4-tuple's h_res slot as a graph output, "
+                    "which the gated-residual variant returns as None. Disable CUDA "
+                    "graphs to train with gated residuals."
+                )
+            if self.tensor_model_parallel_size > 1 and not self.sequence_parallel:
+                warnings.warn(
+                    "hyper_connection_variant='gated_residual' with tensor parallelism "
+                    "but without sequence_parallel duplicates the gated-residual "
+                    "computation (~10% of forward FLOPs) on every TP rank. Enable "
+                    "sequence_parallel so each rank processes s/TP of the sequence.",
+                    UserWarning,
+                    stacklevel=2,
+                )
 
         if self.fine_grained_activation_offloading:
             assert (
