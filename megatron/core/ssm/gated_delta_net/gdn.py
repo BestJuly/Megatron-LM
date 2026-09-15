@@ -74,9 +74,6 @@ class GatedDeltaNet(_GDNBase):
 
         if self.config.deterministic_mode or self.config.gdn_gdr_backend == "torch":
             self.gated_delta_rule = torch_chunk_gated_delta_rule
-        elif self.config.gdn_kernel_backend == "cudnn":
-            # Pre-existing rebench knob; takes precedence over gdn_gdr_backend.
-            self.gated_delta_rule = _get_cudnn_gated_delta_rule()
         elif self.config.gdn_gdr_backend == "fla":
             self.gated_delta_rule = chunk_gated_delta_rule
         elif self.config.gdn_gdr_backend == "cudnn":

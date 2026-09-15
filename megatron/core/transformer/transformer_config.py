@@ -449,11 +449,6 @@ class TransformerConfig(ModelParallelConfig):
     kda_lower_bound: Optional[float] = None
     """Optional lower bound for KDA's bounded gate values."""
 
-    gdn_kernel_backend: Literal["fla", "cudnn"] = "fla"
-    """Gated delta rule kernel backend. The cuDNN backend uses cuDNN Frontend's
-    FLA-compatible GDN adapter and retains its automatic FLA fallback for unsupported cases.
-    With context parallelism, the cuDNN backend currently supports only headwise CP."""
-
     gdn_pre_gated_delta_rule_fusion: bool = False
     """Whether to use the streamed Triton fusion for GatedDeltaNet pre-GDR preprocessing."""
 
@@ -1876,18 +1871,9 @@ class TransformerConfig(ModelParallelConfig):
                     f"gdn_conv_pad_alignment must be positive when set, "
                     f"got {self.gdn_conv_pad_alignment}."
                 )
-            if self.gdn_kernel_backend == "cudnn" and self.deterministic_mode:
-                raise ValueError(
-                    "gdn_kernel_backend='cudnn' is incompatible with deterministic_mode=True; "
-                    "leave gdn_kernel_backend='fla' so deterministic mode can select the "
-                    "PyTorch GDR implementation."
-                )
-
             if self.experimental_attention_variant == "gdn":
                 if self.gdn_gdr_backend not in ("torch", "fla", "internal", "cudnn"):
-                    raise ValueError(
-                        "gdn_gdr_backend must be one of: torch, fla, internal, cudnn."
-                    )
+                    raise ValueError("gdn_gdr_backend must be one of: torch, fla, internal, cudnn.")
                 if self.gdn_gdr_backend == "cudnn" and self.deterministic_mode:
                     raise ValueError(
                         "gdn_gdr_backend='cudnn' is incompatible with deterministic_mode=True; "
@@ -1895,11 +1881,6 @@ class TransformerConfig(ModelParallelConfig):
                     )
 
             if self.context_parallel_size > 1:
-                if self.gdn_kernel_backend == "cudnn" and self.linear_cp_mode != "headwise":
-                    raise ValueError(
-                        "gdn_kernel_backend='cudnn' only supports "
-                        "linear_cp_mode='headwise' when context_parallel_size > 1."
-                    )
                 if (
                     self.experimental_attention_variant == "gdn"
                     and self.gdn_gdr_backend == "cudnn"
@@ -2094,15 +2075,6 @@ class TransformerConfig(ModelParallelConfig):
         if self.gdn_pre_gated_delta_rule_fusion and self.experimental_attention_variant != "gdn":
             raise ValueError(
                 "gdn_pre_gated_delta_rule_fusion is only supported with "
-                "experimental_attention_variant='gdn'."
-            )
-
-        if self.gdn_kernel_backend not in ("fla", "cudnn"):
-            raise ValueError("gdn_kernel_backend must be one of: fla, cudnn.")
-
-        if self.gdn_kernel_backend != "fla" and self.experimental_attention_variant != "gdn":
-            raise ValueError(
-                "gdn_kernel_backend is only configurable with "
                 "experimental_attention_variant='gdn'."
             )
 
