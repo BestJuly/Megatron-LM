@@ -577,7 +577,7 @@ def test_snapshot_carries_the_flags_the_rejections_read(flag):
 
 
 @pytest.mark.parametrize("recipe", ["delayed", "tensorwise", "mxfp8"])
-@pytest.mark.parametrize("checkpoint", [None, "save", "load"])
+@pytest.mark.parametrize("checkpoint", [None, "save", "load", "pretrained_checkpoint"])
 def test_decoder_fp8_without_buffer_reuse_keeps_existing_support(recipe, checkpoint):
     # New reuse constraints must not narrow the FP8 support introduced by PR #55.
     from megatron.core.mdp.integration import compatibility_options_from_args
@@ -604,14 +604,19 @@ def _mxfp8_reuse_args(**overrides):
 
 
 @pytest.mark.parametrize("overlap", [False, True])
-def test_decoder_mxfp8_buffer_reuse_is_accepted(overlap):
+@pytest.mark.parametrize("checkpoint", [None, "save", "load", "pretrained_checkpoint"])
+def test_decoder_mxfp8_buffer_reuse_is_accepted(overlap, checkpoint):
     from megatron.core.mdp.integration import compatibility_options_from_args
 
+    overrides = {} if checkpoint is None else {checkpoint: "checkpoint-path"}
     options = compatibility_options_from_args(
-        _mxfp8_reuse_args(overlap_grad_reduce=overlap, overlap_param_gather=overlap)
+        _mxfp8_reuse_args(
+            overlap_grad_reduce=overlap, overlap_param_gather=overlap, **overrides
+        )
     )
     assert options.reuse_grad_buf_for_mxfp8_param_ag
     assert options.fp8_param_gather
+    assert options.load_requested == (checkpoint in ("load", "pretrained_checkpoint"))
     validate_mdp_config(MdpConfig(enable=True), options)
 
 
@@ -622,8 +627,6 @@ def test_decoder_mxfp8_buffer_reuse_is_accepted(overlap):
         {"fp8_recipe": "delayed"},
         {"fp8_param_gather": False},
         {"bf16": False, "fp16": True},
-        {"save": "checkpoint-path"},
-        {"load": "checkpoint-path"},
     ],
 )
 def test_mxfp8_buffer_reuse_rejects_unvalidated_combinations(overrides):
@@ -631,6 +634,17 @@ def test_mxfp8_buffer_reuse_rejects_unvalidated_combinations(overrides):
 
     options = compatibility_options_from_args(_mxfp8_reuse_args(**overrides))
     with pytest.raises(MdpConfigurationError, match="reuse_grad_buf_for_mxfp8_param_ag"):
+        validate_mdp_config(MdpConfig(enable=True), options)
+
+
+def test_pretrained_checkpoint_uses_the_checkpoint_format_guard():
+    from megatron.core.mdp.integration import compatibility_options_from_args
+
+    options = compatibility_options_from_args(
+        _mxfp8_reuse_args(pretrained_checkpoint="checkpoint-path", ckpt_format="torch")
+    )
+    assert options.load_requested
+    with pytest.raises(MdpConfigurationError, match="checkpoint_mode"):
         validate_mdp_config(MdpConfig(enable=True), options)
 
 

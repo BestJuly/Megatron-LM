@@ -176,6 +176,21 @@ class MdpChainedOptimizer(ChainedOptimizer):
     # Checkpointing
     # ------------------------------------------------------------------
 
+    def _validate_encoder_checkpoint_format(self, sharding_type: Optional[str]) -> None:
+        """Reject the native FP32 coalescing path for INT16 encoder remainders."""
+        if (
+            self._encoder_member is not None
+            and getattr(self.config, "reuse_grad_buf_for_mxfp8_param_ag", False)
+            and sharding_type == "fully_reshardable"
+            and getattr(self._encoder_member.optimizer, "store_param_remainders", False)
+        ):
+            raise MdpCheckpointError(
+                "MDP: fully_reshardable optimizer checkpoints with MXFP8 buffer reuse "
+                "cannot preserve the BF16 encoder's INT16 master-weight remainders. "
+                "Use dp_reshardable, or set store_param_remainders=False when both "
+                "saving and loading."
+            )
+
     def _member_keys(self) -> List[str]:
         """The per-member checkpoint key, in member order.
 
@@ -203,6 +218,7 @@ class MdpChainedOptimizer(ChainedOptimizer):
         from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 
         metadata = kwargs.get("metadata") or {}
+        self._validate_encoder_checkpoint_format(metadata.get("distrib_optim_sharding_type"))
         decoder_needs_prefix = (
             "distrib_optim_sharding_type" in metadata
             and metadata["distrib_optim_sharding_type"]
@@ -236,6 +252,9 @@ class MdpChainedOptimizer(ChainedOptimizer):
                 f"MDP: the checkpoint optimizer state is missing member keys {missing}; "
                 f"it holds {sorted(map(str, state_dict))}."
             )
+        self._validate_encoder_checkpoint_format(
+            state_dict[ENCODER_MEMBER_KEY].get("param_state_sharding_type")
+        )
         for member, key in zip(self.chained_optimizers, member_keys):
             member.load_state_dict(state_dict[key])
         self._synchronize_steps()

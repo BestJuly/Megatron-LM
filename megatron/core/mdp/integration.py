@@ -161,7 +161,10 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
         ),
         checkpoint_mode=getattr(args, "ckpt_format", "torch_dist"),
         save_requested=getattr(args, "save", None) is not None,
-        load_requested=getattr(args, "load", None) is not None,
+        load_requested=(
+            getattr(args, "load", None) is not None
+            or getattr(args, "pretrained_checkpoint", None) is not None
+        ),
         sequence_parallel=bool(getattr(args, "sequence_parallel", False)),
         sequence_packing_scheduler=getattr(args, "sequence_packing_scheduler", None),
         thd_static_packing=bool(getattr(args, "thd_static_packing", False)),

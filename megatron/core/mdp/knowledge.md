@@ -282,8 +282,16 @@ and member identities. A decoder-only chain referencing the same optimizers
 owns native MXFP8 staging/deferred synchronization; it must not see the
 encoder's synchronous gather policy. Forward-time staging under MDP filters each
 member by its own reuse and overlap settings; non-MDP traversal is unchanged.
-Checkpoint save/load remains rejected
-for this new combination until round-trip validation is available.
+Synchronous `torch_dist` checkpoint save/load is supported with decoder MXFP8
+buffer reuse, including full resume and ordinary weight-only initialization
+without `--load-main-params-from-ckpt`. The default `dp_reshardable` optimizer
+format preserves encoder master-weight remainders.
+`fully_reshardable` coalesces state through FP32, so saving or loading optimizer
+state in that format is rejected when the encoder optimizer stores INT16
+remainders. Disable remainder storage at both save and load to use that format.
+Check the actual metadata on load, not only the current CLI's save-format flag.
+
+Both `--load` and `--pretrained-checkpoint` count as checkpoint load requests.
 
 Encoder FP8 is rejected where it becomes observable rather than inferred from
 args: `validate_effective_vision_config` runs on the resolved vision config
@@ -506,8 +514,7 @@ Current major constraints:
   communication overlap;
 - native decoder `overlap_grad_reduce` and `overlap_param_gather` are supported,
   while delayed gradient reduction, parameter-gather overlap with the optimizer
-  step, and MXFP8 grad-buffer reuse for the parameter all-gather are rejected by
-  `validate_mdp_config`;
+  step are rejected by `validate_mdp_config`;
 - no `--sequence-packing-scheduler`; MDP owns its packing, and
   `--mdp-greedy-packing` additionally rejects `--train-samples` and
   `--rampup-batch-size`.

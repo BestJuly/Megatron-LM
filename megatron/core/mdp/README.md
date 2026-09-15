@@ -88,9 +88,13 @@ derive fail loudly instead: with `--use-packed-sequence`, `--fp4-format` and
 Decoder MXFP8 parameter gather may reuse its gradient buffer with BF16 training.
 The encoder keeps independent BF16 buffers and synchronous optimizer updates;
 only decoder members participate in MXFP8 parameter staging. Both decoder
-parameter-gather overlap modes are supported. Checkpoint save/load with this
-new buffer-reuse combination is not yet validated and is rejected; existing
-FP8 configurations without buffer reuse retain their checkpoint behavior.
+parameter-gather overlap modes support synchronous `torch_dist` checkpoint
+save/load, including full resume and ordinary weight-only initialization
+without `--load-main-params-from-ckpt`. For MXFP8 buffer reuse,
+`fully_reshardable` optimizer checkpoints require encoder remainder storage
+disabled at both save and load; the default `dp_reshardable` format supports
+remainder storage. The optimizer checks the actual checkpoint format and
+encoder remainder mode before saving or loading optimizer state.
 
 Rejected at startup: FSDP/HSDP, encoder FP8, full-iteration CUDA graphs, CPU
 activation offload, delayed gradient reduction,

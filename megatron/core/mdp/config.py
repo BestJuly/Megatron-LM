@@ -386,14 +386,6 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
                 "Only the decoder may reuse its gradient buffer for MXFP8 parameter gather.",
                 "enable decoder MXFP8 parameter gather or disable buffer reuse",
             )
-        if options.save_requested or options.load_requested:
-            _reject(
-                "reuse_grad_buf_for_mxfp8_param_ag",
-                True,
-                "checkpoint save/load disabled with MXFP8 buffer reuse",
-                "Checkpoint round trips with the isolated encoder optimizer are not validated.",
-                "disable buffer reuse when saving or loading checkpoints",
-            )
     if options.delay_grad_reduce:
         _reject(
             "delay_grad_reduce",
