@@ -18,8 +18,21 @@ def _validate_internal_gdr_64_aligned_packed_seq_params(
     # ptyche experiments only support positive 64-token-aligned packed
     # sequences. Keep this workaround centralized here so GDN/backend code can
     # trust finalized packed-sequence metadata without duplicating value checks.
-    for name in ("cu_seqlens_q", "cu_seqlens_kv", "cu_seqlens_q_padded", "cu_seqlens_kv_padded"):
-        cu_seqlens = getattr(packed_seq_params, name, None)
+    #
+    # Check only the array the GDR kernel is actually handed. _GDNBase._resolve_cu_seqlens
+    # takes the padded variant whenever it exists and the unpadded one otherwise, and
+    # gdn.py passes that single resolved tensor as `cu_seqlens` to every backend. Under
+    # --pad-packed-seq-alignment the raw cu_seqlens_q still carries the unaligned real
+    # token counts, so validating it rejects packings the kernel would never see.
+    for padded_name, raw_name in (
+        ("cu_seqlens_q_padded", "cu_seqlens_q"),
+        ("cu_seqlens_kv_padded", "cu_seqlens_kv"),
+    ):
+        cu_seqlens = getattr(packed_seq_params, padded_name, None)
+        name = padded_name
+        if cu_seqlens is None:
+            cu_seqlens = getattr(packed_seq_params, raw_name, None)
+            name = raw_name
         if cu_seqlens is None:
             continue
         offsets = cu_seqlens.detach().cpu() if cu_seqlens.device.type != "cpu" else cu_seqlens
