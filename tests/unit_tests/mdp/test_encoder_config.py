@@ -99,7 +99,75 @@ def test_composite_accepts_only_the_encoder_projection():
         MdpChainedOptimizer(members, encoder_member_index=1)
 
 
-def test_forward_staging_excludes_encoder_and_non_reusing_members(monkeypatch):
+def _run_train_step_until_forward(
+    monkeypatch, optimizer, model, *, mdp=True, reuse=True, overlap=True, full_cg=False
+):
+    """Exercise the real train-step setup, stopping before model execution."""
+    import megatron.training.training as training
+
+    args = SimpleNamespace(
+        mdp_enable=mdp,
+        reuse_grad_buf_for_mxfp8_param_ag=reuse,
+        overlap_param_gather=overlap,
+        save_params_interval=None,
+        save_activations_interval=None,
+        save_tokens_per_expert_interval=None,
+        save_wgrads_interval=None,
+        save_dgrads_interval=None,
+        seq_length=128,
+        global_batch_size=1,
+        micro_batch_size=1,
+        decoder_seq_length=None,
+    )
+
+    class ReachedForward(Exception):
+        pass
+
+    def stop_at_forward(**_kwargs):
+        raise ReachedForward
+
+    with monkeypatch.context() as patch:
+        patch.setattr(training, "get_args", lambda: args)
+        patch.setattr(training, "get_timers", lambda: None)
+        patch.setattr(training, "get_num_microbatches", lambda: 1)
+        patch.setattr(training, "has_nvidia_modelopt", False)
+        patch.setattr(
+            training,
+            "get_rerun_state_machine",
+            lambda: SimpleNamespace(should_run_forward_backward=lambda _: True),
+        )
+        patch.setattr(
+            training,
+            "FullCudaGraphWrapper",
+            SimpleNamespace(cuda_graph={"training": object()} if full_cg else {}),
+        )
+        with pytest.raises(ReachedForward):
+            training.train_step(
+                None,
+                iter(()),
+                model,
+                optimizer,
+                None,
+                SimpleNamespace(),
+                stop_at_forward,
+                iteration=0,
+            )
+
+
+@pytest.mark.parametrize("mdp", [False, True])
+@pytest.mark.parametrize(
+    "reuse,overlap,hooks,full_cg,should_stage",
+    [
+        (True, True, True, False, True),
+        (False, True, True, False, False),
+        (True, False, True, False, False),
+        (True, True, False, False, False),
+        (True, True, False, True, True),
+    ],
+)
+def test_train_step_staging_preserves_native_behavior(
+    monkeypatch, mdp, reuse, overlap, hooks, full_cg, should_stage
+):
     import megatron.training.training as training
 
     calls = []
@@ -120,8 +188,23 @@ def test_forward_staging_excludes_encoder_and_non_reusing_members(monkeypatch):
         DistOpt("synchronous", True, False),
         SimpleNamespace(),
     ]
-    training._stage_mxfp8_params_for_forward(SimpleNamespace(chained_optimizers=members))
-    assert calls == ["decoder-dense", "decoder-expert"]
+    model = SimpleNamespace(
+        zero_grad_buffer=lambda: calls.append("zero-buffer"),
+        remove_forward_pre_hook_handles=[object()] if hooks else [],
+    )
+    optimizer = SimpleNamespace(
+        chained_optimizers=members, zero_grad=lambda: calls.append("zero-optimizer")
+    )
+    _run_train_step_until_forward(
+        monkeypatch, optimizer, [model], mdp=mdp, reuse=reuse, overlap=overlap, full_cg=full_cg
+    )
+    expected = []
+    if should_stage:
+        expected = ["decoder-dense", "decoder-expert"]
+        if not mdp:
+            # Preserve the legacy traversal even if member flags differ from args.
+            expected += ["encoder", "non-reusing", "synchronous"]
+    assert calls == ["zero-buffer", "zero-optimizer", *expected]
 
 
 @pytest.mark.parametrize("overlap", [False, True])

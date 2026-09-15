@@ -243,11 +243,11 @@ def test_member_order_is_flat_dense_expert_encoder():
 
 
 @pytest.mark.parametrize("overlap", [False, True])
-def test_mxfp8_reuse_preserves_both_domains_and_global_clipping(overlap):
+def test_mxfp8_reuse_preserves_both_domains_and_global_clipping(overlap, monkeypatch):
     """Compare three real MXFP8/BF16 updates against independently stepped domains."""
     import transformer_engine.pytorch as te
 
-    from megatron.training.training import _stage_mxfp8_params_for_forward
+    from tests.unit_tests.mdp.test_encoder_config import _run_train_step_until_forward
 
     if torch.cuda.get_device_capability()[0] < 10:
         pytest.skip("MXFP8 requires Blackwell")
@@ -347,8 +347,8 @@ def test_mxfp8_reuse_preserves_both_domains_and_global_clipping(overlap):
             ddp.zero_grad_buffer()
             opt.zero_grad()
         if overlap:
-            # Exercise the same member-filtering helper used by train_step.
-            _stage_mxfp8_params_for_forward(composite)
+            # Exercise train_step's actual zero-grad and inline staging path.
+            _run_train_step_until_forward(monkeypatch, composite, [decoder])
             ref_decoder_opt.prepare_model_params_for_param_sync()
         for ddp in (decoder, encoder, ref_decoder, ref_encoder):
             (100 * ddp(inputs).float().square().mean()).backward()

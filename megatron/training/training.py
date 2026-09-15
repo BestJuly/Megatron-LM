@@ -2947,17 +2947,6 @@ def dummy_train_step(data_iterator):
             )
 
 
-def _stage_mxfp8_params_for_forward(optimizer) -> None:
-    """Stage only buffer-reusing, overlapped DistOpts after gradients are zeroed."""
-    for optim_instance in optimizer.chained_optimizers:
-        if (
-            isinstance(optim_instance, DistributedOptimizer)
-            and optim_instance.config.reuse_grad_buf_for_mxfp8_param_ag
-            and optim_instance.config.overlap_param_gather
-        ):
-            optim_instance._copy_main_params_to_param_buffer()
-
-
 def train_step(
     forward_step_func,
     data_iterator,
@@ -3071,7 +3060,15 @@ def train_step(
             forward_pre_hook_enabled = len(model[0].remove_forward_pre_hook_handles) > 0
             full_cg_captured = FullCudaGraphWrapper.cuda_graph.get("training") is not None
             if forward_pre_hook_enabled or full_cg_captured:
-                _stage_mxfp8_params_for_forward(optimizer)
+                for optim_instance in optimizer.chained_optimizers:
+                    if isinstance(optim_instance, DistributedOptimizer):
+                        # MDP adds a synchronous BF16 encoder; do not stage its buffers.
+                        if getattr(args, "mdp_enable", False) and not (
+                            optim_instance.config.reuse_grad_buf_for_mxfp8_param_ag
+                            and optim_instance.config.overlap_param_gather
+                        ):
+                            continue
+                        optim_instance._copy_main_params_to_param_buffer()
 
         # Master weights must remain resident until any main-param copy above is
         # complete. Releasing here keeps optimizer memory out of forward/backward.

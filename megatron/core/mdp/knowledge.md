@@ -280,8 +280,9 @@ onto independent BF16 buffers with synchronous parameter gather. The outer
 composite stays flat for shared overflow detection, global gradient clipping,
 and member identities. A decoder-only chain referencing the same optimizers
 owns native MXFP8 staging/deferred synchronization; it must not see the
-encoder's synchronous gather policy. Forward-time staging filters each member
-by its own reuse and overlap settings. Checkpoint save/load remains rejected
+encoder's synchronous gather policy. Forward-time staging under MDP filters each
+member by its own reuse and overlap settings; non-MDP traversal is unchanged.
+Checkpoint save/load remains rejected
 for this new combination until round-trip validation is available.
 
 Encoder FP8 is rejected where it becomes observable rather than inferred from
