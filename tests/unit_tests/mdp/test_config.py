@@ -576,22 +576,6 @@ def test_snapshot_carries_the_flags_the_rejections_read(flag):
         validate_mdp_config(MdpConfig(enable=True), options)
 
 
-@pytest.mark.parametrize("recipe", ["delayed", "tensorwise", "mxfp8"])
-@pytest.mark.parametrize("checkpoint", [None, "save", "load", "pretrained_checkpoint"])
-def test_decoder_fp8_without_buffer_reuse_keeps_existing_support(recipe, checkpoint):
-    # New reuse constraints must not narrow the FP8 support introduced by PR #55.
-    from megatron.core.mdp.integration import compatibility_options_from_args
-
-    overrides = {} if checkpoint is None else {checkpoint: "checkpoint-path"}
-    options = compatibility_options_from_args(
-        _fake_args(fp8="e4m3", fp8_recipe=recipe, **overrides)
-    )
-    assert options.decoder_fp8_enabled
-    assert options.fp8_recipe == recipe
-    assert not options.reuse_grad_buf_for_mxfp8_param_ag
-    validate_mdp_config(MdpConfig(enable=True), options)
-
-
 def _mxfp8_reuse_args(**overrides):
     values = dict(
         fp8="e4m3",
@@ -603,19 +587,44 @@ def _mxfp8_reuse_args(**overrides):
     return _fake_args(**values)
 
 
-@pytest.mark.parametrize("overlap", [False, True])
-@pytest.mark.parametrize("checkpoint", [None, "save", "load", "pretrained_checkpoint"])
-def test_decoder_mxfp8_buffer_reuse_is_accepted(overlap, checkpoint):
+@pytest.mark.parametrize(
+    "recipe,reuse,overlap,checkpoint",
+    [
+        ("delayed", False, False, None),
+        ("tensorwise", False, False, None),
+        ("mxfp8", False, False, None),
+        ("mxfp8", False, False, "save"),
+        ("mxfp8", False, False, "load"),
+        ("mxfp8", False, False, "pretrained_checkpoint"),
+        ("mxfp8", True, False, None),
+        ("mxfp8", True, True, None),
+        ("mxfp8", True, True, "save"),
+        ("mxfp8", True, True, "load"),
+        ("mxfp8", True, False, "pretrained_checkpoint"),
+    ],
+)
+def test_decoder_fp8_support_matrix(recipe, reuse, overlap, checkpoint):
+    # Cover each recipe, overlap mode and checkpoint entry without crossing
+    # independent settings; non-reusing FP8 must retain its existing support.
     from megatron.core.mdp.integration import compatibility_options_from_args
 
     overrides = {} if checkpoint is None else {checkpoint: "checkpoint-path"}
     options = compatibility_options_from_args(
-        _mxfp8_reuse_args(
-            overlap_grad_reduce=overlap, overlap_param_gather=overlap, **overrides
+        _fake_args(
+            fp8="e4m3",
+            fp8_recipe=recipe,
+            fp8_param_gather=reuse,
+            reuse_grad_buf_for_mxfp8_param_ag=reuse,
+            overlap_grad_reduce=overlap,
+            overlap_param_gather=overlap,
+            **overrides,
         )
     )
-    assert options.reuse_grad_buf_for_mxfp8_param_ag
-    assert options.fp8_param_gather
+    assert options.decoder_fp8_enabled
+    assert options.fp8_recipe == recipe
+    assert options.reuse_grad_buf_for_mxfp8_param_ag == reuse
+    assert options.fp8_param_gather == reuse
+    assert options.save_requested == (checkpoint == "save")
     assert options.load_requested == (checkpoint in ("load", "pretrained_checkpoint"))
     validate_mdp_config(MdpConfig(enable=True), options)
 

@@ -115,7 +115,7 @@ returns to `EMPTY`.
 
 | File | Read when changing |
 |---|---|
-| `config.py` | CLI-derived configuration, validation, supported combinations, vision config overrides. |
+| `config.py` | CLI-derived configuration, validation, supported combinations, typed encoder recompute settings. |
 | `errors.py` | MDP-specific failure classes. |
 | `protocols.py` | Model adapter interface and capture/descriptor carrier types. |
 | `rank_mapping.py` | Rank coordinates, outer-DP planning groups, logical workers, endpoint mapping. |
@@ -290,6 +290,9 @@ format preserves encoder master-weight remainders.
 state in that format is rejected when the encoder optimizer stores INT16
 remainders. Disable remainder storage at both save and load to use that format.
 Check the actual metadata on load, not only the current CLI's save-format flag.
+This optimizer format is distinct from the fully-parallel save/load wrappers,
+which remain unsupported. The reuse checkpoint evidence is from fixed-topology
+DDP/optimizer API round trips, not cross-parallelism or full-35B training resumes.
 
 Both `--load` and `--pretrained-checkpoint` count as checkpoint load requests.
 
