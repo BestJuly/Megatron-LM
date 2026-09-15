@@ -65,6 +65,13 @@ it. `--eval-interval` must stay set: iteration-based data sizing divides by it. 
 drop both together for real data (`--data-path ... --split 99,1,0`) and switch to
 `--tokenizer-type HuggingFaceTokenizer --tokenizer-model Qwen/Qwen3.8-Flash-Next`.
 
+## Verified
+
+The command above was run on 4 GB300s (2026-09-15, `lit/qwen4`): 8 iterations, finite
+`lm loss` / `mtp_1 loss` / `load_balancing_loss` / `indexer loss`, **71.9 GiB peak allocated** per
+GPU at seq 4096. The same command with flag overrides is what produced the
+[support matrix](../validation/support_matrix.md) — run it before trusting a new branch.
+
 ## What to expect
 
 - Iteration 1 is slow (Triton/inductor JIT for GDN, QSA and the PLE hash kernels), after that a
@@ -74,8 +81,11 @@ drop both together for real data (`--data-path ... --split 99,1,0`) and switch t
   then drops far faster than on text (the mock dataset is a deterministic pattern) — mechanics, not
   quality.
 - Gradient-level proof that the memory is really in the graph: `--engram-verify-training` prints
-  per-iteration `num_tables=16 zero_grad_tables=0 nonfinite_tables=0 changed_tables=16`. This is
-  the check that caught two silent no-ops during integration (memory built but never applied).
+  per-iteration `num_tables=N zero_grad_tables=0 nonfinite_tables=0 changed_tables=N` (N = 16
+  tables × EP ranks, so 64 at EP4). This is the check that caught two silent no-ops during
+  integration (memory built but never applied). Two things to know: the flag reads full gradients
+  from `main_grad` and therefore **refuses `--use-distributed-optimizer`**, and a warmup schedule
+  starting at lr 0 makes iteration 1 report `changed_tables=0` — use a constant lr for the check.
 - Parameter counts with and without each of `--engram-*`, `--enable-hyper-connections …`,
   `--mtp-num-layers` must differ; if not, the flag did not reach model construction.
 

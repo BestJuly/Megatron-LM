@@ -16,6 +16,7 @@ model.
 | [`training/proxy_single_node.md`](training/proxy_single_node.md) | An 8-layer / 32-expert proxy with every per-layer dimension real; one `torchrun` on a single node; what to expect |
 | [`training/full_model_64gpu.md`](training/full_model_64gpu.md) | The 48-layer model on 64 GPUs (EP64, BF16): the full argument list, measured memory and step time, from-scratch schedule |
 | [`checkpoint/hf_weights_and_resume.md`](checkpoint/hf_weights_and_resume.md) | Weight-mapping rules from the released checkpoint, the native `torch_dist` checkpoint, and the resume flags; what was measured |
+| [`validation/support_matrix.md`](validation/support_matrix.md) | **What the composed model actually supports** — EP/TP/PP/VPP/CP/THD/recompute/MXFP8/CUDA-graph/FSDP, each measured on the proxy, with the TODO list the gaps produce |
 | [`validation/parity_and_acceptance.md`](validation/parity_and_acceptance.md) | Numerical parity against the HF implementation (random-init proxy and real weights), the acceptance matrix, and what is still unverified |
 | [`integration/branches_and_rebuild.md`](integration/branches_and_rebuild.md) | How the branch is built from three feature branches, what the one remaining glue commit is, and how to rebuild it |
 
@@ -31,6 +32,7 @@ MTP are stock Megatron Core.
 | Numerical parity vs HF | whole-model proxy: logits `max_abs 2.7e-7`, 161/161 parameter gradients, 20-step trajectory; real weights (4-layer truncation): every point before the first MoE router at fp32 noise, routing ties after it (`validation/`) |
 | Released weights | convert strictly (all 131 shards consumed), load exactly as a native `torch_dist` checkpoint at EP64, 50-step resume on 64 GB300s (`checkpoint/`) |
 | Memory / layout | BF16, expert parallelism only: EP64 peaks at 204 GiB per GPU with 29 GiB headroom; EP32 does not fit without recompute (`training/full_model_64gpu.md`) |
+| Parallelism / features | EP, TP+SP, PP, VPP, CP (unpacked), packed rows (`--sft`), recompute and MXFP8 all **measured working** on the composed stack; CUDA graphs, FSDP and packed-rows+CP are rejected at startup ([`validation/support_matrix.md`](validation/support_matrix.md)) |
 | Not yet done | loss quality on real text (all runs used mock data); performance tuning (hybridep, CUDA graphs, fused GR kernels, QSA sparse kernel by default); CP on packed rows; the multimodal variant |
 
 ## Entry point and specs

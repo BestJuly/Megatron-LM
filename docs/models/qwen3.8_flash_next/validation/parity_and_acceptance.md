@@ -62,7 +62,12 @@ MTP forward.
 | real-weight truncation native load, EP4 | `all_ranks_equal: true`, 5,624 / 5,624 tensors equal |
 | unit tests | `tests/unit_tests/transformer/test_gated_residual*.py`, `…/experimental_attention_variant/test_*qsa*.py`, `tests/unit_tests/ssm/test_hybrid_layer_allocation.py`, `tests/unit_tests/models/engram/`, `tests/unit_tests/ssm/gated_delta_net/test_gdn_output_gate.py`; failure sets equal to the base branch (multi-rank tests need `torchrun`; `pyproject` sets `-x`, run with `-o addopts=""` to see the whole file) |
 
-## 6. Not verified
+## 6. Parallelism / feature coverage
+
+Which parallel layouts and features the composed model runs under is a separate, measured
+document: [`support_matrix.md`](support_matrix.md).
+
+## 7. Not verified
 
 - Loss quality on real text (every run used mock data).
 - The MTP head numerically (no reference).
