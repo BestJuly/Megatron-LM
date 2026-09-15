@@ -115,7 +115,7 @@ returns to `EMPTY`.
 
 | File | Read when changing |
 |---|---|
-| `config.py` | CLI-derived configuration, validation, supported combinations, vision config overrides. |
+| `config.py` | CLI-derived configuration, validation, supported combinations, typed encoder recompute settings. |
 | `errors.py` | MDP-specific failure classes. |
 | `protocols.py` | Model adapter interface and capture/descriptor carrier types. |
 | `rank_mapping.py` | Rank coordinates, outer-DP planning groups, logical workers, endpoint mapping. |
@@ -271,9 +271,30 @@ key or reshard them as if they did.
 Decoder and encoder FP8 are configured separately. `args.fp8` reaches only the
 decoder; the vision `TransformerConfig` is built by the adapter and never reads
 it, and the typed encoder arguments (`--encoder-recompute-*`) carry no FP8
-field. Decoder FP8 is not an MDP incompatibility, so `MdpCompatibilityOptions`
-carries no field for it at all; the one thing it asks of MDP, the THD row
-alignment, reads `args.fp8` directly in `forward_step.py`.
+field. Decoder FP8 without buffer reuse remains accepted. The compatibility
+snapshot reads decoder FP8 settings only to validate MXFP8 gradient-buffer
+reuse; packed-row alignment still reads `args.fp8` in `forward_step.py`.
+
+With decoder MXFP8 buffer reuse, project the encoder DDP and optimizer configs
+onto independent BF16 buffers with synchronous parameter gather. The outer
+composite stays flat for shared overflow detection, global gradient clipping,
+and member identities. A decoder-only chain referencing the same optimizers
+owns native MXFP8 staging/deferred synchronization; it must not see the
+encoder's synchronous gather policy. Forward-time staging under MDP filters each
+member by its own reuse and overlap settings; non-MDP traversal is unchanged.
+Synchronous `torch_dist` checkpoint save/load is supported with decoder MXFP8
+buffer reuse, including full resume and ordinary weight-only initialization
+without `--load-main-params-from-ckpt`. The default `dp_reshardable` optimizer
+format preserves encoder master-weight remainders.
+`fully_reshardable` coalesces state through FP32, so saving or loading optimizer
+state in that format is rejected when the encoder optimizer stores INT16
+remainders. Disable remainder storage at both save and load to use that format.
+Check the actual metadata on load, not only the current CLI's save-format flag.
+This optimizer format is distinct from the fully-parallel save/load wrappers,
+which remain unsupported. The reuse checkpoint evidence is from fixed-topology
+DDP/optimizer API round trips, not cross-parallelism or full-35B training resumes.
+
+Both `--load` and `--pretrained-checkpoint` count as checkpoint load requests.
 
 Encoder FP8 is rejected where it becomes observable rather than inferred from
 args: `validate_effective_vision_config` runs on the resolved vision config
@@ -496,8 +517,7 @@ Current major constraints:
   communication overlap;
 - native decoder `overlap_grad_reduce` and `overlap_param_gather` are supported,
   while delayed gradient reduction, parameter-gather overlap with the optimizer
-  step, and MXFP8 grad-buffer reuse for the parameter all-gather are rejected by
-  `validate_mdp_config`;
+  step are rejected by `validate_mdp_config`;
 - no `--sequence-packing-scheduler`; MDP owns its packing, and
   `--mdp-greedy-packing` additionally rejects `--train-samples` and
   `--rampup-batch-size`.

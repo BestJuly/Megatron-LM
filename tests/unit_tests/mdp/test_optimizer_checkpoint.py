@@ -16,6 +16,7 @@ WORLD-sharded encoder both compute ``data_parallel_group_idx == 0``::
 """
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -161,6 +162,46 @@ def test_untagged_composite_keeps_the_inherited_behavior():
     composite = MdpChainedOptimizer([_FakeMember("a"), _FakeMember("b")])
     sharded = composite.sharded_state_dict({}, metadata=dict(_DP_RESHARDABLE_METADATA))
     assert set(sharded) == {0, 1}
+
+
+@pytest.mark.parametrize(
+    "sharding,reuse,remainders",
+    [
+        ("dp_reshardable", True, True),
+        ("fully_reshardable", False, True),
+        ("fully_reshardable", True, False),
+        ("fully_reshardable", True, True),
+    ],
+)
+@pytest.mark.parametrize("is_loading", [False, True])
+def test_encoder_remainder_guard_uses_actual_optimizer_format(
+    sharding, reuse, remainders, is_loading
+):
+    # One supported case per guard condition, plus the rejected combination.
+    composite, _, encoder = _flat_build(1)
+    composite.config = SimpleNamespace(reuse_grad_buf_for_mxfp8_param_ag=reuse)
+    encoder.optimizer.store_param_remainders = remainders
+    metadata = {**_DP_RESHARDABLE_METADATA, "distrib_optim_sharding_type": sharding}
+
+    if reuse and remainders and sharding == "fully_reshardable":
+        with pytest.raises(MdpCheckpointError, match="INT16"):
+            composite.sharded_state_dict({}, is_loading=is_loading, metadata=metadata)
+    else:
+        composite.sharded_state_dict({}, is_loading=is_loading, metadata=metadata)
+
+
+def test_load_rejects_remainder_format_before_loading_any_member():
+    composite, decoder, encoder = _flat_build(1)
+    composite.config = SimpleNamespace(reuse_grad_buf_for_mxfp8_param_ag=True)
+    encoder.optimizer.store_param_remainders = True
+    state = {
+        "chained_0": {"who": "decoder"},
+        ENCODER_MEMBER_KEY: {"param_state_sharding_type": "fully_reshardable"},
+    }
+    with pytest.raises(MdpCheckpointError, match="INT16"):
+        composite.load_state_dict(state)
+    assert decoder[0].loaded_state is None
+    assert encoder.loaded_state is None
 
 
 # ----------------------------------------------------------------------------

@@ -140,9 +140,11 @@ def assert_supported_checkpoint_config(args) -> None:
     two-sharding-domain checkpoint (see the module docstring).
     """
     problems = []
-    save_or_load = (
-        getattr(args, "save", None) is not None or getattr(args, "load", None) is not None
+    load_requested = (
+        getattr(args, "load", None) is not None
+        or getattr(args, "pretrained_checkpoint", None) is not None
     )
+    save_or_load = getattr(args, "save", None) is not None or load_requested
     if save_or_load:
         # Design doc section 12: only the synchronous, persistent, global
         # torch_dist mode is supported. Asynchronous, non-persistent, and
@@ -166,7 +168,7 @@ def assert_supported_checkpoint_config(args) -> None:
         # that never touch a checkpoint are not rejected by the default.
         if getattr(args, "ckpt_fully_parallel_save", False):
             problems.append("--no-ckpt-fully-parallel-save")
-    if getattr(args, "load", None) is not None:
+    if load_requested:
         if getattr(args, "ckpt_fully_parallel_load", False):
             problems.append("--no-ckpt-fully-parallel-load (or omit --ckpt-fully-parallel-load)")
     if problems:

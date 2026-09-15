@@ -1334,7 +1334,7 @@ class ChainedOptimizer(MegatronOptimizer):
                     for model_chunk in optimizer.model_chunks:
                         if model_chunk not in self.model_chunks:
                             self.model_chunks.append(model_chunk)
-                assert self.config == getattr(optimizer, 'config', None)
+                self._validate_optimizer_config(optimizer)
             # If all optimizers are stub optimizers, the ChainedOptimizer is also a stub optimizer
             self.is_stub_optimizer = all(
                 getattr(optimizer, 'is_stub_optimizer', False) for optimizer in chained_optimizers
@@ -1343,6 +1343,10 @@ class ChainedOptimizer(MegatronOptimizer):
         else:
             self.is_stub_optimizer = True
         self.chained_optimizers = chained_optimizers
+
+    def _validate_optimizer_config(self, optimizer: MegatronOptimizer) -> None:
+        """Require uniform configs unless a subclass validates domain-specific differences."""
+        assert self.config == getattr(optimizer, 'config', None)
 
     @property
     def optimizer(self):
