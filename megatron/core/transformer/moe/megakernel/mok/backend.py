@@ -360,6 +360,16 @@ class MoKMegakernel(MegakernelBackend):
     def forward(
         self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
     ) -> torch.Tensor:
+        """Run the fused MoE megakernel (dispatch, routed/shared experts, combine).
+
+        Args:
+            hidden_states: Input activations of shape ``[..., hidden_size]``.
+            probs: Router probabilities, flattened to ``[num_tokens, num_experts]``.
+            routing_map: Token-to-expert routing map matching ``probs``.
+
+        Returns:
+            MoE output with the same shape as ``hidden_states``.
+        """
         original_shape = hidden_states.shape
         x = hidden_states.reshape(-1, original_shape[-1]).contiguous()
         probs = probs.reshape(x.shape[0], -1)
