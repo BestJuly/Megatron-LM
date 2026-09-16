@@ -146,7 +146,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             dynamic_cp=args.dynamic_context_parallel,
             config=config,
         )
-        finalize_packed_seq_params(batch[5])
+        finalize_packed_seq_params(batch[5], config.gdn_gdr_backend)
         return batch
 
     # TODO: this is pretty hacky, find a better way
@@ -189,7 +189,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
             max_seqlen_kv=int(max_seqlen[0].item()),
             qkv_format='thd',
         )
-        finalize_packed_seq_params(packed_seq_params)
+        finalize_packed_seq_params(packed_seq_params, config.gdn_gdr_backend)
         return (None, None, None, None, None, packed_seq_params, None)
 
     thd_tail_padding_policy = resolve_thd_tail_padding_policy(config)
@@ -241,7 +241,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         if 'position_ids' in batch:
             batch['position_ids'] = position_ids
 
-    finalize_packed_seq_params(packed_seq_params)
+    finalize_packed_seq_params(packed_seq_params, config.gdn_gdr_backend)
 
     # Unpack explicitly to avoid relying on dict insertion order.
     return (

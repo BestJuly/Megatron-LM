@@ -75,8 +75,16 @@ def get_packed_seq_params_cp_partition_cu_seqlens(
 
 def finalize_packed_seq_params(
     packed_seq_params: Optional["PackedSeqParams"],
+    gdn_gdr_backend: Optional[str] = None,
 ) -> Optional["PackedSeqParams"]:
-    """Resolve CP metadata and prebuild the THD layout route for a microbatch."""
+    """Resolve CP metadata and prebuild the THD layout route for a microbatch.
+
+    Args:
+        packed_seq_params: THD metadata for this microbatch, or None for SBHD.
+        gdn_gdr_backend: value of ``TransformerConfig.gdn_gdr_backend``. Only
+            ``"internal"`` triggers the temporary 64-alignment check below;
+            callers that omit it get no backend-specific validation.
+    """
     if packed_seq_params is None:
         return None
 
@@ -85,7 +93,16 @@ def finalize_packed_seq_params(
     from megatron.core.packed_seq_params import resolve_cp_group
     from megatron.core.parallel_state import get_context_parallel_group
 
-    _validate_internal_gdr_64_aligned_packed_seq_params(packed_seq_params)
+    # Gate on the backend that actually has the restriction. This check is a
+    # [REMOVE BEFORE MERGE] workaround for the internal GDR CuTe kernels; the
+    # cuDNN and fla backends have no 64-alignment requirement, and running it
+    # for them rejects packings they handle correctly. It was unconditional
+    # until 2026-09-16, which broke every THD run whose packed lengths are not
+    # multiples of 64 regardless of backend -- e.g. the 128-GPU THD-4K
+    # benchmark on gdn_gdr_backend='cudnn' died in get_batch on lengths
+    # [4095, 1] (job 760373, zero iterations).
+    if gdn_gdr_backend == "internal":
+        _validate_internal_gdr_64_aligned_packed_seq_params(packed_seq_params)
 
     cp_group = resolve_cp_group(get_context_parallel_group(), packed_seq_params)
     packed_seq_params.cp_group = cp_group

@@ -134,7 +134,7 @@ def get_batch(data_iterator, vp_stage=None):
             dynamic_cp=is_dynamic_cp,
             config=config,
         )
-        finalize_packed_seq_params(packed_seq_params)
+        finalize_packed_seq_params(packed_seq_params, config.gdn_gdr_backend)
         return (
             attention_mask,
             None,
@@ -338,7 +338,9 @@ def forward_step(data_iterator, model: HybridModel):
             total_tokens=int(cu_seqlens_for_params[-1].item()),
             tokens_per_sample=args.seq_length,
         )
-        finalize_packed_seq_params(packed_seq_params)
+        # forward_step has no TransformerConfig in scope; args carries the
+        # same resolved value.
+        finalize_packed_seq_params(packed_seq_params, args.gdn_gdr_backend)
 
     timers('batch-generator').stop()
 
