@@ -8,6 +8,7 @@ replaces dispatch, routed/shared expert computation, and combine.
 
 from __future__ import annotations
 
+from types import MethodType
 from typing import TYPE_CHECKING
 
 import torch
@@ -67,9 +68,6 @@ class MoKMegakernel(MegakernelBackend):
                 "MOK supports at most moe_router_topk logical routes per token; "
                 "use MOK internal expert padding instead of moe_pad_expert_input_to_capacity"
             )
-        if config.moe_shared_expert_gate:
-            raise ValueError("MOK does not support MCore's optional shared-expert output gate")
-
         self.ep_group = ep_group
         self.num_local_experts = num_local_experts
         self.hidden_size = config.hidden_size
@@ -143,7 +141,7 @@ class MoKMegakernel(MegakernelBackend):
             self._routed_fc1_parameter_names = tuple(self._routed_fc1_parameter_names)
             self._routed_fc2_parameter_names = tuple(self._routed_fc2_parameter_names)
 
-        self._register_shared_weights(shared_experts)
+        self._register_shared_weights(shared_experts, use_output_gate=config.moe_shared_expert_gate)
 
         # MegatronModule.set_is_first_microbatch discovers this attribute and resets it
         # once per optimizer iteration, matching TE's weight-cache lifecycle.
@@ -203,7 +201,7 @@ class MoKMegakernel(MegakernelBackend):
         return tuple(_finish_weight_gradient(param) for param in self.autograd_routed_parameters)
 
     @torch.no_grad()
-    def _register_shared_weights(self, shared: nn.Module) -> None:
+    def _register_shared_weights(self, shared: nn.Module, *, use_output_gate: bool = False) -> None:
         """Validate and alias MCore-owned native BF16 shared weights."""
         fc1_ref = shared.linear_fc1.weight
         fc2_ref = shared.linear_fc2.weight
@@ -234,6 +232,20 @@ class MoKMegakernel(MegakernelBackend):
         # module remains registered and emits the canonical checkpoint entries.
         self.register_parameter("shared_fc1_weight", fc1_ref)
         self.register_parameter("shared_fc2_weight", fc2_ref)
+        output_gate = getattr(shared, "gate_weight", None) if use_output_gate else None
+        if use_output_gate and (
+            not isinstance(output_gate, nn.Parameter)
+            or is_float8tensor(output_gate)
+            or output_gate.dtype != torch.bfloat16
+            or tuple(output_gate.shape) != (1, h)
+            or not output_gate.is_contiguous()
+        ):
+            raise RuntimeError(
+                "MOK shared output gate must be a native contiguous BF16 Parameter with shape [1, H]"
+            )
+        # Include the same gate Parameter in MOK's param-gather hooks. Its native
+        # shared_experts owner still saves/loads the only checkpoint entry.
+        self.register_parameter("shared_output_gate_weight", output_gate)
 
     @torch.no_grad()
     def quantized_routed_weights(self):
@@ -308,6 +320,43 @@ class MoKMegakernel(MegakernelBackend):
         self._split_main_grad_descriptor_cache = None
         self.is_first_microbatch = True
 
+    def _apply(self, *args, **kwargs):
+        """Preserve externally attached parameter attributes across device/dtype moves.
+
+        The routed/shared weights registered on this module are ALIASES of parameters owned by TE
+        modules (``TEGroupedLinear`` etc.). ``torch.nn.Module._apply`` moves traceable wrapper
+        subclasses (TE quantized tensors such as ``MXFP8Tensor``) with
+        ``torch.utils.swap_tensors``, which exchanges the parameter object's whole ``__dict__``.
+        TE's own modules re-attach the externally attached state afterwards
+        (``TransformerEngineBaseModule._apply``), but this plain module's visit of the *same*
+        object (e.g. during ``model.cuda()``) swaps it again and nothing restores it, so mcore's
+        ``allreduce`` / ``partition_dim`` / ``tensor_model_parallel`` stamps and TE's
+        ``_high_precision_init_val`` are lost. DDP / the layer-wise optimizer then treat the routed
+        experts as data-parallel replicas (grads all-reduced across EP ranks, master weights
+        sharded over dp_cp, identical experts across the EP group). Mirror TE's fix here.
+        """
+        snapshots = {
+            name: (param, dict(param.__dict__))
+            for name, param in self._parameters.items()
+            if param is not None
+        }
+        out = super()._apply(*args, **kwargs)
+        for name, (old_param, attrs) in snapshots.items():
+            new_param = self._parameters.get(name)
+            if new_param is None:
+                continue
+            for key, value in attrs.items():
+                if key in new_param.__dict__:
+                    continue
+                if isinstance(value, MethodType) and value.__self__ is old_param:
+                    value = MethodType(value.__func__, new_param)
+                setattr(new_param, key, value)
+        # Invalidate derived views after conversion; parameters stay native-owned.
+        self._routed_weight_view_cache = None
+        self._split_main_grad_descriptor_cache = None
+        self.is_first_microbatch = True
+        return out
+
     def forward(
         self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
     ) -> torch.Tensor:
@@ -325,6 +374,7 @@ class MoKMegakernel(MegakernelBackend):
             x,
             router_weights,
             top_experts,
+            self.shared_output_gate_weight,
             *self.autograd_routed_parameters,
             self.shared_fc1_weight,
             self.shared_fc2_weight,
