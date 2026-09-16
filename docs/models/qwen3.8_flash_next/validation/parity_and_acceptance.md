@@ -71,7 +71,8 @@ document: [`support_matrix.md`](support_matrix.md).
 
 - Loss quality on real text (every run used mock data).
 - The MTP head numerically (no reference).
-- Anything at scale on the current dev base other than the parity proxy and the truncation load:
-  the full-model conversion and the 64-GPU resume were executed on the previous base
-  (`b6b2fbde8`, 2026-09-07).
+- The full-model **conversion** has only been executed on the previous dev base (`b6b2fbde8`); the
+  resulting checkpoint was **re-loaded and trained on the current base** (2026-09-16: 20 iterations
+  on 64 GPUs, exact load, 204.0 GiB peak — reproducing the earlier 204.4 GiB), so the load path is
+  confirmed, but a fresh conversion on the current base has not been re-run.
 - Performance: 16 s/step at EP64 / all-to-all is an unoptimized layout.

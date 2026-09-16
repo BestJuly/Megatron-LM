@@ -20,7 +20,10 @@ Measured on the full model (2026-09-14): (1) 2 h 09 min and 41 GiB host RAM on o
 (2) 61 s on 64 ranks for the 335 GiB write; a fresh EP64 model loads it with
 `--dist-ckpt-strictness raise_unexpected` and **109,632 / 109,632 parameters are exactly equal**;
 (3) 50 iterations on 64 GPUs, numbers in
-[`../training/full_model_64gpu.md`](../training/full_model_64gpu.md). The native checkpoint
+[`../training/full_model_64gpu.md`](../training/full_model_64gpu.md). **Re-verified 2026-09-16**
+after the branch was rebuilt on a newer dev base, the n-gram import was swapped and the router
+moved to post-softmax: the same checkpoint loads exactly and trains 20 iterations with no NaN at
+204.0 GiB peak, so neither the parameter names nor the checkpoint layout moved. The native checkpoint
 reshards across EP (EP1 ↔ EP4 verified on a 4-layer truncation).
 
 ## Mapping rules
