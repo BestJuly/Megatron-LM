@@ -452,9 +452,41 @@ class TestGatedResidualConfigValidation:
         with pytest.raises(ValueError, match="hc_lowrank"):
             make_config(hc_lowrank=0)
 
-    def test_cuda_graphs_rejected(self):
-        with pytest.raises(ValueError, match="CUDA graphs"):
+    def test_cuda_graphs_rejected_outside_the_moe_scopes(self):
+        # The attn scope captures the attention-type layers, which is untested for this
+        # variant; only the MoE scopes are validated.
+        with pytest.raises(ValueError, match="MoE scopes"):
             make_config(cuda_graph_impl="transformer_engine", cuda_graph_modules=["attn"])
+
+    def test_cuda_graphs_rejected_for_whole_layer_capture(self):
+        with pytest.raises(ValueError, match="partial"):
+            make_config(cuda_graph_impl="local")
+
+    def test_cuda_graphs_rejected_when_every_layer_is_captured(self):
+        # An empty cuda_graph_modules means "capture the whole layer".
+        with pytest.raises(ValueError, match="MoE scopes"):
+            make_config(cuda_graph_impl="transformer_engine", cuda_graph_modules=[])
+
+    def test_moe_scoped_partial_cuda_graphs_accepted(self):
+        # The gated residual leaves the 4-tuple's h_res slot None, and the partial-MoE
+        # capture used to pack it as a graph output unconditionally. Capture and replay now
+        # key on HyperConnectionModule.produces_h_res and omit the slot, so this config is
+        # legal -- measured at -6.2 % step time on the Qwen3.8-Flash-Next perf proxy.
+        # num_moe_experts is required: the generic validation rejects a moe_router scope on
+        # a dense model ("moe cuda graph is only supported for MoE").
+        cfg = make_config(
+            num_moe_experts=4,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=["moe_router", "moe_preprocess"],
+        )
+        assert cfg.cuda_graph_impl == "transformer_engine"
+
+    def test_gated_residual_module_produces_no_h_res(self):
+        from megatron.core.transformer.gated_residual import GatedResidualModule
+        from megatron.core.transformer.hyper_connection import HyperConnectionModule
+
+        assert GatedResidualModule.produces_h_res is False
+        assert HyperConnectionModule.produces_h_res is True
 
     def test_fused_mhc_rejected(self):
         with pytest.raises(ValueError, match="use_fused_mhc"):

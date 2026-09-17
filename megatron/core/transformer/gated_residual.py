@@ -179,6 +179,13 @@ class GatedResidualModule(MegatronModule):
             module only computes ``mixed`` — the n→1 contraction.
     """
 
+    produces_h_res: bool = False
+    """The ``h_res`` slot of the 4-tuple is always ``None`` here: the gated-residual variant's
+    residual is the identity, so there is nothing to materialize. CUDA-graph capture reads this
+    to decide whether to pack the slot as a graph output — a ``None`` cannot be a graph output,
+    and packing one unconditionally is what used to make CUDA graphs unavailable for this
+    variant."""
+
     def __init__(self, config: TransformerConfig, layer_number: int, use_combine: bool = True):
         super().__init__(config)
         self.config = config
@@ -282,15 +289,15 @@ class GatedResidualModule(MegatronModule):
                 ``g_write`` survive the forward (recomputed from the residual,
                 which is alive anyway).
             output_slot: Fixed-address arena slot for the attention-only CUDA
-                Graph split. The split is unreachable for the gated-residual
-                variant (CUDA graphs are rejected at config validation), so a
-                non-None slot is a wiring error.
+                Graph split. The split is mHC-only and rejected for this variant
+                at config validation (``mhc_recompute_attn_cuda_graph_split``),
+                so a non-None slot is a wiring error. Partial TE capture of the
+                MoE router/preprocess scopes is supported and does not use this.
         """
         if output_slot is not None:
             raise ValueError(
                 "GatedResidualModule does not support the mHC attention CUDA-graph "
-                "split arena (output_slot); CUDA graphs are not supported with "
-                "hyper_connection_variant='gated_residual' yet."
+                "split arena (output_slot); that split is mHC-only."
             )
 
         if mhc_recompute_manager is not None:

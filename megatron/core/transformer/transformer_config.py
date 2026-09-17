@@ -3017,18 +3017,50 @@ class TransformerConfig(ModelParallelConfig):
                     "mhc_recompute_attn_cuda_graph_split is mHC-only; the gated-residual "
                     "variant does not implement the attention-only split."
                 )
+            # The partial-MoE capture path used to pack the 4-tuple's h_res slot as a graph
+            # output unconditionally, which a None cannot be, so CUDA graphs were rejected
+            # outright for this variant. The capture/replay pair now keys on
+            # HyperConnectionModule.produces_h_res and omits the slot for identity-residual
+            # variants, so the gated residual no longer blocks capture. Only the
+            # TE-backed partial capture is exercised: the `local` implementation captures
+            # the whole layer, which has not been validated against the 4-tuple contract.
             if (
-                self.cuda_graph_impl != "none"
+                self.cuda_graph_impl not in ("none", "transformer_engine")
                 or self.enable_cuda_graph
                 or self.external_cuda_graph
             ):
                 raise ValueError(
-                    "CUDA graphs are not supported with "
-                    "hyper_connection_variant='gated_residual' yet: the partial-MoE "
-                    "capture paths pack the 4-tuple's h_res slot as a graph output, "
-                    "which the gated-residual variant returns as None. Disable CUDA "
-                    "graphs to train with gated residuals."
+                    "CUDA graphs with hyper_connection_variant='gated_residual' are "
+                    "supported only as cuda_graph_impl='transformer_engine' partial "
+                    f"capture, got cuda_graph_impl={self.cuda_graph_impl!r}"
+                    f"{', enable_cuda_graph' if self.enable_cuda_graph else ''}"
+                    f"{', external_cuda_graph' if self.external_cuda_graph else ''}. "
+                    "Whole-layer and full-iteration capture have not been validated "
+                    "against the 4-tuple contract."
                 )
+            if self.cuda_graph_impl == "transformer_engine":
+                _gr_graphable_scopes = {
+                    CudaGraphModule.moe,
+                    CudaGraphModule.moe_router,
+                    CudaGraphModule.moe_preprocess,
+                }
+                # cuda_graph_modules entries may still be plain strings here: this guard runs
+                # before the generic CUDA-graph normalization, and only arguments.py converts
+                # the CLI values to enum members. Compare on names so both forms work.
+                _gr_graphable_names = {m.name for m in _gr_graphable_scopes}
+                _gr_scopes = {
+                    getattr(m, "name", m) for m in (self.cuda_graph_modules or [])
+                }
+                if not _gr_scopes or not _gr_scopes <= _gr_graphable_names:
+                    raise ValueError(
+                        "CUDA graphs with hyper_connection_variant='gated_residual' are "
+                        "validated only for cuda_graph_modules restricted to the MoE "
+                        "scopes (moe / moe_router / moe_preprocess), where the capture "
+                        "covers the aggregate plus the router and dispatch preprocessing; "
+                        f"got {sorted(_gr_scopes) or 'all layers'}. Wider "
+                        "scopes capture the attention-type layers too, which is untested "
+                        "for this variant."
+                    )
             if self.tensor_model_parallel_size > 1 and not self.sequence_parallel:
                 warnings.warn(
                     "hyper_connection_variant='gated_residual' with tensor parallelism "

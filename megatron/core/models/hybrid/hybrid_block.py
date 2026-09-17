@@ -462,7 +462,12 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             # HyperConnectionTransformerLayer), instead of a second autograd path the captured
             # backward does not account for. The experts' raw mlp_output_with_bias (produced
             # on replay) is the layer delta, so `aggregated` need not be captured.
-            return tuple(inner_out) + (h_post, h_res, residual)
+            # The h_res slot is omitted for identity-residual variants (gated_residual),
+            # which leave it None — a None cannot be a CUDA graph output. Keyed on the
+            # module rather than on the variant name; _resume_partial_moe_cuda_graph
+            # mirrors this.
+            hc_state = (h_post, h_res) if self.hyper_connection.produces_h_res else (h_post,)
+            return tuple(inner_out) + hc_state + (residual,)
 
         hidden_states, context = self.forward(*args, **kwargs)
         cuda_graph_outputs = [hidden_states]
@@ -507,7 +512,8 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         """Run the eager expert/BDA tail from captured router/preprocess outputs."""
         assert self._inner_is_partial_moe_capture()
         residual = out.pop()  # n-stream [s, b, n*C] — graph output (see capture)
-        h_res = out.pop()
+        # Only packed by variants that produce one; see the capture side.
+        h_res = out.pop() if self.hyper_connection.produces_h_res else None
         h_post = out.pop()
         # Resume the inner MoE experts eagerly to the raw delta (mlp_output_with_bias),
         # then let the n-stream BDA own the residual — identical to the eager forward
