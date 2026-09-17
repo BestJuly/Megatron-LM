@@ -470,6 +470,10 @@ def core_transformer_config_from_args(args, config_class=None):
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
         pattern = args.hybrid_layer_pattern
+        # Whether GatedDeltaNet layers are actually built. transformer_config cannot derive
+        # this itself (it does not hold the layer pattern) and cannot read it off
+        # experimental_attention_variant, which is one global name for the whole stack.
+        kw_args['has_gated_delta_net_layers'] = Symbols.GDN in pattern
         has_kda = Symbols.KDA in pattern
         has_dsv4_csa = any(s in pattern for s in (Symbols.WINDOW, Symbols.CSA, Symbols.HCA))
         has_dsa = Symbols.DS_ATTENTION in pattern
