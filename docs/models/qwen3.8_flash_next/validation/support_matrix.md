@@ -28,7 +28,8 @@ them) and they are the only thing that proves the *combination* works.
 | **Activation recompute, full** | ✅ | `--recompute-granularity full --recompute-method uniform --recompute-num-layers 1` | 50.7 GiB (−29 %) |
 | **Activation recompute, selective** | ✅ | `--recompute-granularity selective --recompute-modules core_attn mhc` | 62.5 GiB (−13 %) |
 | **MXFP8** | ✅ | `--fp8-format e4m3 --fp8-recipe mxfp8` | 72.4 GiB |
-| **CUDA graphs** | ⛔ | `--cuda-graph-impl local` | rejected: the gated-residual variant returns `None` in the 4-tuple's `h_res` slot, which the partial-MoE capture path packs as a graph output. QSA's sparse path and the memory also reject capture |
+| **CUDA graphs, MoE scopes** | ✅ | `--cuda-graph-impl transformer_engine --cuda-graph-modules moe_router moe_preprocess --cuda-graph-warmup-steps 2` | 30 iterations, **−6.2 % step time**, peak allocated unchanged (42.57 vs 42.59 GiB), loss identical to the eager run at iteration 1 (lm loss 1.073585E+01, grad norm 6.642). `_layer_is_graphable` leaves a hybrid layer eager unless its inner layer is MoE, so this captures the gated-residual aggregate plus the router and dispatch preprocessing and never touches GDN, QSA or the memory. `[moe_router]` alone measures the same — `moe_preprocess` adds nothing. Needed two fixes: the gated residual used to pack its always-`None` `h_res` slot as a graph output, and Engram rejected every `cuda_graph_impl` |
+| **CUDA graphs, wider scopes** | ⛔ | `--cuda-graph-impl local`, or `transformer_engine` with `attn` in the scope list | rejected at config validation, by the gated-residual guard and again by Engram. QSA's sparse path builds its selection superset with host synchronization and a data-dependent union size; the memory's hashed lookup and its all-to-all have data-dependent shapes. **This is the largest remaining throughput opening** — the MoE-scoped capture leaves the half of the step where the idle lives |
 | **FSDP** | ⛔ | `--use-megatron-fsdp --ckpt-format fsdp_dtensor` | rejected: "Engram does not yet support FSDP" |
 
 ## Correctness checks that ran with the matrix
@@ -39,11 +40,24 @@ them) and they are the only thing that proves the *combination* works.
 | MTP on the hybrid path | `mtp_1 loss` finite and tracking `lm loss` in every case |
 | Losses | finite and decreasing in all 11 passing cases |
 
+## Throughput
+
+Measured separately on a **performance** proxy (the same 8-layer shape with the vocabulary scaled
+down by the same 1/6 as the layers, so the component mix matches the 48-layer model), 2026-09-17:
+`agent_works/qwen38-perf-proxy/REPORT.md` in the toolkit repo. Headline for this branch: **do not
+set `NVTE_NORM_FWD_USE_CUDNN` / `NVTE_NORM_BWD_USE_CUDNN`** — they cost this model 5-10x step time
+even though the Qwen3.5-397B recipe relies on them — and **`gdn_pre_gated_delta_rule_fusion`, a P0
+on 397B, is a ~10x regression here**. The GPU is idle ~44 % of the step and ~25 % of its busy time
+goes to generic elementwise/copy kernels, so flag-level tuning does very little; launch-count
+reduction is what pays.
+
 ## TODO — what this matrix says is missing
 
-1. **CUDA graphs** — all three new operators reject capture, for three different reasons (GR's
-   `h_res` graph-output contract, QSA's host-synchronizing superset build, the memory's
-   data-dependent lookup/all-to-all shapes). The single largest step-time opening.
+1. **CUDA graphs beyond the MoE scopes** — the gated-residual blocker is fixed and the MoE-scoped
+   capture now runs (see above). Two of the three original blockers remain and both are the same
+   shape: QSA's host-synchronizing superset build and the memory's data-dependent lookup /
+   all-to-all shapes both need a fixed upper bound with the dynamic size consumed inside the
+   kernel. Still the single largest step-time opening.
 2. **Packed rows + CP** — blocked upstream (`cu_seqlens_padded=None`), not by this model. The
    last piece of long-context packed training.
 3. **FSDP** — rejected by the memory; the only route to a non-EP memory layout.
