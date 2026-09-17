@@ -608,7 +608,43 @@ class EngramConfig:
         # Activation recomputation is supported: checkpointed_forward already forwards
         # input_ids to the layers it replays, and the Engram collectives stay rank-symmetric
         # under replay because every rank in the EP/TP group recomputes the same layer block.
-        if transformer_config.cuda_graph_impl != "none":
-            raise ValueError("Engram does not yet support CUDA graphs.")
+        # CUDA graphs: Engram modules hang off attention-type layers, and their hashed
+        # lookup plus its all-to-all have data-dependent shapes, so any capture scope that
+        # contains an attention-type layer is still rejected. Partial Transformer Engine
+        # capture restricted to the MoE scopes is not such a scope: _layer_is_graphable
+        # leaves a hybrid layer eager unless its inner layer is MoE, and Engram never sits
+        # on one. Rejecting it too made the whole partial-capture route unavailable to
+        # Engram models for no reason.
+        if transformer_config.cuda_graph_impl not in ("none", "transformer_engine"):
+            raise ValueError(
+                "Engram does not yet support cuda_graph_impl="
+                f"{transformer_config.cuda_graph_impl!r}: whole-layer and full-iteration "
+                "capture take the Engram lookup with them, and its hashed gather and "
+                "all-to-all have data-dependent shapes."
+            )
+        if transformer_config.cuda_graph_impl == "transformer_engine":
+            # Local import: megatron.core.transformer is not a dependency of this package.
+            from megatron.core.transformer.enums import CudaGraphModule
+
+            moe_only_scopes = {
+                CudaGraphModule.moe,
+                CudaGraphModule.moe_router,
+                CudaGraphModule.moe_preprocess,
+            }
+            # Entries may be plain strings (only arguments.py converts the CLI values to
+            # enum members, and this validation can run before that). Compare on names.
+            moe_only_names = {m.name for m in moe_only_scopes}
+            scopes = {
+                getattr(m, "name", m) for m in (transformer_config.cuda_graph_modules or [])
+            }
+            if not scopes or not scopes <= moe_only_names:
+                raise ValueError(
+                    "Engram supports cuda_graph_impl='transformer_engine' only with "
+                    "cuda_graph_modules restricted to the MoE scopes "
+                    "(moe / moe_router / moe_preprocess), which leave attention-type "
+                    f"layers eager; got {sorted(scopes) or 'all layers'}. "
+                    "The Engram lookup's hashed gather and all-to-all have data-dependent "
+                    "shapes and cannot be captured."
+                )
         if use_fsdp:
             raise ValueError("Engram does not yet support FSDP.")
