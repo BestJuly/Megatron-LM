@@ -1018,6 +1018,48 @@ def _get_megatron_emerging_optimizer(
     return ChainedOptimizer(results)
 
 
+def _log_layer_wise_routing(model_chunks, config) -> None:
+    """Summarize which parameters the matrix optimizer (e.g. Muon) will own.
+
+    Emitted once, on rank 0, whenever a non-Adam/SGD optimizer is selected. The routing rule
+    (:func:`is_managed_by_layer_wise_optimizer`) is "2-D and not tagged
+    ``is_embedding_or_output_parameter``", which is easy to get silently wrong for a new module:
+    an untagged 2-D table would be handed to Newton-Schulz orthogonalization, which is both
+    meaningless for an embedding and very expensive. Printing the split makes that visible at
+    startup instead of in a loss curve.
+    """
+    from megatron.core.optimizer.layer_wise_optimizer import is_managed_by_layer_wise_optimizer
+
+    matrix_n = matrix_e = other_n = other_e = 0
+    suspicious = []
+    for chunk in model_chunks:
+        for name, param in chunk.named_parameters():
+            if not param.requires_grad:
+                continue
+            if is_managed_by_layer_wise_optimizer(param):
+                matrix_n += 1
+                matrix_e += param.numel()
+                # An embedding-shaped table reaching the matrix optimizer is a tagging bug.
+                if getattr(param, 'is_engram_embedding', False) or 'embedding' in name.lower():
+                    suspicious.append((name, tuple(param.shape)))
+            else:
+                other_n += 1
+                other_e += param.numel()
+    log_single_rank(
+        logger,
+        logging.INFO,
+        f"[optimizer routing] optimizer={config.optimizer!r}: "
+        f"matrix/layer-wise group {matrix_n} params ({matrix_e/1e6:.1f} M elems), "
+        f"scalar/embedding group {other_n} params ({other_e/1e6:.1f} M elems)",
+    )
+    if suspicious:
+        warnings.warn(
+            "Embedding-like parameters were routed to the matrix (Newton-Schulz) optimizer: "
+            f"{suspicious[:8]}. They are missing is_embedding_or_output_parameter.",
+            UserWarning,
+            stacklevel=2,
+        )
+
 def get_megatron_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
@@ -1069,6 +1111,7 @@ def get_megatron_optimizer(
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
     # unify them so both use a single pg_collection-based flow.
     if config.optimizer not in ('adam', 'sgd'):
+        _log_layer_wise_routing(model_chunks, config)
         return _get_megatron_emerging_optimizer(
             config=config,
             model_chunks=model_chunks,
