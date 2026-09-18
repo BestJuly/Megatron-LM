@@ -2,7 +2,7 @@
 
 """Base multimodal model for FSDP + EP and PP training.
 
-Composes a vision encoder and a ``GPTModel`` language decoder.  The
+Composes a vision encoder and a ``HybridModel`` language decoder.  The
 vision encoder is built only on the first PP stage; the language
 decoder spans all PP stages following standard Megatron PP layout
 flags.
@@ -19,7 +19,7 @@ from torch import Tensor
 
 from examples.multimodal_dev.observability import nvtx_phase
 from megatron.core import parallel_state, tensor_parallel
-from megatron.core.models.gpt import GPTModel
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -83,14 +83,15 @@ def _thd_cp_partition_index(cu_seqlens_padded, total_tokens, cp_size, cp_rank):
 class MultimodalModel(MegatronModule):
     """Base class for multimodal vision-language models.
 
-    Composes a pre-constructed vision encoder and a ``GPTModel`` language
+    Composes a pre-constructed vision encoder and a ``HybridModel`` language
     decoder.  Supports pipeline parallelism: the vision encoder is built
     only on the first PP stage, while the language decoder spans all PP
     stages following standard Megatron PP layout flags.
 
     Args:
         language_config: ``TransformerConfig`` for the language decoder.
-        language_spec: ``ModuleSpec`` for decoder transformer layers.
+        hybrid_stack_spec: ``ModuleSpec`` defining HybridModel layer families.
+        hybrid_layer_pattern: Ordered HybridModel decoder and MTP layer pattern.
         vision_encoder: Pre-constructed vision encoder module (or ``None``
             on non-first PP stages).
         vocab_size: Language model vocabulary size.
@@ -99,21 +100,20 @@ class MultimodalModel(MegatronModule):
         position_embedding_type: Position embedding type for the decoder.
         rotary_percent: Fraction of hidden dim for RoPE.
         rotary_base: Base frequency for RoPE.
-        mrope_section: MRoPE channel sections.
-        mtp_block_spec: Optional MTP block spec.
         parallel_output: Keep outputs split across TP ranks.
         share_embeddings_and_output_weights: Tie input/output embeddings.
         pre_process: First PP stage flag — when True, build embedding +
             run vision encoder + scatter image embeddings.
         post_process: Last PP stage flag — when True, build output layer +
-            compute loss inside ``GPTModel``.
-        vp_stage: Virtual pipeline stage (forwarded to ``GPTModel``).
+            compute loss inside ``HybridModel``.
+        vp_stage: Virtual pipeline stage (forwarded to ``HybridModel``).
     """
 
     def __init__(
         self,
         language_config: TransformerConfig,
-        language_spec: ModuleSpec,
+        hybrid_stack_spec: ModuleSpec,
+        hybrid_layer_pattern: str,
         vision_encoder: Optional[MegatronModule],
         vocab_size: int,
         max_sequence_length: int,
@@ -121,8 +121,6 @@ class MultimodalModel(MegatronModule):
         position_embedding_type: str = "rope",
         rotary_percent: float = 1.0,
         rotary_base: int = 10000,
-        mrope_section: Optional[list] = None,
-        mtp_block_spec: Optional[ModuleSpec] = None,
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
         pre_process: bool = True,
@@ -133,20 +131,24 @@ class MultimodalModel(MegatronModule):
 
         self.image_token_id = image_token_id
         self.pre_process = pre_process
-        self.post_process = post_process
         self.vp_stage = vp_stage
+        # ``post_process`` is deliberately not stored: nothing reads it off this
+        # wrapper, and ``get_attr_wrapped_model(model, 'post_process', ...)``
+        # (schedules.clear_embedding_activation_buffer) must keep resolving to
+        # the HybridModel that owns ``embedding_activation_buffer``.
         # Surfaced for ``finalize_model_grads._allreduce_word_embedding_grads``
-        # which inspects the outer module (not the wrapped GPTModel) when
+        # which inspects the outer module (not the wrapped HybridModel) when
         # PP > 1 and either tied embeddings or MTP layers are in use.
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
 
         # Vision encoder lives only on the first PP stage.
         self.vision_model = vision_encoder if pre_process else None
-        self.language_model = GPTModel(
+        self.language_model = HybridModel(
             config=language_config,
-            transformer_layer_spec=language_spec,
+            hybrid_stack_spec=hybrid_stack_spec,
             vocab_size=vocab_size,
             max_sequence_length=max_sequence_length,
+            hybrid_layer_pattern=hybrid_layer_pattern,
             pre_process=pre_process,
             post_process=post_process,
             vp_stage=vp_stage,
@@ -155,7 +157,6 @@ class MultimodalModel(MegatronModule):
             position_embedding_type=position_embedding_type,
             rotary_percent=rotary_percent,
             rotary_base=rotary_base,
-            mtp_block_spec=mtp_block_spec,
         )
 
     def shared_embedding_or_output_weight(self):
@@ -166,10 +167,8 @@ class MultimodalModel(MegatronModule):
         return self.language_model.shared_embedding_or_output_weight()
 
     def set_input_tensor(self, input_tensor):
-        """Forward the activation from the previous PP stage into
-        ``GPTModel``.  No PP-specific routing is needed here:
-        ``GPTModel.set_input_tensor`` already handles the case based on
-        its own ``pre_process`` flag.
+        """Forward the previous PP stage's activation into ``HybridModel``,
+        which routes it according to its own ``pre_process`` flag.
         """
         if not isinstance(input_tensor, list):
             input_tensor = [input_tensor]
@@ -494,7 +493,9 @@ class MultimodalModel(MegatronModule):
                 ``loss_mask``: only true padding, not SFT prompt tokens.
             pixel_values: Preprocessed image pixels.
             image_grid_thw: ``[num_images, 3]`` grid dimensions.
-            decoder_input: Pre-computed decoder input (skip embed).
+            decoder_input: Pre-computed decoder input (skip embed). Only
+                honored on the first pipeline stage; later stages take
+                their activation from ``set_input_tensor``.
             packed_seq_params: ``PackedSeqParams`` for THD attention.
 
         Returns:
