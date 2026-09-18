@@ -69,6 +69,11 @@
 #                    VISION_NUM_LAYERS defaults, so selecting a variant yields
 #                    a self-consistent shape with no further env args; all four
 #                    remain overridable. MTP_NUM_LAYERS is variant-independent.
+#   ATTN_CADENCE=<str>  one period of the decoder attention layout, one symbol
+#                    per block: 'G' GatedDeltaNet, '*' full attention. Default
+#                    "GGG*" when GDN=1 (equivalent to the old
+#                    --linear-attention-freq 4), "*" when GDN=0. Expanded to
+#                    --hybrid-layer-pattern, which Qwen3.5-VL now requires.
 #   EXTRA="..."      extra args appended verbatim
 #
 # Shape overrides: PP VPP TP EP CP MBS GBS SEQ_LEN NUM_LAYERS NUM_EXPERTS
@@ -211,14 +216,47 @@ fi
 
 GDN_ARGS=()
 if [ "$GDN" = "1" ]; then
+    # --linear-attention-freq is deliberately absent: since the Qwen3.5-VL
+    # HybridModel migration, HybridModel takes the GDN / full-attention
+    # placement from --hybrid-layer-pattern, and TransformerConfig skips the
+    # linear_attention_freq assertion for hybrid models, so passing it would
+    # only create a second source of truth. See HYBRID_MODEL_ARGS below.
     GDN_ARGS=( --experimental-attention-variant gated_delta_net
-               --linear-attention-freq 4
                --linear-conv-kernel-dim 4
                --linear-key-head-dim 128
                --linear-value-head-dim 128
                --linear-num-key-heads 16
                --linear-num-value-heads "$LINEAR_NUM_VALUE_HEADS" )
 fi
+
+# HybridModel expresses each historical GPT block as two independently ordered
+# layers: attention (GatedDeltaNet 'G' or full attention '*') followed by an
+# MLP ('-' dense, 'E' MoE). Qwen3.5-VL now *requires* --hybrid-layer-pattern.
+#
+# ATTN_CADENCE is one period of the attention layout, one symbol per block.
+# "GGG*" -- three GatedDeltaNet blocks then one full-attention block -- is
+# exactly what this script previously expressed as --linear-attention-freq 4,
+# so the resulting model is unchanged. The cadence repeats and is truncated to
+# NUM_LAYERS; --hybrid-layer-pattern has no repeat syntax, so expand it here.
+# GDN=0 degenerates to all-full-attention.
+ATTN_CADENCE=${ATTN_CADENCE:-$([ "$GDN" = "1" ] && echo "GGG*" || echo "*")}
+if [ "${NUM_EXPERTS:-0}" -gt 0 ]; then
+    MLP_LAYER_SYMBOL="E"
+else
+    MLP_LAYER_SYMBOL="-"
+fi
+HYBRID_LAYER_PATTERN=""
+for ((block_idx = 0; block_idx < NUM_LAYERS; block_idx++)); do
+    ATTN_LAYER_SYMBOL="${ATTN_CADENCE:block_idx % ${#ATTN_CADENCE}:1}"
+    HYBRID_LAYER_PATTERN+="${ATTN_LAYER_SYMBOL}${MLP_LAYER_SYMBOL}"
+done
+# Each MTP depth replicates the final decoder block, matching the former GPT
+# path's copy.copy(spec.layer_specs[-1]).
+LAST_BLOCK_ATTN_SYMBOL="${ATTN_CADENCE:(NUM_LAYERS - 1) % ${#ATTN_CADENCE}:1}"
+for ((mtp_depth = 0; mtp_depth < MTP_NUM_LAYERS; mtp_depth++)); do
+    HYBRID_LAYER_PATTERN+="/${LAST_BLOCK_ATTN_SYMBOL}${MLP_LAYER_SYMBOL}"
+done
+HYBRID_MODEL_ARGS=( --hybrid-layer-pattern "$HYBRID_LAYER_PATTERN" )
 
 # MTP_NUM_LAYERS=0 omits the MTP args entirely (Megatron treats the arg's
 # absence and 0 the same, but omitting keeps the command line honest).
@@ -340,6 +378,7 @@ fi
     "${ROUTER_FUSION_ARGS[@]}" \
     "${CE_ARGS[@]}" \
     "${GDN_ARGS[@]}" \
+    "${HYBRID_MODEL_ARGS[@]}" \
     "${EP_OVERLAP_ARGS[@]}" \
     "${PROF_ARGS[@]}" \
     "${MDP_ARGS[@]}" \
