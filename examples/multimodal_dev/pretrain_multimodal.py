@@ -106,8 +106,6 @@ def model_provider(
         args=args,
         language_config=language_config,
         vision_config=vision_config,
-        pre_process=pre_process,
-        post_process=post_process,
         **kwargs,
     )
 
@@ -220,6 +218,16 @@ if __name__ == "__main__":
     quantized_row_alignment(args)
     if getattr(args, "mdp_enable", False):
         _setup_mdp(args)
+    # multimodal_dev's model_provider builds the full model on every rank and
+    # does not honor pre_process / post_process pipeline-stage flags. PP>1
+    # would silently violate Megatron's pipeline-parallel contract.
+    if args.pipeline_model_parallel_size > 1:
+        raise ValueError(
+            "multimodal_dev does not support pipeline_model_parallel_size > 1 "
+            f"(got {args.pipeline_model_parallel_size}). The model provider "
+            "builds the full model on every rank; pipeline-stage splitting is "
+            "not wired through. Run with --pipeline-model-parallel-size 1."
+        )
     full_config = pretrain_cfg_container_from_args(args)
     pretrain(
         full_config,

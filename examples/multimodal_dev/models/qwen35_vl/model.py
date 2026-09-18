@@ -60,9 +60,6 @@ class Qwen35VLModel(MultimodalModel):
         mtp_block_spec: ModuleSpec = None,
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
-        pre_process: bool = True,
-        post_process: bool = True,
-        vp_stage: Optional[int] = None,
         build_vision_encoder: bool = True,
     ):
         if vision_spec is None:
@@ -72,11 +69,11 @@ class Qwen35VLModel(MultimodalModel):
         self.vision_start_token_id = vision_start_token_id
         self.spatial_merge_size = spatial_merge_size
 
-        # Vision encoder lives on the first PP stage only. Under MDP the
-        # replicated encoder domain replaces it (build_vision_encoder=False):
-        # an unused in-model copy would still drift under weight decay and
-        # collide with the vision_model.* checkpoint keys.
-        if pre_process and build_vision_encoder:
+        # Under MDP the replicated encoder domain replaces the in-model
+        # encoder (build_vision_encoder=False): an unused in-model copy would
+        # still drift under weight decay and collide with the vision_model.*
+        # checkpoint keys.
+        if build_vision_encoder:
             vkw = dict(VISION_KWARGS)
             vkw["spatial_merge_size"] = spatial_merge_size
             vkw["out_hidden_size"] = language_config.hidden_size
@@ -110,9 +107,6 @@ class Qwen35VLModel(MultimodalModel):
             share_embeddings_and_output_weights=(
                 share_embeddings_and_output_weights
             ),
-            pre_process=pre_process,
-            post_process=post_process,
-            vp_stage=vp_stage,
         )
 
     def compute_position_ids(

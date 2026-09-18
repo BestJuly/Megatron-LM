@@ -18,8 +18,6 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_src_rank,
-    is_pipeline_first_stage,
-    is_pipeline_last_stage,
 )
 from megatron.core.utils import get_attr_wrapped_model
 from megatron.training import get_args
@@ -1014,19 +1012,7 @@ def forward_step(data_iterator, model, return_schedule_plan: bool = False):
         real_cu_seqlens=batch.get("flops_cu_seqlens"),
     )
 
-    # ``pixel_values`` is the heavy vision tensor and is only consumed
-    # on the first PP stage; drop it elsewhere.  ``image_grid_thw`` is
-    # small and is needed on every PP stage by ``compute_position_ids``
-    # (MRoPE freqs are computed per-stage from position_ids).
-    is_first = is_pipeline_first_stage()
-    is_last = is_pipeline_last_stage()
-
-    pixel_values = batch.get("pixel_values", None) if is_first else None
-    image_grid_thw = batch.get("image_grid_thw", None)
-    # A text-only microbatch collates to zero pixel rows; take the text path.
-    if pixel_values is not None and pixel_values.shape[0] == 0:
-        pixel_values = None
-        image_grid_thw = None
+    pixel_values = batch.get("pixel_values", None)
     if (
         pixel_values is not None
         and pixel_values.is_floating_point()
@@ -1042,7 +1028,7 @@ def forward_step(data_iterator, model, return_schedule_plan: bool = False):
         loss_mask=batch.get("loss_mask", None),
         padding_mask=batch.get("padding_mask", None),
         pixel_values=pixel_values,
-        image_grid_thw=image_grid_thw,
+        image_grid_thw=batch.get("image_grid_thw", None),
         packed_seq_params=batch.get("packed_seq_params", None),
     )
     if return_schedule_plan:
@@ -1059,14 +1045,9 @@ def forward_step(data_iterator, model, return_schedule_plan: bool = False):
 
     # Slice loss_mask the same way the model sliced its inputs, so the
     # mask aligns with the CP-shard output.  Delegated to MultimodalModel
-    # so the slicing rule lives in one place.  The PP scheduler only
-    # invokes the loss closure on the last PP stage, so on non-last
-    # stages the mask is left untouched.
-    if is_last:
-        from examples.multimodal_dev.models.base import MultimodalModel
+    # so the slicing rule lives in one place.
+    from examples.multimodal_dev.models.base import MultimodalModel
 
-        loss_mask = MultimodalModel.cp_split_loss_mask(
-            loss_mask, batch.get("packed_seq_params", None)
-        )
+    loss_mask = MultimodalModel.cp_split_loss_mask(loss_mask, batch.get("packed_seq_params", None))
 
     return output_tensor, partial(loss_func, loss_mask)

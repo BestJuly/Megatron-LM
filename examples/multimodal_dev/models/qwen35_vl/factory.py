@@ -38,14 +38,7 @@ def set_vision_flops_metadata(args, language_config, vision_config):
     args.vision_out_hidden_size = language_config.hidden_size
 
 
-def build_model(
-    args,
-    language_config,
-    vision_config,
-    pre_process: bool = True,
-    post_process: bool = True,
-    **kwargs,
-):
+def build_model(args, language_config, vision_config, **kwargs):
     """Build a complete Qwen3.5-VL model instance.
 
     Handles language spec construction, optional MTP block spec, and
@@ -56,29 +49,24 @@ def build_model(
         language_config: ``TransformerConfig`` for the language decoder
             (already post-processed by :func:`post_language_config`).
         vision_config: ``TransformerConfig`` for the vision encoder.
-        pre_process: First PP stage flag — vision encoder + embedding live here.
-        post_process: Last PP stage flag — output projection + loss live here.
         **kwargs: Extra keyword arguments (e.g. ``vp_stage``).
 
     Returns:
         A :class:`Qwen35VLModel` instance.
     """
-    from examples.multimodal_dev.models.qwen35_vl.model import Qwen35VLModel
-    from examples.multimodal_dev.models.qwen35_vl.specs import (
-        get_qwen35_vl_language_spec,
-    )
-    from megatron.core import parallel_state
     from megatron.core.models.gpt.gpt_layer_specs import (
         get_gpt_mtp_block_spec,
     )
 
-    vp_stage = kwargs.get("vp_stage", None)
-    pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+    from examples.multimodal_dev.models.qwen35_vl.model import Qwen35VLModel
+    from examples.multimodal_dev.models.qwen35_vl.specs import (
+        get_qwen35_vl_language_spec,
+    )
 
     language_spec = get_qwen35_vl_language_spec(
         config=language_config,
-        vp_stage=vp_stage,
-        pp_rank=pp_rank,
+        vp_stage=kwargs.get("vp_stage", None),
+        pp_rank=None,
     )
 
     mtp_block_spec = None
@@ -89,8 +77,8 @@ def build_model(
             use_transformer_engine=(
                 args.transformer_impl == "transformer_engine"
             ),
-            vp_stage=vp_stage,
-            pp_rank=pp_rank,
+            vp_stage=kwargs.get("vp_stage", None),
+            pp_rank=None,
         )
 
     # When --untie-embeddings-and-output-weights is NOT passed, Megatron
@@ -112,7 +100,4 @@ def build_model(
         mtp_block_spec=mtp_block_spec,
         parallel_output=True,
         share_embeddings_and_output_weights=share_embeddings,
-        pre_process=pre_process,
-        post_process=post_process,
-        vp_stage=vp_stage,
     )
