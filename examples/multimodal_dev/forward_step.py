@@ -877,7 +877,24 @@ def get_batch(data_iterator: Iterator[list[Dict[str, Any]]], vp_stage: Optional[
     """Get a batch from *data_iterator* and broadcast across TP ranks."""
     device = "cuda"
     args = get_args()
-    include_pixel_values = is_pipeline_first_stage(ignore_virtual=False, vp_stage=vp_stage)
+
+    # Dropping pixels off non-first pipeline stages is correct only when the
+    # in-model encoder is what consumes them, i.e. when that encoder lives on
+    # the first stage. Under MDP the encoder is a separate, replicated domain
+    # and ownership of a microbatch's pixels is decided by the capture window,
+    # not by pipeline rank: a rank that is not PP stage 0 can still be the
+    # owner and must materialize the pixels. MDP applies its own suppression
+    # inside pack_or_pad_batch (pixel_capture_suppressed()), so leave the
+    # pipeline rule out of it here.
+    #
+    # Getting this wrong is not a silent slowdown: the collate still emits
+    # image_grid_thw on every stage, so a stage that drops the pixels but
+    # keeps the grids trips MDP's payload check with
+    #   "pixel data and grid metadata either both exist or both are absent".
+    if getattr(args, "mdp_enable", False):
+        include_pixel_values = True
+    else:
+        include_pixel_values = is_pipeline_first_stage(ignore_virtual=False, vp_stage=vp_stage)
 
     group = get_tensor_model_parallel_group()
     # Single-member TP group: skip the device flag tensor and the broadcast
