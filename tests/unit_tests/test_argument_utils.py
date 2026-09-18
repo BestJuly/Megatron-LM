@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import signal
 from argparse import ArgumentError, ArgumentParser, Namespace
@@ -657,6 +657,21 @@ class TestArgumentGroupFactoryArgparseMeta:
 class TestMegatronNetworkArgumentGeneration:
     """Test Megatron's TransformerConfig-derived argument group."""
 
+    def test_balanced_dynamic_pack_state_is_not_registered_as_a_cli_arg(self):
+        """The derived routing state must not be exposed as a user-provided option."""
+        from megatron.core.transformer import TransformerConfig
+        from megatron.training.arguments import _add_network_size_args
+
+        parser = ArgumentParser()
+        _add_network_size_args(parser)
+
+        destinations = {action.dest for action in parser._actions}
+        assert "dsa_cp_balance_indexer_graph_dynamic_packs" not in destinations
+        assert (
+            "dsa_cp_balance_indexer_graph_dynamic_packs"
+            not in TransformerConfig.__dataclass_fields__
+        )
+
     def test_transformer_callback_fields_are_not_registered_as_cli_args(self):
         """Callback fields are runtime hooks, not CLI-provided values."""
         from megatron.training.arguments import _add_network_size_args
@@ -679,6 +694,24 @@ class TestMegatronNetworkArgumentGeneration:
         args = parser.parse_args([])
         for field_name in callback_fields:
             assert not hasattr(args, field_name)
+
+    def test_hybrid_layer_pattern_help_lists_every_public_symbol(self):
+        """The public help must describe every symbol accepted by the pattern parser."""
+        from megatron.training.arguments import _add_experimental_args
+
+        parser = _add_experimental_args(ArgumentParser())
+        action = next(action for action in parser._actions if action.dest == "hybrid_layer_pattern")
+        for symbol_and_name in (
+            "M (mamba)",
+            "G (gdn)",
+            "K (kda)",
+            "* (attention)",
+            "D (dsa)",
+            "+ (mla)",
+            "- (mlp)",
+            "E (moe)",
+        ):
+            assert symbol_and_name in action.help
 
 
 class TestDsv4HybridCsaCompressRatioNormalization:

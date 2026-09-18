@@ -15,9 +15,12 @@ from megatron.core import mpu
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.packed_seq_params import PackedSeqParams, build_static_thd_metadata
 from megatron.core.parallel_state import (
+    get_pipeline_model_parallel_world_size,
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_src_rank,
+    is_pipeline_first_stage,
+    is_pipeline_last_stage,
 )
 from megatron.core.utils import get_attr_wrapped_model
 from megatron.training import get_args
@@ -390,6 +393,16 @@ def build_vision_sidecar(
         "vision_item_meta": torch.empty(0, 6, dtype=torch.int64),
         "vision_decoder_positions": torch.empty(0, dtype=torch.int64),
     }
+def seqlen_alignment_factor(tp_size: int, cp_size: int, sequence_parallel: bool) -> int:
+    """Return the factor a batched sequence length must be divisible by.
+
+    CP splits the sequence into ``2 * cp_size`` chunks (load-balanced
+    ordering), and SP splits each rank's shard across TP ranks on top of
+    that.  Without CP, only the SP split constrains the length.
+    """
+    if cp_size > 1:
+        return (tp_size * cp_size * 2) if sequence_parallel else (cp_size * 2)
+    return tp_size if sequence_parallel else 1
 
 
 def pack_or_pad_batch(
@@ -397,6 +410,7 @@ def pack_or_pad_batch(
     use_packed_sequence: bool = False,
     seq_length: Optional[int] = None,
     device="cuda",
+    include_pixel_values: bool = True,
     pad_to_multiple: Optional[int] = None,
     with_vision_sidecar: bool = False,
 ) -> Dict[str, Any]:
@@ -409,6 +423,12 @@ def pack_or_pad_batch(
     ``PackedSeqParams`` (``cu_seqlens``, ``cu_seqlens_padded``,
     ``max_seqlen``, ``total_tokens``) is broadcast alongside the data, so
     every rank can build an identical ``PackedSeqParams`` on its own.
+
+    ``include_pixel_values`` must be False on non-first pipeline stages:
+    only the first stage holds the vision encoder, so collating and
+    broadcasting ``pixel_values`` elsewhere is pure overhead.
+    ``input_ids`` and ``image_grid_thw`` are still needed on every stage
+    for MRoPE position construction.
     """
     tp_size = mpu.get_tensor_model_parallel_world_size()
     cp_size = mpu.get_context_parallel_world_size()
@@ -422,10 +442,7 @@ def pack_or_pad_batch(
     except AssertionError:
         has_sp = False
 
-    if cp_size > 1:
-        divisible_by = (tp_size * cp_size * 2) if has_sp else (cp_size * 2)
-    else:
-        divisible_by = tp_size if has_sp else 1
+    divisible_by = seqlen_alignment_factor(tp_size, cp_size, has_sp)
     if pad_to_multiple is not None:
         # Quantized GEMMs check the rank-local tensor (after the CP slice and,
         # under SP, before the all-gather), so lift the multiple by both factors.
@@ -478,6 +495,11 @@ def pack_or_pad_batch(
 
         suppress_pixels = pixel_capture_suppressed()
 
+        # Two independent reasons not to materialize pixels, and either is
+        # sufficient: upstream drops them off every non-first PP stage, MDP
+        # drops them when this rank is not the owner of the capture window.
+        emit_pixels = include_pixel_values and not suppress_pixels
+
         # MDP capture fast path (TP=1): build each packed field directly in
         # one pinned buffer (no per-sample F.pad + concat churn) and move it
         # with a non-blocking copy. Pageable H2D copies each carry an implicit
@@ -521,7 +543,7 @@ def pack_or_pad_batch(
                     )
                 seqlens_list.append(seqlen)
                 seqlens_padded_list.append(target_len)
-                if not suppress_pixels:
+                if emit_pixels:
                     pixel_values_list.append(sample["pixel_values"])
                 image_grid_thw_list.append(sample["image_grid_thw"])
 
@@ -638,7 +660,7 @@ def pack_or_pad_batch(
                 packed_batch["labels"] = _concat_field(labels_list, -100)
                 packed_batch["loss_mask"] = _concat_field(loss_mask_list, 0)
             packed_batch["padding_mask"] = padding_mask_thd.unsqueeze(0)
-            if not suppress_pixels:
+            if emit_pixels:
                 if use_pinned and pixel_values_list:
                     total_rows = sum(int(p.shape[0]) for p in pixel_values_list)
                     pixels = torch.empty(
@@ -749,7 +771,18 @@ def pack_or_pad_batch(
     if is_src:
         assert batch is not None, "source TP rank must provide a batch"
         max_seqlens = max(x["input_ids"].shape[0] for x in batch)
-        target_seqlens = min(max_seqlens, seq_length)
+        if get_pipeline_model_parallel_world_size() > 1:
+            # The PP scheduler sizes its P2P recv buffers from --seq-length
+            # (this BSHD path leaves ``variable_seq_lengths`` unset), so the
+            # padded length must be static rather than the per-microbatch max.
+            assert max_seqlens <= seq_length, (
+                f"sample length {max_seqlens} exceeds --seq-length {seq_length}; "
+                "under PP>1 the batch is padded to a static --seq-length and "
+                "longer samples cannot be represented"
+            )
+            target_seqlens = seq_length
+        else:
+            target_seqlens = min(max_seqlens, seq_length)
         # Round target seqlen up to the parallelism alignment factor so the
         # batched tensor is divisible for CP (+SP) splitting downstream.
         if divisible_by > 1:
@@ -782,7 +815,8 @@ def pack_or_pad_batch(
         if has_padding:
             positions = torch.arange(target_seqlens).unsqueeze(0)
             padded_batch["padding_mask"] = positions >= torch.tensor(real_seqlens).unsqueeze(1)
-        padded_batch["pixel_values"] = torch.concat([x["pixel_values"] for x in batch])
+        if emit_pixels:
+            padded_batch["pixel_values"] = torch.concat([x["pixel_values"] for x in batch])
         padded_batch["image_grid_thw"] = torch.concat([x["image_grid_thw"] for x in batch])
 
     return broadcast_data_batch(padded_batch, device=device)
@@ -838,10 +872,11 @@ def quantized_row_alignment(args) -> Optional[int]:
     )
 
 
-def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
+def get_batch(data_iterator: Iterator[list[Dict[str, Any]]], vp_stage: Optional[int] = None):
     """Get a batch from *data_iterator* and broadcast across TP ranks."""
     device = "cuda"
     args = get_args()
+    include_pixel_values = is_pipeline_first_stage(ignore_virtual=False, vp_stage=vp_stage)
 
     group = get_tensor_model_parallel_group()
     # Single-member TP group: skip the device flag tensor and the broadcast
@@ -876,6 +911,7 @@ def get_batch(data_iterator: Iterator[list[Dict[str, Any]]]):
         args.use_packed_sequence,
         args.seq_length,
         device=device,
+        include_pixel_values=include_pixel_values,
         with_vision_sidecar=getattr(args, "mdp_enable", False),
         pad_to_multiple=quantized_row_alignment(args),
     )
@@ -999,8 +1035,9 @@ def forward_step(data_iterator, model, return_schedule_plan: bool = False):
     # Native counterpart of mdp.p1_get_batch: the dataset fetch + THD pack
     # + TP broadcast. MDP hoists this out of the schedule into window capture,
     # so a like-for-like timeline comparison needs it named on both sides.
+    vp_stage = get_attr_wrapped_model(model, "vp_stage")
     with nvtx_phase("get_batch"):
-        batch = get_batch(data_iterator)
+        batch = get_batch(data_iterator, vp_stage=vp_stage)
 
     if batch is None:
         return None, None
@@ -1012,6 +1049,7 @@ def forward_step(data_iterator, model, return_schedule_plan: bool = False):
         real_cu_seqlens=batch.get("flops_cu_seqlens"),
     )
 
+    # ``pixel_values`` is absent here on non-first stages (see pack_or_pad_batch).
     pixel_values = batch.get("pixel_values", None)
     if (
         pixel_values is not None
@@ -1045,9 +1083,13 @@ def forward_step(data_iterator, model, return_schedule_plan: bool = False):
 
     # Slice loss_mask the same way the model sliced its inputs, so the
     # mask aligns with the CP-shard output.  Delegated to MultimodalModel
-    # so the slicing rule lives in one place.
-    from examples.multimodal_dev.models.base import MultimodalModel
+    # so the slicing rule lives in one place.  Only the last PP stage runs
+    # the loss closure, so other stages leave the mask untouched.
+    if is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage):
+        from examples.multimodal_dev.models.base import MultimodalModel
 
-    loss_mask = MultimodalModel.cp_split_loss_mask(loss_mask, batch.get("packed_seq_params", None))
+        loss_mask = MultimodalModel.cp_split_loss_mask(
+            loss_mask, batch.get("packed_seq_params", None)
+        )
 
     return output_tensor, partial(loss_func, loss_mask)
