@@ -283,6 +283,11 @@ case "$CE_FUSION" in
     *) echo "ERROR: CE_FUSION must be te|native|off, got '$CE_FUSION'" >&2; exit 1 ;;
 esac
 
+# The decoder applies 3D MRoPE. --mrope-section below must match MROPE_SECTION
+# in models/qwen35_vl/configuration.py and sum to half the rotary dimension
+# (kv_channels * rotary_percent / 2 = 256 * 0.25 / 2 = 32); the Qwen3.5-VL
+# factory rejects any other split. Note the launch below is one
+# backslash-continued command, so no comment may be placed inside it.
 PROF_ARGS=()
 TORCHRUN=( torchrun
            --nnodes "$NNODES"
@@ -350,7 +355,8 @@ fi
     --seq-length "$SEQ_LEN" \
     --normalization RMSNorm --apply-layernorm-1p --norm-epsilon 1e-06 \
     --swiglu --disable-bias-linear \
-    --position-embedding-type rope \
+    --position-embedding-type mrope \
+    --mrope-section 11 11 10 \
     --rotary-percent 0.25 --rotary-base 10000000 \
     --rotary-seq-len-interpolation-factor 1 \
     --qk-layernorm --attention-output-gate \
