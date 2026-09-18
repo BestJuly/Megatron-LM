@@ -434,6 +434,21 @@ def pack_or_pad_batch(
     cp_size = mpu.get_context_parallel_world_size()
     is_src = mpu.get_tensor_model_parallel_rank() == 0
 
+    # Owner-sharded pixel reading: during MDP window capture of a microbatch
+    # owned by another worker, skip pixel materialization + H2D wholesale. All
+    # text tensors and vision item metadata (grid_thw, sidecar) are still built
+    # from input_ids/grids, so every offset stays valid. False outside a
+    # sharded MDP capture.
+    from megatron.core.mdp.window import pixel_capture_suppressed
+
+    suppress_pixels = pixel_capture_suppressed()
+
+    # Two independent reasons not to materialize pixels, and either is
+    # sufficient: upstream drops them off every non-first PP stage, MDP drops
+    # them when this rank is not the owner of the capture window. Computed
+    # here, ahead of the THD/BSHD split, because both layouts consult it.
+    emit_pixels = include_pixel_values and not suppress_pixels
+
     # SP is an explicit runtime option; TP>1 does not imply SP is enabled.
     # get_args() itself raises in test contexts where megatron globals are
     # not initialised.
@@ -485,20 +500,6 @@ def pack_or_pad_batch(
             # cu_seqlens_q, which would inflate the FLOPs accumulator; the
             # pre-tail vector is therefore emitted separately (see
             # accumulate_flops_stats).
-
-        # Owner-sharded pixel reading: during MDP window capture of a
-        # microbatch owned by another worker, skip pixel
-        # materialization + H2D wholesale. All text tensors and vision item
-        # metadata (grid_thw, sidecar) are still built from input_ids/grids,
-        # so every offset stays valid. False outside a sharded MDP capture.
-        from megatron.core.mdp.window import pixel_capture_suppressed
-
-        suppress_pixels = pixel_capture_suppressed()
-
-        # Two independent reasons not to materialize pixels, and either is
-        # sufficient: upstream drops them off every non-first PP stage, MDP
-        # drops them when this rank is not the owner of the capture window.
-        emit_pixels = include_pixel_values and not suppress_pixels
 
         # MDP capture fast path (TP=1): build each packed field directly in
         # one pinned buffer (no per-sample F.pad + concat churn) and move it
