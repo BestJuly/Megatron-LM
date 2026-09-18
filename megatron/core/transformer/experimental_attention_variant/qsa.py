@@ -58,6 +58,8 @@ from megatron.core.transformer.experimental_attention_variant.dsa_masking import
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import nvtx_decorator
+
 
 
 class QSASelection(NamedTuple):
@@ -178,6 +180,7 @@ class QSAIndexer(MegatronModule):
         # frequencies are position-deterministic, so one gather per length suffices.
         self._cp_freqs_cache = {}
 
+    @nvtx_decorator(message="QSA::indexer.project")
     def _project(self, hidden_states: Tensor, rotary_pos_emb: Tensor):
         """Shared front-end: detach, SP-gather, project, norm and RoPE the queries."""
         # Selection is not differentiable and (by design) the indexer does not
@@ -200,6 +203,7 @@ class QSAIndexer(MegatronModule):
         q = self.q_layernorm(q.reshape(s, b, self.n_heads, self.head_dim))
         return q, raw_keys
 
+    @nvtx_decorator(message="QSA::indexer.block_keys")
     def _block_keys(self, raw_keys: Tensor, rotary_pos_emb: Tensor, n_blocks: int) -> Tensor:
         """Parameter-free fp32 mean-pool + norm + block-first-token RoPE."""
         r = self.compress_ratio
@@ -216,6 +220,7 @@ class QSAIndexer(MegatronModule):
             cp_group=self.pg_collection.cp,
         ).squeeze(2)
 
+    @nvtx_decorator(message="QSA::indexer.select")
     def select(
         self,
         hidden_states: Tensor,
@@ -571,6 +576,7 @@ class QSAIndexer(MegatronModule):
         return mask
 
     @torch.no_grad()
+    @nvtx_decorator(message="QSA::indexer.topk")
     def _streaming_topk(
         self, q: Tensor, block_keys: Tensor, m_t: Tensor, n_blocks: int, k: int
     ) -> Tuple[Tensor, Tensor]:
@@ -746,6 +752,7 @@ class QSASelfAttention(SelfAttention):
             )
         return output, bias
 
+    @nvtx_decorator(message="QSA::rope_qk")
     def _rope_qk(self, query, key, freqs, cu_seqlens):
         """Apply the main-attention partial RoPE to q/k ([s, b, h, d] layout).
 
@@ -805,6 +812,7 @@ class QSASelfAttention(SelfAttention):
             for t in tensors
         ]
 
+    @nvtx_decorator(message="QSA::sparse_attn")
     def _sparse_forward(self, hidden_states, freqs, packed_seq_params):
         """Sparse kernel path: indexer selection -> query-tile shared-superset GQA.
 
@@ -889,6 +897,7 @@ class QSASelfAttention(SelfAttention):
         output, bias = self.linear_proj(core_out)
         return output, bias, selection
 
+    @nvtx_decorator(message="QSA::indexer_loss")
     def _compute_indexer_loss(
         self,
         hidden_states: Tensor,
