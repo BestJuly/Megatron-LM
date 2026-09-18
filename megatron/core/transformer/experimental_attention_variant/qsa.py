@@ -986,9 +986,13 @@ class QSASelfAttention(SelfAttention):
                     ).view(b, c, k * r, ng_local, d)
 
                     q_c = q_bt[:, c0:c1].view(b, c, ng_local, hpg, d)
+                    # Operands stay in the model dtype; cuBLAS accumulates bf16 matmuls in
+                    # fp32, and the result is promoted before the softmax so every reduction
+                    # below is still fp32. Upcasting the operands instead doubled the tensor
+                    # traffic of the two gathers above and pushed this matmul onto TF32.
                     teacher = torch.einsum(
-                        "bcghd,bctgd->bcght", q_c.float(), k_sel.float()
-                    ) * scale  # [b, c, g, h, T]
+                        "bcghd,bctgd->bcght", q_c, k_sel
+                    ).float() * scale  # [b, c, g, h, T]
                     valid_t = picked_c.repeat_interleave(r, dim=-1)  # [b, c, T]
                     probs = masked_softmax(
                         teacher, valid_t[:, :, None, None, :].expand_as(teacher)
@@ -1023,7 +1027,11 @@ class QSASelfAttention(SelfAttention):
                 bk_bt, 1, blk.reshape(b, c * k)[..., None].expand(-1, -1, d_idx)
             ).view(b, c, k, d_idx)
             q_idx = selection.q.permute(1, 0, 2, 3)[:, c0:c1]  # [b, c, nh, d_idx]
-            student = torch.einsum("bchd,bckd->bchk", q_idx.float(), bk_sel.float())
+            # Same policy as the teacher: bf16 operands, fp32 accumulation inside the
+            # matmul, promoted before the relu/head-sum so the reduction and the
+            # log-softmax below are unchanged. This one carries the indexer gradient, so
+            # the promotion happens before any nonlinearity.
+            student = torch.einsum("bchd,bckd->bchk", q_idx, bk_sel).float()
             student = torch.relu(student).sum(dim=2) / math.sqrt(d_idx)  # [b, c, k]
             log_probs = masked_log_softmax(student, picked_c)
 
