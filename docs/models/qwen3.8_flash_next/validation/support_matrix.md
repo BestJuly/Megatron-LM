@@ -32,6 +32,15 @@ them) and they are the only thing that proves the *combination* works.
 | **CUDA graphs, wider scopes** | ⛔ | `--cuda-graph-impl local`, or `transformer_engine` with `attn` in the scope list | rejected at config validation, by the gated-residual guard and again by Engram. QSA's sparse path builds its selection superset with host synchronization and a data-dependent union size; the memory's hashed lookup and its all-to-all have data-dependent shapes. **This is the largest remaining throughput opening** — the MoE-scoped capture leaves the half of the step where the idle lives |
 | **FSDP** | ⛔ | `--use-megatron-fsdp --ckpt-format fsdp_dtensor` | rejected: "Engram does not yet support FSDP" |
 
+## Optimizer
+
+| Feature | Whole model | How it was run | Notes |
+|---|:---:|---|---|
+| **Adam + distributed optimizer** | ✅ | the default of every recipe here | expert-parallel parameters — the routed experts and the memory's hashed tables — shard their optimizer state over the **expert** data-parallel group, dense parameters over the ordinary one |
+| **Muon + distributed optimizer** | ✅ | `--optimizer muon --use-distributed-optimizer` (drop `--use-precision-aware-optimizer` and its four dtype flags; Muon rejects them) | Muon owns the 2-D matrices through the layer-wise optimizer; everything else goes to Adam siblings. **The memory's tables are expert-parallel *and* Adam-managed at once**, which used to be rejected at startup and forced the distributed optimizer off entirely, un-sharding every optimizer state. Measured on the proxy: peak allocated **−15.84 GiB (−23.7 %)** at expert-DP 2, −6.05 GiB at expert-DP 1 (dense side only), iteration-1 losses identical to the un-sharded arm, `torch_dist` round trip clean. Check the startup `[optimizer routing]` line: the tables must land in the scalar/embedding group, never in the matrix group |
+| **Muon + expert tensor parallelism** | ❓ | — | untested: every run above used `--expert-tensor-parallel-size 1`. ETP does not change the sharding logic, it only shrinks the expert data-parallel group (`expert_data_parallel_size = world_size // (ETP × EP × PP)`), and the expert sibling is built with the same process groups the standard path uses — but this is reasoned from the code, not measured |
+| **Muon + precision-aware optimizer** | ⛔ | `--optimizer muon --use-precision-aware-optimizer` | rejected: "only supported with adam" |
+
 ## Correctness checks that ran with the matrix
 
 | Check | Result |
