@@ -24,14 +24,16 @@ parallelism changes which rank holds a weight, not which experts a token passes 
 all-to-all is an exact move. Only the multi-step trajectory diverges, where reduction order meets
 accumulated drift.
 
-> ⚠️ **The harness that produces these numbers is not in this repository.** It lives with the
-> development toolkit (fixture generation, HF↔Megatron conversion, and the in-process comparison),
-> together with a side-installed `transformers` build that provides `qwen4_exp`. The table below
-> is a record of results, not something a reader of this branch can reproduce as-is. Two
-> environment settings are essential if it is ever re-created: `NVIDIA_TF32_OVERRIDE=0` and
-> `TRITON_F32_DEFAULT=ieee`, **on both the HF and the Megatron side** — without them TE and Triton
-> silently run fp32 GEMMs as TF32 and every linear carries ~1e-3 of noise, which makes a 1e-6
-> comparison meaningless.
+> **To reproduce this yourself**, run
+> [`examples/qwen3.8_flash_next/parity/run_parity.sh`](../../../../examples/qwen3.8_flash_next/parity/run_parity.sh)
+> — a self-contained harness in this repository, one GPU, about five minutes. It needs only a
+> `transformers` build that provides `qwen4_exp` (see that directory's README). It exports the two
+> settings the comparison depends on, `NVIDIA_TF32_OVERRIDE=0` and `TRITON_F32_DEFAULT=ieee`;
+> without them TE and Triton silently run fp32 GEMMs as TF32 and every linear carries ~1e-3 of
+> noise, which makes a 1e-6 comparison meaningless.
+>
+> That harness covers EP1 and excludes MTP. The EP4 column and the real-weight rows below come
+> from the development harness, which additionally shards across ranks.
 
 | Check | Result |
 |---|---|

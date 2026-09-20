@@ -10,6 +10,13 @@ This folder is the entry point for the `lit/qwen4` branch. It ties together the 
 documents that live one level up and adds what is specific to assembling and running the whole
 model.
 
+> **Want to run something rather than read?** Go to
+> [`examples/qwen3.8_flash_next/`](../../../examples/qwen3.8_flash_next/). It holds the runnable
+> counterpart of everything here: a self-contained parity harness that checks this implementation
+> against Hugging Face `qwen4_exp` on one GPU in about five minutes, and launch scripts for the
+> proxy and the full model. These documents record what was measured; that directory is how you
+> reproduce it.
+
 | Document | Contents |
 |---|---|
 | [`architecture/config_mapping.md`](architecture/config_mapping.md) | HF `config.json` → Megatron arguments, field by field; the hybrid layer pattern; the settings that are easy to get wrong (router path, PLE width, GDN gate, MTP norms) |
