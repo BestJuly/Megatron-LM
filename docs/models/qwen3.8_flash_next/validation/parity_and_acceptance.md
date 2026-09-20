@@ -15,13 +15,29 @@ allocation), 14 / 14 cases. The QSA indexer is covered by the whole-model compar
 ## 2. Whole-model parity on a random-init proxy (4 layers `GEQE/QE`, hidden 512, 8 experts, PLE)
 
 Same weights on both sides (written by HF, converted to Megatron), same tokens, fp32, TP1 and EP4
-(EP2 earlier), re-run after every rebuild of the branch:
+(EP2 earlier), re-run after every rebuild of the branch. **Last re-run 2026-09-20 on the current
+head**, after the QSA and optimizer commits: both layouts pass, `logits max_abs 2.83e-7`,
+161 / 161 gradients, step-0 loss identical to every digit.
+
+The forward is **bit-identical between TP1 and EP4** (same `max_abs` to the last digit): expert
+parallelism changes which rank holds a weight, not which experts a token passes through, and the
+all-to-all is an exact move. Only the multi-step trajectory diverges, where reduction order meets
+accumulated drift.
+
+> ⚠️ **The harness that produces these numbers is not in this repository.** It lives with the
+> development toolkit (fixture generation, HF↔Megatron conversion, and the in-process comparison),
+> together with a side-installed `transformers` build that provides `qwen4_exp`. The table below
+> is a record of results, not something a reader of this branch can reproduce as-is. Two
+> environment settings are essential if it is ever re-created: `NVIDIA_TF32_OVERRIDE=0` and
+> `TRITON_F32_DEFAULT=ieee`, **on both the HF and the Megatron side** — without them TE and Triton
+> silently run fp32 GEMMs as TF32 and every linear carries ~1e-3 of noise, which makes a 1e-6
+> comparison meaningless.
 
 | Check | Result |
 |---|---|
 | forward, 55 sub-module points (GDN in/core/out, QSA q/k norms and outputs, router probabilities, MoE out, GR mixed / write gate, PLE, exit contract, `lm_head`) | all at `allclose(1e-6, 1e-5)`; **logits `max_abs 2.7e-7`, argmax 100 %**; QSA selection sets (0 / 524288 differ) and MoE top-k sets (0 / 8192) identical |
 | gradients after one step, 161 parameters | 161 / 161 within `rel_l2 1e-5` / `max_abs 1e-4` (worst `2.2e-3` on GDN `A_log` / `dt_bias`, tiny-magnitude tensors); EP-sharded gradients gathered from the ranks |
-| 20-step AdamW trajectory | `\|Δloss\| ≤ 2.1e-4` (TP1) / `≤ 3.0e-4` (EP4), no jump; steps 0–1 exact |
+| 20-step AdamW trajectory | `\|Δloss\|` peaks in the **2e-4 … 3e-4** band by step 20 across re-runs (2026-09-20: 2.8e-4 TP1 / 2.2e-4 EP4; earlier: 2.1e-4 / 3.0e-4 — the two layouts swap places between runs, so this is tail noise, not a systematic offset). The gate is **no jump**: the divergence must accumulate smoothly alongside the parameter drift (~9e-2 by step 20), not step. Steps 0–1 exact |
 
 Four model-level defects were found only by this harness (all fixed on the branch): an extra
 final RMSNorm after the gated-residual exit; a MoE router without HF's top-k renormalization
