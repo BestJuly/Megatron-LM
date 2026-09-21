@@ -80,13 +80,9 @@ def mdp_config_from_args(args) -> MdpConfig:
         enable=mdp_enabled(args),
         encoder_cp=getattr(args, "mdp_encoder_cp", 1),
         encoder_max_payload_rows=getattr(args, "mdp_encoder_max_payload_rows", None),
-        encoder_recompute_granularity=getattr(
-            args, "encoder_recompute_granularity", None
-        ),
+        encoder_recompute_granularity=getattr(args, "encoder_recompute_granularity", None),
         encoder_recompute_method=getattr(args, "encoder_recompute_method", None),
-        encoder_recompute_num_layers=getattr(
-            args, "encoder_recompute_num_layers", None
-        ),
+        encoder_recompute_num_layers=getattr(args, "encoder_recompute_num_layers", None),
         encoder_recompute_modules=tuple(modules) if modules is not None else None,
         locality_slack_permille=getattr(args, "mdp_locality_slack_permille", 10),
         row_alignment=getattr(args, "mdp_row_alignment", 1),
@@ -95,6 +91,8 @@ def mdp_config_from_args(args) -> MdpConfig:
         pixel_locality=getattr(args, "mdp_pixel_locality", False),
         overlap_window_capture=getattr(args, "mdp_overlap_window_capture", False),
         greedy_packing=getattr(args, "mdp_greedy_packing", False),
+        ffd_packing=getattr(args, "mdp_ffd_packing", False),
+        ffd_packing_buffer_size=getattr(args, "mdp_ffd_packing_buffer_size", 128),
         greedy_packing_approximate_resume=getattr(
             args, "mdp_greedy_packing_approximate_resume", False
         ),
@@ -120,9 +118,7 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
     # validate_mdp_config's rejection can fire instead of building planning
     # groups that no longer match the decoder replicas.
     rank_order = (
-        "tp-cp-ep-pp-dp"
-        if getattr(args, "use_tp_pp_dp_mapping", False)
-        else SUPPORTED_RANK_ORDER
+        "tp-cp-ep-pp-dp" if getattr(args, "use_tp_pp_dp_mapping", False) else SUPPORTED_RANK_ORDER
     )
     return MdpCompatibilityOptions(
         world_size=args.world_size,
@@ -131,14 +127,10 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
         context_parallel_size=args.context_parallel_size,
         expert_parallel_size=getattr(args, "expert_model_parallel_size", 1),
         rank_order=rank_order,
-        virtual_pipeline_parallel_size=getattr(
-            args, "virtual_pipeline_model_parallel_size", None
-        ),
+        virtual_pipeline_parallel_size=getattr(args, "virtual_pipeline_model_parallel_size", None),
         calculate_per_token_loss=getattr(args, "calculate_per_token_loss", False),
         use_distributed_optimizer=getattr(args, "use_distributed_optimizer", False),
-        distributed_optimizer_instances=getattr(
-            args, "num_distributed_optimizer_instances", 1
-        ),
+        distributed_optimizer_instances=getattr(args, "num_distributed_optimizer_instances", 1),
         fp16=bool(args.fp16),
         bf16=bool(args.bf16),
         fsdp_enabled=fsdp,
@@ -177,7 +169,7 @@ def validate_from_args(args) -> None:
     """Run the full support-matrix validation from the parsed args."""
     config = mdp_config_from_args(args)
     validate_mdp_config(config, compatibility_options_from_args(args))
-    if config.greedy_packing:
+    if config.packing_enabled:
         # get_train_valid_test_num_samples() sizes the datasets from
         # train_iters * global_batch_size, i.e. micro_batch_size samples per bin.
         # Greedy bins hold as many samples as the token budget takes, so a real
@@ -185,7 +177,7 @@ def validate_from_args(args) -> None:
         # train_iters is reached. Sizing is the caller's blend/epoch decision, so
         # this is a warning rather than a rejection.
         logger.warning(
-            "MDP: --mdp-greedy-packing consumes more samples per iteration than "
+            "MDP: token-budget packing consumes more samples per iteration than "
             "train_iters x global_batch_size, the target size the dataset blend is "
             "built from. Provision the training data for up to "
             "train_iters x global_batch_size x (thd_max_packed_sequences / "
@@ -224,9 +216,7 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
         )
     )
     rank_view = rank_map.view(torch.distributed.get_rank())
-    process_groups = install_mdp_process_groups(
-        rank_map, group_registry=MdpGroupRegistry()
-    )
+    process_groups = install_mdp_process_groups(rank_map, group_registry=MdpGroupRegistry())
     encoder_pgs = build_encoder_pg_collection(
         rank_map, encoder_cp=mdp_config.encoder_cp, process_groups=process_groups
     )
@@ -260,7 +250,7 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
     compat = compatibility_options_from_args(args)
     greedy_token_budget = (
         args.max_seqlen_per_dp_cp_rank * args.context_parallel_size
-        if mdp_config.greedy_packing
+        if mdp_config.packing_enabled
         else None
     )
     greedy_max_num_seqs = greedy_max_real_sequences(compat)

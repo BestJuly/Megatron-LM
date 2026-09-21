@@ -242,7 +242,8 @@ def train_valid_test_datasets_provider(
         )
     path = Path(paths[0])
     root, splits = load_training_selection(path, args.max_seqlen_per_dp_cp_rank)
-    cap = int(args.thd_max_packed_sequences) - 1 if args.mdp_greedy_packing else 1
+    packing = args.mdp_greedy_packing or getattr(args, "mdp_ffd_packing", False)
+    cap = int(args.thd_max_packed_sequences) - 1 if packing else 1
     result = []
     for split, requested in zip(('train', 'val'), train_val_test_num_samples[:2]):
         # The request is in nominal pack-slot units; the stream can drain cap records per slot.

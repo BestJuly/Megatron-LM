@@ -1,6 +1,6 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Greedy token-budget packing for the MDP decoder data path.
+"""Greedy and buffered first-fit decreasing token-budget packing for the MDP decoder data path.
 
 Without this module a microbatch is exactly ``--micro-batch-size`` samples, so
 the packed THD length ``T`` is whatever those samples happen to sum to. With it,
@@ -26,6 +26,7 @@ normalization is unaffected by a varying sample count per iteration.
 """
 
 import threading
+from collections import deque
 from typing import Any, Callable, Iterator, List, Optional
 
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
@@ -41,13 +42,13 @@ def decoder_sample_length(sample: Any) -> int:
         return int(sample["input_ids"].shape[0])
     except (KeyError, TypeError, AttributeError) as exc:
         raise MdpConfigurationError(
-            "MDP: greedy packing violates: every sample carries a 1-D 'input_ids' "
+            "MDP: packing violates: every sample carries a 1-D 'input_ids' "
             f"tensor (got {type(sample).__name__})."
         ) from exc
 
 
-class GreedySampleStream:
-    """Wrap a microbatch-list iterator so ``next()`` returns one greedy bin.
+class PackedSampleStream:
+    """Shared sample buffering and commit accounting for token-budget streams.
 
     The underlying data iterator yields whole ``--micro-batch-size`` lists (the
     dataloader uses an identity collate over a ``batch_sampler``), so this holds
@@ -92,15 +93,17 @@ class GreedySampleStream:
     ) -> None:
         if token_budget <= 0:
             raise MdpConfigurationError(
-                f"MDP: greedy packing violates: token_budget > 0 (got {token_budget}). "
+                f"MDP: packing violates: token_budget > 0 (got {token_budget}). "
                 "Set --max-seqlen-per-dp-cp-rank."
             )
         if align < 1 or token_budget % align != 0:
             raise MdpConfigurationError(
-                f"MDP: greedy packing violates: token_budget ({token_budget}) is "
+                f"MDP: packing violates: token_budget ({token_budget}) is "
                 f"divisible by the collator row alignment ({align}); otherwise a full "
                 "bin cannot be split legally across CP/SP ranks."
             )
+        if max_num_seqs is not None and max_num_seqs < 1:
+            raise MdpConfigurationError("MDP: max_num_seqs must be positive or None.")
         self._iterator = iterator
         self._token_budget = token_budget
         self._max_num_seqs = max_num_seqs
@@ -137,12 +140,12 @@ class GreedySampleStream:
         """
         if count < 0:
             raise MdpStateError(
-                f"MDP: greedy packing violates: committed sample count >= 0 (got {count})."
+                f"MDP: packing violates: committed sample count >= 0 (got {count})."
             )
         with self._lock:
             if self._committed_samples + count > self._drained_samples:
                 raise MdpStateError(
-                    "MDP: greedy packing violates: committed samples "
+                    "MDP: packing violates: committed samples "
                     f"({self._committed_samples} + {count}) <= drained samples "
                     f"({self._drained_samples}); a window was committed twice."
                 )
@@ -153,7 +156,7 @@ class GreedySampleStream:
         """True once the underlying iterator has raised ``StopIteration``."""
         return self._exhausted and self._buffer_cursor >= len(self._buffer)
 
-    def __iter__(self) -> "GreedySampleStream":
+    def __iter__(self) -> "PackedSampleStream":
         return self
 
     def _next_sample(self) -> Optional[Any]:
@@ -177,8 +180,14 @@ class GreedySampleStream:
 
     def _aligned_length(self, sample: Any) -> int:
         length = int(self._length_of(sample))
+        if length <= 0:
+            raise MdpStateError(f"MDP: sample length must be positive (got {length}).")
         align = self._align
         return ((length + align - 1) // align) * align
+
+
+class GreedySampleStream(PackedSampleStream):
+    """Pack samples in source order, closing each bin when the next cannot fit."""
 
     def __next__(self) -> List[Any]:
         """One greedy bin, or raise ``StopIteration`` at end of stream.
@@ -213,3 +222,70 @@ class GreedySampleStream:
                 raise StopIteration
             self._drained_samples += len(bin_samples)
             return bin_samples
+
+
+class FfdSampleStream(PackedSampleStream):
+    """First-fit decreasing packing over bounded, disjoint sample windows.
+
+    Sort each window by descending aligned length (stable source-order ties),
+    then place each complete sample into the first eligible bin in creation
+    order. Drain all bins before reading the next window, including partial
+    bins at EOF. The sample-count bound excludes the underlying dataloader's
+    current list and worker prefetch; large image payloads can use substantial
+    host memory. Read-ahead is not counted as drained or committed consumption.
+
+    Args:
+        buffer_size: Maximum number of samples in one sorting window.
+        **kwargs: Shared token budget, sequence cap, alignment and length reader.
+    """
+
+    def __init__(self, iterator: Iterator, *, buffer_size: int = 128, **kwargs) -> None:
+        super().__init__(iterator, **kwargs)
+        if buffer_size < 1:
+            raise MdpConfigurationError("MDP: FFD buffer_size must be positive.")
+        self._buffer_size = buffer_size
+        self._bins = deque()
+
+    @property
+    def exhausted(self) -> bool:
+        """True only after both source samples and prepacked bins are exhausted."""
+        return super().exhausted and not self._bins
+
+    def __next__(self) -> List[Any]:
+        """Emit one FFD bin, without consuming or dropping any other planned bin."""
+        with self._lock:
+            if not self._bins:
+                window = []
+                for _ in range(self._buffer_size):
+                    sample = self._next_sample()
+                    if sample is None:
+                        break
+                    length = self._aligned_length(sample)
+                    if length > self._token_budget:
+                        raise MdpStateError(
+                            f"MDP: sample aligned length ({length}) exceeds the FFD "
+                            f"token budget ({self._token_budget}). Raise "
+                            "--max-seqlen-per-dp-cp-rank or filter overlong samples."
+                        )
+                    window.append((length, sample))
+                # Python's stable sort preserves source order for equal lengths.
+                window.sort(key=lambda item: -item[0])
+                bins = []
+                totals = []
+                for length, sample in window:
+                    for index, samples in enumerate(bins):
+                        if totals[index] + length <= self._token_budget and (
+                            self._max_num_seqs is None or len(samples) < self._max_num_seqs
+                        ):
+                            samples.append(sample)
+                            totals[index] += length
+                            break
+                    else:
+                        bins.append([sample])
+                        totals.append(length)
+                self._bins.extend(bins)
+            if not self._bins:
+                raise StopIteration
+            samples = self._bins.popleft()
+            self._drained_samples += len(samples)
+            return samples

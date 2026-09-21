@@ -98,3 +98,11 @@ processor stub; they require the normal Megatron test dependencies, including
 PyTorch and Pillow. They cover ordered reads, supervision, budget/provenance
 rejection and split isolation. They do not certify model forward/backward or
 performance; validate a new training environment with a GPU smoke run.
+
+
+For buffered FFD, replace `--mdp-greedy-packing` with `--mdp-ffd-packing` and
+optionally set `--mdp-ffd-packing-buffer-size` (default 128 samples). Native
+sampler ownership and complete-record admission stay unchanged. Both policies
+provision the same virtual dataset length, preserving source order for a
+controlled comparison; FFD changes bin assignment within each buffer. Both
+are benchmark paths without exact checkpoint resume.

@@ -126,7 +126,7 @@ returns to `EMPTY`.
 | `storage.py` | Endpoint embedding leaves and lifecycle checks. |
 | `bridge.py` | Canonical ledger and `all_to_all_single` transport for all three payload phases. |
 | `window.py` | Whole-iteration capture, microbatch replay cursors, pixel ownership context. |
-| `packing.py` | Greedy token-budget bin filling and the cross-iteration sample buffer (`--mdp-greedy-packing`). |
+| `packing.py` | Greedy and buffered first-fit decreasing (FFD) token-budget packing, shared sample buffering and commit accounting. |
 | `activation.py` | Retained-graph and complete-replay encoder handles, RNG recipes, chunk backward. |
 | `encoder.py` | Encoder process groups, DDP/ZeRO-1 domain, gradient finalization. |
 | `runtime.py` | P0-P5 orchestration, prefetch handoff, per-iteration state and metrics. |
@@ -370,8 +370,65 @@ Primary flags:
 - `--mdp-overlap-window-capture`
 - `--mdp-debug-plan-payload-check`
 - `--mdp-greedy-packing`
+- `--mdp-ffd-packing`
+- `--mdp-ffd-packing-buffer-size`
+- `--mdp-packing-approximate-resume`
 - `--mdp-greedy-packing-approximate-resume`
 - `--mdp-mock-dataset-config-json`
+
+### Buffered first-fit decreasing packing
+
+`--mdp-ffd-packing` selects FFD instead of `--mdp-greedy-packing`; the two flags
+are mutually exclusive. `--mdp-ffd-packing-buffer-size` (default 128, positive)
+sets the number of complete samples read into each sorting window. Sort by
+aligned decoder length descending, breaking ties by source order; place each
+sample into the first bin in creation order satisfying the token budget and
+real-sequence cap. Emit all bins, including partial ones, before reading the
+next window. At EOF drain the pending bins. No sample or image is truncated,
+dropped, duplicated, or moved between DP replicas.
+
+This follows Energon's buffered select-then-pack interface; Energon itself
+leaves grouping to the task encoder. The existing multimodal task encoder's
+`greedy_knapsack` is a descending knapsack fill, not an API provided by Energon.
+The FFD stream has no Energon runtime dependency.
+
+The entry point follows the greedy/static separation introduced in PR #48:
+
+| Grouping policy | CLI selection | Variable THD shape | Fixed THD shape |
+| --- | --- | --- | --- |
+| Fixed sample count | Neither MDP packing flag | Default | Add `--thd-static-packing` |
+| In-order greedy | `--mdp-greedy-packing` | Supported | Add `--thd-static-packing` |
+| Buffered FFD | `--mdp-ffd-packing` | Supported | Add `--thd-static-packing` |
+
+Static THD controls the collator's output shape; it does not choose the grouping
+algorithm. Its existing alignment, token-budget and dummy-tail requirements
+still apply. `--mdp-overlap-window-capture` is independent of both controls.
+Both policies enter through `add_multimodal_args`, `mdp_config_from_args` and
+`maybe_build_mdp_domain`; only the sample-stream implementation differs.
+Internal `greedy_*` helper and runtime field names are retained for compatibility
+and now serve both token-budget policies. The collator is unchanged.
+
+Both policies use `MdpConfig.packing_enabled` for validation, stream capture and
+sample accounting. `PackedSampleStream` owns source-list buffering and commits;
+`GreedySampleStream` and `FfdSampleStream` own grouping. Reading an FFD window
+is not consumption: only emitted bins increment `drained_samples`, and only
+installed iteration windows commit them. Pending FFD bins survive iteration
+boundaries and keep `exhausted` false even after the source reaches EOF.
+
+All greedy restrictions below apply equally to FFD: fixed bin-count MBS/GBS,
+real all-reduced committed sample counts, independent static THD shape, reserved
+dummy tail slot, no sample-based training/rampup, and no exact resume.
+`--mdp-packing-approximate-resume` is a policy-neutral alias for the existing
+`--mdp-greedy-packing-approximate-resume`; either explicitly accepts approximate
+resume with either policy. FFD additionally retains decoded image payloads in
+its bounded window; the bound is in samples, not bytes, and excludes loader
+prefetch/current source list. Provision host memory accordingly.
+
+For performance comparisons, use identical dataset/sampler settings, token
+budget, model and topology. Report useful tokens/s, records/s, fill ratio and
+iteration time together. A higher fill ratio increases useful work per step;
+iteration time alone does not compare packing throughput. FFD reorders complete
+samples, so per-step loss and visual workload need not match greedy.
 
 Packing flags MDP consumes from the core config (all optional, all off by
 default):

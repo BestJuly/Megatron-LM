@@ -29,22 +29,13 @@ from megatron.core.mdp.activation import (
     capture_encoder_rng_state,
 )
 from megatron.core.mdp.allocator import MdpBufferAllocator
-from megatron.core.mdp.bridge import (
-    BridgeBufferKey,
-    BridgePhase,
-    BridgeTensorSpec,
-    ModalityBridge,
-)
+from megatron.core.mdp.bridge import BridgeBufferKey, BridgePhase, BridgeTensorSpec, ModalityBridge
 from megatron.core.mdp.config import MdpConfig
 from megatron.core.mdp.encoder import EncoderDomain, finalize_encoder_grads
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
 from megatron.core.mdp.groups import MdpProcessGroups, broadcast_descriptors
-from megatron.core.mdp.packing import GreedySampleStream, decoder_sample_length
-from megatron.core.mdp.observability import (
-    MdpIterationMetrics,
-    nvtx_phase,
-    worker_loads_from_plan,
-)
+from megatron.core.mdp.observability import MdpIterationMetrics, nvtx_phase, worker_loads_from_plan
+from megatron.core.mdp.packing import FfdSampleStream, GreedySampleStream, decoder_sample_length
 from megatron.core.mdp.plan import MdpBatchPlan, split_encoder_layout
 from megatron.core.mdp.planner import MdpPlanner, assert_consistent_plan
 from megatron.core.mdp.protocols import MdpModelAdapter
@@ -109,9 +100,7 @@ class MdpRuntime:
         self._plan: Optional[MdpBatchPlan] = None
         self._iter_specs: dict = {}
         self._iter_ledgers: dict = {}
-        self._handle: Optional[
-            Union[EncoderForwardHandle, EncoderWholeRecomputeHandle]
-        ] = None
+        self._handle: Optional[Union[EncoderForwardHandle, EncoderWholeRecomputeHandle]] = None
         self._eval_outputs: Sequence = ()
         self._chunk_layouts: Sequence = ()
         self._chunk_of_item: dict = {}
@@ -238,9 +227,7 @@ class MdpRuntime:
         for phase in (BridgePhase.PIXEL, BridgePhase.EMBEDDING, BridgePhase.GRADIENT):
             specs = pixel_specs if phase is BridgePhase.PIXEL else io_specs
             self._iter_specs[phase] = specs
-            self._iter_ledgers[phase] = self.bridge.build_ledger(
-                phase, plan, self.rank_map, specs
-            )
+            self._iter_ledgers[phase] = self.bridge.build_ledger(phase, plan, self.rank_map, specs)
         self._plan_build_ms = (time.monotonic() - plan_start) * 1000.0
 
         # The producer chunk layouts are known from the plan alone; carve the
@@ -267,8 +254,7 @@ class MdpRuntime:
                 chunk_payloads.append(payload)
                 for segment in chunk.segments:
                     pixel_dest[BridgeBufferKey(segment.global_item_id)] = payload[
-                        segment.payload_row_start : segment.payload_row_start
-                        + segment.payload_rows
+                        segment.payload_row_start : segment.payload_row_start + segment.payload_rows
                     ]
                     self._chunk_of_item[segment.global_item_id] = (chunk_index, segment)
 
@@ -301,10 +287,7 @@ class MdpRuntime:
         chunk_outputs = []
         chunk_rng_states = []
         encoder = self.encoder_domain.encoder_ddp
-        whole_recompute = (
-            not forward_only
-            and self.config.encoder_recompute_granularity == "whole"
-        )
+        whole_recompute = not forward_only and self.config.encoder_recompute_granularity == "whole"
         forward_start = time.monotonic()
         for chunk_index, chunk in enumerate(self._chunk_layouts):
             payload = chunk_payloads[chunk_index]
@@ -337,8 +320,7 @@ class MdpRuntime:
                     ],
                     chunk_layouts=tuple(self._chunk_layouts),
                     output_metadata=tuple(
-                        EncoderOutputMetadata.from_tensor(output)
-                        for output in chunk_outputs
+                        EncoderOutputMetadata.from_tensor(output) for output in chunk_outputs
                     ),
                     chunk_rng_states=tuple(chunk_rng_states),
                 )
@@ -373,8 +355,7 @@ class MdpRuntime:
                     )
                     for segment in layout.segments:
                         emb_dest[BridgeBufferKey(segment.global_item_id)] = leaf[
-                            segment.leaf_row_start : segment.leaf_row_start
-                            + segment.output_rows
+                            segment.leaf_row_start : segment.leaf_row_start + segment.output_rows
                         ]
                     leaves.append((layout.microbatch_id, leaf[: layout.total_output_rows]))
         with nvtx_phase("p3_embedding_exchange"):
@@ -424,8 +405,7 @@ class MdpRuntime:
             )
         if self._token_capture_count != 0:
             raise MdpStateError(
-                "MDP: the global token tensor was captured more than once this "
-                "iteration."
+                "MDP: the global token tensor was captured more than once this " "iteration."
             )
         self._captured_num_tokens = token_tensor
         self._token_capture_count = 1
@@ -582,13 +562,20 @@ class MdpRuntime:
         iterator = self._first_iterator(data_iterators)
         entry = self._greedy_streams.get(id(iterator))
         if entry is None:
+            stream_type = FfdSampleStream if self.config.ffd_packing else GreedySampleStream
+            stream_kwargs = (
+                {"buffer_size": self.config.ffd_packing_buffer_size}
+                if self.config.ffd_packing
+                else {}
+            )
             entry = (
-                GreedySampleStream(
+                stream_type(
                     iterator,
                     token_budget=self._greedy_token_budget,
                     max_num_seqs=self._greedy_max_num_seqs,
                     align=self._greedy_row_alignment,
                     length_of=decoder_sample_length,
+                    **stream_kwargs,
                 ),
                 # Evaluation runs forward_only; recorded so its consumption is
                 # kept out of consumed_train_samples.
@@ -611,7 +598,7 @@ class MdpRuntime:
         unconsumed; commit happens when the window is installed for its
         iteration, so neither shifts the count.
         """
-        if not self.config.greedy_packing:
+        if not self.config.packing_enabled:
             return None
         return sum(
             stream.consumed_samples
@@ -627,7 +614,7 @@ class MdpRuntime:
         The caller commits the count only once the window is installed for an
         iteration; a prefetched window that is never consumed commits nothing.
         """
-        if not self.config.greedy_packing:
+        if not self.config.packing_enabled:
             return self._capture(data_iterators, num_microbatches), None
         stream = self._greedy_stream(data_iterators)
         drained_before = stream.drained_samples
@@ -643,10 +630,10 @@ class MdpRuntime:
             # train_iters x global_batch_size *samples*, which under-counts
             # whenever the mean sample is shorter than the per-bin share.
             raise MdpStateError(
-                f"{error} Under --mdp-greedy-packing the sample stream must be "
+                f"{error} Under MDP token-budget packing the sample stream must be "
                 "provisioned by tokens, not by samples: each bin consumes about "
                 f"{self._greedy_token_budget} tokens' worth of samples, so raise "
-                "--train-samples / the dataset size (roughly by "
+                "the dataset size (roughly by "
                 "token_budget / (mean_sample_len x micro_batch_size)), or lower "
                 "--max-seqlen-per-dp-cp-rank."
             ) from error
@@ -705,8 +692,12 @@ class MdpRuntime:
             for value in record.model_payload.values():
                 _record(value)
             params = record.decoder_packed_seq_params
-            for name in ("cu_seqlens_q", "cu_seqlens_kv", "cu_seqlens_q_padded",
-                         "cu_seqlens_kv_padded"):
+            for name in (
+                "cu_seqlens_q",
+                "cu_seqlens_kv",
+                "cu_seqlens_q_padded",
+                "cu_seqlens_kv_padded",
+            ):
                 _record(getattr(params, name, None))
         for tensor in window.payload_sidecar().values():
             _record(tensor)
@@ -786,6 +777,4 @@ class MdpRuntime:
         self.storage.assert_empty()
         self.bridge.assert_idle()
         if not self._forward_only and not self._token_consumed:
-            raise MdpStateError(
-                "MDP: the global token tensor was captured but never consumed."
-            )
+            raise MdpStateError("MDP: the global token tensor was captured but never consumed.")
