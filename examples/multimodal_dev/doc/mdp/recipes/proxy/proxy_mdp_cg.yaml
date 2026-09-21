@@ -1,0 +1,163 @@
+# NOTE: site-specific values below are replaced with <PLACEHOLDER>.
+# Replace before use:
+#   <CONTAINER_SQSH>  the training container (TE 2.18 / cuDNN 9.25 / FA4)
+#   <FLA_PREFIX>      fla >= 0.6.0 side prefix (needed for GDN CUDA-graph capture)
+#   <NVRX_PREFIX>     nvidia-resiliency-ext 0.6.0 side prefix (the branch asserts >= 0.6.0)
+# The MEGATRON block is the toolkit's checkout directive; ignore it if you are
+# not using mcore-devtoolkit and just check out the commit named in README.md.
+
+# Proxy MDP overlap x CUDA-graph probe -- proxy_mdp_cg.
+#
+# megatron/core/mdp/config.py:442 REJECTS overlap_window_capture together with
+# per-layer CUDA graphs. The stated reason is a predicted race: window prefetch
+# runs H2D copies and allocations from a background thread on a side stream
+# while capture is in flight, and the message itself says the conflict is
+# "timing-dependent rather than reproducible" -- i.e. it was reasoned about,
+# not measured. These two arms grade that prediction.
+#
+# proxy_mdp_cg runs with graphs ON and overlap OFF.
+# 40 iterations rather than 20: the guarded failure is a race, so exposure
+# matters more than a tight median.
+#
+# A clean run is NOT proof of safety. It is evidence that the combination does
+# not fail immediately or deterministically, which is a different claim.
+
+MEGATRON:
+  repo: https://github.com/BestJuly/Megatron-LM.git
+  branch: lit/mdp_fast_pass
+
+ENTRY:
+  script: examples/multimodal_dev/pretrain_multimodal.py
+
+CONTAINER:
+  image: <CONTAINER_SQSH>
+
+ENV_VARS:
+  NVTE_FUSED_ATTN: "1"
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: "1"
+  PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True"
+  # 1 and NVLS off, matching run_cg_cell.sh's COMMON_ENV rather than the 35B
+  # recipes' 8 -- this probe is a proxy-vs-proxy A/B, so it follows the proxy.
+  CUDA_DEVICE_MAX_CONNECTIONS: "1"
+  NCCL_NVLS_ENABLE: "0"
+  NUM_OF_TOKENS_PER_CHUNK_DISPATCH_API: "128"
+  NUM_OF_TOKENS_PER_CHUNK_COMBINE_API: "128"
+  NUM_OF_TOKENS_PER_CHUNK_PREPROCESSING_API: "128"
+  FLA_DISABLE_TENSOR_CACHE: "1"
+  # Megatron asserts this whenever CUDA graphs meet expandable_segments.
+  NCCL_GRAPH_REGISTER: "0"
+  PYTHONPATH: "<FLA_PREFIX>:<NVRX_PREFIX>"
+
+ARGS:
+  use_mcore_models: true
+  use_flash_attn: true
+  transformer_impl: transformer_engine
+  hf_processor_path: "Qwen/Qwen3.5-35B-A3B"
+  sft: true
+  enable_experimental: true
+
+  # ---- Proxy model overrides (last-wins over the 35b_a3b model config) ----
+  model_variant: 35b_a3b_light
+  num_layers: 20
+  num_experts: 128
+  vision_num_layers: 13
+
+  # ---- Parallelism -------------------------------------------------------
+  tensor_model_parallel_size: 1
+  pipeline_model_parallel_size: 1
+  expert_model_parallel_size: 4
+  expert_tensor_parallel_size: 1
+  context_parallel_size: 1
+  cp_comm_type: a2a
+  sequence_parallel: true
+
+  # ---- Shape -------------------------------------------------------------
+  micro_batch_size: 1
+  global_batch_size: 32
+  seq_length: 16384
+  total_seq_length: 16384
+  train_iters: 40
+  bf16: true
+  use_packed_sequence: true
+  use_vanilla_collate_fn: true
+
+  mtp_num_layers: 1
+  mtp_loss_scaling_factor: 0.1
+
+  # ---- THD packing -------------------------------------------------------
+  mdp_greedy_packing: true
+  thd_static_packing: true
+  pad_packed_seq_alignment: max
+  max_seqlen_per_dp_cp_rank: 16384
+  thd_max_packed_sequences: 32
+  mdp_mock_dataset_config_json: '{"mode":"distribution","type":"lognormal","format":"thd","min_seq_len":512,"max_seq_len":4096,"mean_seq_len":2048,"lognormal_sigma":1.1}'
+
+  # ---- Partial CUDA graphs ON ---------------------------------------------
+  cuda_graph_impl: transformer_engine
+  cuda_graph_warmup_steps: 2
+  cuda_graph_modules: [attn, moe_router, moe_preprocess]
+
+  # ---- MDP ---------------------------------------------------------------
+  mdp_enable: true
+  # Complete-encoder recompute (PR #53 typed argument). --recompute-vision is
+  # hard-rejected under --mdp-enable, so the two paths spell it differently.
+  encoder_recompute_granularity: whole
+  # THE AXIS OF THIS PROBE.
+  mdp_overlap_window_capture: false
+
+  # ---- MoE dispatcher ----------------------------------------------------
+  moe_token_dispatcher_type: flex
+  moe_flex_dispatcher_backend: hybridep
+  moe_flex_dispatcher_num_sms: 32
+  moe_grouped_gemm: true
+  moe_permute_fusion: true
+  moe_router_fusion: true
+  moe_router_dtype: fp32
+  moe_router_force_load_balancing: true
+
+  gdn_pre_gated_delta_rule_fusion: true
+
+  # ---- Explicitly off ----------------------------------------------------
+  overlap_moe_expert_parallel_comm: false
+  overlap_dispatch_backward_with_experts_wgrad: false
+  ep_overlap_early_attn_memory_release: false
+
+  # ---- Loss fusion -------------------------------------------------------
+  cross_entropy_loss_fusion: true
+  cross_entropy_fusion_impl: te
+  calculate_per_token_loss: true
+
+  # ---- Optimizer ---------------------------------------------------------
+  optimizer: adam
+  use_distributed_optimizer: true
+  use_precision_aware_optimizer: true
+  main_grads_dtype: fp32
+  main_params_dtype: fp32
+  exp_avg_dtype: bf16
+  exp_avg_sq_dtype: bf16
+
+  lr: 1.2e-4
+  min_lr: 1.2e-5
+  lr_decay_style: cosine
+  lr_warmup_iters: 2
+  weight_decay: 0.1
+  clip_grad: 1.0
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+
+  manual_gc: true
+  manual_gc_interval: 10
+
+  eval_iters: 1
+  eval_interval: 100000
+
+  log_throughput: true
+  log_interval: 1
+  log_device_memory_used: true
+  log_memory_interval: 1
+  distributed_timeout_minutes: 20
+
+SLURM:
+  nnodes: 1
+  gpus_per_node: 4
+  time_limit: "0:30:00"
