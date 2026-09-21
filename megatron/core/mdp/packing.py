@@ -229,8 +229,9 @@ class FfdSampleStream(PackedSampleStream):
 
     Sort each window by descending aligned length (stable source-order ties),
     then place each complete sample into the first eligible bin in creation
-    order. Drain all bins before reading the next window, including partial
-    bins at EOF. The sample-count bound excludes the underlying dataloader's
+    order. Refill freed buffer slots before emitting each subsequent bin, like
+    Energon's reading/prepacking buffers. Form the next window's bins only after
+    the current bins drain. The sample-count bound excludes the dataloader's
     current list and worker prefetch; large image payloads can use substantial
     host memory. Read-ahead is not counted as drained or committed consumption.
 
@@ -244,34 +245,41 @@ class FfdSampleStream(PackedSampleStream):
         if buffer_size < 1:
             raise MdpConfigurationError("MDP: FFD buffer_size must be positive.")
         self._buffer_size = buffer_size
-        self._bins = deque()
+        self._bins: deque[List[Any]] = deque()
+        self._pending_samples = 0
+        self._reading_window: List[tuple[int, Any]] = []
 
     @property
     def exhausted(self) -> bool:
         """True only after both source samples and prepacked bins are exhausted."""
-        return super().exhausted and not self._bins
+        return super().exhausted and not self._bins and not self._reading_window
 
     def __next__(self) -> List[Any]:
         """Emit one FFD bin, without consuming or dropping any other planned bin."""
         with self._lock:
+            # Replenish only the slots released by emitted packs. This keeps
+            # the same disjoint sorting windows while letting loader workers
+            # refill throughout training instead of stalling on a whole window
+            # at every boundary. Pending + unread samples never exceed the cap.
+            while len(self._reading_window) + self._pending_samples < self._buffer_size:
+                sample = self._next_sample()
+                if sample is None:
+                    break
+                length = self._aligned_length(sample)
+                if length > self._token_budget:
+                    raise MdpStateError(
+                        f"MDP: sample aligned length ({length}) exceeds the FFD "
+                        f"token budget ({self._token_budget}). Raise "
+                        "--max-seqlen-per-dp-cp-rank or filter overlong samples."
+                    )
+                self._reading_window.append((length, sample))
             if not self._bins:
-                window = []
-                for _ in range(self._buffer_size):
-                    sample = self._next_sample()
-                    if sample is None:
-                        break
-                    length = self._aligned_length(sample)
-                    if length > self._token_budget:
-                        raise MdpStateError(
-                            f"MDP: sample aligned length ({length}) exceeds the FFD "
-                            f"token budget ({self._token_budget}). Raise "
-                            "--max-seqlen-per-dp-cp-rank or filter overlong samples."
-                        )
-                    window.append((length, sample))
+                window = self._reading_window
+                self._reading_window = []
                 # Python's stable sort preserves source order for equal lengths.
                 window.sort(key=lambda item: -item[0])
-                bins = []
-                totals = []
+                bins: List[List[Any]] = []
+                totals: List[int] = []
                 for length, sample in window:
                     for index, samples in enumerate(bins):
                         if totals[index] + length <= self._token_budget and (
@@ -284,8 +292,10 @@ class FfdSampleStream(PackedSampleStream):
                         bins.append([sample])
                         totals.append(length)
                 self._bins.extend(bins)
+                self._pending_samples = len(window)
             if not self._bins:
                 raise StopIteration
             samples = self._bins.popleft()
+            self._pending_samples -= len(samples)
             self._drained_samples += len(samples)
             return samples

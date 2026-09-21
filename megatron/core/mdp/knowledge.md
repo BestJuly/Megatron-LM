@@ -383,8 +383,11 @@ are mutually exclusive. `--mdp-ffd-packing-buffer-size` (default 128, positive)
 sets the number of complete samples read into each sorting window. Sort by
 aligned decoder length descending, breaking ties by source order; place each
 sample into the first bin in creation order satisfying the token budget and
-real-sequence cap. Emit all bins, including partial ones, before reading the
-next window. At EOF drain the pending bins. No sample or image is truncated,
+real-sequence cap. Before each subsequent bin, refill the slots freed by the
+previous emission into a separate reading window, keeping reading plus pending
+samples within the configured buffer size. This matches Energon's refill cadence
+and lets loader workers replenish continuously. Form the next window's bins only
+after the current bins drain. At EOF emit all pending and partial-window bins. No sample or image is truncated,
 dropped, duplicated, or moved between DP replicas.
 
 This follows Energon's buffered select-then-pack interface; Energon itself
