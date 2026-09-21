@@ -193,10 +193,14 @@ if [ "$VPP" -lt 1 ]; then
     echo "ERROR: VPP must be >= 1, got '$VPP'" >&2
     exit 1
 fi
+# HybridModel derives the virtual pipeline stages from the number of '|'
+# segments in --hybrid-layer-pattern and rejects
+# --num-virtual-stages-per-pipeline-rank outright:
+#   "--num-virtual-stages-per-pipeline-rank should not be used with
+#    --hybrid-layer-pattern. Virtual pipeline stages are derived from the
+#    number of | segments in the pattern."
+# VPP is therefore expressed in the pattern below, not as a CLI flag.
 VPP_ARGS=()
-if [ "$VPP" -gt 1 ]; then
-    VPP_ARGS=( --num-virtual-stages-per-pipeline-rank "$VPP" )
-fi
 
 EP_OVERLAP_ARGS=()
 if [ "$EP_OVERLAP" = "1" ]; then
@@ -245,8 +249,27 @@ if [ "${NUM_EXPERTS:-0}" -gt 0 ]; then
 else
     MLP_LAYER_SYMBOL="-"
 fi
+# With VPP>1 the pattern must be split into PP x VPP '|' segments -- that is
+# the only way to express virtual pipeline stages to HybridModel. With VPP=1
+# the segmentation is left implicit (Megatron splits evenly, which is the same
+# thing) so the emitted pattern stays identical to before for every other cell.
+HYBRID_SEGMENTS=$((PP * VPP))
+if [ "$VPP" -gt 1 ]; then
+    if [ $((NUM_LAYERS % HYBRID_SEGMENTS)) -ne 0 ]; then
+        echo "ERROR: NUM_LAYERS=$NUM_LAYERS is not divisible by PP*VPP=$HYBRID_SEGMENTS" >&2
+        exit 1
+    fi
+    HYBRID_BLOCKS_PER_SEGMENT=$((NUM_LAYERS / HYBRID_SEGMENTS))
+else
+    HYBRID_BLOCKS_PER_SEGMENT=0
+fi
+
 HYBRID_LAYER_PATTERN=""
 for ((block_idx = 0; block_idx < NUM_LAYERS; block_idx++)); do
+    if [ "$HYBRID_BLOCKS_PER_SEGMENT" -gt 0 ] && [ "$block_idx" -gt 0 ] \
+       && [ $((block_idx % HYBRID_BLOCKS_PER_SEGMENT)) -eq 0 ]; then
+        HYBRID_LAYER_PATTERN+="|"
+    fi
     ATTN_LAYER_SYMBOL="${ATTN_CADENCE:block_idx % ${#ATTN_CADENCE}:1}"
     HYBRID_LAYER_PATTERN+="${ATTN_LAYER_SYMBOL}${MLP_LAYER_SYMBOL}"
 done
