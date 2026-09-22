@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Composite-optimizer tests: WORLD overflow union and atomic update (fp16).
 
@@ -12,13 +12,20 @@ subgroup makes ranks disagree about skipping the step; MdpChainedOptimizer
 unions the verdict over WORLD before any scaler update.
 """
 
+import math
 import os
 
 import pytest
 import torch
 
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.mdp.optimizer import MdpChainedOptimizer, build_mdp_composite_optimizer
+from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor
+from megatron.core.mdp.encoder import build_encoder_ddp_config
+from megatron.core.mdp.optimizer import (
+    MdpChainedOptimizer,
+    build_encoder_optimizer_config,
+    build_mdp_composite_optimizer,
+)
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.optimizer import ChainedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -233,3 +240,154 @@ def test_member_order_is_flat_dense_expert_encoder():
     )
     # get_loss_scale asserts the members agree before returning member 0's.
     assert float(composite.get_loss_scale()) == 2.0**16
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_mxfp8_reuse_preserves_both_domains_and_global_clipping(overlap, monkeypatch):
+    """Compare three real MXFP8/BF16 updates against independently stepped domains."""
+    import transformer_engine.pytorch as te
+
+    from tests.unit_tests.mdp.test_encoder_config import _run_train_step_until_forward
+
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("MXFP8 requires Blackwell")
+
+    common = dict(
+        optimizer="adam",
+        lr=1e-3,
+        clip_grad=0.01,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        use_distributed_optimizer=True,
+        use_precision_aware_optimizer=True,
+        exp_avg_dtype=torch.bfloat16,
+        exp_avg_sq_dtype=torch.bfloat16,
+    )
+    decoder_config = OptimizerConfig(
+        **common,
+        fp8_recipe="mxfp8",
+        reuse_grad_buf_for_mxfp8_param_ag=True,
+        overlap_param_gather=overlap,
+    )
+    decoder_ddp_config = DistributedDataParallelConfig(
+        use_distributed_optimizer=True,
+        grad_reduce_in_fp32=True,
+        fp8_param_gather=True,
+        reuse_grad_buf_for_mxfp8_param_ag=True,
+        overlap_grad_reduce=overlap,
+        overlap_param_gather=overlap,
+    )
+
+    class Linear(torch.nn.Module):
+        def __init__(self, fp8):
+            super().__init__()
+            self.config = TransformerConfig(
+                num_layers=1,
+                hidden_size=128,
+                num_attention_heads=1,
+                bf16=True,
+                params_dtype=torch.bfloat16,
+                calculate_per_token_loss=True,
+                fp8="e4m3" if fp8 else None,
+                fp8_recipe="mxfp8",
+                fp8_param=fp8,
+            )
+            torch.manual_seed(1234)
+            torch.cuda.manual_seed(1234)
+            with get_fp8_context(self.config, is_init=True):
+                self.proj = te.Linear(128, 128, bias=False, params_dtype=torch.bfloat16)
+
+        def forward(self, inputs):
+            with get_fp8_context(self.config):
+                return self.proj(inputs)
+
+    def build(fp8, *, reference=False):
+        model = Linear(fp8).cuda()
+        if fp8:
+            opt_config, ddp_config = decoder_config, decoder_ddp_config
+        elif reference:
+            # A plain BF16 reference, independent of the projection under test.
+            opt_config = OptimizerConfig(**common)
+            ddp_config = DistributedDataParallelConfig(
+                use_distributed_optimizer=True, grad_reduce_in_fp32=True
+            )
+        else:
+            opt_config = build_encoder_optimizer_config(decoder_config)
+            ddp_config = build_encoder_ddp_config(decoder_ddp_config)
+        pgs = _pgs(_subgroup() if fp8 else torch.distributed.group.WORLD)
+        ddp = DistributedDataParallel(
+            config=model.config, ddp_config=ddp_config, module=model, pg_collection=pgs
+        )
+        opt = get_megatron_optimizer(
+            opt_config, [ddp], pg_collection=pgs, use_gloo_process_groups=False
+        )
+        return ddp, opt
+
+    decoder, decoder_opt = build(True)
+    encoder, encoder_opt = build(False)
+    ref_decoder, ref_decoder_opt = build(True, reference=True)
+    ref_encoder, ref_encoder_opt = build(False, reference=True)
+    composite = build_mdp_composite_optimizer(decoder_opt, encoder_opt)
+    assert is_mxfp8tensor(decoder.module.proj.weight)
+    assert not is_mxfp8tensor(encoder.module.proj.weight)
+    assert encoder.module.proj.weight.dtype == torch.bfloat16
+    assert composite._decoder_chain.chained_optimizers == decoder_opt.chained_optimizers
+    initial_encoder = encoder.module.proj.weight.detach().clone()
+    inputs = torch.full(
+        (128, 128), (torch.distributed.get_rank() + 1) / 8, device="cuda", dtype=torch.bfloat16
+    )
+    clipping_exercised = False
+    for _ in range(3):
+        for ddp, opt in (
+            (decoder, decoder_opt),
+            (encoder, encoder_opt),
+            (ref_decoder, ref_decoder_opt),
+            (ref_encoder, ref_encoder_opt),
+        ):
+            ddp.zero_grad_buffer()
+            opt.zero_grad()
+        if overlap:
+            # Exercise train_step's actual zero-grad and inline staging path.
+            _run_train_step_until_forward(monkeypatch, composite, [decoder])
+            ref_decoder_opt.prepare_model_params_for_param_sync()
+        for ddp in (decoder, encoder, ref_decoder, ref_encoder):
+            (100 * ddp(inputs).float().square().mean()).backward()
+            ddp.finish_grad_sync()
+
+        refs = (ref_decoder_opt, ref_encoder_opt)
+        assert not ref_decoder_opt.prepare_grads()
+        assert not ref_encoder_opt.prepare_grads()
+        expected_norm = math.sqrt(sum(opt.get_grad_norm() ** 2 for opt in refs))
+        coefficient = min(1.0, common["clip_grad"] / (expected_norm + 1e-6))
+        clipping_exercised |= coefficient < 1.0
+        # Independent global clipping, not per-domain clipping or another MDP chain.
+        with torch.no_grad():
+            for opt in refs:
+                for param in opt.get_parameters():
+                    grad = (
+                        param.decoupled_grad
+                        if opt.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+                        else param.grad
+                    )
+                    if grad is not None:
+                        grad.mul_(coefficient)
+                assert opt.step_with_ready_grads()
+
+        success, norm, _ = composite.step()
+        assert success
+        assert norm == pytest.approx(expected_norm, rel=1e-6)
+        for actual, reference in zip(
+            decoder_opt.get_parameters(), ref_decoder_opt.get_parameters()
+        ):
+            torch.testing.assert_close(actual, reference, rtol=1e-6, atol=1e-7)
+        torch.testing.assert_close(
+            encoder.module.proj.weight, ref_encoder.module.proj.weight, rtol=0, atol=0
+        )
+        replicas = [
+            torch.empty_like(initial_encoder) for _ in range(torch.distributed.get_world_size())
+        ]
+        torch.distributed.all_gather(replicas, encoder.module.proj.weight.detach())
+        assert all(torch.equal(replicas[0], replica) for replica in replicas[1:])
+    assert clipping_exercised
+    assert not torch.equal(initial_encoder, encoder.module.proj.weight)
+    composite.prepare_model_params_for_param_sync()

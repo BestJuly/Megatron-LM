@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Pretrain utilities."""
 
@@ -3062,6 +3062,12 @@ def train_step(
             if forward_pre_hook_enabled or full_cg_captured:
                 for optim_instance in optimizer.chained_optimizers:
                     if isinstance(optim_instance, DistributedOptimizer):
+                        # MDP adds a synchronous BF16 encoder; do not stage its buffers.
+                        if getattr(args, "mdp_enable", False) and not (
+                            optim_instance.config.reuse_grad_buf_for_mxfp8_param_ag
+                            and optim_instance.config.overlap_param_gather
+                        ):
+                            continue
                         optim_instance._copy_main_params_to_param_buffer()
 
         # Master weights must remain resident until any main-param copy above is
