@@ -32,7 +32,28 @@ class MdpRankSpec:
 
 @dataclass(frozen=True)
 class MdpRankView:
-    """The slice of the rank map one rank needs; no global rank lists are copied."""
+    """The slice of the rank map one rank needs; no global rank lists are copied.
+
+    Two distinct roles hide behind the word "endpoint", and decoder context
+    parallelism separates them:
+
+    - ``endpoint_rank`` / ``lane_id``: the group's single **descriptor source**
+      (``group[0]``). It emits ``global_item_id`` values and broadcasts the
+      descriptor records, so it must stay one rank at every CP size.
+    - ``decoder_endpoint_ranks``: the ranks that **consume** vision embeddings,
+      i.e. every pipeline-stage-0 rank of the group, indexed by ``cp_rank``.
+      At CP=1 that is exactly ``(endpoint_rank,)``.
+
+    ``my_cp_rank`` and ``my_pp_rank`` are this rank's coordinates inside the
+    group; ``is_decoder_endpoint`` is ``my_pp_rank == 0``.
+
+    ``my_encoder_cp_rank`` is this rank's position **inside its logical worker**
+    (``index_in_group % encoder_cp``), i.e. which shard of the vision chunk it
+    encodes. It is NOT interchangeable with ``my_cp_rank``: the two coincide
+    only when ``encoder_cp == cp``, which is exactly the topology
+    ``test_extension_hook_encoder_cp2`` uses, so substituting one for the other
+    passes that test and is wrong everywhere else.
+    """
 
     global_rank: int
     outer_dp_rank: int
@@ -41,6 +62,15 @@ class MdpRankView:
     endpoint_rank: int
     planning_group_ranks: tuple
     worker_ids: tuple
+    decoder_endpoint_ranks: tuple = ()
+    my_cp_rank: int = 0
+    my_pp_rank: int = 0
+    my_encoder_cp_rank: int = 0
+
+    @property
+    def is_decoder_endpoint(self) -> bool:
+        """True when this rank runs ``pre_process`` and consumes vision rows."""
+        return self.my_pp_rank == 0
 
 
 class MdpRankMap:
@@ -88,15 +118,29 @@ class MdpRankMap:
         return self._groups
 
     def endpoint_rank(self, outer_dp_rank: int) -> int:
-        """The PP0 endpoint rank of one planning group."""
+        """The group's descriptor source: its ``(tp0, cp0, pp0)`` rank."""
         return self._groups[outer_dp_rank][0]
+
+    def decoder_endpoint_ranks(self, outer_dp_rank: int) -> tuple:
+        """The group's pipeline-stage-0 ranks, indexed by ``cp_rank``.
+
+        ``RankGenerator``'s ``tp-cp-pp`` group orders earlier dimensions faster,
+        so with ``tp == 1`` a member's index is ``cp_rank + cp * pp_rank`` and
+        the first ``cp`` entries are exactly the PP0 ranks. These are the ranks
+        that run ``pre_process`` and therefore need vision embeddings.
+        """
+        return self._groups[outer_dp_rank][: self._spec.cp]
 
     def worker_ranks(self, outer_dp_rank: int, worker_id: int) -> tuple:
         """Resolve one logical worker to its physical ranks.
 
         With ``encoder_cp=1`` this always returns a one-element tuple. With
-        ``encoder_cp>1`` one logical worker maps to ``encoder_cp`` ranks; the plan
-        is unchanged and only the bridge's physical expansion differs.
+        ``encoder_cp>1`` one logical worker maps to ``encoder_cp`` ranks.
+
+        Note that the plan CONTENT does change: ``num_workers_per_group`` is
+        ``cp*pp // encoder_cp``, so raising ``encoder_cp`` renumbers every
+        ``producer_worker_id`` and redistributes the LPT assignment. Only the
+        plan SCHEMA is unchanged.
         """
         num_workers = self.num_workers_per_group
         if not 0 <= worker_id < num_workers:
@@ -117,6 +161,7 @@ class MdpRankMap:
         outer_dp_rank, index_in_group = self._rank_to_coord[global_rank]
         group = self._groups[outer_dp_rank]
         endpoint = group[0]
+        cp = self._spec.cp
         return MdpRankView(
             global_rank=global_rank,
             outer_dp_rank=outer_dp_rank,
@@ -125,6 +170,10 @@ class MdpRankMap:
             endpoint_rank=endpoint,
             planning_group_ranks=group,
             worker_ids=tuple(range(self.num_workers_per_group)),
+            decoder_endpoint_ranks=group[:cp],
+            my_cp_rank=index_in_group % cp,
+            my_pp_rank=index_in_group // cp,
+            my_encoder_cp_rank=index_in_group % self._spec.encoder_cp,
         )
 
 
@@ -173,6 +222,21 @@ def build_rank_map(spec: MdpRankSpec) -> MdpRankMap:
         raise MdpConfigurationError(
             f"MDP: encoder_cp={spec.encoder_cp} violates: encoder_cp divides "
             f"inner_dp = CP * PP = {inner_dp}."
+        )
+    # Dividing inner_dp is necessary but not sufficient. Workers are contiguous
+    # blocks of a group ordered cp-fastest (index = cp_rank + cp * pp_rank), so a
+    # block is a uniform set of ranks only when it sits inside one pipeline stage
+    # (encoder_cp divides cp) or spans whole pipeline stages (cp divides
+    # encoder_cp). Enumerating the real generator over every accepted (cp, pp,
+    # encoder_cp) shows the looser rule alone admits five ragged cases --
+    # (cp,pp,e) in {(2,3,3), (3,2,2), (3,4,2), (3,4,4), (4,3,3)} -- where one
+    # worker straddles two stages while another does not, or a cp coordinate
+    # repeats inside a worker.
+    if spec.cp % spec.encoder_cp != 0 and spec.encoder_cp % spec.cp != 0:
+        raise MdpConfigurationError(
+            f"MDP: encoder_cp={spec.encoder_cp} violates: encoder_cp divides CP "
+            f"({spec.cp}) or CP divides encoder_cp. Otherwise a logical worker's "
+            "rank block is ragged across pipeline stages."
         )
 
     decoder_dp = spec.world_size // model_parallel

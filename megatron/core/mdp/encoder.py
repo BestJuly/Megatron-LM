@@ -9,6 +9,7 @@ factor 1.0). The distributed optimizer shards its state over the same WORLD
 domain. The encoder never enters the decoder schedule model list.
 """
 
+import dataclasses
 import logging
 from dataclasses import dataclass, replace
 from typing import Any, Sequence
@@ -68,16 +69,19 @@ def build_encoder_pg_collection(
     ``get_pg_size(None) == 1`` — exactly the intended meaning).
 
     The singleton is created the way Megatron itself does it: each rank calls
-    ``new_group`` once with its own rank list. The ``encoder_cp>1`` evolution
-    (cp = each logical worker's ranks, dp = workers sharing a cp coordinate)
-    changes only this function, but its DDP/ZeRO semantics still require
-    revalidation and are rejected here.
+    ``new_group`` once with its own rank list.
+
+    With ``encoder_cp>1`` the ONLY addition is ``cp`` = this rank's logical
+    worker. Everything else stays WORLD, and that is load-bearing rather than
+    conservative: ``setup_process_groups_for_ddp`` overwrites
+    ``intra_dp_cp := dp_cp`` whenever there is one optimizer instance (which
+    ``build_encoder_domain`` enforces), so ``dp_cp`` alone is BOTH the
+    gradient SUM-reduce group AND the ZeRO-1 shard count. Narrowing it to
+    "workers sharing a cp coordinate" would drop the cross-CP partial sums and
+    the encoder would silently train on ``1/encoder_cp`` of its own gradient --
+    finite, non-NaN, and convergent-looking. CP peers are gradient-summing
+    peers; that is exactly why MCore folds CP into ``dp_cp`` for its own models.
     """
-    if encoder_cp != 1:
-        raise MdpConfigurationError(
-            f"MDP: encoder_cp={encoder_cp} violates: encoder_cp == 1. The encoder-CP "
-            "group construction requires revalidating MCore CP gradient semantics."
-        )
     world = process_groups.world_group
     mine = torch.distributed.new_group(ranks=[torch.distributed.get_rank()])
 
@@ -89,12 +93,35 @@ def build_encoder_pg_collection(
     pgs.tp = mine
     pgs.pp = mine
     pgs.ep = mine
+    # The encoder's own context-parallel group. Both Attention.__init__ and
+    # TEDotProductAttention.__init__ require the attribute to exist; at
+    # encoder_cp=1 the singleton makes TE skip CP registration entirely, which
+    # is what keeps the encoder out of the DECODER's CP group.
+    pgs.cp = mine if encoder_cp == 1 else process_groups.encoder_cp_group
+    if encoder_cp != 1 and pgs.cp is None:
+        raise MdpConfigurationError(
+            f"MDP: encoder_cp={encoder_cp} violates: an encoder-CP process group "
+            "was installed. install_mdp_process_groups must run first."
+        )
     pgs.mp = None
     # The encoder has no experts. Set expt_dp explicitly so DDP's fallback
     # does not create another singleton group with a warning.
     pgs.expt_dp = None
     pgs.tp_ep_pp = None
     pgs.inter_dist_opt = None
+    # Stated as assertions because these three are the silent-wrong-gradient
+    # surface: dp_cp is the SUM-reduce group and the ZeRO shard count, and
+    # intra_dist_opt is the grad-norm / found_inf reduction group.
+    if pgs.dp_cp is not world or pgs.intra_dp_cp is not world:
+        raise MdpConfigurationError(
+            "MDP: the encoder gradient-reduce domain violates: it stays WORLD at "
+            "every encoder_cp. Narrowing it drops the cross-CP partial sums."
+        )
+    if pgs.intra_dist_opt is not world:
+        raise MdpConfigurationError(
+            "MDP: the encoder grad-stats domain violates: it stays WORLD at every "
+            "encoder_cp, so the combined norm counts each shard once."
+        )
     return pgs
 
 
@@ -136,6 +163,23 @@ def build_encoder_domain(
 
     effective_config = apply_encoder_recompute_config(model_config, mdp_config)
     validate_effective_vision_config(mdp_config, effective_config)
+    # Encoder context parallelism is set here, not through
+    # --mdp-vision-config-override: the override allowlist is deliberately just
+    # the recompute keys, and this is not a user knob but a consequence of
+    # --mdp-encoder-cp. TE only takes its CP branch when
+    # config.context_parallel_size > 1, and cp_comm_type only reaches attention
+    # when the size is > 1 AND the type is not None, so both must be set.
+    #
+    # "p2p" specifically: MCore's a2a+p2p wrapper reads the GLOBAL
+    # get_hierarchical_context_parallel_groups() rather than
+    # pg_collection.hcp, which would hand the encoder the decoder's
+    # hierarchical groups.
+    if mdp_config.encoder_cp > 1:
+        effective_config = dataclasses.replace(
+            effective_config,
+            context_parallel_size=mdp_config.encoder_cp,
+            cp_comm_type="p2p",
+        )
     logger.info(
         "MDP: effective encoder recompute granularity: %s",
         mdp_config.encoder_recompute_granularity,

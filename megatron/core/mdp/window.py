@@ -27,6 +27,11 @@ from megatron.core.mdp.protocols import CapturedMicrobatch, MdpModelAdapter, Vis
 _PIXEL_OWNERSHIP = threading.local()
 
 
+# A worker id no rank can hold, used to mark "this rank is not the materializer
+# even though its worker owns the microbatch" without widening the context tuple.
+_NOT_AN_OWNER = -1
+
+
 def pixel_capture_suppressed() -> bool:
     """True when the in-progress capture microbatch is NOT owned by this worker.
 
@@ -38,6 +43,45 @@ def pixel_capture_suppressed() -> bool:
         return False
     owner_worker_id, my_worker_id = context
     return owner_worker_id != my_worker_id
+
+
+def _decoder_offset_in_sample(item, microbatch_id: int, output_rows: int) -> int:
+    """Offset of an item's first decoder row inside its packed sample.
+
+    The descriptor carries a start offset and a row count, not the per-row
+    position tuple, so the run must be contiguous and contained in the sample
+    the span columns describe. The collator checks contiguity too; this is the
+    check at the point where the *plan input* is built, because at decoder CP>1
+    a violation here does not fail loudly — it silently routes rows to the wrong
+    context-parallel rank.
+    """
+    where = (
+        f"item (mb={microbatch_id}, sample={item.sample_id}, "
+        f"ordinal={item.image_ordinal})"
+    )
+    positions = item.decoder_positions
+    start = positions[0]
+    if positions[-1] - start != output_rows - 1:
+        raise MdpConfigurationError(
+            f"MDP: {where} violates: decoder positions are contiguous "
+            f"({start}..{positions[-1]} for {output_rows} rows)."
+        )
+    if item.sample_padded_len <= 0:
+        # The adapter did not supply the sample span. That is inert at CP=1,
+        # where the split is the identity and the offset is never read; at CP>1
+        # the planner's split_item rejects a non-positive span, so an adapter
+        # that never learned to emit it fails loudly there rather than routing
+        # rows by a fabricated offset here.
+        return 0
+    offset = start - item.sample_padded_start
+    if offset < 0 or offset + output_rows > item.sample_padded_len:
+        raise MdpConfigurationError(
+            f"MDP: {where} violates: its decoder rows lie inside its sample's "
+            f"padded span [{item.sample_padded_start}, "
+            f"{item.sample_padded_start + item.sample_padded_len}); got "
+            f"[{start}, {start + output_rows})."
+        )
+    return offset
 
 
 @dataclass(frozen=True)
@@ -123,6 +167,7 @@ class MdpIterationWindow:
         lane_id: Optional[int],
         my_worker_id: int,
         num_workers: int,
+        my_encoder_cp_rank: int = 0,
     ) -> "MdpIterationWindow":
         """Consume one real iterator and build records, descriptors, and sidecar.
 
@@ -132,7 +177,12 @@ class MdpIterationWindow:
         planning group (one endpoint per group generates them).
 
         Every worker materializes and cuts pixels only for the microbatches it owns
-        (``microbatch_id % num_workers == my_worker_id``); the ownership context
+        (``microbatch_id % num_workers == my_worker_id``), and under
+        ``encoder_cp>1`` only the worker's LEAD rank does: ``my_worker_id`` is
+        identical across a worker's ranks, so without the extra condition all
+        ``encoder_cp`` of them would decode and H2D the identical payload. The
+        lead is also the bridge's PIXEL source, so the rank that materializes is
+        the rank that sends. The ownership context
         set around each ``adapter.get_batch`` call lets the model collate path
         skip pixel materialization on non-owners.
         """
@@ -153,9 +203,14 @@ class MdpIterationWindow:
         merge = adapter.spatial_merge_size
         for microbatch_id in range(num_microbatches):
             owner_worker_id = microbatch_id % num_workers
-            owns_pixels = owner_worker_id == my_worker_id
+            owns_pixels = (
+                owner_worker_id == my_worker_id and my_encoder_cp_rank == 0
+            )
             try:
-                _PIXEL_OWNERSHIP.value = (owner_worker_id, my_worker_id)
+                _PIXEL_OWNERSHIP.value = (
+                    owner_worker_id,
+                    my_worker_id if my_encoder_cp_rank == 0 else _NOT_AN_OWNER,
+                )
                 with nvtx_phase("p1_get_batch"):
                     captured = adapter.get_batch(iterator)
             finally:
@@ -195,6 +250,9 @@ class MdpIterationWindow:
                             f"len(decoder_positions) == output_rows "
                             f"({len(item.decoder_positions)} != {output_rows})."
                         )
+                    offset_in_sample = _decoder_offset_in_sample(
+                        item, microbatch_id, output_rows
+                    )
                     descriptors.append(
                         VisionDescriptor(
                             global_item_id=item_id,
@@ -207,6 +265,9 @@ class MdpIterationWindow:
                             output_rows=output_rows,
                             grid_thw=item.grid_thw,
                             owner_worker_id=owner_worker_id,
+                            sample_padded_start=item.sample_padded_start,
+                            sample_padded_len=item.sample_padded_len,
+                            decoder_offset_in_sample=offset_in_sample,
                         )
                     )
                 if owns_pixels:

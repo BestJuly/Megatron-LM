@@ -8,6 +8,8 @@ Both the standalone and MIMO training paths import from here.
 
 from typing import Optional
 
+import torch
+
 from examples.multimodal_dev.models.base import _NO_CP_GROUP
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_transformer_block_with_experimental_attention_variant_spec,
@@ -81,26 +83,67 @@ def _apply_rope_fp32(
     return out.to(orig_dtype)
 
 
-def _apply_rope_fp32_no_cp(
+def _apply_rope_fp32_vision_cp(
     t, freqs, config, cu_seqlens=None, mscale=1.0, cp_group=None, max_seqlen=None
 ):
-    """Same as ``_apply_rope_fp32`` but forces CP-size=1.
+    """``_apply_rope_fp32`` with the ENCODER's CP group, never the decoder's.
 
     The vision encoder uses THD packed sequences for variable-resolution
-    images.  When the language model uses CP>1, the global CP group would
-    incorrectly split the vision seqlens.  This wrapper substitutes a
-    trivial group so the vision RoPE sees the full packed sequence.
+    images. When the language model uses CP>1, the global CP group would
+    incorrectly split the vision seqlens -- so when the encoder is not itself
+    context-parallel this substitutes a trivial group and the vision RoPE sees
+    the full packed sequence, exactly as before.
+
+    Under ``--mdp-encoder-cp e > 1`` the encoder IS context-parallel over its
+    own group of size ``e``, and that group must be used: leaving the size-1
+    dummy in place while the tensor holds zigzag-sharded rows makes
+    ``_apply_rotary_pos_emb_thd`` take its ``cp_size == 1`` branch and give
+    every row the frequency of its LOCAL index instead of its global position.
+    Wrong values, no shape error. The caller passes the encoder's group, and a
+    size-1 group is indistinguishable from the old behaviour.
     """
     range_name = "qwen35_vl.vision_encoder.rope_apply"
     nvtx_range_push(range_name)
     try:
+        # Discriminate on the VISION CONFIG, never on the group we were handed.
+        # The group is `self.pg_collection.cp` of the attention module, and in
+        # the native (non-MDP) build no pg_collection is passed, so
+        # TransformerBlock falls back to the MPU groups and hands us the
+        # DECODER's CP group. Under `--context-parallel-size 2` that group has
+        # size 2 while the vision tensor is NOT sharded -- an earlier version of
+        # this wrapper passed it through and `_is_raw_mrope_freqs_thd` raised
+        # `freqs sequence length must match local tokens times cp_size` on the
+        # first vision-bearing microbatch of every native CP>1 run.
+        #
+        # Only MDP encoder CP sets `context_parallel_size = encoder_cp` on the
+        # vision config (megatron/core/mdp/encoder.py); the native vision config
+        # leaves it at 1. That is the fact that says whether THIS encoder's
+        # tensor is sharded, so it is the fact to branch on.
+        encoder_cp = int(getattr(config, "context_parallel_size", 1) or 1)
+        if encoder_cp == 1:
+            effective = _NO_CP_GROUP
+        else:
+            if cp_group is None:
+                raise RuntimeError(
+                    f"vision config says context_parallel_size={encoder_cp} but the "
+                    "attention module has no CP group; the encoder was built without "
+                    "the encoder-CP pg_collection."
+                )
+            group_size = torch.distributed.get_world_size(group=cp_group)
+            if group_size != encoder_cp:
+                raise RuntimeError(
+                    f"vision config says context_parallel_size={encoder_cp} but the "
+                    f"attention CP group has size {group_size}. RoPE would be applied "
+                    "for the wrong sharding: wrong values, no shape error."
+                )
+            effective = cp_group
         return _apply_rope_fp32(
             t,
             freqs,
             config,
             cu_seqlens,
             mscale,
-            cp_group=_NO_CP_GROUP,
+            cp_group=effective,
             max_seqlen=max_seqlen,
         )
     finally:
@@ -121,7 +164,7 @@ class Qwen35VLVisionSelfAttention(SelfAttention):
         import megatron.core.transformer.attention as _attn_mod
 
         _orig = _attn_mod.apply_rotary_pos_emb
-        _attn_mod.apply_rotary_pos_emb = _apply_rope_fp32_no_cp
+        _attn_mod.apply_rotary_pos_emb = _apply_rope_fp32_vision_cp
         try:
             return super().forward(*args, **kwargs)
         finally:

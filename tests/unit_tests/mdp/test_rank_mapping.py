@@ -88,6 +88,95 @@ def test_extension_hook_encoder_cp2():
     assert seen == set(range(16))
 
 
+@pytest.mark.parametrize(
+    "pp,cp,dp",
+    [(2, 2, 2), (1, 2, 4), (4, 2, 1), (2, 4, 1), (1, 4, 2), (1, 8, 1), (2, 1, 4)],
+)
+def test_decoder_endpoints_are_the_pipeline_stage_zero_ranks(pp, cp, dp):
+    """Every PP0 rank runs pre_process, so every PP0 rank consumes vision rows.
+
+    The group's members are ordered cp-fastest, so the endpoints are the first
+    ``cp`` entries. This pins the index formula the whole decoder-CP routing
+    rests on: get it wrong and the plan names ranks that are internally
+    consistent but physically wrong, which surfaces as a bridge hang.
+    """
+    world = pp * cp * dp
+    rank_map = build_rank_map(
+        MdpRankSpec(world_size=world, tp=1, pp=pp, cp=cp, ep=1, encoder_cp=1)
+    )
+    for outer_dp_rank, group in enumerate(rank_map.planning_groups()):
+        endpoints = rank_map.decoder_endpoint_ranks(outer_dp_rank)
+        assert endpoints == group[:cp]
+        assert len(endpoints) == cp
+        assert rank_map.endpoint_rank(outer_dp_rank) == endpoints[0]
+        for index_in_group, rank in enumerate(group):
+            view = rank_map.view(rank)
+            assert view.my_cp_rank == index_in_group % cp
+            assert view.my_pp_rank == index_in_group // cp
+            assert view.is_decoder_endpoint == (index_in_group < cp)
+            assert view.decoder_endpoint_ranks == endpoints
+            # Exactly one rank per group is still the descriptor source.
+            assert (view.lane_id is not None) == (rank == endpoints[0])
+
+
+def test_cp1_leaves_the_endpoint_set_degenerate():
+    rank_map = build_rank_map(
+        MdpRankSpec(world_size=8, tp=1, pp=2, cp=1, ep=1, encoder_cp=1)
+    )
+    for outer_dp_rank, group in enumerate(rank_map.planning_groups()):
+        view = rank_map.view(group[0])
+        assert view.decoder_endpoint_ranks == (view.endpoint_rank,)
+        assert view.is_decoder_endpoint
+        assert rank_map.view(group[1]).is_decoder_endpoint is False
+
+
+@pytest.mark.parametrize("cp,pp,ecp", [(2, 2, 2), (4, 2, 2), (4, 2, 4), (1, 4, 2), (2, 2, 1)])
+def test_my_encoder_cp_rank_is_the_position_inside_the_logical_worker(cp, pp, ecp):
+    """The shard coordinate, and why it is not my_cp_rank.
+
+    my_encoder_cp_rank says WHICH SHARD of the vision chunk this rank encodes.
+    It equals my_cp_rank only when encoder_cp == cp, which is precisely the
+    topology test_extension_hook_encoder_cp2 uses -- so a bug substituting one
+    for the other would pass there and be wrong everywhere else.
+    """
+    world = cp * pp * 2
+    rank_map = build_rank_map(
+        MdpRankSpec(world_size=world, tp=1, pp=pp, cp=cp, ep=1, encoder_cp=ecp)
+    )
+    saw_divergence = False
+    for outer_dp_rank, group in enumerate(rank_map.planning_groups()):
+        for index_in_group, rank in enumerate(group):
+            view = rank_map.view(rank)
+            assert view.my_encoder_cp_rank == index_in_group % ecp
+            # The map must agree with itself: worker_ranks indexed by the shard
+            # coordinate must come back to this very rank.
+            mine = rank_map.worker_ranks(outer_dp_rank, view.my_worker_id)
+            assert mine[view.my_encoder_cp_rank] == rank
+            if view.my_encoder_cp_rank != view.my_cp_rank:
+                saw_divergence = True
+    if ecp != cp:
+        assert saw_divergence, (
+            "expected my_encoder_cp_rank to diverge from my_cp_rank when "
+            "encoder_cp != cp; a test that never sees them differ cannot catch "
+            "the substitution bug"
+        )
+
+
+@pytest.mark.parametrize("cp,pp,ecp", [(2, 3, 3), (3, 2, 2), (3, 4, 2), (3, 4, 4), (4, 3, 3)])
+def test_ragged_worker_blocks_are_rejected(cp, pp, ecp):
+    """encoder_cp dividing cp*pp is necessary but not sufficient.
+
+    Workers are contiguous blocks of a cp-fastest group, so a block is uniform
+    only when encoder_cp divides cp or cp divides encoder_cp. Each case here
+    passes the old inner_dp check and produces a ragged block.
+    """
+    assert (cp * pp) % ecp == 0, "these cases must pass the looser rule"
+    with pytest.raises(MdpConfigurationError, match="divides CP"):
+        build_rank_map(
+            MdpRankSpec(world_size=cp * pp * 2, tp=1, pp=pp, cp=cp, ep=1, encoder_cp=ecp)
+        )
+
+
 def test_local_view_has_no_global_lists():
     # O(W^2) guard: a view carries only its own group, not all groups.
     rank_map = build_rank_map(_spec(world_size=8, pp=2))

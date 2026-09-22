@@ -147,7 +147,10 @@ def add_multimodal_args(parser):
         "--mdp-encoder-cp",
         type=int,
         default=1,
-        help="MDP encoder context-parallel width (must currently be 1).",
+        help="MDP encoder context-parallel width. 1 or 2; a logical worker spans "
+        "this many ranks and its vision chunk is zigzag-sharded across them. "
+        "Beyond 2 every frame must satisfy h*w %% (2*e) == 0, which real "
+        "grids violate data-dependently.",
     )
     group.add_argument(
         "--mdp-encoder-max-payload-rows",

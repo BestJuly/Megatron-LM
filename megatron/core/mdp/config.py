@@ -77,6 +77,7 @@ class MdpCompatibilityOptions:
     # validate_mdp_config for the composite-optimizer mechanism.
     reuse_grad_buf_for_mxfp8_param_ag: bool = False
     sequence_parallel: bool = False
+    cp_partition_mode: str = "zigzag"
     sequence_packing_scheduler: Optional[str] = None
     thd_static_packing: bool = False
     max_seqlen_per_dp_cp_rank: Optional[int] = None
@@ -125,14 +126,29 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
         return
 
     # --- MdpConfig field validation ---
-    if config.encoder_cp != 1:
+    if config.encoder_cp not in (1, 2):
         _reject(
             "encoder_cp",
             config.encoder_cp,
-            "encoder_cp == 1",
-            "Encoder context parallelism is a registered extension hook, not an "
-            "implemented capability.",
-            "1",
+            "encoder_cp in (1, 2)",
+            "Encoder context parallelism is implemented for e=2. Beyond that "
+            "every vision frame must satisfy h*w % (2*encoder_cp) == 0, which "
+            "real grids violate data-dependently (14 of the 137 frames in the "
+            "shipped mock pool at e=4), and the vision encoder has no "
+            "frame-padding path to fix it.",
+            "2",
+        )
+    if config.encoder_cp > 1 and (
+        options.context_parallel_size % config.encoder_cp != 0
+        and config.encoder_cp % options.context_parallel_size != 0
+    ):
+        _reject(
+            "encoder_cp",
+            config.encoder_cp,
+            "encoder_cp divides CP or CP divides encoder_cp",
+            "A logical worker is a contiguous block of a cp-fastest planning "
+            "group, so any other ratio makes one worker straddle two pipeline "
+            "stages while another does not.",
         )
     if config.encoder_max_payload_rows is not None and config.encoder_max_payload_rows <= 0:
         _reject(
@@ -244,14 +260,25 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "The current MDP support matrix requires TP=1.",
             "1",
         )
-    if options.context_parallel_size != 1:
+    if options.context_parallel_size < 1:
         _reject(
             "context_parallel_size",
             options.context_parallel_size,
-            "decoder CP == 1",
-            "Decoder context parallelism is a registered extension hook, not an "
-            "implemented capability.",
+            "context_parallel_size >= 1",
+            "Decoder context parallelism is supported; the size must be positive.",
             "1",
+        )
+    if options.context_parallel_size > 1 and options.cp_partition_mode != "zigzag":
+        _reject(
+            "cp_partition_mode",
+            options.cp_partition_mode,
+            "cp_partition_mode == 'zigzag'",
+            "MDP routes each vision item's rows with an integer inverse of the "
+            "zigzag partition (megatron.core.mdp.cp_partition). Under "
+            "'contiguous' the decoder would slice its sequence differently from "
+            "the plan, delivering every embedding to the wrong rank without any "
+            "shape error.",
+            "zigzag",
         )
     model_parallel = (
         options.tensor_parallel_size
@@ -470,6 +497,26 @@ def _validate_packing(config: MdpConfig, options: MdpCompatibilityOptions) -> No
                 "microbatch would otherwise overflow it inside _pad_cu_seqlens.",
                 str(samples + 1),
             )
+    if (
+        options.thd_static_packing
+        and options.context_parallel_size > 1
+        and options.max_seqlen_per_dp_cp_rank is not None
+        and options.max_seqlen_per_dp_cp_rank % 2 != 0
+    ):
+        # build_static_thd_metadata splits the padding tail with a bare
+        # `dummy_seq_len % (2 * cp) == 0` assert mid-iteration. The static target
+        # is max_seqlen_per_dp_cp_rank * cp, so an odd per-rank length makes that
+        # assert unsatisfiable. Reject at startup, in both packing modes, rather
+        # than a hundred iterations in.
+        _reject(
+            "max_seqlen_per_dp_cp_rank",
+            options.max_seqlen_per_dp_cp_rank,
+            "max_seqlen_per_dp_cp_rank is even under --thd-static-packing with CP > 1",
+            "The static THD target is max_seqlen_per_dp_cp_rank x "
+            "context_parallel_size and its padding tail must still divide by "
+            "2 * context_parallel_size.",
+            str(options.max_seqlen_per_dp_cp_rank + 1),
+        )
     if not config.greedy_packing:
         return
     if (options.save_requested or options.load_requested) and (

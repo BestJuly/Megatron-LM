@@ -136,6 +136,57 @@ def test_handle_rejects_mismatched_layout_rows():
         )
 
 
+def test_whole_recompute_handle_sizes_payloads_per_encoder_cp_shard():
+    """Under encoder CP the retained payload is this rank's shard, not the chunk.
+
+    The layout keeps describing the whole chunk, so the handle must divide by
+    ``encoder_cp`` before checking. Output rows stay undivided: the encoder
+    all-gathers before the patch merger, so every rank replays the full output.
+    """
+    layout = _layout()
+    shard_rows = layout.total_payload_rows // 2
+    outputs = _run_encoder(torch.randn(4, 4, requires_grad=True), [layout.total_output_rows])
+
+    handle = EncoderWholeRecomputeHandle(
+        iteration=0,
+        producer_worker_id=0,
+        chunk_payloads=[torch.zeros(shard_rows, 4)],
+        chunk_layouts=(layout,),
+        output_metadata=tuple(EncoderOutputMetadata.from_tensor(o) for o in outputs),
+        chunk_rng_states=((),),
+        encoder_cp=2,
+    )
+    assert handle.chunk_payloads[0].shape[0] == shard_rows
+
+    # The whole-chunk payload, which is what the pre-encoder-CP code retained,
+    # must now be rejected -- silently replaying 2x the rows this rank owns
+    # would corrupt the recomputed activations rather than fail.
+    with pytest.raises(MdpStateError, match="total_payload_rows / encoder_cp"):
+        EncoderWholeRecomputeHandle(
+            iteration=0,
+            producer_worker_id=0,
+            chunk_payloads=[torch.zeros(layout.total_payload_rows, 4)],
+            chunk_layouts=(layout,),
+            output_metadata=tuple(EncoderOutputMetadata.from_tensor(o) for o in outputs),
+            chunk_rng_states=((),),
+            encoder_cp=2,
+        )
+
+
+def test_whole_recompute_handle_rejects_indivisible_encoder_cp():
+    layout = _layout()
+    with pytest.raises(MdpStateError, match="divide by encoder_cp"):
+        EncoderWholeRecomputeHandle(
+            iteration=0,
+            producer_worker_id=0,
+            chunk_payloads=[torch.zeros(1, 4)],
+            chunk_layouts=(layout,),
+            output_metadata=(EncoderOutputMetadata.from_tensor(torch.zeros(layout.total_output_rows, 4)),),
+            chunk_rng_states=((),),
+            encoder_cp=7,
+        )
+
+
 def test_forward_only_release_needs_no_backward():
     layout = _layout()
     with torch.no_grad():
