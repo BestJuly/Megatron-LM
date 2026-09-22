@@ -301,6 +301,7 @@ def build_static_thd_metadata(
     max_num_seqs: int,
     cp_size: int = 1,
     cp_partition_mode: str = "zigzag",
+    dummy_seq_length: Optional[int] = None,
 ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
     """Pad already-packed *global* THD metadata to a fixed shape.
 
@@ -320,10 +321,15 @@ def build_static_thd_metadata(
         target_len: Global physical row count every batch is padded to
             (``max_seqlen_per_dp_cp_rank * cp_size``).
         max_num_seqs: ``thd_max_packed_sequences``; both tensors are padded to
-            ``max_num_seqs + 1`` entries. The dummy tail occupies one of those
-            sequence slots, so the caller must leave room for it.
+            ``max_num_seqs + 1`` entries. The dummy tail occupies at least one
+            sequence slot, so the caller must leave room for it.
         cp_size: Context-parallel world size.
         cp_partition_mode: ``zigzag`` or ``contiguous``.
+        dummy_seq_length: Preferred maximum global length of each dummy segment.
+            ``None`` preserves one dummy sequence. Otherwise split the tail into
+            balanced CP-aligned segments using only available sequence slots;
+            segments may exceed this target when slots are scarce. Real sample
+            boundaries and the physical row count never change.
 
     Returns:
         ``(cu_seqlens, cu_seqlens_padded, real_cu_seqlens)``. ``real_cu_seqlens``
@@ -331,6 +337,19 @@ def build_static_thd_metadata(
         appended and thereby polluted ``cu_seqlens`` -- FLOPs accounting must use
         it instead, or the tail is counted as real tokens.
     """
+    if dummy_seq_length is not None and dummy_seq_length <= 0:
+        raise ValueError("dummy_seq_length must be a positive integer.")
+    alignment = 1
+    if dummy_seq_length is not None and cp_size > 1:
+        if cp_partition_mode not in ("zigzag", "contiguous"):
+            raise ValueError(f"Unknown CP partition mode: {cp_partition_mode!r}.")
+        alignment = 2 * cp_size if cp_partition_mode == "zigzag" else cp_size
+        if dummy_seq_length < alignment:
+            raise ValueError(
+                f"dummy_seq_length ({dummy_seq_length}) must be at least the "
+                f"CP partition alignment ({alignment})."
+            )
+
     actual_len = int(cu_seqlens_padded[-1].item())
     assert actual_len <= target_len, (
         f"Packed THD length ({actual_len}) exceeds the static target ({target_len}). "
@@ -347,15 +366,34 @@ def build_static_thd_metadata(
                 f"2 * context_parallel_size ({2 * cp_size}) for zigzag partitioning."
             )
         real_cu_seqlens = cu_seqlens
-        if torch.equal(cu_seqlens, cu_seqlens_padded):
-            cu_seqlens = _append_dummy_seq(cu_seqlens, target_len)
+        if dummy_seq_length is None:
+            if torch.equal(cu_seqlens, cu_seqlens_padded):
+                cu_seqlens = _append_dummy_seq(cu_seqlens, target_len)
+            else:
+                # Preserve the distinct valid/physical endpoints when gaps exist.
+                cu_seqlens = _append_dummy_seq(
+                    cu_seqlens, int(cu_seqlens[-1].item()) + dummy_seq_len
+                )
+            cu_seqlens_padded = _append_dummy_seq(cu_seqlens_padded, target_len)
         else:
-            # Gaps already exist between real sequences; the dummy's valid and
-            # physical lengths are both exactly the new tail length.
-            cu_seqlens = _append_dummy_seq(
-                cu_seqlens, int(cu_seqlens[-1].item()) + dummy_seq_len
+            available_slots = max_num_seqs - (cu_seqlens.numel() - 1)
+            assert (
+                available_slots >= 1
+            ), "thd_max_packed_sequences must leave at least one slot for the dummy tail."
+            assert dummy_seq_len % alignment == 0, (
+                f"THD dummy padding length ({dummy_seq_len}) must be divisible by "
+                f"CP partition alignment ({alignment})."
             )
-        cu_seqlens_padded = _append_dummy_seq(cu_seqlens_padded, target_len)
+            tail_units = dummy_seq_len // alignment
+            target_units = dummy_seq_length // alignment
+            num_segments = min((tail_units + target_units - 1) // target_units, available_slots)
+            # Balanced integer lengths minimize sum(L^2) for this segment count.
+            # Each offset uses its own valid/physical origin, preserving gaps.
+            offsets = cu_seqlens.new_tensor(
+                [i * tail_units // num_segments * alignment for i in range(1, num_segments + 1)]
+            )
+            cu_seqlens = torch.cat((cu_seqlens, cu_seqlens[-1] + offsets))
+            cu_seqlens_padded = torch.cat((cu_seqlens_padded, cu_seqlens_padded[-1] + offsets))
 
     target_entries = max_num_seqs + 1
     return (

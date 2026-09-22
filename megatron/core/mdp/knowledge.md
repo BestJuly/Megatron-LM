@@ -681,3 +681,32 @@ Before landing a new capability:
 6. compare loss and gradient norm against the current reference;
 7. report iteration time and all-rank peak allocated/reserved memory;
 8. update this file and README when the mental model or entry points change.
+
+
+## Static dummy-tail segmentation
+
+The multimodal static-THD collator accepts `--thd-dummy-seq-length N`, a
+preferred maximum **global** dummy sequence length (for example, 8192).
+Without this option it appends one dummy sequence as before. With the option,
+it splits only the physical padding tail into balanced independent sequences,
+reducing the full-attention sum-of-squared-lengths cost of a long tail.
+
+This is shared by fixed-count, greedy and FFD grouping. It changes no sample
+assignment, real sequence boundary, token/label/mask/pixel tensor, fixed THD
+shape or real-token/FLOPs counter. The original one-dummy-slot reservation is
+unchanged: segmentation uses spare sequence slots, and can exceed N if those
+slots are insufficient. Thus N is a target, not an admission limit. Increasing
+`thd_max_packed_sequences` separately can change packing/sampler behavior and
+must not be mixed into a same-work segmentation comparison.
+
+At CP>1, lengths respect the global CP partition quantum (2*CP for zigzag,
+CP for contiguous); N is rounded down to this quantum and cannot be smaller
+than it. This does not expand MDP's supported parallelism matrix. The option
+requires static THD, retains `append_dummy_seq`, and keeps the conservative
+static `max_seqlen` bound. It does not eliminate dense/GDN padding-row work.
+
+Segmentation is limited to dropless, non-Sinkhorn MoE routing. Capacity-based
+token dropping or Sinkhorn normalization can couple changed dummy activations
+to real-token routing, so TransformerConfig rejects those combinations. The
+multimodal padding mask continues to exclude padding from router auxiliary
+losses. Numerical checks use zero dropout, as in the measured training recipe.
