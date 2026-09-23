@@ -43,7 +43,14 @@ class MdpConfig:
     pixel_locality: bool = False
     overlap_window_capture: bool = False
     greedy_packing: bool = False
+    ffd_packing: bool = False
+    ffd_packing_buffer_size: int = 128
     greedy_packing_approximate_resume: bool = False
+
+    @property
+    def packing_enabled(self) -> bool:
+        """Whether decoder microbatches are filled by a token-budget stream."""
+        return self.greedy_packing or self.ffd_packing
 
 
 @dataclass(frozen=True)
@@ -275,10 +282,7 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
                 "Decoder EP communication overlap requires expert parallelism.",
                 "expert_parallel_size > 1",
             )
-        if (
-            options.pipeline_parallel_size > 1
-            and options.virtual_pipeline_parallel_size is None
-        ):
+        if options.pipeline_parallel_size > 1 and options.virtual_pipeline_parallel_size is None:
             _reject(
                 "overlap_moe_expert_parallel_comm",
                 options.overlap_moe_expert_parallel_comm,
@@ -439,6 +443,21 @@ def _validate_packing(config: MdpConfig, options: MdpCompatibilityOptions) -> No
     that treat samples-per-iteration as a constant exchange rate
     (``--train-samples``, ``--rampup-batch-size``).
     """
+    if config.greedy_packing and config.ffd_packing:
+        _reject(
+            "ffd_packing",
+            True,
+            "only one packing policy is enabled",
+            "Choose --mdp-greedy-packing or --mdp-ffd-packing.",
+        )
+    if config.ffd_packing and config.ffd_packing_buffer_size < 1:
+        _reject(
+            "ffd_packing_buffer_size",
+            config.ffd_packing_buffer_size,
+            "ffd_packing_buffer_size > 0",
+            "FFD needs a nonempty sorting window.",
+        )
+    packing_flag = "--mdp-ffd-packing" if config.ffd_packing else "--mdp-greedy-packing"
     if options.sequence_packing_scheduler is not None:
         _reject(
             "sequence_packing_scheduler",
@@ -449,7 +468,7 @@ def _validate_packing(config: MdpConfig, options: MdpCompatibilityOptions) -> No
             "MDP owns its packing (--mdp-greedy-packing).",
             "None",
         )
-    if options.thd_static_packing and not config.greedy_packing:
+    if options.thd_static_packing and not config.packing_enabled:
         # Without greedy packing a microbatch is exactly micro_batch_size samples
         # (eval_micro_batch_size on the eval loaders), and the static padding tail
         # is appended to cu_seqlens as one more ordinary sequence, so the pack
@@ -470,7 +489,7 @@ def _validate_packing(config: MdpConfig, options: MdpCompatibilityOptions) -> No
                 "microbatch would otherwise overflow it inside _pad_cu_seqlens.",
                 str(samples + 1),
             )
-    if not config.greedy_packing:
+    if not config.packing_enabled:
         return
     if (options.save_requested or options.load_requested) and (
         not config.greedy_packing_approximate_resume
@@ -483,13 +502,13 @@ def _validate_packing(config: MdpConfig, options: MdpCompatibilityOptions) -> No
         # samples. Greedy packing is a benchmarking path; make that explicit
         # rather than silently corrupting a resume.
         _reject(
-            "greedy_packing",
-            config.greedy_packing,
-            "--save / --load is not combined with --mdp-greedy-packing",
-            "The greedy sample buffer is not checkpointed and the sampler cannot be "
+            "ffd_packing" if config.ffd_packing else "greedy_packing",
+            config.packing_enabled,
+            f"--save / --load is not combined with {packing_flag}",
+            "The packing sample buffer is not checkpointed and the sampler cannot be "
             "repositioned per DP rank, so a resume may skip or repeat samples. Pass "
-            "--mdp-greedy-packing-approximate-resume to accept that, or drop "
-            "--mdp-greedy-packing for runs that checkpoint.",
+            "--mdp-packing-approximate-resume to accept that, or drop "
+            f"{packing_flag} for runs that checkpoint.",
             "False",
         )
     if options.train_samples is not None:
@@ -507,7 +526,7 @@ def _validate_packing(config: MdpConfig, options: MdpCompatibilityOptions) -> No
         _reject(
             "train_samples",
             options.train_samples,
-            "--train-samples is not combined with --mdp-greedy-packing",
+            f"--train-samples is not combined with {packing_flag}",
             "train_iters = train_samples // global_batch_size assumes a fixed "
             "samples-per-iteration rate; greedy packing fills bins to a token "
             "budget instead, so the real sample count per iteration is data "
@@ -523,7 +542,7 @@ def _validate_packing(config: MdpConfig, options: MdpCompatibilityOptions) -> No
         _reject(
             "rampup_batch_size",
             options.rampup_batch_size,
-            "--rampup-batch-size is not combined with --mdp-greedy-packing",
+            f"--rampup-batch-size is not combined with {packing_flag}",
             "Rampup thresholds are nominal sample counts, but greedy packing "
             "reports the real consumed-sample count, so the batch size would ramp "
             "faster than requested by a data-dependent factor.",
@@ -533,13 +552,13 @@ def _validate_packing(config: MdpConfig, options: MdpCompatibilityOptions) -> No
         _reject(
             "max_seqlen_per_dp_cp_rank",
             options.max_seqlen_per_dp_cp_rank,
-            "max_seqlen_per_dp_cp_rank is set when --mdp-greedy-packing is on",
+            f"max_seqlen_per_dp_cp_rank is set when {packing_flag} is on",
             "The greedy token budget is max_seqlen_per_dp_cp_rank x "
             "context_parallel_size; there is no default for it.",
         )
     alignment = thd_row_alignment(options)
     budget = options.max_seqlen_per_dp_cp_rank * options.context_parallel_size
-    if budget % alignment != 0:
+    if budget <= 0 or budget % alignment != 0:
         _reject(
             "max_seqlen_per_dp_cp_rank",
             options.max_seqlen_per_dp_cp_rank,
@@ -549,10 +568,7 @@ def _validate_packing(config: MdpConfig, options: MdpCompatibilityOptions) -> No
             "discovering this inside TransformerEngine gives a far worse error.",
         )
     minimum = 2 if options.thd_static_packing else 1
-    if (
-        options.thd_max_packed_sequences is not None
-        and options.thd_max_packed_sequences < minimum
-    ):
+    if options.thd_max_packed_sequences is not None and options.thd_max_packed_sequences < minimum:
         _reject(
             "thd_max_packed_sequences",
             options.thd_max_packed_sequences,
@@ -590,10 +606,7 @@ def validate_effective_vision_config(
 ) -> None:
     """Reject unsupported combinations visible only after adapter resolution."""
     recompute_granularity = getattr(effective_config, "recompute_granularity", None)
-    if (
-        config.encoder_recompute_granularity == "whole"
-        and recompute_granularity is not None
-    ):
+    if config.encoder_recompute_granularity == "whole" and recompute_granularity is not None:
         _reject(
             "effective vision recompute_granularity",
             recompute_granularity,

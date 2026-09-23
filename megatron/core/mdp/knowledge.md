@@ -126,7 +126,7 @@ returns to `EMPTY`.
 | `storage.py` | Endpoint embedding leaves and lifecycle checks. |
 | `bridge.py` | Canonical ledger and `all_to_all_single` transport for all three payload phases. |
 | `window.py` | Whole-iteration capture, microbatch replay cursors, pixel ownership context. |
-| `packing.py` | Greedy token-budget bin filling and the cross-iteration sample buffer (`--mdp-greedy-packing`). |
+| `packing.py` | Greedy and buffered first-fit decreasing (FFD) token-budget packing, shared sample buffering and commit accounting. |
 | `activation.py` | Retained-graph and complete-replay encoder handles, RNG recipes, chunk backward. |
 | `encoder.py` | Encoder process groups, DDP/ZeRO-1 domain, gradient finalization. |
 | `runtime.py` | P0-P5 orchestration, prefetch handoff, per-iteration state and metrics. |
@@ -370,8 +370,68 @@ Primary flags:
 - `--mdp-overlap-window-capture`
 - `--mdp-debug-plan-payload-check`
 - `--mdp-greedy-packing`
+- `--mdp-ffd-packing`
+- `--mdp-ffd-packing-buffer-size`
+- `--mdp-packing-approximate-resume`
 - `--mdp-greedy-packing-approximate-resume`
 - `--mdp-mock-dataset-config-json`
+
+### Buffered first-fit decreasing packing
+
+`--mdp-ffd-packing` selects FFD instead of `--mdp-greedy-packing`; the two flags
+are mutually exclusive. `--mdp-ffd-packing-buffer-size` (default 128, positive)
+sets the number of complete samples read into each sorting window. Sort by
+aligned decoder length descending, breaking ties by source order; place each
+sample into the first bin in creation order satisfying the token budget and
+real-sequence cap. Before each subsequent bin, refill the slots freed by the
+previous emission into a separate reading window, keeping reading plus pending
+samples within the configured buffer size. This matches Energon's refill cadence
+and lets loader workers replenish continuously. Form the next window's bins only
+after the current bins drain. At EOF emit all pending and partial-window bins. No sample or image is truncated,
+dropped, duplicated, or moved between DP replicas.
+
+This follows Energon's buffered select-then-pack interface; Energon itself
+leaves grouping to the task encoder. The existing multimodal task encoder's
+`greedy_knapsack` is a descending knapsack fill, not an API provided by Energon.
+The FFD stream has no Energon runtime dependency.
+
+The entry point follows the greedy/static separation introduced in PR #48:
+
+| Grouping policy | CLI selection | Variable THD shape | Fixed THD shape |
+| --- | --- | --- | --- |
+| Fixed sample count | Neither MDP packing flag | Default | Add `--thd-static-packing` |
+| In-order greedy | `--mdp-greedy-packing` | Supported | Add `--thd-static-packing` |
+| Buffered FFD | `--mdp-ffd-packing` | Supported | Add `--thd-static-packing` |
+
+Static THD controls the collator's output shape; it does not choose the grouping
+algorithm. Its existing alignment, token-budget and dummy-tail requirements
+still apply. `--mdp-overlap-window-capture` is independent of both controls.
+Both policies enter through `add_multimodal_args`, `mdp_config_from_args` and
+`maybe_build_mdp_domain`; only the sample-stream implementation differs.
+Internal `greedy_*` helper and runtime field names are retained for compatibility
+and now serve both token-budget policies. The collator is unchanged.
+
+Both policies use `MdpConfig.packing_enabled` for validation, stream capture and
+sample accounting. `PackedSampleStream` owns source-list buffering and commits;
+`GreedySampleStream` and `FfdSampleStream` own grouping. Reading an FFD window
+is not consumption: only emitted bins increment `drained_samples`, and only
+installed iteration windows commit them. Pending FFD bins survive iteration
+boundaries and keep `exhausted` false even after the source reaches EOF.
+
+All greedy restrictions below apply equally to FFD: fixed bin-count MBS/GBS,
+real all-reduced committed sample counts, independent static THD shape, reserved
+dummy tail slot, no sample-based training/rampup, and no exact resume.
+`--mdp-packing-approximate-resume` is a policy-neutral alias for the existing
+`--mdp-greedy-packing-approximate-resume`; either explicitly accepts approximate
+resume with either policy. FFD additionally retains decoded image payloads in
+its bounded window; the bound is in samples, not bytes, and excludes loader
+prefetch/current source list. Provision host memory accordingly.
+
+For performance comparisons, use identical dataset/sampler settings, token
+budget, model and topology. Report useful tokens/s, records/s, fill ratio and
+iteration time together. A higher fill ratio increases useful work per step;
+iteration time alone does not compare packing throughput. FFD reorders complete
+samples, so per-step loss and visual workload need not match greedy.
 
 Packing flags MDP consumes from the core config (all optional, all off by
 default):
@@ -624,3 +684,32 @@ Before landing a new capability:
 6. compare loss and gradient norm against the current reference;
 7. report iteration time and all-rank peak allocated/reserved memory;
 8. update this file and README when the mental model or entry points change.
+
+
+## Static dummy-tail segmentation
+
+The multimodal static-THD collator accepts `--thd-dummy-seq-length N`, a
+preferred maximum **global** dummy sequence length (for example, 8192).
+Without this option it appends one dummy sequence as before. With the option,
+it splits only the physical padding tail into balanced independent sequences,
+reducing the full-attention sum-of-squared-lengths cost of a long tail.
+
+This is shared by fixed-count, greedy and FFD grouping. It changes no sample
+assignment, real sequence boundary, token/label/mask/pixel tensor, fixed THD
+shape or real-token/FLOPs counter. The original one-dummy-slot reservation is
+unchanged: segmentation uses spare sequence slots, and can exceed N if those
+slots are insufficient. Thus N is a target, not an admission limit. Increasing
+`thd_max_packed_sequences` separately can change packing/sampler behavior and
+must not be mixed into a same-work segmentation comparison.
+
+At CP>1, lengths respect the global CP partition quantum (2*CP for zigzag,
+CP for contiguous); N is rounded down to this quantum and cannot be smaller
+than it. This does not expand MDP's supported parallelism matrix. The option
+requires static THD, retains `append_dummy_seq`, and keeps the conservative
+static `max_seqlen` bound. It does not eliminate dense/GDN padding-row work.
+
+Segmentation is limited to dropless, non-Sinkhorn MoE routing. Capacity-based
+token dropping or Sinkhorn normalization can couple changed dummy activations
+to real-token routing, so TransformerConfig rejects those combinations. The
+multimodal padding mask continues to exclude padding from router auxiliary
+losses. Numerical checks use zero dropout, as in the measured training recipe.

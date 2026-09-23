@@ -136,3 +136,13 @@ endpoints + multi-slice routes for decoder CP, the typed encoder configuration
 + row-capacity policy for encoder FP8, and the unified buffer allocator
 for full-iteration CUDA graphs. The hooks guarantee no breaking schema change is
 needed later; they do not mean the capability is implemented.
+
+
+### Buffered FFD decoder packing
+
+Use `--mdp-ffd-packing --mdp-ffd-packing-buffer-size 128` in place of
+`--mdp-greedy-packing` to enable deterministic first-fit decreasing over bounded
+sample windows. The policies are mutually exclusive and share token budgets,
+static THD limits, actual sample accounting, and approximate-resume restrictions.
+FFD retains more complete image samples on the host; tune the buffer with host
+memory and data capture latency in mind. See [knowledge.md](knowledge.md#buffered-first-fit-decreasing-packing).

@@ -187,6 +187,26 @@ class TestStaticShapes:
         assert not bool(packed["padding_mask"][0, :real].any())
         assert bool((packed["labels"][0, real:] == -100).all())
 
+    def test_segmentation_changes_only_dummy_metadata(self, static_args, mdp_enable, sample_device):
+        batch = [
+            _make_sample(length, base=i * 1000, device=sample_device)
+            for i, length in enumerate([5, 13, 7])
+        ]
+        static_args(mdp_enable=mdp_enable)
+        baseline = fs.pack_or_pad_batch(batch, use_packed_sequence=True, device="cuda")
+        static_args(mdp_enable=mdp_enable, thd_dummy_seq_length=8)
+        segmented = fs.pack_or_pad_batch(batch, use_packed_sequence=True, device="cuda")
+        for key in ("input_ids", "labels", "loss_mask", "padding_mask",
+                    "pixel_values", "image_grid_thw", "flops_cu_seqlens"):
+            assert torch.equal(baseline[key], segmented[key]), key
+        before = baseline["packed_seq_params"]
+        after = segmented["packed_seq_params"]
+        assert after.cu_seqlens_q.tolist() == [0, 5, 18, 25, 32, 40, 48, 56, 64]
+        assert torch.equal(after.cu_seqlens_q, after.cu_seqlens_q_padded)
+        assert after.max_seqlen_q == before.max_seqlen_q == MAX_SEQLEN
+        assert after.total_tokens == before.total_tokens == MAX_SEQLEN
+        assert after.pad_between_seqs == before.pad_between_seqs
+
     def test_overflow_is_rejected_with_a_named_flag(self, static_args, mdp_enable, sample_device):
         static_args(mdp_enable=mdp_enable)
         batch = [

@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
 from dataclasses import dataclass, field
@@ -144,6 +144,16 @@ class ModelParallelConfig:
     Requires max_seqlen_per_dp_cp_rank, thd_max_packed_sequences,
     pad_packed_seq_alignment='max', and thd_tail_padding_policy='append_dummy_seq',
     and is mutually exclusive with sequence_packing_scheduler.
+    """
+
+    thd_dummy_seq_length: Optional[int] = None
+    """Preferred maximum GLOBAL length of each static THD dummy-tail sequence.
+
+    The multimodal static-THD collator splits the padding tail into balanced
+    sequences using only unused thd_max_packed_sequences slots. If slots are
+    scarce, segments may exceed this target; real samples are never repacked.
+    At CP>1 the target is rounded down to the partition alignment. Requires
+    thd_static_packing and a positive length. None preserves one dummy sequence.
     """
 
     expert_model_parallel_size: int = 1
@@ -601,6 +611,12 @@ class ModelParallelConfig:
                         f"({self.max_seqlen_per_dp_cp_rank}), got "
                         f"{self.pad_packed_seq_alignment}."
                     )
+
+        if self.thd_dummy_seq_length is not None:
+            if self.thd_dummy_seq_length <= 0:
+                raise ValueError("thd_dummy_seq_length must be a positive integer.")
+            if not self.thd_static_packing:
+                raise ValueError("thd_dummy_seq_length requires thd_static_packing.")
 
         if self.thd_static_packing:
             if self.sequence_packing_scheduler is not None:

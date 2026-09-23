@@ -482,6 +482,7 @@ def pack_or_pad_batch(
         # CP slicing happens later in models/base.py.
         static_target_T = None
         static_max_num_seqs = None
+        static_dummy_seq_length = None
         try:
             static_args = get_args()
         except AssertionError:
@@ -489,6 +490,7 @@ def pack_or_pad_batch(
         if static_args is not None and getattr(static_args, "thd_static_packing", False):
             static_target_T = int(static_args.max_seqlen_per_dp_cp_rank) * cp_size
             static_max_num_seqs = int(static_args.thd_max_packed_sequences)
+            static_dummy_seq_length = getattr(static_args, "thd_dummy_seq_length", None)
             # The tail policy is always append_dummy_seq here, matching what
             # --sequence-packing-scheduler produces; TransformerConfig rejects
             # thd_static_packing + extend_last, which is unusable at any CP size
@@ -731,6 +733,7 @@ def pack_or_pad_batch(
                 target_len=static_target_T,
                 max_num_seqs=static_max_num_seqs,
                 cp_size=cp_size,
+                dummy_seq_length=static_dummy_seq_length,
             )
             # max_seqlen must be the padded static value: the tail belongs to a
             # sequence now, and a stale (shorter) max silently produces wrong
