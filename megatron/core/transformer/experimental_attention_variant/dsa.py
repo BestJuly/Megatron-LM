@@ -1,17 +1,24 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
+import functools
+import logging
 import math
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
 import torch
 
 from megatron.core import parallel_state
+from megatron.core._rank_utils import log_single_rank
+from megatron.core.extensions.transformer_engine import te_general_gemm
+from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
     YarnRotaryEmbedding,
     apply_rotary_pos_emb,
+    should_use_fused_mla_rope,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -23,10 +30,29 @@ from megatron.core.transformer.experimental_attention_variant import (
     dsa_layout,
     dsa_masking,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
+    build_packed_allgather_cp_local_positions_from_host as _build_cp_positions_from_host,
+)
+from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
+    build_packed_allgather_cp_query_positions_and_key_reorder_from_host as _cp_reorder_from_host,
+)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import get_pg_size
+from megatron.core.utils import ensure_params_ready, get_pg_size
+
+logger = logging.getLogger(__name__)
+_DSA_WEIGHTS_PROJ_TE_GEMM_FALLBACK_WARNED = False
+
+try:
+    from transformer_engine.pytorch.module.base import get_dummy_wgrad
+except ImportError:
+    get_dummy_wgrad = None
+
+try:
+    from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
+except ImportError:
+    fused_mla_rope_inplace = None
 
 try:
     from fast_hadamard_transform import hadamard_transform
@@ -630,20 +656,20 @@ def _compute_index_scores(
     q: torch.Tensor, weights: torch.Tensor, k: torch.Tensor, use_relu: bool = True
 ) -> torch.Tensor:
     """
-    Perform index score using BF16 precision.
+    Perform index scoring with BF16/FP32 inputs.
 
     Reference:
         https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/kernel.py#L254-L274
-    This is a BF16 implementation of the `fp8_index` logic:
+    This implementation accepts BF16/FP32 inputs for the `fp8_index` scoring logic:
         1. Compute attention scores: q @ k^T;
         2. Optionally apply ReLU activation (DeepSeek V3.2 only; disabled for GLM5);
         3. Weight by attention weights;
         4. Sum across attention heads.
 
     Args:
-        q: BF16 [seqlen_q, batch, index_n_heads, index_head_dim], the query tensor.
-        weights: BF16 [seqlen_q, batch, index_n_heads], the attention weights.
-        k: BF16 [seqlen_k, batch, index_head_dim], the key tensor.
+        q: BF16/FP32 [seqlen_q, batch, index_n_heads, index_head_dim], the query tensor.
+        weights: BF16/FP32 [seqlen_q, batch, index_n_heads], the attention weights.
+        k: BF16/FP32 [seqlen_k, batch, index_head_dim], the key tensor.
 
     Returns:
         index_scores: FP32 [batch, seqlen_q, seqlen_k], the index scores.
@@ -1218,6 +1244,167 @@ class DSAttentionSubmodules:
     indexer: Union[ModuleSpec, type] = None
 
 
+def _dsa_weights_proj_te_gemm_is_unsupported(error: RuntimeError) -> bool:
+    """Return whether a TE GEMM error permits the documented FP32 fallback."""
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "cublas_status_not_supported",
+            "unable to find suitable cublas gemm algorithm",
+            "unable to find any suitable algorithms",
+        )
+    )
+
+
+def _warn_dsa_weights_proj_te_gemm_fallback(error: RuntimeError) -> None:
+    """Warn once when TE cannot provide the requested FP32 GEMM output."""
+    global _DSA_WEIGHTS_PROJ_TE_GEMM_FALLBACK_WARNED
+    if _DSA_WEIGHTS_PROJ_TE_GEMM_FALLBACK_WARNED:
+        return
+    _DSA_WEIGHTS_PROJ_TE_GEMM_FALLBACK_WARNED = True
+    log_single_rank(
+        logger,
+        logging.WARNING,
+        "Transformer Engine GEMM does not support BF16-input/FP32-output for the DSA indexer "
+        "weights projection on this platform; using torch.mm with FP32 operands instead. "
+        f"Original TE error: {error}",
+    )
+
+
+def _dsa_weights_proj_forward_gemm(
+    x: torch.Tensor, weight: torch.Tensor, te_gemm_supported: Optional[bool]
+) -> Tuple[torch.Tensor, Optional[bool]]:
+    """Project BF16 indexer weights with FP32 accumulation and output."""
+    x_shape = x.shape
+    x_2d = x.reshape(-1, x_shape[-1])
+
+    if te_gemm_supported is not False and te_general_gemm is not None and x_2d.is_cuda:
+        try:
+            output = te_general_gemm(weight, x_2d, out_dtype=torch.float32, layout="TN")[0]
+            return output.reshape(*x_shape[:-1], weight.size(0)), True
+        except RuntimeError as error:
+            if not _dsa_weights_proj_te_gemm_is_unsupported(error):
+                raise
+            te_gemm_supported = False
+            _warn_dsa_weights_proj_te_gemm_fallback(error)
+
+    # Do not emulate the requested precision by casting a low-precision output.
+    # Casting both operands makes the fallback a genuine FP32 linear operation.
+    output = torch.mm(x_2d.float(), weight.float().t())
+    return output.reshape(*x_shape[:-1], weight.size(0)), te_gemm_supported
+
+
+def _dsa_weights_proj_wgrad(
+    x: torch.Tensor,
+    grad_output: torch.Tensor,
+    weight: torch.Tensor,
+    linear: torch.nn.Module,
+    is_first_microbatch: Optional[bool],
+) -> Tuple[torch.Tensor, None]:
+    """Compute or accumulate the high-precision weight gradient."""
+    x_2d = x.reshape(-1, x.size(-1))
+    grad_output_2d = grad_output.reshape(-1, grad_output.size(-1))
+    grad_weight = torch.mm(grad_output_2d.float().t(), x_2d.float())
+
+    if getattr(linear, "fuse_wgrad_accumulation", False):
+        if hasattr(weight, "__fsdp_param__"):
+            main_grad = weight.get_main_grad()
+        else:
+            main_grad = getattr(weight, "main_grad", None)
+        if main_grad is not None:
+            if is_first_microbatch is True or getattr(weight, "overwrite_main_grad", False):
+                main_grad.copy_(grad_weight)
+            else:
+                main_grad.add_(grad_weight)
+            weight.main_grad = main_grad
+            if hasattr(weight, "grad_added_to_main_grad"):
+                weight.grad_added_to_main_grad = True
+            # The delayed-WGrad owner ignores this return value when accumulation is fused.
+            return grad_weight, None
+
+    return grad_weight.to(dtype=weight.dtype), None
+
+
+class _DSAWeightsProjection(torch.autograd.Function):
+    """BF16-operand, FP32-output linear used only by the DSA indexer."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        linear: torch.nn.Module,
+        indexer: torch.nn.Module,
+    ) -> torch.Tensor:
+        """Run the FP32-output projection and save operands for backward."""
+        ctx.save_for_backward(x, weight)
+        ctx.linear = linear
+        # This path does not use TE's parameter-transpose cache. Keep the
+        # first-microbatch signal solely for fused WGrad overwrite/accumulate semantics.
+        ctx.is_first_microbatch = getattr(linear, "is_first_microbatch", None)
+        if hasattr(linear, "is_first_microbatch"):
+            linear.is_first_microbatch = False
+        output, indexer._weights_proj_te_gemm_supported = _dsa_weights_proj_forward_gemm(
+            x, weight, indexer._weights_proj_te_gemm_supported
+        )
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """Propagate gradients with MCore's deferred and fused-WGrad semantics."""
+        x, weight = ctx.saved_tensors
+        linear = ctx.linear
+
+        grad_input = None
+        if ctx.needs_input_grad[0]:
+            grad_output_2d = grad_output.reshape(-1, grad_output.size(-1))
+            grad_input = torch.mm(grad_output_2d.float(), weight.float())
+            grad_input = grad_input.reshape_as(x).to(dtype=x.dtype)
+
+        grad_weight = None
+        if ctx.needs_input_grad[1]:
+            if (
+                getattr(linear, "wgrad_store", None) is not None
+                and linear.wgrad_store.delay_wgrad_compute()
+            ):
+                wgrad_func = functools.partial(
+                    _dsa_weights_proj_wgrad,
+                    weight=weight,
+                    linear=linear,
+                    is_first_microbatch=ctx.is_first_microbatch,
+                )
+                linear.wgrad_store.put([x, grad_output], wgrad_func)
+            else:
+                grad_weight, _ = _dsa_weights_proj_wgrad(
+                    x, grad_output, weight, linear, ctx.is_first_microbatch
+                )
+
+            if getattr(linear, "fuse_wgrad_accumulation", False) and hasattr(
+                weight, "grad_added_to_main_grad"
+            ):
+                # Keep a dummy grad for MCore's parameter hook, including delayed WGrad.
+                zero_dummy = getattr(weight, "zero_out_wgrad", False)
+                if get_dummy_wgrad is not None:
+                    grad_weight = get_dummy_wgrad(list(weight.shape), weight.dtype, zero=zero_dummy)
+                elif zero_dummy:
+                    grad_weight = torch.zeros_like(weight, requires_grad=False)
+                else:
+                    grad_weight = torch.empty_like(weight, requires_grad=False)
+
+        return grad_input, grad_weight, None, None
+
+
+def _dsa_weights_projection_fp32(x: torch.Tensor, indexer: torch.nn.Module) -> torch.Tensor:
+    """Apply the non-quantized DSA indexer projection with a true FP32 output."""
+    linear = indexer.linear_weights_proj
+    weight = getattr(linear, "weight", None)
+    if weight is None:
+        raise RuntimeError("DSA indexer linear_weights_proj must expose a weight parameter.")
+    ensure_params_ready([weight])
+    return _DSAWeightsProjection.apply(x, weight, linear, indexer)
+
+
 class DSAIndexer(MegatronModule):
     """
     DSA Lightning Indexer for DeepSeek Sparse Attention.
@@ -1322,21 +1509,42 @@ class DSAIndexer(MegatronModule):
             submodules.k_norm, config=k_norm_config, hidden_size=self.index_head_dim, eps=k_norm_eps
         )
 
-        self.linear_weights_proj = build_module(
-            submodules.linear_weights_proj,
-            self.hidden_size,
-            self.index_n_heads,
-            config=self.config,
-            init_method=self.config.init_method,
-            bias=False,
-            skip_bias_add=False,
-            skip_weight_param_allocation=False,
-            parallel_mode="duplicated",
+        weights_proj_init_context = (
+            get_fp8_disabled_context(self.config, is_init=True)
+            if not self.config.dsa_indexer_weights_proj_use_quantization
+            else nullcontext()
         )
+        with weights_proj_init_context:
+            self.linear_weights_proj = build_module(
+                submodules.linear_weights_proj,
+                self.hidden_size,
+                self.index_n_heads,
+                config=self.config,
+                init_method=self.config.init_method,
+                bias=False,
+                skip_bias_add=False,
+                skip_weight_param_allocation=False,
+                parallel_mode="duplicated",
+            )
+        self._weights_proj_te_gemm_supported: Optional[bool] = None
         # Indexer projections are duplicated across tensor-parallel ranks, so their gradients
         # should be averaged during final gradient synchronization.
         for param in self.parameters():
             setattr(param, "average_gradients_across_tp_domain", True)
+
+    def _project_indexer_weights(self, x: torch.Tensor) -> torch.Tensor:
+        """Run ``linear_weights_proj`` according to the DSA-specific precision contract."""
+        weights_proj_context = (
+            get_fp8_disabled_context(self.config)
+            if not self.config.dsa_indexer_weights_proj_use_quantization
+            else nullcontext()
+        )
+        with weights_proj_context:
+            if self.config.dsa_indexer_weights_proj_output_dtype == "fp32":
+                return _dsa_weights_projection_fp32(x, self)
+
+            weights, _ = self.linear_weights_proj(x)
+            return weights.to(dtype=torch.bfloat16)
 
     def backward_dw(self):
         """Compute the deferred weight gradients (delay_wgrad_compute) of the indexer linears."""
@@ -1347,12 +1555,40 @@ class DSAIndexer(MegatronModule):
     def _apply_rope(
         self,
         x: torch.Tensor,
-        rotary_pos_emb: torch.Tensor,
+        rotary_pos_emb: Optional[torch.Tensor],
         mscale: float,
         cu_seqlens: Optional[torch.Tensor] = None,
         max_seqlen: Optional[int] = None,
+        rotary_pos_cos: Optional[torch.Tensor] = None,
+        rotary_pos_sin: Optional[torch.Tensor] = None,
     ):
         """Apply RoPE to the input tensor."""
+        if rotary_pos_cos is not None or rotary_pos_sin is not None:
+            assert rotary_pos_cos is not None and rotary_pos_sin is not None
+            assert fused_mla_rope_inplace is not None, "Fused MLA RoPE is not available"
+            if cu_seqlens is not None and cu_seqlens.device != x.device:
+                cu_seqlens = cu_seqlens.to(device=x.device)
+            squeezed_batch_dim = False
+            # THD RoPE expects [t, h, d], while indexer tensors are [t, 1, h, d].
+            if cu_seqlens is not None and x.ndim == 4 and x.size(1) == 1:
+                x = x.squeeze(1)
+                squeezed_batch_dim = True
+            x = fused_mla_rope_inplace(
+                x,
+                rotary_pos_cos,
+                rotary_pos_sin,
+                nope_dim=self.index_head_dim - self.qk_pos_emb_head_dim,
+                emb_dim=self.qk_pos_emb_head_dim,
+                cu_seqlens_q=cu_seqlens,
+                cp_rank=self.pg_collection.cp.rank(),
+                cp_size=self.pg_collection.cp.size(),
+                rope_first=True,
+            )
+            if squeezed_batch_dim:
+                x = x.unsqueeze(1)
+            return x
+
+        assert rotary_pos_emb is not None
         # x_pe   [seqlen, batch, *, qk_pos_emb_head_dim]
         # x_nope [seqlen, batch, *, index_head_dim - qk_pos_emb_head_dim]
         # To align with DeepSeek's implementation,
@@ -1396,7 +1632,17 @@ class DSAIndexer(MegatronModule):
         rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
             None, None, x, self.config, packed_seq_params
         )
-        if self.config.rope_type == "rope":
+        fused_indexer_rope = self.config.dsa_indexer_rope_interleaved and should_use_fused_mla_rope(
+            self.config
+        )
+        rotary_pos_cos = rotary_pos_sin = None
+        if fused_indexer_rope:
+            rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
+                rotary_seq_len, dtype=x.dtype, packed_seq=packed_seq
+            )
+            rotary_pos_emb = None
+            mscale = 1.0
+        elif self.config.rope_type == "rope":
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq)
             mscale = 1.0
         else:
@@ -1430,7 +1676,13 @@ class DSAIndexer(MegatronModule):
         #   -> [seqlen, batch, index_n_heads, index_head_dim]
         q = q.reshape(seqlen, bsz, self.index_n_heads, self.index_head_dim)
         q = self._apply_rope(
-            q, rotary_pos_emb, mscale, cu_seqlens=cu_seqlens_q, max_seqlen=max_seqlen_q
+            q,
+            rotary_pos_emb,
+            mscale,
+            cu_seqlens=cu_seqlens_q,
+            max_seqlen=max_seqlen_q,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
         )
 
         # =========================================
@@ -1446,7 +1698,13 @@ class DSAIndexer(MegatronModule):
         # [seqlen, batch, index_head_dim] -> [seqlen, batch, 1, index_head_dim]
         k = k.reshape(seqlen, bsz, 1, self.index_head_dim)
         k = self._apply_rope(
-            k, rotary_pos_emb, mscale, cu_seqlens=cu_seqlens_kv, max_seqlen=max_seqlen_kv
+            k,
+            rotary_pos_emb,
+            mscale,
+            cu_seqlens=cu_seqlens_kv,
+            max_seqlen=max_seqlen_kv,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
         )
         # [seqlen, batch, 1, index_head_dim] -> [seqlen, batch, index_head_dim]
         k = k.reshape(seqlen, bsz, self.index_head_dim)
@@ -1462,7 +1720,7 @@ class DSAIndexer(MegatronModule):
         # Prepare weights for index scores
         # =========================================
         # [seqlen, batch, hidden_size] -> [seqlen, batch, index_n_heads]
-        weights, _ = self.linear_weights_proj(x)
+        weights = self._project_indexer_weights(x)
         weights = weights * (self.index_n_heads**-0.5) * self.softmax_scale
 
         return q, k, weights
@@ -1686,6 +1944,7 @@ class DSAttention(MegatronModule):
     requires_dsa_inputs = True
     _HOLDER_ATTR = "_dsa_index_share_topk_holder"
     _LENGTH_HOLDER_ATTR = "_dsa_index_share_topk_length_holder"
+    _LAYOUT_HOLDER_ATTR = "_dsa_packed_cp_layout_holder"
 
     def __init__(
         self,
@@ -1770,6 +2029,45 @@ class DSAttention(MegatronModule):
             holder = {}
             setattr(carrier, self._LENGTH_HOLDER_ATTR, holder)
         return holder
+
+    def _get_packed_cp_layout_cache(
+        self, packed_seq_params: Optional[PackedSeqParams]
+    ) -> Optional[dict]:
+        """Return the per-microbatch memo for packed-CP layout metadata, or None.
+
+        The CP query positions and key reorder indices depend only on
+        ``cu_seqlens_q``/``cu_seqlens_kv``, ``cp_size``, ``cp_rank`` and the
+        requested output sizes. All of those are identical for every layer in a
+        microbatch, yet each layer rebuilds them, and each rebuild loops
+        ``cp_size`` times over :func:`build_packed_allgather_cp_local_positions`,
+        whose boolean-mask indexing has data-dependent output shapes and so
+        forces a device-to-host size readback.
+
+        ``PackedSeqParams`` is the only carrier used here. It is constructed per
+        microbatch, so a memo hung on it cannot outlive the layout it describes
+        -- which matters under dynamic CP, where the layout changes between
+        microbatches. The index-share top-k holders fall back to
+        ``attention_mask``/``self.config``, but that is only safe because every
+        computing layer overwrites its slot before any sharing layer reads it. A
+        layout memo has no such write-before-read ordering and ``self.config``
+        outlives the microbatch, so caching there could serve a stale layout.
+        """
+        if packed_seq_params is None:
+            return None
+        cache = getattr(packed_seq_params, self._LAYOUT_HOLDER_ATTR, None)
+        if cache is None:
+            cache = {}
+            setattr(packed_seq_params, self._LAYOUT_HOLDER_ATTR, cache)
+        return cache
+
+    @staticmethod
+    def _memoized(cache: Optional[dict], key: tuple, build):
+        """Return ``cache[key]``, building it on first use. No-op when cache is None."""
+        if cache is None:
+            return build()
+        if key not in cache:
+            cache[key] = build()
+        return cache[key]
 
     def backward_dw(self):
         """Compute the deferred weight gradients (delay_wgrad_compute) of the indexer."""
@@ -1870,27 +2168,61 @@ class DSAttention(MegatronModule):
         nonpacked_query_positions = None
         kv_reorder_idx = None
         single_packed_thd_sequence = False
+        # Layout metadata is identical for every layer in a microbatch; memoize it on
+        # the per-microbatch PackedSeqParams so only the first DSA layer pays for it.
+        layout_cache = self._get_packed_cp_layout_cache(packed_seq_params)
         if packed_thd:
             cu_seqlens_q, cu_seqlens_kv = dsa_layout.get_packed_qk_cu_seqlens(packed_seq_params)
-            single_packed_thd_sequence = (
-                cp_size > 1 and cu_seqlens_q.numel() == 2 and cu_seqlens_kv.numel() == 2
-            )
+            # Host copies of the compacted cu_seqlens, stored by
+            # prebuild_thd_cp_partition_routes at batch-construction time. When
+            # present, the layout builders below run entirely on the host: no
+            # kernels, no device readbacks, one async copy of the finished table.
+            host_cu_q = getattr(packed_seq_params, "thd_cp_host_cu_seqlens_q", None)
+            host_cu_kv = getattr(packed_seq_params, "thd_cp_host_cu_seqlens_kv", None)
+            # Whether the pack holds one sequence is a fact about the pack, not about
+            # context parallelism; which kernels accept that layout is the scoring
+            # plan's decision. Consumers that genuinely need CP already test cp_size.
+            single_packed_thd_sequence = cu_seqlens_q.numel() == 2 and cu_seqlens_kv.numel() == 2
             packed_query_output_size = (
                 sequence_parallel_tp_full_rows if sequence_parallel_tp else sq
             )
             packed_global_output_size = packed_query_output_size * cp_size
+            query_cu_seqlens_cover_output = (
+                single_packed_thd_sequence
+                and isinstance(packed_seq_params.max_seqlen_q, int)
+                and packed_seq_params.max_seqlen_q == packed_global_output_size
+            )
+            key_cu_seqlens_cover_output = (
+                single_packed_thd_sequence
+                and isinstance(packed_seq_params.max_seqlen_kv, int)
+                and packed_seq_params.max_seqlen_kv == packed_global_output_size
+            )
             if sequence_parallel_query_is_local and cp_size == 1:
                 row_start = sequence_parallel_tp_row_start
                 packed_query_positions = torch.arange(
                     row_start, row_start + sq, dtype=torch.int64, device=query.device
                 )
             elif sequence_parallel_tp and cp_size > 1:
-                packed_query_positions_full = dsa_layout.build_packed_allgather_cp_local_positions(
-                    cu_seqlens_q,
-                    cp_size,
-                    cp_rank,
-                    query.device,
-                    output_size=packed_query_output_size,
+                packed_query_positions_full = self._memoized(
+                    layout_cache,
+                    ("local_positions", cp_size, cp_rank, packed_query_output_size),
+                    lambda: (
+                        _build_cp_positions_from_host(
+                            host_cu_q,
+                            cp_size,
+                            cp_rank,
+                            query.device,
+                            output_size=packed_query_output_size,
+                        )
+                        if host_cu_q is not None
+                        else dsa_layout.build_packed_allgather_cp_local_positions(
+                            cu_seqlens_q,
+                            cp_size,
+                            cp_rank,
+                            query.device,
+                            output_size=packed_query_output_size,
+                        )
+                    ),
                 )
                 if sequence_parallel_query_is_local:
                     row_start = sequence_parallel_tp_row_start
@@ -1898,31 +2230,45 @@ class DSAttention(MegatronModule):
                 else:
                     packed_query_positions = packed_query_positions_full
             elif cp_size > 1:
-                # For one sequence, host max-seqlen metadata proves whether cu_seqlens already
-                # covers every packed row without synchronizing on the CUDA cu_seqlens tensor.
-                query_cu_seqlens_cover_output = (
-                    single_packed_thd_sequence
-                    and isinstance(packed_seq_params.max_seqlen_q, int)
-                    and packed_seq_params.max_seqlen_q == packed_global_output_size
-                )
-                key_cu_seqlens_cover_output = (
-                    single_packed_thd_sequence
-                    and isinstance(packed_seq_params.max_seqlen_kv, int)
-                    and packed_seq_params.max_seqlen_kv == packed_global_output_size
-                )
-                packed_query_positions, kv_reorder_idx = (
-                    dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
-                        cu_seqlens_q=cu_seqlens_q,
-                        cu_seqlens_kv=cu_seqlens_kv,
-                        cp_size=cp_size,
-                        cp_rank=cp_rank,
-                        device=query.device,
-                        local_output_size=packed_query_output_size,
-                        key_local_output_size=packed_query_output_size,
-                        global_output_size=packed_global_output_size,
-                        query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
-                        key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
-                    )
+                packed_query_positions, kv_reorder_idx = self._memoized(
+                    layout_cache,
+                    (
+                        "positions_and_reorder",
+                        cp_size,
+                        cp_rank,
+                        packed_query_output_size,
+                        packed_query_output_size,
+                        packed_global_output_size,
+                        query_cu_seqlens_cover_output,
+                        key_cu_seqlens_cover_output,
+                    ),
+                    lambda: (
+                        _cp_reorder_from_host(
+                            host_cu_q,
+                            host_cu_kv,
+                            cp_size=cp_size,
+                            cp_rank=cp_rank,
+                            device=query.device,
+                            local_output_size=packed_query_output_size,
+                            key_local_output_size=packed_query_output_size,
+                            global_output_size=packed_global_output_size,
+                            query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
+                            key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
+                        )
+                        if host_cu_q is not None and host_cu_kv is not None
+                        else dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
+                            cu_seqlens_q=cu_seqlens_q,
+                            cu_seqlens_kv=cu_seqlens_kv,
+                            cp_size=cp_size,
+                            cp_rank=cp_rank,
+                            device=query.device,
+                            local_output_size=packed_query_output_size,
+                            key_local_output_size=packed_query_output_size,
+                            global_output_size=packed_global_output_size,
+                            query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
+                            key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
+                        )
+                    ),
                 )
             if packed_query_positions is not None:
                 packed_query_positions = packed_query_positions.contiguous()
@@ -1930,7 +2276,6 @@ class DSAttention(MegatronModule):
             _validate_nonpacked_cp_uniform_length(
                 sq=sq, skv=key.size(0), cp_size=cp_size, cp_group=cp_group, device=query.device
             )
-
         if sequence_parallel_tp:
             if key.size(0) == local_sequence_rows:
                 key = gather_from_sequence_parallel_region(key, group=tp_group)
@@ -1963,15 +2308,49 @@ class DSAttention(MegatronModule):
             # Gather local-sequence tensors, then undo MCore's zigzag rank order.
             def _build_kv_reorder_idx(local_len):
                 if packed_thd:
-                    _, idx = dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
-                        cu_seqlens_q=cu_seqlens_q,
-                        cu_seqlens_kv=cu_seqlens_kv,
-                        cp_size=cp_size,
-                        cp_rank=cp_rank,
-                        device=query.device,
-                        local_output_size=local_len,
-                        key_local_output_size=local_len,
-                        global_output_size=local_len * cp_size,
+                    # Same memo key shape as the branch above, so when the output sizes
+                    # coincide this reuses that result instead of rerunning the cp_size loop.
+                    _, idx = self._memoized(
+                        layout_cache,
+                        (
+                            "positions_and_reorder",
+                            cp_size,
+                            cp_rank,
+                            local_len,
+                            local_len,
+                            local_len * cp_size,
+                            query_cu_seqlens_cover_output,
+                            key_cu_seqlens_cover_output,
+                        ),
+                        lambda: (
+                            _cp_reorder_from_host(
+                                host_cu_q,
+                                host_cu_kv,
+                                cp_size=cp_size,
+                                cp_rank=cp_rank,
+                                device=query.device,
+                                local_output_size=local_len,
+                                key_local_output_size=local_len,
+                                global_output_size=local_len * cp_size,
+                                query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
+                                key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
+                            )
+                            if host_cu_q is not None and host_cu_kv is not None
+                            else (
+                                dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder
+                            )(
+                                cu_seqlens_q=cu_seqlens_q,
+                                cu_seqlens_kv=cu_seqlens_kv,
+                                cp_size=cp_size,
+                                cp_rank=cp_rank,
+                                device=query.device,
+                                local_output_size=local_len,
+                                key_local_output_size=local_len,
+                                global_output_size=local_len * cp_size,
+                                query_cu_seqlens_cover_output=query_cu_seqlens_cover_output,
+                                key_cu_seqlens_cover_output=key_cu_seqlens_cover_output,
+                            )
+                        ),
                     )
                     return idx
                 return dsa_layout.build_zigzag_allgather_cp_key_reorder(
@@ -2076,9 +2455,11 @@ class DSAttention(MegatronModule):
         )
         use_fused_kernels = dsa_kernels.use_fused_dsa_kernels(self.config)
         sparse_indexer_loss = self.config.dsa_indexer_use_sparse_loss
+        # Reports a packed causal layout with identity key positions. CP size is an
+        # independent geometry fact; the scoring plan and packed metadata eligibility
+        # decide which executor can safely consume the layout.
         use_local_indexer_varlen = (
             packed_thd
-            and cp_size > 1
             and attn_mask_type == AttnMaskType.causal
             and varlen_starts is not None
             and varlen_ends is not None
@@ -2303,6 +2684,7 @@ class DSAttention(MegatronModule):
                     local_packed_cp_query_len=local_packed_cp_query_len,
                     packed_seq_params=packed_seq_params,
                     cp_size=cp_size,
+                    varlen_is_plain_causal=varlen_is_plain_causal,
                 )
                 if fused_topk_with_loss is not None:
                     topk_indices, topk_length, indexer_loss = fused_topk_with_loss
@@ -2349,6 +2731,7 @@ class DSAttention(MegatronModule):
                     local_packed_cp_query_len=local_packed_cp_query_len,
                     packed_seq_params=packed_seq_params,
                     cp_size=cp_size,
+                    varlen_is_plain_causal=varlen_is_plain_causal,
                 )
                 if fused_topk is not None:
                     topk_indices, topk_length = fused_topk
