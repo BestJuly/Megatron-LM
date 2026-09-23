@@ -71,7 +71,16 @@ class Qwen35VLMdpAdapter:
         # copy per item avoids a device sync per vision item.
         positions_cpu = positions.cpu().tolist()
         for row in meta.cpu().tolist():
-            sample_id, ordinal, t, h, w, payload_row_start = (int(v) for v in row)
+            (
+                sample_id,
+                ordinal,
+                t,
+                h,
+                w,
+                payload_row_start,
+                sample_padded_start,
+                sample_padded_len,
+            ) = (int(v) for v in row)
             output_rows = t * (h // merge) * (w // merge)
             decoder_positions = tuple(
                 positions_cpu[position_cursor : position_cursor + output_rows]
@@ -85,6 +94,8 @@ class Qwen35VLMdpAdapter:
                     payload_row_start=payload_row_start,
                     payload_rows=t * h * w,
                     decoder_positions=decoder_positions,
+                    sample_padded_start=sample_padded_start,
+                    sample_padded_len=sample_padded_len,
                 )
             )
         if position_cursor != positions.numel():
