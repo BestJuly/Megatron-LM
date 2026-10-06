@@ -66,10 +66,11 @@ def add_multimodal_args(parser):
     group.add_argument(
         "--model-arch",
         type=str,
-        default="qwen35_vl",
+        required=True,
         help=(
             "Model architecture; must be a key of "
-            "examples.multimodal_dev.models.MODEL_REGISTRY."
+            "examples.multimodal_dev.models.MODEL_REGISTRY. Required: no "
+            "architecture is privileged as a default."
         ),
     )
     group.add_argument(
@@ -87,8 +88,11 @@ def add_multimodal_args(parser):
     group.add_argument(
         "--image-token-id",
         type=int,
-        default=248056,
-        help="Token ID for image placeholder tokens",
+        default=None,
+        help=(
+            "Token ID for image placeholder tokens. Default: the selected "
+            "architecture's own placeholder id."
+        ),
     )
     group.add_argument(
         "--image-size",

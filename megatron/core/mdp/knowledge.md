@@ -165,6 +165,9 @@ Supported models (keep in sync with the README support matrix):
 
 Adding a model is a package under `models/<arch>/` plus a registry entry; it
 must not need edits to `pretrain_multimodal.py`, `forward_step.py` or MDP core.
+Shared code has no architecture defaults (`--model-arch` is required,
+`--image-token-id` defaults to `None` = the package's own id), and nothing
+outside a package may read vision geometry from `args`.
 The decoder is built by the hook *after* the model's vision encoder so the
 init RNG order stays fixed for a given package.
 

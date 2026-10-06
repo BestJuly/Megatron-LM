@@ -15,8 +15,8 @@ Qwen3.5-VL keys each vision item by ``(t, h, w)`` patch-grid dimensions, packs
 import torch
 
 from examples.multimodal_dev.models.qwen35_vl.configuration import (
-    QWEN35_VL_IMAGE_TOKEN_ID,
     VISION_KWARGS,
+    resolve_image_token_id,
 )
 from examples.multimodal_dev.models.qwen35_vl.specs import get_qwen35_vl_vision_spec
 from examples.multimodal_dev.models.qwen35_vl.vision_encoder import Qwen35VLVisionEncoder
@@ -55,7 +55,7 @@ def build_collate_spec(args, vision_kwargs: dict = None) -> VisionCollateSpec:
             )
 
     return VisionCollateSpec(
-        image_token_id=getattr(args, "image_token_id", QWEN35_VL_IMAGE_TOKEN_ID),
+        image_token_id=resolve_image_token_id(args),
         shape_key_width=3,
         payload_rows_of=lambda k: k[0] * k[1] * k[2],
         output_rows_of=lambda k: k[0] * (k[1] // merge) * (k[2] // merge),

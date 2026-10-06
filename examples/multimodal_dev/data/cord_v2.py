@@ -358,7 +358,11 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         getattr(args, "total_seq_length", None)
         or getattr(args, "seq_length", 2048)
     )
-    image_token_id = getattr(args, "image_token_id", None)
+    # Registered under qwen35_vl: the CLI value, else that architecture's id
+    # (the vocab lookup in the dataset is only a fallback for direct callers).
+    from examples.multimodal_dev.models.qwen35_vl.configuration import resolve_image_token_id
+
+    image_token_id = resolve_image_token_id(args)
 
     # Load real data
     train_examples = load_cord_v2(split="train")
