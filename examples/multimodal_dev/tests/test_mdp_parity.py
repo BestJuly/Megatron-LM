@@ -53,6 +53,7 @@ from megatron.core.mdp.protocols import CapturedMicrobatch, CapturedVisionItem
 from megatron.core.mdp.rank_mapping import MdpRankSpec, build_rank_map
 from megatron.core.mdp.runtime import MdpRuntime
 from megatron.core.mdp.storage import MdpEmbeddingStorage
+from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
@@ -149,17 +150,25 @@ def _build_language_model(with_encoder, vision_config):
     # not an encoder was built first.
     torch.manual_seed(1234)
     model_parallel_cuda_manual_seed(1234)
-    model = MultimodalModel(
-        language_config=_language_config(),
-        language_spec=get_gpt_layer_with_transformer_engine_spec(),
-        vision_encoder=encoder,
+    # Any decoder MCore builds can sit behind MultimodalModel; a plain GPTModel
+    # keeps this test about MDP routing rather than a particular stack.
+    language_config = _language_config()
+    language_model = GPTModel(
+        config=language_config,
+        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
         vocab_size=VOCAB,
         max_sequence_length=SEQ,
-        image_token_id=IMAGE_TOKEN_ID,
         position_embedding_type="rope",
         parallel_output=False,
         pre_process=True,
         post_process=True,
+    )
+    model = MultimodalModel(
+        language_config=language_config,
+        language_model=language_model,
+        vision_encoder=encoder,
+        image_token_id=IMAGE_TOKEN_ID,
+        pre_process=True,
     )
     return model.cuda()
 
@@ -193,7 +202,8 @@ class _ParityAdapter:
     """Real Qwen encoder factory/encode; capture comes from the test batch."""
 
     payload_width = PATCH_DIM
-    spatial_merge_size = 2
+    shape_key_width = 3
+    output_hidden_size = HIDDEN
 
     def __init__(self, vision_config, microbatches):
         self._vision_config = vision_config
@@ -206,12 +216,17 @@ class _ParityAdapter:
     def estimate_cost(self, item):
         return item.payload_rows
 
+    def validate_item(self, item):
+        t, h, w = item.shape_key
+        assert item.payload_rows == t * h * w
+        assert item.output_rows == t * (h // 2) * (w // 2)
+
     def build_encoder(self, model_config, *, pg_collection):
         return _build_vision_encoder(model_config)
 
     def encode(self, encoder, payload, layout):
         grid_thw = torch.tensor(
-            [segment.grid_thw for segment in layout.segments],
+            [segment.shape_key for segment in layout.segments],
             dtype=torch.long,
             device=payload.device,
         )
@@ -229,9 +244,10 @@ def _captured_microbatch(pixel_values, slots):
             CapturedVisionItem(
                 sample_id=0,
                 image_ordinal=ordinal,
-                grid_thw=grid,
+                shape_key=grid,
                 payload_row_start=payload_start,
                 payload_rows=rows,
+                output_rows=t * (h // 2) * (w // 2),
                 decoder_positions=tuple(slots[ordinal]),
             )
         )
@@ -280,12 +296,13 @@ def _build_runtime(vision_config, microbatches, *, mdp_config=None):
             encoder_ddp=encoder_ddp, encoder_optimizer=None, effective_config=vision_config
         ),
         planner=MdpPlanner(
-            view, locality_slack_permille=10, capacity_policy=RowCapacityPolicy()
+            view, locality_slack_permille=10, capacity_policy=RowCapacityPolicy(),
+            shape_key_width=3,
         ),
         bridge=ModalityBridge(allocator),
         storage=MdpEmbeddingStorage(allocator),
         allocator=allocator,
-        hidden_size=HIDDEN,
+        output_hidden_size=HIDDEN,
         params_dtype=DTYPE,
         num_vpp_chunks=1,
     )

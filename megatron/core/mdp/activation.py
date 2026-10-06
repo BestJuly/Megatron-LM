@@ -2,6 +2,9 @@
 
 """MDP encoder autograd: retained-graph and complete-replay forward handles.
 
+The vision-only ``PackedSeqParams`` for a chunk is built by the adapter inside
+``encode`` from ``layout.segments[].shape_key`` — core owns no vision geometry.
+
 The default path retains graph-connected P2 outputs and uses native MCore
 ``TransformerConfig`` checkpointing when requested.  The Design-Doc ``all``
 mode instead retains pixels, layouts, output metadata, and RNG recipes; P5
@@ -14,15 +17,8 @@ from typing import Callable, Sequence
 import torch
 from torch import Tensor
 
-from megatron.core.mdp.allocator import MdpBufferAllocator
 from megatron.core.mdp.errors import MdpStateError
-from megatron.core.mdp.plan import (
-    EncoderThdLayout,
-    EncoderThdSegment,
-    frame_cu_seqlens,
-    frame_lengths,
-)
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.mdp.plan import EncoderThdLayout
 
 
 def capture_encoder_rng_state() -> tuple:
@@ -44,30 +40,6 @@ class EncoderOutputMetadata:
     def from_tensor(cls, output: Tensor) -> "EncoderOutputMetadata":
         """Capture metadata without retaining the output or its autograd graph."""
         return cls(shape=output.shape, dtype=output.dtype, device=output.device)
-
-
-def build_encoder_packed_seq_params(
-    segments: Sequence[EncoderThdSegment], *, allocator: MdpBufferAllocator, device
-) -> PackedSeqParams:
-    """Vision-only ``PackedSeqParams(qkv_format="thd")`` for one chunk sub-layout.
-
-    Frame boundaries are derived from each segment's ``grid_thw``; this metadata
-    is unrelated to — and must never be mixed with — decoder sample ``cu_seqlens``.
-    """
-    cu = frame_cu_seqlens(segments)
-    lengths = frame_lengths(segments)
-    max_seqlen = max(lengths) if lengths else 0
-    cu_tensor = allocator.acquire(
-        rows=len(cu), width=0, dtype=torch.int32, device=device, tag="encoder_cu_seqlens"
-    )
-    cu_tensor.copy_(torch.tensor(cu, dtype=torch.int32))
-    return PackedSeqParams(
-        qkv_format="thd",
-        cu_seqlens_q=cu_tensor,
-        cu_seqlens_kv=cu_tensor,
-        max_seqlen_q=max_seqlen,
-        max_seqlen_kv=max_seqlen,
-    )
 
 
 @dataclass

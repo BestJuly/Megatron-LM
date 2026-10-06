@@ -160,7 +160,9 @@ def test_full_iteration_at_row_alignment_16():
     from megatron.core.mdp.planner import MdpPlanner
 
     runtime.config = MdpConfig(enable=True, row_alignment=16)
-    runtime.planner = MdpPlanner(view, locality_slack_permille=10, capacity_policy=policy)
+    runtime.planner = MdpPlanner(
+        view, locality_slack_permille=10, capacity_policy=policy, shape_key_width=3
+    )
 
     replay = runtime.begin_iteration(iter(range(10)), num_microbatches=2, forward_only=False)
     harness._drive_decoder(runtime, view, replay, backward=True)

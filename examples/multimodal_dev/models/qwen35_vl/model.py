@@ -7,7 +7,7 @@ language decoder using MRoPE and hybrid GatedDeltaNet / full-attention
 layers.
 """
 
-from typing import Optional
+from typing import Callable, Optional
 
 from torch import Tensor
 
@@ -16,14 +16,12 @@ from examples.multimodal_dev.models.qwen35_vl.configuration import (
     QWEN35_VL_IMAGE_TOKEN_ID,
     QWEN35_VL_VIDEO_TOKEN_ID,
     QWEN35_VL_VISION_START_TOKEN_ID,
-    QWEN35_VL_VOCAB_SIZE,
-    ROTARY_BASE,
-    ROTARY_PERCENT,
     VISION_KWARGS,
 )
 from examples.multimodal_dev.models.qwen35_vl.mrope import get_rope_index
 from examples.multimodal_dev.models.qwen35_vl.specs import get_qwen35_vl_vision_spec
 from examples.multimodal_dev.models.qwen35_vl.vision_encoder import Qwen35VLVisionEncoder
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 
@@ -33,61 +31,41 @@ class Qwen35VLModel(MultimodalModel):
 
     Args:
         language_config: ``TransformerConfig`` for the language decoder.
-        hybrid_stack_spec: ``ModuleSpec`` defining HybridModel layer families.
-        hybrid_layer_pattern: Ordered HybridModel decoder and MTP layer pattern.
+        language_model_builder: Zero-argument callable returning this stage's
+            decoder (the registry's ``language_model_builder_fn``, bound by the
+            entry point). Called *after* the vision encoder is constructed so
+            the parameter-initialization RNG stream keeps its historical order.
         vision_config: ``TransformerConfig`` for the vision encoder.
         vision_spec: ``ModuleSpec`` for vision encoder layers.
-        vocab_size: Vocabulary size.
-        max_sequence_length: Maximum sequence length.
         image_token_id: Token ID for image placeholders.
         spatial_merge_size: Vision encoder spatial merge factor.
-        position_embedding_type: Decoder position embedding type. Qwen3.5-VL
-            only supports ``mrope``; the argument exists so the constructed
-            model and the parsed CLI args describe the same decoder.
-        parallel_output: Keep outputs split across TP.
-        share_embeddings_and_output_weights: Tie embeddings.
-        pre_process: First PP stage flag — build the embedding and the
-            vision encoder here.
-        post_process: Last PP stage flag — build the output layer and
-            compute loss here.
+        pre_process: First PP stage flag — build the vision encoder here.
         vp_stage: Virtual pipeline stage index, or ``None`` when VPP is
-            disabled (selects the non-VPP ``is_pipeline_*_stage`` path).
+            disabled.
         build_vision_encoder: Build the in-model vision encoder. MDP sets
             this to ``False``: its replicated encoder domain owns the
             encoder, and an unused in-model copy would still drift under
             weight decay and collide with the ``vision_model.*``
             checkpoint keys.
+
+    The decoder's position embedding must be MRoPE; the factory checks the
+    recipe before anything is built.
     """
 
     def __init__(
         self,
         language_config: TransformerConfig,
-        hybrid_stack_spec: ModuleSpec,
-        hybrid_layer_pattern: str,
+        language_model_builder: Callable[[], MegatronModule],
         vision_config: TransformerConfig,
         vision_spec: ModuleSpec = None,
-        vocab_size: int = QWEN35_VL_VOCAB_SIZE,
-        max_sequence_length: int = 262144,
         image_token_id: int = QWEN35_VL_IMAGE_TOKEN_ID,
         video_token_id: int = QWEN35_VL_VIDEO_TOKEN_ID,
         vision_start_token_id: int = QWEN35_VL_VISION_START_TOKEN_ID,
         spatial_merge_size: int = 2,
-        position_embedding_type: str = "mrope",
-        parallel_output: bool = True,
-        share_embeddings_and_output_weights: bool = False,
         pre_process: bool = True,
-        post_process: bool = True,
         vp_stage: Optional[int] = None,
         build_vision_encoder: bool = True,
     ):
-        if position_embedding_type != "mrope":
-            raise ValueError(
-                "Qwen3.5-VL requires --position-embedding-type mrope, but got "
-                f"'{position_embedding_type}'. The decoder applies 3D MRoPE, so any "
-                "other setting would make the parsed args and checkpoint metadata "
-                "describe a different model than the one being trained."
-            )
-
         if vision_spec is None:
             vision_spec = get_qwen35_vl_vision_spec()
 
@@ -119,21 +97,10 @@ class Qwen35VLModel(MultimodalModel):
 
         super().__init__(
             language_config=language_config,
-            hybrid_stack_spec=hybrid_stack_spec,
-            hybrid_layer_pattern=hybrid_layer_pattern,
+            language_model=language_model_builder(),
             vision_encoder=vision_encoder,
-            vocab_size=vocab_size,
-            max_sequence_length=max_sequence_length,
             image_token_id=image_token_id,
-            position_embedding_type=position_embedding_type,
-            rotary_percent=ROTARY_PERCENT,
-            rotary_base=ROTARY_BASE,
-            parallel_output=parallel_output,
-            share_embeddings_and_output_weights=(
-                share_embeddings_and_output_weights
-            ),
             pre_process=pre_process,
-            post_process=post_process,
             vp_stage=vp_stage,
         )
 

@@ -2,10 +2,15 @@
 
 """Base multimodal model for FSDP + EP and PP training.
 
-Composes a vision encoder and a ``HybridModel`` language decoder.  The
-vision encoder is built only on the first PP stage; the language
-decoder spans all PP stages following standard Megatron PP layout
-flags.
+Composes a vision encoder and a pre-built language decoder.  The vision
+encoder is built only on the first PP stage; the language decoder spans
+all PP stages following standard Megatron PP layout flags.
+
+The decoder is not constructed here. A model package receives a
+``language_model_builder`` from the entry point (the registry's
+``language_model_builder_fn``, default :func:`build_language_model`), so
+any decoder MCore can build -- with its own spec, builder-side features
+and full keyword set -- becomes multimodal without editing this file.
 
 Subclasses override ``compute_position_ids()`` for model-specific
 position encoding (e.g. MRoPE for Qwen3.5-VL).
@@ -19,9 +24,8 @@ from torch import Tensor
 
 from examples.multimodal_dev.observability import nvtx_phase
 from megatron.core import parallel_state, tensor_parallel
-from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -80,51 +84,86 @@ def _thd_cp_partition_index(cu_seqlens_padded, total_tokens, cp_size, cp_rank):
     return idx.long()
 
 
+def build_language_model(
+    args,
+    language_config: TransformerConfig,
+    *,
+    pre_process: bool,
+    post_process: bool,
+    vp_stage: Optional[int] = None,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+    **config_overrides,
+) -> MegatronModule:
+    """Default ``language_model_builder_fn``: the decoder exactly as ``pretrain_hybrid`` builds it.
+
+    Goes through ``hybrid_config_from_args`` + ``HybridModelBuilder`` rather than
+    calling ``HybridModel(...)`` directly, so the multimodal decoder gets
+    everything the text-only decoder gets: ``--spec`` (static spec or a
+    ``config -> spec`` factory), builder-side spec selection and stack features,
+    and the full keyword set (``fp16_lm_cross_entropy``,
+    ``seq_len_interpolation_factor``, ``pg_collection``, ...). A hand-written
+    constructor call silently drops whatever the builder later learns.
+
+    Args:
+        args: Megatron parsed arguments.
+        language_config: The decoder ``TransformerConfig``, already
+            post-processed by the model's ``post_language_config_fn``. Used
+            as-is; not rebuilt from ``args``.
+        pre_process / post_process / vp_stage: Pipeline placement.
+        pg_collection: Model process groups; defaults to the global mpu groups.
+        **config_overrides: ``HybridModelConfig`` fields the model package pins
+            regardless of the CLI (e.g. architectural RoPE constants).
+    """
+    from megatron.training.argument_utils import hybrid_config_from_args
+    from megatron.training.models.hybrid import HybridModelBuilder
+
+    model_config = hybrid_config_from_args(args, config=language_config)
+    for name, value in config_overrides.items():
+        if not hasattr(model_config, name):
+            raise AttributeError(f"HybridModelConfig has no field '{name}' to override")
+        setattr(model_config, name, value)
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    return HybridModelBuilder(model_config).build_model(
+        pg_collection, pre_process=pre_process, post_process=post_process, vp_stage=vp_stage
+    )
+
+
 class MultimodalModel(MegatronModule):
     """Base class for multimodal vision-language models.
 
-    Composes a pre-constructed vision encoder and a ``HybridModel`` language
-    decoder.  Supports pipeline parallelism: the vision encoder is built
-    only on the first PP stage, while the language decoder spans all PP
-    stages following standard Megatron PP layout flags.
+    Composes a pre-constructed vision encoder and a pre-constructed language
+    decoder.  Supports pipeline parallelism: the vision encoder lives only on
+    the first PP stage, while the language decoder spans all PP stages
+    following standard Megatron PP layout flags.
+
+    The decoder must accept ``decoder_input`` / ``input_ids`` /
+    ``position_ids`` / ``packed_seq_params`` / ``labels`` keyword arguments and
+    expose ``embedding`` on the first stage (``HybridModel`` and ``GPTModel``
+    both do). It is called on every PP stage with ``input_ids`` alongside
+    ``decoder_input``, so token-indexed decoder features (e.g. hashed n-gram
+    memories) see the raw ids on every stage.
 
     Args:
         language_config: ``TransformerConfig`` for the language decoder.
-        hybrid_stack_spec: ``ModuleSpec`` defining HybridModel layer families.
-        hybrid_layer_pattern: Ordered HybridModel decoder and MTP layer pattern.
+        language_model: The built decoder for this PP/VPP stage, normally from
+            :func:`build_language_model`. Its own ``pre_process`` /
+            ``post_process`` must match this wrapper's placement.
         vision_encoder: Pre-constructed vision encoder module (or ``None``
-            on non-first PP stages).
-        vocab_size: Language model vocabulary size.
-        max_sequence_length: Maximum sequence length.
+            on non-first PP stages / under MDP).
         image_token_id: Token ID for image placeholder tokens.
-        position_embedding_type: Position embedding type for the decoder.
-        rotary_percent: Fraction of hidden dim for RoPE.
-        rotary_base: Base frequency for RoPE.
-        parallel_output: Keep outputs split across TP ranks.
-        share_embeddings_and_output_weights: Tie input/output embeddings.
-        pre_process: First PP stage flag — when True, build embedding +
-            run vision encoder + scatter image embeddings.
-        post_process: Last PP stage flag — when True, build output layer +
-            compute loss inside ``HybridModel``.
-        vp_stage: Virtual pipeline stage (forwarded to ``HybridModel``).
+        pre_process: First PP stage flag — when True, run vision encoder +
+            scatter image embeddings into the text embeddings.
+        vp_stage: Virtual pipeline stage (must match the decoder's).
     """
 
     def __init__(
         self,
         language_config: TransformerConfig,
-        hybrid_stack_spec: ModuleSpec,
-        hybrid_layer_pattern: str,
+        language_model: MegatronModule,
         vision_encoder: Optional[MegatronModule],
-        vocab_size: int,
-        max_sequence_length: int,
         image_token_id: int,
-        position_embedding_type: str = "rope",
-        rotary_percent: float = 1.0,
-        rotary_base: int = 10000,
-        parallel_output: bool = True,
-        share_embeddings_and_output_weights: bool = False,
         pre_process: bool = True,
-        post_process: bool = True,
         vp_stage: Optional[int] = None,
     ):
         super().__init__(config=language_config)
@@ -135,29 +174,17 @@ class MultimodalModel(MegatronModule):
         # ``post_process`` is deliberately not stored: nothing reads it off this
         # wrapper, and ``get_attr_wrapped_model(model, 'post_process', ...)``
         # (schedules.clear_embedding_activation_buffer) must keep resolving to
-        # the HybridModel that owns ``embedding_activation_buffer``.
+        # the decoder that owns ``embedding_activation_buffer``.
         # Surfaced for ``finalize_model_grads._allreduce_word_embedding_grads``
-        # which inspects the outer module (not the wrapped HybridModel) when
+        # which inspects the outer module (not the wrapped decoder) when
         # PP > 1 and either tied embeddings or MTP layers are in use.
-        self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
+        self.share_embeddings_and_output_weights = bool(
+            getattr(language_model, "share_embeddings_and_output_weights", False)
+        )
 
         # Vision encoder lives only on the first PP stage.
         self.vision_model = vision_encoder if pre_process else None
-        self.language_model = HybridModel(
-            config=language_config,
-            hybrid_stack_spec=hybrid_stack_spec,
-            vocab_size=vocab_size,
-            max_sequence_length=max_sequence_length,
-            hybrid_layer_pattern=hybrid_layer_pattern,
-            pre_process=pre_process,
-            post_process=post_process,
-            vp_stage=vp_stage,
-            parallel_output=parallel_output,
-            share_embeddings_and_output_weights=(share_embeddings_and_output_weights),
-            position_embedding_type=position_embedding_type,
-            rotary_percent=rotary_percent,
-            rotary_base=rotary_base,
-        )
+        self.language_model = language_model
 
     def shared_embedding_or_output_weight(self):
         """Surface the wrapped language model's shared embedding / output

@@ -9,14 +9,17 @@ vision-language models built on Megatron-Core (FSDP + EP).
 multimodal_dev/
 ├── pretrain_multimodal.py   # Training entry point (model-agnostic)
 ├── forward_step.py          # Forward step, TP broadcast, loss computation
+├── mdp_adapter.py           # Registry dispatch: MDP adapter + VisionCollateSpec
 ├── arguments.py             # Multimodal CLI arguments
 ├── data/
 │   └── mock.py              # Mock dataset for end-to-end testing
 ├── models/
 │   ├── __init__.py          # MODEL_REGISTRY — central model registry
-│   ├── base.py              # MultimodalModel base class (vision encoder + HybridModel)
+│   ├── base.py              # MultimodalModel (vision encoder + built decoder), default decoder hook
+│   ├── vision_base.py       # VisionCollateSpec, BaseGridVisionAdapter (shared MDP plumbing)
 │   └── qwen35_vl/           # Qwen3.5-VL architecture
 │       ├── factory.py       # Factory functions for pretrain entry point
+│       ├── mdp_adapter.py   # Qwen3.5-VL MDP adapter + collate spec
 │       ├── model.py         # Qwen35VLModel (MRoPE, vision encoder wiring)
 │       ├── configuration.py # TransformerConfig builders and constants
 │       ├── specs.py         # Vision layer spec builders
@@ -163,6 +166,8 @@ is delegated to factory functions registered in `MODEL_REGISTRY`
 - Building `language_config` from Megatron CLI args
 - Constructing `vision_config` via the registry
 - Applying vision recompute and dtype propagation
+- Binding the registry's decoder hook (`language_model_builder_fn`) to the
+  stage placement and passing it to the model factory
 - Routing to model and dataset factories
 
 The `forward_step` is also model-agnostic — it uses the model's
@@ -208,32 +213,47 @@ def set_vision_flops_metadata(args, language_config, vision_config):
 
         args.vision_num_layers, vision_hidden_size, vision_ffn_hidden_size,
         vision_num_attention_heads, vision_kv_channels, vision_in_channels,
-        vision_patch_size, vision_temporal_patch_size,
-        vision_spatial_merge_size, vision_out_hidden_size
+        vision_patch_size, vision_temporal_patch_size, vision_out_hidden_size,
+        vision_merge_dim
 
-    The term assumes a ViT shaped like Qwen3.5-VL's: Conv3d patch embed
-    (kernel == stride), MHA (no GQA), bidirectional attention over
-    per-frame chunks, a non-gated MLP, and a two-layer patch merger. An
-    arch that differs structurally needs its own branch there rather than
-    just these fields.
+    plus the shape knobs ``vision_gated_mlp`` (default False) and
+    ``vision_merger_hidden_size`` (default ``vision_merge_dim``). The
+    per-batch row counts (patch rows, packed-attention ``L^2``, merged rows)
+    are not derived from these fields: the collator measures them through
+    the model's ``VisionCollateSpec.workload_of``. See
+    ``megatron/training/training.py::vision_encoder_flops``.
     """
     args.count_vision_model_flops = True
-    args.vision_flops_variant = "llava_next"
     # ... set dimension fields for FLOPs calculation
 
-def build_model(args, language_config, vision_config, **kwargs):
-    """(Required) Build and return the complete model instance."""
+def build_model(args, language_config, vision_config, language_model_builder, **kwargs):
+    """(Required) Build and return the complete model instance.
+
+    ``language_model_builder(**config_overrides)`` builds this stage's decoder
+    (registry ``language_model_builder_fn``; default ``HybridModelBuilder``,
+    so ``--spec`` and builder-side features apply). Never construct
+    ``HybridModel(...)`` here -- it would silently drop whatever the builder
+    adds. Pass only architectural constants as overrides.
+    """
     from .model import LlavaNextModel
-    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 
     return LlavaNextModel(
         language_config=language_config,
-        hybrid_stack_spec=hybrid_stack_spec,
-        hybrid_layer_pattern=args.hybrid_layer_pattern,
+        # Build the vision encoder first, then call the builder: the order
+        # fixes the parameter-initialization RNG stream.
+        language_model_builder=lambda: language_model_builder(rotary_base=1_000_000),
         vision_config=vision_config,
+        pre_process=kwargs.get("pre_process", True),
+        vp_stage=kwargs.get("vp_stage"),
         # ... model-specific args
     )
 ```
+
+`MultimodalModel(language_config, language_model, vision_encoder,
+image_token_id, pre_process, vp_stage)` wraps an already-built decoder; any
+decoder that accepts `decoder_input` / `input_ids` / `position_ids` /
+`packed_seq_params` / `labels` and exposes `embedding` works (`HybridModel`,
+`GPTModel`).
 
 ### Step 3 — Register in `MODEL_REGISTRY`
 
@@ -254,11 +274,38 @@ MODEL_REGISTRY["llava_next"] = {
     "vision_config_fn": get_llava_next_vision_config,      # required
     "post_language_config_fn": _llava_next_post_language_config,  # optional
     "vision_flops_fn": _llava_next_vision_flops,           # optional
+    "vision_collate_spec_fn": _llava_next_collate_spec,    # packed multimodal
+    "mdp_adapter_fn": _llava_next_mdp_adapter,             # --mdp-enable
     "dataset_providers": {                                  # optional
         "mock": "multimodal_dev.data.llava_mock.train_valid_test_datasets_provider",
     },
 }
 ```
+
+### Step 3b — Vision collate spec and MDP adapter
+
+The THD collator and MDP never read vision geometry from loose `args`
+attributes; they ask the model. Provide, usually in
+`models/<arch>/mdp_adapter.py`:
+
+- `build_collate_spec(args) -> VisionCollateSpec`
+  (`models/vision_base.py`): image-token id, `shape_key_width`,
+  `payload_rows_of`, `output_rows_of`, `workload_of`, `grid_key`,
+  `require_contiguous_slots`. It must be callable on every rank without a
+  model instance.
+- `build_mdp_adapter(args, language_config, vision_config)`: normally a
+  `BaseGridVisionAdapter` subclass that only implements `build_encoder` and
+  `encode`; `output_hidden_size` is the width of one encoder output row
+  (the projector output), which MDP uses for its bridge buffers.
+
+MDP core sees an item only as `payload_rows`, `output_rows`, an LPT cost and
+an opaque `shape_key`; see `megatron/core/mdp/README.md`.
+
+Shared code carries no architecture defaults: `--model-arch` is required and
+`--image-token-id` defaults to `None`, meaning "the architecture's own id".
+Resolve it once in the package (Qwen3.5-VL: `configuration.resolve_image_token_id`)
+and use that everywhere the package needs the id (factory, collate spec,
+datasets).
 
 ### Step 4 — (Optional) Add a dataset provider
 
@@ -288,8 +335,11 @@ torchrun --nproc_per_node=8 multimodal_dev/pretrain_multimodal.py \
 
 | Field | Required | Signature |
 |-------|----------|-----------|
-| `model_factory_fn` | Yes | `(args, language_config, vision_config, **kwargs) -> MegatronModule` |
+| `model_factory_fn` | Yes | `(args, language_config, vision_config, pre_process, post_process, language_model_builder, **kwargs) -> MegatronModule` |
+| `language_model_builder_fn` | No | `(args, language_config, *, pre_process, post_process, vp_stage, pg_collection, **config_overrides) -> decoder`; default `models.base.build_language_model` |
 | `vision_config_fn` | Yes | `(num_layers_override=None) -> TransformerConfig` |
 | `post_language_config_fn` | No | `(language_config, args) -> None` |
 | `vision_flops_fn` | No | `(args, language_config, vision_config) -> None` |
+| `vision_collate_spec_fn` | For packed (THD) training | `(args) -> VisionCollateSpec` |
+| `mdp_adapter_fn` | For `--mdp-enable` | `(args, language_config, vision_config) -> MdpModelAdapter` |
 | `dataset_providers` | No | `Dict[str, str \| callable]` |

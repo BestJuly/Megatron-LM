@@ -56,7 +56,8 @@ class _TinyEncoder(torch.nn.Module):
 
 class _TinyAdapter:
     payload_width = 8
-    spatial_merge_size = 2
+    shape_key_width = 3
+    output_hidden_size = 8
 
     def build_encoder(self, model_config, *, pg_collection):
         return _TinyEncoder(model_config)

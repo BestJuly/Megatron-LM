@@ -49,9 +49,10 @@ def _item(sample_id, ordinal, grid, payload_row_start):
     return CapturedVisionItem(
         sample_id=sample_id,
         image_ordinal=ordinal,
-        grid_thw=grid,
+        shape_key=grid,
         payload_row_start=payload_row_start,
         payload_rows=t * h * w,
+        output_rows=output_rows,
         decoder_positions=tuple(range(100, 100 + output_rows)),
     )
 
@@ -69,7 +70,8 @@ class _ShardAwareAdapter:
     """Returns pixels only when the capture context says this worker owns them."""
 
     payload_width = WIDTH
-    spatial_merge_size = MERGE
+    shape_key_width = 3
+    output_hidden_size = WIDTH
 
     def __init__(self, microbatch_items, suppress=True):
         # microbatch_items: list of (items, total_rows) per microbatch.
@@ -91,6 +93,11 @@ class _ShardAwareAdapter:
 
     def estimate_cost(self, item):
         return item.payload_rows
+
+    def validate_item(self, item):
+        t, h, w = item.shape_key
+        assert item.payload_rows == t * h * w
+        assert item.output_rows == t * (h // MERGE) * (w // MERGE)
 
 
 def _window_microbatches():
@@ -189,7 +196,7 @@ def _descriptor(item_id, cost, mb=0, grid=(1, 4, 4), owner=0, lane=0):
         estimated_cost_units=cost,
         payload_rows=t * h * w,
         output_rows=t * (h // 2) * (w // 2),
-        grid_thw=grid,
+        shape_key=grid,
         owner_worker_id=owner,
     )
 
@@ -201,7 +208,9 @@ def _assignment(plan):
 def test_owner_metadata_does_not_change_digest_without_locality():
     baseline = [_descriptor(i, cost=10 + (i * 7) % 5, mb=i % 4, owner=0) for i in range(9)]
     sharded = [_descriptor(i, cost=10 + (i * 7) % 5, mb=i % 4, owner=(i % 4)) for i in range(9)]
-    planner = MdpPlanner(_view(), locality_slack_permille=10, capacity_policy=RowCapacityPolicy())
+    planner = MdpPlanner(
+        _view(), locality_slack_permille=10, capacity_policy=RowCapacityPolicy(), shape_key_width=3
+    )
     plan_a = planner.build_plan(0, baseline, [0, 1, 2, 3])
     plan_b = planner.build_plan(0, sharded, [0, 1, 2, 3])
     # Owner metadata must not perturb LPT when locality is off.
@@ -217,7 +226,11 @@ def test_locality_prefers_owner_only_within_slack():
     # eligible and locality may follow the owner freely.
     equal = [_descriptor(i, cost=100, mb=i, owner=i % 4) for i in range(8)]
     local_planner = MdpPlanner(
-        view, locality_slack_permille=10, capacity_policy=RowCapacityPolicy(), pixel_locality=True
+        view,
+        locality_slack_permille=10,
+        capacity_policy=RowCapacityPolicy(),
+        pixel_locality=True,
+        shape_key_width=3,
     )
     plan = local_planner.build_plan(0, equal, list(range(8)))
     assignment = _assignment(plan)
@@ -229,9 +242,15 @@ def test_locality_prefers_owner_only_within_slack():
         _descriptor(i, cost=10, mb=i, owner=1) for i in range(1, 5)
     ]
     strict_local = MdpPlanner(
-        view, locality_slack_permille=0, capacity_policy=RowCapacityPolicy(), pixel_locality=True
+        view,
+        locality_slack_permille=0,
+        capacity_policy=RowCapacityPolicy(),
+        pixel_locality=True,
+        shape_key_width=3,
     )
-    strict_base = MdpPlanner(view, locality_slack_permille=0, capacity_policy=RowCapacityPolicy())
+    strict_base = MdpPlanner(
+        view, locality_slack_permille=0, capacity_policy=RowCapacityPolicy(), shape_key_width=3
+    )
     plan_local = strict_local.build_plan(0, skewed, list(range(5)))
     plan_base = strict_base.build_plan(0, skewed, list(range(5)))
     local_assignment = _assignment(plan_local)
@@ -286,7 +305,7 @@ def _dist_setup(num_items=8, pixel_locality=False):
                 estimated_cost_units=t * h * w,
                 payload_rows=t * h * w,
                 output_rows=t * (h // 2) * (w // 2),
-                grid_thw=(t, h, w),
+                shape_key=(t, h, w),
                 owner_worker_id=i % num_workers,
             )
         )
@@ -295,6 +314,7 @@ def _dist_setup(num_items=8, pixel_locality=False):
         locality_slack_permille=10,
         capacity_policy=RowCapacityPolicy(),
         pixel_locality=pixel_locality,
+        shape_key_width=3,
     )
     plan = planner.build_plan(0, descriptors, list(range(max(num_items, 1))))
     return rank_map, view, plan, descriptors
@@ -385,12 +405,16 @@ def test_alltoall_sentinels_and_zero_split_participation():
             estimated_cost_units=16,
             payload_rows=16,
             output_rows=4,
-            grid_thw=(1, 4, 4),
+            shape_key=(1, 4, 4),
             owner_worker_id=0,
         )
     ]
     planner = MdpPlanner(
-        view, locality_slack_permille=10, capacity_policy=RowCapacityPolicy(), pixel_locality=True
+        view,
+        locality_slack_permille=10,
+        capacity_policy=RowCapacityPolicy(),
+        pixel_locality=True,
+        shape_key_width=3,
     )
     single_plan = planner.build_plan(1, single, [0])
     assert _assignment(single_plan) == {0: 0}
@@ -441,7 +465,9 @@ def test_owner_zero_routes_pixels_from_worker_zero():
     rank = torch.distributed.get_rank()
     rank_map = build_rank_map(MdpRankSpec(world_size=world, tp=1, pp=4, cp=1, ep=1, encoder_cp=1))
     view = rank_map.view(rank)
-    planner = MdpPlanner(view, locality_slack_permille=10, capacity_policy=RowCapacityPolicy())
+    planner = MdpPlanner(
+        view, locality_slack_permille=10, capacity_policy=RowCapacityPolicy(), shape_key_width=3
+    )
     baseline = [_descriptor(i, cost=16 + i, mb=i, lane=view.outer_dp_rank) for i in range(4)]
     bridge = ModalityBridge(DirectBufferAllocator())
     plan = planner.build_plan(0, baseline, [0, 1, 2, 3])

@@ -56,7 +56,9 @@ def _setup():
         _make_descriptor(1, 9, view.outer_dp_rank),
         _make_descriptor(2, 8, view.outer_dp_rank),
     ]
-    planner = MdpPlanner(view, locality_slack_permille=0, capacity_policy=RowCapacityPolicy())
+    planner = MdpPlanner(
+        view, locality_slack_permille=0, capacity_policy=RowCapacityPolicy(), shape_key_width=3
+    )
     plan = planner.build_plan(0, descriptors, [0])
     return rank_map, view, plan, descriptors
 
@@ -72,7 +74,7 @@ def _make_descriptor(item_id, cost, lane):
         estimated_cost_units=cost,
         payload_rows=t * h * w,
         output_rows=t * (h // 2) * (w // 2),
-        grid_thw=GRIDS[item_id],
+        shape_key=GRIDS[item_id],
         owner_worker_id=0,
     )
 
@@ -200,7 +202,9 @@ def test_empty_member_performs_noop_exchange():
     groups = install_mdp_process_groups(rank_map, group_registry=MdpGroupRegistry())
     # An artificial plan with no routes: every member still calls exchange
     # exactly once and gets an empty mapping back.
-    empty_planner = MdpPlanner(view, locality_slack_permille=0, capacity_policy=RowCapacityPolicy())
+    empty_planner = MdpPlanner(
+        view, locality_slack_permille=0, capacity_policy=RowCapacityPolicy(), shape_key_width=3
+    )
     empty_plan = empty_planner.build_plan(1, [], [0])
     ledger = bridge.build_ledger(BridgePhase.PIXEL, empty_plan, rank_map, {})
     assert ledger.entries == ()

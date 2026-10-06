@@ -85,6 +85,9 @@ Preserve these unless the feature design is intentionally changed:
 - The composite optimizer treats decoder and encoder overflow, norm clipping,
   and step success as one atomic decision.
 - MDP-owned buffers must be allocated through `MdpBufferAllocator`.
+- Core owns no vision geometry. `shape_key` is opaque; `output_rows` is supplied
+  by the adapter, never recomputed in core; `adapter.validate_item` owns every
+  rule relating `shape_key` to the row counts.
 
 ## Phase machine
 
@@ -117,10 +120,10 @@ returns to `EMPTY`.
 |---|---|
 | `config.py` | CLI-derived configuration, validation, supported combinations, typed encoder recompute settings. |
 | `errors.py` | MDP-specific failure classes. |
-| `protocols.py` | Model adapter interface and capture/descriptor carrier types. |
+| `protocols.py` | Model adapter interface and capture/descriptor carrier types. Read first when adding a model. |
 | `rank_mapping.py` | Rank coordinates, outer-DP planning groups, logical workers, endpoint mapping. |
 | `groups.py` | Process-group creation and fixed-width descriptor broadcast. |
-| `plan.py` | Route/layout schema, row-capacity policy, chunk splitting, plan digest. |
+| `plan.py` | Route/layout schema, row-capacity policy, chunk splitting, plan digest (width-aware in `shape_key_width`). |
 | `planner.py` | Integer deterministic LPT assignment, pixel locality preference, consistency check. |
 | `allocator.py` | The only allocation entry point for MDP-owned communication/storage buffers. |
 | `storage.py` | Endpoint embedding leaves and lifecycle checks. |
@@ -142,14 +145,31 @@ returns to `EMPTY`.
 |---|---|
 | `arguments.py` | User-facing `--mdp-*` arguments. |
 | `forward_step.py` | Dual-THD collation, sidecar creation, owner-aware pixel suppression, native and MDP forward steps. |
-| `mdp_adapter.py` | Qwen3.5-VL implementation of `MdpModelAdapter`. |
+| `mdp_adapter.py` | Registry dispatch for the adapter and the vision collate spec. |
+| `models/vision_base.py` | `VisionCollateSpec` and `BaseGridVisionAdapter`: the model-independent half of the adapter, shared by every flat-patch encoder. |
+| `models/<arch>/mdp_adapter.py` | Per-architecture adapter: encoder factory, `encode`, and the model's collate spec. |
+| `models/__init__.py` | `MODEL_REGISTRY`; `mdp_adapter_fn` and `vision_collate_spec_fn` are the MDP-relevant entries; `language_model_builder_fn` (optional) selects the decoder build path. |
 | `data/mdp_mock.py` | Deterministic multi-image/video/text-only dataset with pixel sentinels. |
 | `pretrain_multimodal.py` | Adapter registration, startup validation, schedule selection. |
-| `models/base.py` | Native vision path and external `vision_embeddings` injection. |
+| `models/base.py` | `MultimodalModel` (takes a *built* decoder), native vision path, external `vision_embeddings` injection; `build_language_model`, the default decoder hook (`hybrid_config_from_args` + `HybridModelBuilder`). |
 | `models/qwen35_vl/vision_encoder.py` | Vision forward path and cached position metadata consumption. |
 | `models/qwen35_vl/vision_pos_cache.py` | Grid-derived position/RoPE/cu-seqlens cache. |
 | `observability.py` | Native multimodal NVTX ranges used for MDP-vs-native comparison. |
 | `scripts/run_mdp_experiments.sh` | Reproducible reference launcher and profiling wrapper. |
+
+Supported models (keep in sync with the README support matrix):
+
+| `--model-arch` | Encoder package | Decoder hook | Shape key | Notes |
+|---|---|---|---|---|
+| `qwen35_vl` | `models/qwen35_vl` (ViT, merge 2) | default `build_language_model`; factory pins `rotary_percent`/`rotary_base` | `(t, h, w)`, width 3 | reference model |
+
+Adding a model is a package under `models/<arch>/` plus a registry entry; it
+must not need edits to `pretrain_multimodal.py`, `forward_step.py` or MDP core.
+Shared code has no architecture defaults (`--model-arch` is required,
+`--image-token-id` defaults to `None` = the package's own id), and nothing
+outside a package may read vision geometry from `args`.
+The decoder is built by the hook *after* the model's vision encoder so the
+init RNG order stays fixed for a given package.
 
 ### Megatron training seams
 
@@ -162,13 +182,18 @@ returns to `EMPTY`.
 
 ## Data contract
 
-The collator builds normal decoder tensors plus an MDP vision sidecar:
+The collator builds normal decoder tensors plus an MDP vision sidecar. It is
+model-agnostic and is driven entirely by the registry's `VisionCollateSpec`
+(image-token id, shape-key width, `payload_rows_of`, `output_rows_of`,
+`workload_of`, `require_contiguous_slots`) -- never by loose `args.vision_*`
+attributes:
 
-- `vision_item_meta`: per-item sample, ordinal, `(t,h,w)`, and payload start;
+- `vision_item_meta`: per-item `(sample, ordinal, payload_row_start, *shape_key)`;
 - `vision_decoder_positions`: absolute image-token positions in the decoder's
   packed physical layout;
 - `pixel_values`: present only on the owner worker for that microbatch;
-- `image_grid_thw`: present on all workers and used to derive item shapes;
+- `spec.grid_key` (`image_grid_thw` for the grid family): present on all workers
+  and used to derive item shapes;
 - `flops_cu_seqlens`: present only under `--thd-static-packing`; the
   pre-tail-pad valid `cu_seqlens`, because the static tail is represented as an
   ordinary dummy sequence and would otherwise inflate the FLOPs accumulator.
@@ -190,9 +215,9 @@ only the explicit vision carrier types.
 
 Validation happens before distributed transport:
 
-- pixels and grid metadata are consistent;
-- payload rows equal `sum(t*h*w)`;
-- decoder image-token slots equal post-merge vision output rows;
+- pixels and shape metadata are consistent;
+- payload rows equal `sum(payload_rows_of(shape_key))`;
+- decoder image-token slots equal `sum(output_rows_of(shape_key))`;
 - item intervals do not overlap or exceed the flat pixel payload;
 - decoder packed format is THD;
 - item ordering is deterministic.
@@ -214,7 +239,8 @@ The plan contains:
 - a 16-byte deterministic digest.
 
 Capacity padding affects allocations only. Segment offsets accumulate valid
-rows, and attention frame boundaries are derived from `grid_thw`.
+rows; attention sub-sequence boundaries inside a producer's pack are derived by
+the adapter from `segments[].shape_key` inside `encode`, not by core.
 
 ## Runtime and prefetch
 
@@ -502,9 +528,24 @@ P5.
 There is deliberately no pixel-sharding flag. Pixel owner sharding is part of
 the MDP definition in this baseline.
 
+Adding a vision encoder (no core change required if the model fits the
+row/shape-key contract):
+
+1. `models/<arch>/` with the encoder module, specs, configuration and factory;
+2. `models/<arch>/mdp_adapter.py`: a `BaseGridVisionAdapter` subclass plus a
+   `build_collate_spec(args)`;
+3. a `MODEL_REGISTRY` entry wiring `mdp_adapter_fn` and
+   `vision_collate_spec_fn`;
+4. `set_vision_flops_metadata` for the throughput logger, including
+   `vision_gated_mlp`, `vision_merge_dim` and `vision_merger_hidden_size`.
+
+Core changes are needed only when the wire schema must change (a different
+`shape_key_width`); that means `protocols.py`, `groups.py`, `plan.py` (bump
+`PLAN_SCHEMA_VERSION`), `planner.py` and their tests, in one commit.
+
 Current major constraints:
 
-- Qwen3.5-VL adapter;
+- one adapter per run, one encoder per model;
 - TP=1;
 - decoder CP=1;
 - encoder CP=1;

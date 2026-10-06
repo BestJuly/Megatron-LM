@@ -16,6 +16,7 @@ from examples.multimodal_dev.models.qwen35_vl.configuration import (
     QWEN35_VL_IMAGE_TOKEN_ID,
     QWEN35_VL_VIDEO_TOKEN_ID,
     QWEN35_VL_VISION_START_TOKEN_ID,
+    resolve_image_token_id,
 )
 from examples.multimodal_dev.models.qwen35_vl.mrope import get_rope_index
 
@@ -232,7 +233,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         seq_length=getattr(args, "total_seq_length", 1024),
         image_seq_length=getattr(args, "image_seq_length", 256),
         vocab_size=getattr(args, "padded_vocab_size", 248320),
-        image_token_id=getattr(args, "image_token_id", 248056),
+        image_token_id=resolve_image_token_id(args),
         image_size=getattr(args, "image_size", 224),
     )
 
