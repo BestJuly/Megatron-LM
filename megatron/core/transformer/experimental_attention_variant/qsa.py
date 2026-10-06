@@ -953,7 +953,10 @@ class QSASelfAttention(SelfAttention):
         tp_group = self.pg_collection.tp
         tp_size = tp_group.size() if tp_group is not None else 1
 
-        chunk = 256
+        # Query-chunk size for the two passes below. Pure memory staging: the softmax is over
+        # the last (token) axis and `mass` accumulates per chunk, so the chunk size cannot
+        # change any result - it only trades peak memory for kernel launches.
+        chunk = max(1, int(self.config.qsa_indexer_loss_chunk))
         arange_r = torch.arange(r, device=order.device)
 
         # Pass 1 (no grad): local-head teacher, block-max-pooled into a small

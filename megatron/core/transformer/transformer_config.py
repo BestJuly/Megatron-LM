@@ -495,6 +495,14 @@ class TransformerConfig(ModelParallelConfig):
     attention distribution aggregated to blocks, normalized over the selected block set
     only). None or 0 disables indexer training."""
 
+    qsa_indexer_loss_chunk: int = 256
+    """Query-chunk size for the QSA indexer distillation loss.
+
+    Pure memory staging: the loss's softmax is over the token axis and its accumulator is
+    per-chunk, so this cannot change any result - it trades peak memory for kernel launches.
+    Measured on the Qwen3.8-Flash-Next performance proxy: 256 1292 ms, 1024 1247 ms (-3.5 %)
+    for +0.8 GiB, 4096 1238 ms (-4.2 %) for +13.1 GiB."""
+
     qsa_use_sparse_attention: bool = False
     """Use the sparse GQA Triton kernel path (gathered block-sparse attention over the
     selected 4-token blocks; supports BSHD and packed THD). When False, the dense-mask
@@ -2246,6 +2254,10 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "qsa_indexer_n_heads and qsa_indexer_head_dim must be positive, got "
                     f"{self.qsa_indexer_n_heads} and {self.qsa_indexer_head_dim}."
+                )
+            if self.qsa_indexer_loss_chunk < 1:
+                raise ValueError(
+                    f"qsa_indexer_loss_chunk must be positive, got {self.qsa_indexer_loss_chunk}."
                 )
             if self.qsa_indexer_loss_coeff is not None and self.qsa_indexer_loss_coeff < 0:
                 raise ValueError(
