@@ -94,12 +94,21 @@ def test_factory_rejects_mrope_section_with_wrong_partition():
         )
 
 
-def test_factory_passes_hybrid_pattern(monkeypatch):
+def test_factory_builds_decoder_through_the_hook(monkeypatch):
+    """The factory never constructs the decoder itself: it calls the registry
+    hook, pinning only the architectural RoPE constants."""
+    from examples.multimodal_dev.models.qwen35_vl.configuration import ROTARY_BASE
+
     captured = {}
+    hook_calls = []
 
     def fake_model(**kwargs):
         captured.update(kwargs)
-        return "model"
+        return SimpleNamespace(decoder=kwargs["language_model_builder"]())
+
+    def fake_hook(**overrides):
+        hook_calls.append(overrides)
+        return "decoder"
 
     monkeypatch.setattr(
         "examples.multimodal_dev.models.qwen35_vl.model.Qwen35VLModel", fake_model
@@ -108,27 +117,71 @@ def test_factory_passes_hybrid_pattern(monkeypatch):
         _args(),
         language_config=_language_config(),
         vision_config=SimpleNamespace(),
+        language_model_builder=fake_hook,
     )
 
-    assert result == "model"
-    assert captured["hybrid_layer_pattern"] == "GEGEGE*E/*E"
-    assert captured["share_embeddings_and_output_weights"] is False
-    # The model must be told which position embedding the CLI asked for, so the
-    # constructed decoder and the saved args cannot describe different models.
-    assert captured["position_embedding_type"] == "mrope"
+    assert result.decoder == "decoder"
+    assert hook_calls == [{"rotary_percent": ROTARY_PERCENT, "rotary_base": ROTARY_BASE}]
+    assert captured["image_token_id"] == 42
+    # Decoder-shaped kwargs belong to the builder now, not the model class.
+    for gone in ("hybrid_stack_spec", "hybrid_layer_pattern", "vocab_size"):
+        assert gone not in captured
 
 
-def test_model_rejects_non_mrope_position_embedding():
+def test_factory_rejects_non_mrope_position_embedding():
     """A recipe declaring plain rope must fail loudly, not build an MRoPE decoder."""
-    from examples.multimodal_dev.models.qwen35_vl.model import Qwen35VLModel
-
     with pytest.raises(ValueError, match="requires --position-embedding-type mrope"):
-        Qwen35VLModel(
-            language_config=SimpleNamespace(hidden_size=128),
-            hybrid_stack_spec=SimpleNamespace(),
-            hybrid_layer_pattern=MOE_PATTERN_4_BLOCKS,
+        factory.build_model(
+            _args(position_embedding_type="rope"),
+            language_config=_language_config(),
             vision_config=SimpleNamespace(),
-            position_embedding_type="rope",
+            language_model_builder=lambda **_: pytest.fail("decoder must not be built"),
+        )
+
+
+def test_default_language_model_builder_goes_through_hybrid_builder(monkeypatch):
+    """``build_language_model`` = hybrid_config_from_args + HybridModelBuilder,
+    with the caller's TransformerConfig, overrides applied, and placement kept."""
+    import megatron.training.argument_utils as argument_utils
+    import megatron.training.models.hybrid as hybrid
+    from examples.multimodal_dev.models.base import build_language_model
+
+    seen = {}
+
+    class FakeConfig(SimpleNamespace):
+        pass
+
+    def fake_config_from_args(args, config=None):
+        seen["config"] = config
+        return FakeConfig(rotary_percent=1.0, rotary_base=10000)
+
+    class FakeBuilder:
+        def __init__(self, model_config):
+            seen["model_config"] = model_config
+
+        def build_model(self, pg_collection, pre_process, post_process, vp_stage):
+            seen["placement"] = (pg_collection, pre_process, post_process, vp_stage)
+            return "decoder"
+
+    monkeypatch.setattr(argument_utils, "hybrid_config_from_args", fake_config_from_args)
+    monkeypatch.setattr(hybrid, "HybridModelBuilder", FakeBuilder)
+    language_config = object()
+    pg = object()
+
+    out = build_language_model(
+        SimpleNamespace(), language_config, pre_process=True, post_process=False,
+        vp_stage=1, pg_collection=pg, rotary_percent=0.25,
+    )
+
+    assert out == "decoder"
+    assert seen["config"] is language_config
+    assert seen["model_config"].rotary_percent == 0.25
+    assert seen["model_config"].rotary_base == 10000
+    assert seen["placement"] == (pg, True, False, 1)
+    with pytest.raises(AttributeError, match="no field 'not_a_field'"):
+        build_language_model(
+            SimpleNamespace(), language_config, pre_process=True, post_process=True,
+            pg_collection=pg, not_a_field=1,
         )
 
 
@@ -192,3 +245,49 @@ def test_language_config_num_layers_is_hybrid_layer_count():
     assert config.output_layer_init_method.keywords["std"] == pytest.approx(
         config.init_method_std / math.sqrt(config.num_layers)
     )
+
+
+def test_model_provider_binds_registry_language_model_builder(monkeypatch):
+    """The entry point hands the factory the registry's decoder hook, bound to
+    this stage's placement; the factory only adds config overrides."""
+    import examples.multimodal_dev.pretrain_multimodal as training_entrypoint
+    from examples.multimodal_dev.models import MODEL_REGISTRY
+
+    args = SimpleNamespace(model_arch="qwen35_vl", model_variant=None, vision_num_layers=None)
+    language_config = SimpleNamespace(apply_rope_fusion=False, bf16=True, fp16=False)
+    hook_calls = []
+
+    def hook(hook_args, hook_language_config, **kwargs):
+        hook_calls.append((hook_args, hook_language_config, kwargs))
+        return "decoder"
+
+    def build_model(*, language_model_builder, **kwargs):
+        return language_model_builder(rotary_base=7)
+
+    registry = {
+        "vision_config_fn": lambda **kwargs: SimpleNamespace(),
+        "model_factory_fn": build_model,
+        "language_model_builder_fn": hook,
+    }
+    monkeypatch.setattr(training_entrypoint, "get_args", lambda: args)
+    monkeypatch.setattr(
+        training_entrypoint, "core_transformer_config_from_args", lambda args: language_config
+    )
+    monkeypatch.setitem(MODEL_REGISTRY, "qwen35_vl", registry)
+
+    assert training_entrypoint.model_provider(pre_process=False, post_process=True, vp_stage=1) == (
+        "decoder"
+    )
+    assert hook_calls == [
+        (
+            args,
+            language_config,
+            dict(
+                pre_process=False,
+                post_process=True,
+                vp_stage=1,
+                pg_collection=None,
+                rotary_base=7,
+            ),
+        )
+    ]

@@ -148,14 +148,25 @@ returns to `EMPTY`.
 | `mdp_adapter.py` | Registry dispatch for the adapter and the vision collate spec. |
 | `models/vision_base.py` | `VisionCollateSpec` and `BaseGridVisionAdapter`: the model-independent half of the adapter, shared by every flat-patch encoder. |
 | `models/<arch>/mdp_adapter.py` | Per-architecture adapter: encoder factory, `encode`, and the model's collate spec. |
-| `models/__init__.py` | `MODEL_REGISTRY`; `mdp_adapter_fn` and `vision_collate_spec_fn` are the MDP-relevant entries. |
+| `models/__init__.py` | `MODEL_REGISTRY`; `mdp_adapter_fn` and `vision_collate_spec_fn` are the MDP-relevant entries; `language_model_builder_fn` (optional) selects the decoder build path. |
 | `data/mdp_mock.py` | Deterministic multi-image/video/text-only dataset with pixel sentinels. |
 | `pretrain_multimodal.py` | Adapter registration, startup validation, schedule selection. |
-| `models/base.py` | Native vision path and external `vision_embeddings` injection. |
+| `models/base.py` | `MultimodalModel` (takes a *built* decoder), native vision path, external `vision_embeddings` injection; `build_language_model`, the default decoder hook (`hybrid_config_from_args` + `HybridModelBuilder`). |
 | `models/qwen35_vl/vision_encoder.py` | Vision forward path and cached position metadata consumption. |
 | `models/qwen35_vl/vision_pos_cache.py` | Grid-derived position/RoPE/cu-seqlens cache. |
 | `observability.py` | Native multimodal NVTX ranges used for MDP-vs-native comparison. |
 | `scripts/run_mdp_experiments.sh` | Reproducible reference launcher and profiling wrapper. |
+
+Supported models (keep in sync with the README support matrix):
+
+| `--model-arch` | Encoder package | Decoder hook | Shape key | Notes |
+|---|---|---|---|---|
+| `qwen35_vl` | `models/qwen35_vl` (ViT, merge 2) | default `build_language_model`; factory pins `rotary_percent`/`rotary_base` | `(t, h, w)`, width 3 | reference model |
+
+Adding a model is a package under `models/<arch>/` plus a registry entry; it
+must not need edits to `pretrain_multimodal.py`, `forward_step.py` or MDP core.
+The decoder is built by the hook *after* the model's vision encoder so the
+init RNG order stays fixed for a given package.
 
 ### Megatron training seams
 

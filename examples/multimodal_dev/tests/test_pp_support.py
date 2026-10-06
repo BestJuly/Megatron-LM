@@ -42,6 +42,7 @@ from megatron.core import parallel_state as ps
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import _allreduce_word_embedding_grads
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -124,19 +125,25 @@ def _build_model(
     # this every rank would build a different vision encoder.
     torch.manual_seed(1234)
     vision = _CountingVisionEncoder(config, HIDDEN, dtype)
-    model = MultimodalModel(
-        language_config=config,
+    language_model = HybridModel(
+        config=config,
         hybrid_stack_spec=hybrid_stack_spec,
-        hybrid_layer_pattern=layer_pattern,
-        vision_encoder=vision,
         vocab_size=VOCAB,
         max_sequence_length=SEQ,
-        image_token_id=IMAGE_TOKEN_ID,
-        position_embedding_type="rope",
-        parallel_output=False,
-        share_embeddings_and_output_weights=share_embeddings_and_output_weights,
+        hybrid_layer_pattern=layer_pattern,
         pre_process=pre_process,
         post_process=post_process,
+        vp_stage=vp_stage,
+        parallel_output=False,
+        share_embeddings_and_output_weights=share_embeddings_and_output_weights,
+        position_embedding_type="rope",
+    )
+    model = MultimodalModel(
+        language_config=config,
+        language_model=language_model,
+        vision_encoder=vision,
+        image_token_id=IMAGE_TOKEN_ID,
+        pre_process=pre_process,
         vp_stage=vp_stage,
     )
     return model.cuda()

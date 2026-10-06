@@ -65,7 +65,19 @@ interprets (`adapter.shape_key_width` slots). Row arithmetic, attention
 segmentation and geometry validation belong to the adapter; core never assumes a
 `(t, h, w)` patch grid or a spatial merge factor.
 
-Supported: Qwen3.5-VL (one vision encoder), `TP=1`, decoder `CP=1`,
+The decoder is equally opaque. Core touches it only through parameter
+disjointness against the encoder, `len(model)` (VPP chunks), the wrapped native
+schedule and the `finalize_model_grads` token capture. Which decoder runs is the
+model package's choice: `examples/multimodal_dev` builds it through the
+registry's `language_model_builder_fn`, by default `hybrid_config_from_args` +
+`HybridModelBuilder` -- the same path as `pretrain_hybrid.py`, so `--spec` and
+builder-side stack features apply.
+
+| `--model-arch` | Vision encoder | Decoder build path | Status |
+|---|---|---|---|
+| `qwen35_vl` | Qwen3.5 ViT (grid shape key `(t, h, w)`, merge 2) | default hook (`HybridModelBuilder`), RoPE fraction/base pinned | supported |
+
+Supported: one vision encoder per model, `TP=1`, decoder `CP=1`,
 `encoder_cp=1`, native PP/VPP/EP, fully replicated encoder with WORLD ZeRO-1,
 `calculate_per_token_loss=True`, bf16 main path (fp16 covered by
 overflow-union tests), THD packed sequences on both sides, native MCore vision

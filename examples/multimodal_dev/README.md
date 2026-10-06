@@ -15,7 +15,7 @@ multimodal_dev/
 │   └── mock.py              # Mock dataset for end-to-end testing
 ├── models/
 │   ├── __init__.py          # MODEL_REGISTRY — central model registry
-│   ├── base.py              # MultimodalModel base class (vision encoder + HybridModel)
+│   ├── base.py              # MultimodalModel (vision encoder + built decoder), default decoder hook
 │   ├── vision_base.py       # VisionCollateSpec, BaseGridVisionAdapter (shared MDP plumbing)
 │   └── qwen35_vl/           # Qwen3.5-VL architecture
 │       ├── factory.py       # Factory functions for pretrain entry point
@@ -166,6 +166,8 @@ is delegated to factory functions registered in `MODEL_REGISTRY`
 - Building `language_config` from Megatron CLI args
 - Constructing `vision_config` via the registry
 - Applying vision recompute and dtype propagation
+- Binding the registry's decoder hook (`language_model_builder_fn`) to the
+  stage placement and passing it to the model factory
 - Routing to model and dataset factories
 
 The `forward_step` is also model-agnostic — it uses the model's
@@ -224,19 +226,34 @@ def set_vision_flops_metadata(args, language_config, vision_config):
     args.count_vision_model_flops = True
     # ... set dimension fields for FLOPs calculation
 
-def build_model(args, language_config, vision_config, **kwargs):
-    """(Required) Build and return the complete model instance."""
+def build_model(args, language_config, vision_config, language_model_builder, **kwargs):
+    """(Required) Build and return the complete model instance.
+
+    ``language_model_builder(**config_overrides)`` builds this stage's decoder
+    (registry ``language_model_builder_fn``; default ``HybridModelBuilder``,
+    so ``--spec`` and builder-side features apply). Never construct
+    ``HybridModel(...)`` here -- it would silently drop whatever the builder
+    adds. Pass only architectural constants as overrides.
+    """
     from .model import LlavaNextModel
-    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 
     return LlavaNextModel(
         language_config=language_config,
-        hybrid_stack_spec=hybrid_stack_spec,
-        hybrid_layer_pattern=args.hybrid_layer_pattern,
+        # Build the vision encoder first, then call the builder: the order
+        # fixes the parameter-initialization RNG stream.
+        language_model_builder=lambda: language_model_builder(rotary_base=1_000_000),
         vision_config=vision_config,
+        pre_process=kwargs.get("pre_process", True),
+        vp_stage=kwargs.get("vp_stage"),
         # ... model-specific args
     )
 ```
+
+`MultimodalModel(language_config, language_model, vision_encoder,
+image_token_id, pre_process, vp_stage)` wraps an already-built decoder; any
+decoder that accepts `decoder_input` / `input_ids` / `position_ids` /
+`packed_seq_params` / `labels` and exposes `embedding` works (`HybridModel`,
+`GPTModel`).
 
 ### Step 3 — Register in `MODEL_REGISTRY`
 
@@ -312,7 +329,8 @@ torchrun --nproc_per_node=8 multimodal_dev/pretrain_multimodal.py \
 
 | Field | Required | Signature |
 |-------|----------|-----------|
-| `model_factory_fn` | Yes | `(args, language_config, vision_config, **kwargs) -> MegatronModule` |
+| `model_factory_fn` | Yes | `(args, language_config, vision_config, pre_process, post_process, language_model_builder, **kwargs) -> MegatronModule` |
+| `language_model_builder_fn` | No | `(args, language_config, *, pre_process, post_process, vp_stage, pg_collection, **config_overrides) -> decoder`; default `models.base.build_language_model` |
 | `vision_config_fn` | Yes | `(num_layers_override=None) -> TransformerConfig` |
 | `post_language_config_fn` | No | `(language_config, args) -> None` |
 | `vision_flops_fn` | No | `(args, language_config, vision_config) -> None` |
