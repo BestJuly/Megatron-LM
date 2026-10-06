@@ -20,9 +20,10 @@ def _item(sample_id, ordinal, grid, payload_row_start, positions=None):
     return CapturedVisionItem(
         sample_id=sample_id,
         image_ordinal=ordinal,
-        grid_thw=grid,
+        shape_key=grid,
         payload_row_start=payload_row_start,
         payload_rows=t * h * w,
+        output_rows=output_rows,
         decoder_positions=(
             tuple(range(100, 100 + output_rows)) if positions is None else positions
         ),
@@ -47,7 +48,8 @@ def _microbatch(items, total_rows, sentinel_base=0.0):
 
 class _StubAdapter:
     payload_width = 4
-    spatial_merge_size = MERGE
+    shape_key_width = 3
+    output_hidden_size = 8
 
     def __init__(self, microbatches):
         self._microbatches = list(microbatches)
@@ -60,6 +62,18 @@ class _StubAdapter:
 
     def estimate_cost(self, item):
         return item.payload_rows
+
+    def validate_item(self, item):
+        """Stand-in for a real adapter's geometry rule: (t,h,w) with merge=2."""
+        t, h, w = item.shape_key
+        if h % MERGE or w % MERGE:
+            raise MdpConfigurationError(
+                f"MDP: item {item.shape_key} violates: h and w divisible by {MERGE}."
+            )
+        if t * h * w != item.payload_rows:
+            raise MdpConfigurationError(
+                f"MDP: item {item.shape_key} violates: payload_rows == t*h*w."
+            )
 
 
 def _default_microbatches():

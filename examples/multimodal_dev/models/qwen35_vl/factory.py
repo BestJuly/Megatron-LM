@@ -32,9 +32,15 @@ def post_language_config(language_config, args):
 
 
 def set_vision_flops_metadata(args, language_config, vision_config):
-    """Expose Qwen3.5-VL vision-model dimensions for FLOPs estimation."""
+    """Expose Qwen3.5-VL vision-model dimensions for FLOPs estimation.
+
+    Only dimensions and shape flags live here. The per-batch row counts the
+    formula needs (patch rows, packed-attention ``L^2``, merged rows) are
+    measured at collate time through ``VisionCollateSpec.workload_of``; nothing
+    downstream reads these attributes to derive geometry.
+    """
+    merge = VISION_KWARGS["spatial_merge_size"]
     args.count_vision_model_flops = True
-    args.vision_flops_variant = "qwen35_vl_v2"
     args.vision_num_layers = vision_config.num_layers
     args.vision_hidden_size = vision_config.hidden_size
     args.vision_ffn_hidden_size = vision_config.ffn_hidden_size
@@ -43,8 +49,12 @@ def set_vision_flops_metadata(args, language_config, vision_config):
     args.vision_in_channels = VISION_KWARGS["in_channels"]
     args.vision_patch_size = VISION_KWARGS["patch_size"]
     args.vision_temporal_patch_size = VISION_KWARGS["temporal_patch_size"]
-    args.vision_spatial_merge_size = VISION_KWARGS["spatial_merge_size"]
     args.vision_out_hidden_size = language_config.hidden_size
+    # Plain (non-gated) GELU MLP, and a two-layer merger over the concatenated
+    # m x m patch window.
+    args.vision_gated_mlp = False
+    args.vision_merge_dim = vision_config.hidden_size * merge * merge
+    args.vision_merger_hidden_size = args.vision_merge_dim
 
 
 def build_model(

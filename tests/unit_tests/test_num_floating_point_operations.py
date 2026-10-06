@@ -1628,8 +1628,10 @@ def _add_vision_args(args, *, num_layers=27):
     args.vision_in_channels = 3
     args.vision_patch_size = 16
     args.vision_temporal_patch_size = 2
-    args.vision_spatial_merge_size = 2
     args.vision_out_hidden_size = 2048
+    args.vision_gated_mlp = False
+    args.vision_merge_dim = 1152 * 2 * 2
+    args.vision_merger_hidden_size = 1152 * 2 * 2
     return args
 
 
@@ -1649,7 +1651,11 @@ class TestVisionEncoderFlops:
         args = _make_gpt_args()
         baseline = num_floating_point_operations(args, 8)
         with_stats = num_floating_point_operations(
-            args, 8, vision_patch_rows_in_batch=12345, vision_attn_squared_sum_in_batch=678
+            args,
+            8,
+            vision_patch_rows_in_batch=12345,
+            vision_attn_squared_sum_in_batch=678,
+            vision_output_rows_in_batch=90,
         )
         assert baseline == with_stats
 
@@ -1662,22 +1668,24 @@ class TestVisionEncoderFlops:
 
     def test_vision_term_matches_closed_form(self):
         args = _add_vision_args(_make_gpt_args())
-        # One item, grid (t=1, h=8, w=8): 64 patch rows, one attention chunk.
-        rows, attn_sq = 64, 64**2
+        # One item, grid (t=1, h=8, w=8): 64 patch rows, one attention chunk,
+        # 16 rows out after a 2x2 spatial merge.
+        rows, attn_sq, merged = 64, 64**2, 16
         language_only = num_floating_point_operations(args, 8)
         total = num_floating_point_operations(
             args,
             8,
             vision_patch_rows_in_batch=rows,
             vision_attn_squared_sum_in_batch=attn_sq,
+            vision_output_rows_in_batch=merged,
         )
 
-        h, m = args.vision_hidden_size, args.vision_spatial_merge_size
+        h = args.vision_hidden_size
         p = args.vision_kv_channels * args.vision_num_attention_heads / h
         patch_in = args.vision_in_channels * args.vision_temporal_patch_size * (
             args.vision_patch_size**2
         )
-        merge_dim = h * m * m
+        merge_dim = args.vision_merge_dim
         expected = 3 * (
             2 * rows * patch_in * h
             + args.vision_num_layers
@@ -1686,37 +1694,77 @@ class TestVisionEncoderFlops:
                 + 4 * attn_sq * h * p
                 + 4 * rows * h * args.vision_ffn_hidden_size
             )
-            + 2
-            * (rows / (m * m))
-            * (merge_dim * merge_dim + merge_dim * args.vision_out_hidden_size)
+            + 2 * merged * (merge_dim * merge_dim + merge_dim * args.vision_out_hidden_size)
         )
         assert total - language_only == pytest.approx(expected, rel=1e-12)
+
+    def test_gated_vision_mlp_adds_one_matrix(self):
+        """SwiGLU vision MLPs (DeepSeek-V4, GLM) have three matrices, not two."""
+        args = _add_vision_args(_make_gpt_args())
+        rows, attn_sq, merged = 64, 0, 16
+        kwargs = dict(
+            vision_patch_rows_in_batch=rows,
+            vision_attn_squared_sum_in_batch=attn_sq,
+            vision_output_rows_in_batch=merged,
+        )
+        plain = num_floating_point_operations(args, 8, **kwargs)
+        args.vision_gated_mlp = True
+        gated = num_floating_point_operations(args, 8, **kwargs)
+        extra = (
+            3
+            * args.vision_num_layers
+            * 2
+            * rows
+            * args.vision_hidden_size
+            * args.vision_ffn_hidden_size
+        )
+        assert gated - plain == pytest.approx(extra, rel=1e-12)
+
+    def test_merged_rows_are_reported_not_derived(self):
+        """Merge policies that are not exact (ceil division under padding,
+        temporal pooling) must not be reconstructed from a merge factor."""
+        args = _add_vision_args(_make_gpt_args())
+        kwargs = dict(
+            vision_patch_rows_in_batch=64, vision_attn_squared_sum_in_batch=0
+        )
+        few = num_floating_point_operations(args, 8, vision_output_rows_in_batch=8, **kwargs)
+        many = num_floating_point_operations(args, 8, vision_output_rows_in_batch=16, **kwargs)
+        assert many > few
 
     def test_vision_term_scales_linearly_in_rows(self):
         """Token-linear terms double with rows; the L^2 term is separate."""
         args = _add_vision_args(_make_gpt_args())
         base = num_floating_point_operations(args, 8)
         one = num_floating_point_operations(
-            args, 8, vision_patch_rows_in_batch=64, vision_attn_squared_sum_in_batch=0
+            args,
+            8,
+            vision_patch_rows_in_batch=64,
+            vision_attn_squared_sum_in_batch=0,
+            vision_output_rows_in_batch=16,
         )
         two = num_floating_point_operations(
-            args, 8, vision_patch_rows_in_batch=128, vision_attn_squared_sum_in_batch=0
+            args,
+            8,
+            vision_patch_rows_in_batch=128,
+            vision_attn_squared_sum_in_batch=0,
+            vision_output_rows_in_batch=32,
         )
         assert (two - base) == pytest.approx(2 * (one - base), rel=1e-12)
 
     def test_accumulator_roundtrip(self):
         """``update_vision_stats`` accumulates and drains like its seqlen twin."""
-        assert consume_vision_stats_in_iteration() == (None, None)
-        update_vision_stats(64, 64**2)
-        update_vision_stats(16, 16**2)
-        assert consume_vision_stats_in_iteration() == (80, 64**2 + 16**2)
+        assert consume_vision_stats_in_iteration() == (None, None, None)
+        update_vision_stats(64, 64**2, 16)
+        update_vision_stats(16, 16**2, 4)
+        assert consume_vision_stats_in_iteration() == (80, 64**2 + 16**2, 20)
         # Draining resets: a second consume reports "no vision work".
-        assert consume_vision_stats_in_iteration() == (None, None)
+        assert consume_vision_stats_in_iteration() == (None, None, None)
 
     def test_reset_discards_eval_contribution(self):
-        update_vision_stats(64, 4096)
+        update_vision_stats(64, 4096, 16)
         reset_vision_stats_in_iteration()
-        assert consume_vision_stats_in_iteration() == (None, None)
+        assert consume_vision_stats_in_iteration() == (None, None, None)
+
 
 def _make_dsa_args(dsa_indexer_loss_coeff=0.01, dsa_indexer_use_sparse_loss=False):
     """Minimal MLA + DSA args (GLM-5.2 style, small scale).

@@ -6,6 +6,22 @@
 behavior is injected through :class:`MdpModelAdapter`. Pixel slicing and
 descriptor assembly are pure data transformations and belong in core (the
 window), not in the adapter.
+
+Core is deliberately blind to vision geometry. It moves rows between ranks and
+never interprets what a row means, so every item is described to core by four
+integers plus an opaque ``shape_key``:
+
+* ``payload_rows``  -- rows of the flat pixel payload (PIXEL transport size);
+* ``output_rows``   -- rows the encoder emits (EMBEDDING/GRADIENT transport size
+  and endpoint leaf size), computed by the adapter, never by core;
+* ``estimated_cost_units`` -- an integer LPT ordering key;
+* ``shape_key``     -- a fixed-width tuple of non-negative integers that the
+  adapter alone interprets. Core ships it over the wire and folds it into the
+  plan digest so a producer can rebuild encoder metadata for items whose pixels
+  were materialized on another rank.
+
+For a patch-grid ViT the shape key is ``(t, h, w)``; nothing in core requires
+that reading.
 """
 
 from dataclasses import dataclass
@@ -27,17 +43,21 @@ class CapturedVisionItem:
     """One vision item as captured from the model's native collation.
 
     ``payload_row_start/payload_rows`` index rows of the microbatch's
-    ``flat_pixel_payload``. ``decoder_positions`` are absolute token offsets in the
-    current decoder microbatch THD ``[1, T_dec]`` (following the physical layout in
-    ``cu_seqlens_q_padded`` when alignment padding exists); they stay endpoint-local
-    and never enter descriptors, routes, or the plan.
+    ``flat_pixel_payload``. ``output_rows`` is the adapter's own count of the rows
+    its encoder will emit for this item; core uses it verbatim to size transports
+    and the endpoint leaf. ``shape_key`` is opaque to core (see the module
+    docstring). ``decoder_positions`` are absolute token offsets in the current
+    decoder microbatch THD ``[1, T_dec]`` (following the physical layout in
+    ``cu_seqlens_q_padded`` when alignment padding exists); they stay
+    endpoint-local and never enter descriptors, routes, or the plan.
     """
 
     sample_id: int
     image_ordinal: int
-    grid_thw: tuple
+    shape_key: tuple
     payload_row_start: int
     payload_rows: int
+    output_rows: int
     decoder_positions: tuple
 
 
@@ -66,8 +86,9 @@ class VisionDescriptor:
 
     Invariants: ``global_item_id`` is stable and unique within its outer-DP
     planning group; ``estimated_cost_units`` is a non-negative integer used only
-    for ordering and never sizes a buffer; for spatial merge size ``m``,
-    ``payload_rows == t*h*w`` and ``output_rows == t*(h/m)*(w/m)``.
+    for ordering and never sizes a buffer; ``payload_rows`` and ``output_rows``
+    are positive; ``shape_key`` holds exactly ``adapter.shape_key_width``
+    non-negative integers.
 
     ``owner_worker_id`` is the logical worker holding this item's pixels at
     dispatch time: ``microbatch_id % num_workers``.
@@ -81,15 +102,21 @@ class VisionDescriptor:
     estimated_cost_units: int
     payload_rows: int
     output_rows: int
-    grid_thw: tuple
+    shape_key: tuple
     owner_worker_id: int
 
 
 class MdpModelAdapter(Protocol):
     """Everything model-specific MDP core needs, and nothing more."""
 
+    #: Trailing width of one flat pixel payload row.
     payload_width: int
-    spatial_merge_size: int
+    #: Number of int64 slots one ``shape_key`` occupies on the descriptor wire.
+    shape_key_width: int
+    #: Hidden width of one encoder output row; sizes the EMBEDDING/GRADIENT
+    #: buffers and the endpoint leaf. Usually the decoder hidden size, because
+    #: the modality projector is the last stage of the encoder.
+    output_hidden_size: int
 
     def get_batch(self, data_iterator: Iterator) -> Optional[CapturedMicrobatch]:
         """Reuse native model collation for one microbatch."""
@@ -97,6 +124,19 @@ class MdpModelAdapter(Protocol):
 
     def estimate_cost(self, item: CapturedVisionItem) -> int:
         """Integer ordering cost for LPT; must never size any buffer."""
+        ...
+
+    def validate_item(self, item: CapturedVisionItem) -> None:
+        """Model-specific geometry check for one captured item.
+
+        Called by the window before any distributed transport, once per item, on
+        every worker. Core has already checked the model-independent invariants
+        (ordering, positive row counts, payload interval inside the flat
+        payload, ``len(shape_key) == shape_key_width``); this hook owns whatever
+        relates ``shape_key`` to ``payload_rows``/``output_rows`` for this model.
+        Raise :class:`~megatron.core.mdp.errors.MdpConfigurationError` on
+        violation.
+        """
         ...
 
     def build_encoder(
@@ -110,12 +150,13 @@ class MdpModelAdapter(Protocol):
     ) -> "Tensor":
         """Run encoder forward on one already-rebased chunk sub-layout.
 
-        The adapter reads the ordered ``grid_thw`` from ``layout.segments`` and
+        The adapter reads the ordered ``shape_key`` from ``layout.segments`` and
         constructs a vision-only ``PackedSeqParams(qkv_format="thd")``; it must
         never read or reuse the decoder ``PackedSeqParams``, and it is unaware
-        that chunking exists. In the default training mode the return value
-        stays graph-connected; in complete-encoder recompute mode core first
-        calls it under ``no_grad`` in P2 and then calls it again with gradients
-        enabled in P5. Only detached views cross the EMBEDDING bridge.
+        that chunking exists. The return value must have exactly
+        ``layout.total_output_rows`` rows. In the default training mode the
+        return value stays graph-connected; in complete-encoder recompute mode
+        core first calls it under ``no_grad`` in P2 and then calls it again with
+        gradients enabled in P5. Only detached views cross the EMBEDDING bridge.
         """
         ...

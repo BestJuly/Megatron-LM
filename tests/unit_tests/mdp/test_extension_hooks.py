@@ -160,7 +160,8 @@ def test_full_iteration_at_row_alignment_16():
 
     runtime.config = MdpConfig(enable=True, row_alignment=16)
     runtime.planner = MdpPlanner(
-        view, locality_slack_permille=10, capacity_policy=policy
+        view, locality_slack_permille=10, capacity_policy=policy,
+        shape_key_width=3,
     )
 
     replay = runtime.begin_iteration(

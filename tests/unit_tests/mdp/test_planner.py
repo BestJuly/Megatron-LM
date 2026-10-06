@@ -35,7 +35,7 @@ def _descriptor(item_id, cost, mb=0, sample=None, ordinal=0, grid=(1, 4, 4), lan
         estimated_cost_units=cost,
         payload_rows=t * h * w,
         output_rows=t * (h // 2) * (w // 2),
-        grid_thw=grid,
+        shape_key=grid,
         owner_worker_id=0,
     )
 
@@ -45,6 +45,7 @@ def _planner(slack=10, alignment=1, view=None):
         view or _view(),
         locality_slack_permille=slack,
         capacity_policy=RowCapacityPolicy(alignment_rows=alignment),
+        shape_key_width=3,
     )
 
 
@@ -122,7 +123,7 @@ def test_text_only_microbatch_gets_empty_layout():
 
 def test_producer_layout_offsets_are_valid_row_cumulative():
     # The encoder consumes a contiguous pack whose frame boundaries derive
-    # from grid_thw alone, so segment offsets accumulate valid rows even
+    # from shape_key alone, so segment offsets accumulate valid rows even
     # under a non-trivial capacity policy; capacity sizes buffers only.
     descriptors = [_descriptor(0, cost=10), _descriptor(1, cost=9)]
     single_worker = _view(worker_ids=(0,), group=(0,))
@@ -153,6 +154,9 @@ def test_cross_microbatch_packing_in_one_producer():
     [
         (lambda d: [d[0], d[0]], "unique"),
         (lambda d: [_descriptor(0, cost=-1)], "non-negative"),
+        # Model geometry is the adapter's business (checked in the window), but
+        # the planner still guards the invariants it depends on: positive row
+        # counts and a shape key of the width it will pack into the digest.
         (
             lambda d: [
                 VisionDescriptor(
@@ -162,13 +166,30 @@ def test_cross_microbatch_packing_in_one_producer():
                     owner_dp_lane=0,
                     microbatch_id=0,
                     estimated_cost_units=1,
-                    payload_rows=99,
+                    payload_rows=0,
                     output_rows=4,
-                    grid_thw=(1, 4, 4),
+                    shape_key=(1, 4, 4),
                     owner_worker_id=0,
                 )
             ],
-            "t\\*h\\*w",
+            "positive",
+        ),
+        (
+            lambda d: [
+                VisionDescriptor(
+                    global_item_id=0,
+                    sample_id=0,
+                    image_ordinal=0,
+                    owner_dp_lane=0,
+                    microbatch_id=0,
+                    estimated_cost_units=1,
+                    payload_rows=16,
+                    output_rows=4,
+                    shape_key=(4, 4),
+                    owner_worker_id=0,
+                )
+            ],
+            "slots",
         ),
         (lambda d: [_descriptor(0, cost=1, mb=5)], "microbatch"),
         (lambda d: [_descriptor(0, cost=1, lane=3)], "outer-DP"),

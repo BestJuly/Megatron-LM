@@ -70,7 +70,8 @@ class _StubAdapter:
     """Deterministic capture: two microbatches, three items in mb0, mb1 text-only."""
 
     payload_width = WIDTH
-    spatial_merge_size = MERGE
+    shape_key_width = 3
+    output_hidden_size = WIDTH
 
     def __init__(self, lane):
         self._lane = lane if lane is not None else 0
@@ -95,9 +96,10 @@ class _StubAdapter:
                 CapturedVisionItem(
                     sample_id=index,
                     image_ordinal=0,
-                    grid_thw=grid,
+                    shape_key=grid,
                     payload_row_start=payload_start,
                     payload_rows=rows,
+                    output_rows=output_rows,
                     decoder_positions=tuple(range(output_rows)),
                 )
             )
@@ -115,6 +117,11 @@ class _StubAdapter:
 
     def estimate_cost(self, item):
         return item.payload_rows
+
+    def validate_item(self, item):
+        t, h, w = item.shape_key
+        assert item.payload_rows == t * h * w
+        assert item.output_rows == t * (h // MERGE) * (w // MERGE)
 
     def build_encoder(self, model_config, *, pg_collection):
         return _TinyEncoder(model_config)
@@ -178,11 +185,12 @@ def _build_runtime():
             view,
             locality_slack_permille=config.locality_slack_permille,
             capacity_policy=RowCapacityPolicy(config.row_alignment),
+            shape_key_width=adapter.shape_key_width,
         ),
         bridge=ModalityBridge(allocator),
         storage=MdpEmbeddingStorage(allocator),
         allocator=allocator,
-        hidden_size=WIDTH,
+        output_hidden_size=WIDTH,
         params_dtype=torch.float32,
         num_vpp_chunks=1,
     )

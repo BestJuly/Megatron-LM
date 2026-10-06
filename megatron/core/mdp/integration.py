@@ -281,12 +281,16 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
             rank_view,
             locality_slack_permille=mdp_config.locality_slack_permille,
             capacity_policy=RowCapacityPolicy(mdp_config.row_alignment),
+            shape_key_width=adapter.shape_key_width,
             pixel_locality=mdp_config.pixel_locality,
         ),
         bridge=ModalityBridge(allocator),
         storage=MdpEmbeddingStorage(allocator),
         allocator=allocator,
-        hidden_size=args.hidden_size,
+        # The encoder's own output width, not the decoder's: the modality
+        # projector is the last stage of the encoder, so the adapter is the only
+        # thing that knows how wide an embedding row is.
+        output_hidden_size=adapter.output_hidden_size,
         params_dtype=params_dtype,
         num_vpp_chunks=len(model),
         greedy_token_budget=greedy_token_budget,
