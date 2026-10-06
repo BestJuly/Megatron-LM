@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Encoder forward-handle and encoder THD params tests (CPU only)."""
+"""Encoder forward-handle tests (CPU only)."""
 
 from contextlib import contextmanager
 
@@ -11,9 +11,7 @@ from megatron.core.mdp.activation import (
     EncoderForwardHandle,
     EncoderOutputMetadata,
     EncoderWholeRecomputeHandle,
-    build_encoder_packed_seq_params,
 )
-from megatron.core.mdp.allocator import DirectBufferAllocator
 from megatron.core.mdp.errors import MdpStateError
 from megatron.core.mdp.plan import EncoderThdLayout, EncoderThdSegment, split_encoder_layout
 
@@ -29,7 +27,7 @@ def _segment(item_id, grid, payload_start, output_start):
         payload_rows=t * h * w,
         output_row_start=output_start,
         output_rows=t * (h // 2) * (w // 2),
-        grid_thw=grid,
+        shape_key=grid,
     )
 
 
@@ -44,24 +42,13 @@ def _layout():
     return EncoderThdLayout(producer_worker_id=0, segments=tuple(segments))
 
 
-def test_encoder_packed_seq_params_from_segments():
+def test_layout_carries_shape_keys_for_the_adapter():
+    """Core stores the shape keys verbatim; building the vision
+    ``PackedSeqParams`` from them is the adapter's job inside ``encode``."""
     layout = _layout()
-    params = build_encoder_packed_seq_params(
-        layout.segments, allocator=DirectBufferAllocator(), device=torch.device("cpu")
-    )
-    assert params.qkv_format == "thd"
-    # Frames: (1,4,4)->16; (2,4,8)->32,32; (1,8,8)->64.
-    assert params.cu_seqlens_q.tolist() == [0, 16, 48, 80, 144]
-    assert params.cu_seqlens_q is params.cu_seqlens_kv
-    assert params.max_seqlen_q == 64
-
-
-def test_empty_segments_yield_zero_params():
-    params = build_encoder_packed_seq_params(
-        (), allocator=DirectBufferAllocator(), device=torch.device("cpu")
-    )
-    assert params.cu_seqlens_q.tolist() == [0]
-    assert params.max_seqlen_q == 0
+    assert [s.shape_key for s in layout.segments] == [(1, 4, 4), (2, 4, 8), (1, 8, 8)]
+    assert layout.total_payload_rows == 16 + 64 + 64
+    assert layout.total_output_rows == 4 + 16 + 16
 
 
 def _run_encoder(weight, payload_rows_list, seed=0):

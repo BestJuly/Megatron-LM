@@ -15,6 +15,7 @@ Run with::
 
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -25,10 +26,14 @@ if _REPO_ROOT not in sys.path:
 
 from examples.multimodal_dev.data.mdp_mock import MdpThdMockDataset, item_sentinel
 from examples.multimodal_dev.forward_step import build_vision_sidecar, pack_or_pad_batch
+from examples.multimodal_dev.models.qwen35_vl.mdp_adapter import build_collate_spec
 from tests.unit_tests.test_utilities import Utils
 
 IMAGE_TOKEN_ID = 248056
 MERGE = 2
+# The collator no longer reads loose ``args.vision_*`` attributes; a model's
+# geometry reaches it only through the registry-provided spec.
+SPEC = build_collate_spec(SimpleNamespace(image_token_id=IMAGE_TOKEN_ID))
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -70,7 +75,10 @@ def test_sidecar_metadata_and_sentinels():
     text_only_position = indices.index(text_only)
     batch = _batch(indices, dataset)
     packed = pack_or_pad_batch(
-        [dict(s) for s in batch], use_packed_sequence=True, with_vision_sidecar=True
+        [dict(s) for s in batch],
+        use_packed_sequence=True,
+        with_vision_sidecar=True,
+        vision_collate_spec=SPEC,
     )
     meta = packed["vision_item_meta"].cpu()
     positions = packed["vision_decoder_positions"].cpu()
@@ -78,7 +86,7 @@ def test_sidecar_metadata_and_sentinels():
     pixels = packed["pixel_values"].cpu()
 
     expected_items = sum(int(s["image_grid_thw"].shape[0]) for s in batch)
-    assert meta.shape == (expected_items, 6)
+    assert meta.shape == (expected_items, 3 + SPEC.shape_key_width)
     # Ordered by (sample_index, image_ordinal).
     order = [(int(r[0]), int(r[1])) for r in meta]
     assert order == sorted(order)
@@ -88,7 +96,9 @@ def test_sidecar_metadata_and_sentinels():
 
     position_cursor = 0
     for row in meta:
-        sample_index, ordinal, t, h, w, payload_row_start = (int(v) for v in row)
+        # Row layout: fixed prefix, then the model's shape key.
+        sample_index, ordinal, payload_row_start = (int(v) for v in row[:3])
+        t, h, w = (int(v) for v in row[3:])
         payload_rows = t * h * w
         output_rows = t * (h // MERGE) * (w // MERGE)
         # Sentinel round-trip: the packed pixel slice is exactly this item.
@@ -119,6 +129,7 @@ def test_sidecar_positions_follow_the_alignment_tail():
         use_packed_sequence=True,
         pad_to_multiple=align,
         with_vision_sidecar=True,
+        vision_collate_spec=SPEC,
     )
     params = packed["packed_seq_params"]
     # A tail has to exist, or this says nothing test_sidecar_metadata_and_sentinels
@@ -140,12 +151,15 @@ def test_sidecar_positions_respect_interleaved_text():
     )
     batch = _batch([index], dataset)
     packed = pack_or_pad_batch(
-        [dict(s) for s in batch], use_packed_sequence=True, with_vision_sidecar=True
+        [dict(s) for s in batch],
+        use_packed_sequence=True,
+        with_vision_sidecar=True,
+        vision_collate_spec=SPEC,
     )
     meta = packed["vision_item_meta"].cpu()
     positions = packed["vision_decoder_positions"].cpu()
     assert meta.shape[0] == len(grids)
-    t0, h0, w0 = (int(v) for v in meta[0][2:5])
+    t0, h0, w0 = (int(v) for v in meta[0][3:6])
     first_rows = t0 * (h0 // MERGE) * (w0 // MERGE)
     first_end = int(positions[first_rows - 1])
     second_start = int(positions[first_rows])
@@ -157,9 +171,12 @@ def test_text_only_batch_produces_empty_sidecar():
     text_only = next(i for i, (grids, _) in enumerate(dataset.scenarios) if not grids)
     batch = _batch([text_only], dataset)
     packed = pack_or_pad_batch(
-        [dict(s) for s in batch], use_packed_sequence=True, with_vision_sidecar=True
+        [dict(s) for s in batch],
+        use_packed_sequence=True,
+        with_vision_sidecar=True,
+        vision_collate_spec=SPEC,
     )
-    assert packed["vision_item_meta"].shape == (0, 6)
+    assert packed["vision_item_meta"].shape == (0, 3 + SPEC.shape_key_width)
     assert packed["vision_decoder_positions"].numel() == 0
     assert packed["pixel_values"].shape[0] == 0
 
@@ -172,9 +189,7 @@ def _sidecar(batch):
     cu = [0]
     for length in lengths:
         cu.append(cu[-1] + length)
-    return build_vision_sidecar(
-        batch, cu, image_token_id=IMAGE_TOKEN_ID, spatial_merge_size=MERGE
-    )
+    return build_vision_sidecar(batch, cu, SPEC)
 
 
 def test_guard_pixel_grid_all_or_nothing():
@@ -187,7 +202,7 @@ def test_guard_pixel_grid_all_or_nothing():
 def test_guard_pixel_rows_match_grids():
     sample = dict(MdpThdMockDataset(num_samples=8)[0])
     sample["pixel_values"] = sample["pixel_values"][:-1]
-    with pytest.raises(ValueError, match="sum\\(t\\*h\\*w\\)"):
+    with pytest.raises(ValueError, match="sum\\(payload_rows_of"):
         _sidecar([sample])
 
 
@@ -207,3 +222,22 @@ def test_guard_grid_divisible_by_merge():
     sample["image_grid_thw"] = torch.tensor([[1, 3, 8]], dtype=torch.long)
     with pytest.raises(ValueError, match="divisible by spatial_merge_size"):
         _sidecar([sample])
+
+
+def test_collate_spec_cache_keeps_args_picklable():
+    """Megatron pickles ``args`` into every checkpoint; the resolved collate spec
+    holds closures and must never be stored on it."""
+    import argparse
+    import pickle
+
+    from examples.multimodal_dev.mdp_adapter import build_vision_collate_spec
+
+    args = argparse.Namespace(model_arch="qwen35_vl", image_token_id=248056)
+    spec = build_vision_collate_spec(args)
+    assert build_vision_collate_spec(args) is spec  # memoized
+    assert vars(args) == {"model_arch": "qwen35_vl", "image_token_id": 248056}
+    pickle.dumps(args)
+
+    other = argparse.Namespace(model_arch="qwen35_vl", image_token_id=17)
+    assert build_vision_collate_spec(other).image_token_id == 17
+    assert build_vision_collate_spec(args).image_token_id == 248056

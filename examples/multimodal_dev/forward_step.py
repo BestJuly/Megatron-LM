@@ -201,43 +201,52 @@ def accumulate_flops_stats(packed_seq_params, real_cu_seqlens=None) -> None:
     update_seqlen_stats_from_cu_seqlens(cu_seqlens)
 
 
-def accumulate_vision_flops_stats_from_grids(grid_thw) -> None:
-    """Report one micro-batch's vision work from a ``[N, 3]`` ``grid_thw``.
+def accumulate_vision_flops_stats(shape_keys) -> None:
+    """Report one micro-batch's vision work from a ``[N, shape_key_width]`` tensor.
 
-    Used by the native (in-model encoder) path, where ``image_grid_thw`` is
-    broadcast to every PP stage. Stays on device: the two reductions are fused
-    kernels, no ``.item()``.
+    The per-model arithmetic lives in ``VisionCollateSpec.workload_of``; this
+    function only routes it into the training-loop accumulator. Native and MDP
+    callers pass the same shape keys (device tensor and host tensor
+    respectively), so both arms publish byte-for-byte equivalent statistics.
+    Stays reduction-only: no ``.item()``, no host sync on the device path.
     """
-    if grid_thw is None or grid_thw.numel() == 0:
+    if shape_keys is None or shape_keys.numel() == 0:
         # A text-only DP rank must still enter the global stats reduction.
-        _update_vision_stats(0.0, 0.0)
+        _update_vision_stats(0.0, 0.0, 0.0)
         return
-    t, h, w = grid_thw[:, 0], grid_thw[:, 1], grid_thw[:, 2]
-    frame = (h * w).to(torch.float64)
-    t = t.to(torch.float64)
-    _update_vision_stats((t * frame).sum(), (t * frame * frame).sum())
+    from examples.multimodal_dev.mdp_adapter import build_vision_collate_spec
+
+    spec = build_vision_collate_spec(get_args())
+    rows, attn_squared_sum, output_rows = spec.workload_of(shape_keys)
+    _update_vision_stats(rows, attn_squared_sum, output_rows)
 
 
-def accumulate_vision_flops_stats_from_items(vision_items) -> None:
-    """Report one micro-batch's vision work from MDP's captured vision records.
+def shape_keys_from_batch(batch: Dict[str, Any]) -> Optional[torch.Tensor]:
+    """``[N, shape_key_width]`` shape keys out of a collated batch.
 
-    The MDP replay record carries ``grid_thw`` as plain Python tuples on every
-    rank (only the pixel payload is owner-sharded), so the two sums are computed
-    on the host and added to the device accumulator as scalars. Byte-for-byte
-    the same quantities the native path reports for the same data.
+    The key is the model's, from ``VisionCollateSpec.grid_key``, so a model that
+    names its metadata something other than ``image_grid_thw`` still reports
+    vision work.
     """
-    rows = 0
-    attn_sq = 0
-    for item in vision_items:
-        t, h, w = (int(v) for v in item.grid_thw)
-        frame = h * w
-        rows += t * frame
-        attn_sq += t * frame * frame
-    _update_vision_stats(float(rows), float(attn_sq))
+    from examples.multimodal_dev.mdp_adapter import build_vision_collate_spec
+
+    return batch.get(build_vision_collate_spec(get_args()).grid_key, None)
+
+
+def shape_keys_from_vision_items(vision_items) -> Optional[torch.Tensor]:
+    """``[N, shape_key_width]`` host tensor from MDP's captured vision records.
+
+    The replay record carries ``shape_key`` as plain Python tuples on every rank
+    (only the pixel payload is owner-sharded), so this costs no collective and no
+    device sync.
+    """
+    if not vision_items:
+        return None
+    return torch.tensor([item.shape_key for item in vision_items], dtype=torch.int64)
 
 
 def _accumulate_workload_stats(
-    model, packed_seq_params, *, vision_items=None, image_grid_thw=None, real_cu_seqlens=None
+    model, packed_seq_params, *, shape_keys=None, real_cu_seqlens=None
 ) -> None:
     """Report one micro-batch's decoder and vision work exactly once per rank.
 
@@ -253,19 +262,16 @@ def _accumulate_workload_stats(
         return
 
     accumulate_flops_stats(packed_seq_params, real_cu_seqlens=real_cu_seqlens)
-    if vision_items is not None:
-        accumulate_vision_flops_stats_from_items(vision_items)
-    else:
-        accumulate_vision_flops_stats_from_grids(image_grid_thw)
+    accumulate_vision_flops_stats(shape_keys)
 
 
-def _update_vision_stats(patch_rows, attn_squared_sum) -> None:
+def _update_vision_stats(patch_rows, attn_squared_sum, output_rows) -> None:
     """Forward vision work to the training-loop accumulator (lazy import)."""
     try:
         from megatron.training.training import update_vision_stats
     except ImportError:  # pragma: no cover - training stack unavailable
         return
-    update_vision_stats(patch_rows, attn_squared_sum)
+    update_vision_stats(patch_rows, attn_squared_sum, output_rows)
 
 
 def _build_packed_seq_params(seq_lengths: torch.Tensor, device: torch.device) -> PackedSeqParams:
@@ -311,79 +317,93 @@ def _build_packed_seq_params_from_cu_seqlens(
 def build_vision_sidecar(
     batch: list[Dict[str, Any]],
     cu_seqlens_padded: list[int],
-    image_token_id: int,
-    spatial_merge_size: int,
+    spec: "VisionCollateSpec",
 ) -> Dict[str, torch.Tensor]:
     """Build the per-item vision sidecar for a THD-packed batch.
 
-    For every vision item, records ``(sample_index, image_ordinal, t, h, w,
-    payload_row_start)`` plus that item's decoder image-token positions in the
-    packed ``[1, T]`` layout, ordered by ``(sample_index, image_ordinal)``.
-    Both outputs are plain integer tensors so they survive the TP broadcast.
+    For every vision item, records ``(sample_index, image_ordinal,
+    payload_row_start, *shape_key)`` plus that item's decoder image-token
+    positions in the packed ``[1, T]`` layout, ordered by ``(sample_index,
+    image_ordinal)``. Both outputs are plain integer tensors so they survive the
+    TP broadcast.
+
+    All model geometry comes from *spec* (see
+    :class:`~examples.multimodal_dev.models.vision_base.VisionCollateSpec`); this
+    function knows only that an item has a shape key, a payload row count and an
+    output row count.
 
     Consistency guards (fail the batch rather than silently degrade):
 
-    * pixel data and grid metadata are all-or-nothing per sample;
-    * per-sample pixel rows equal ``sum(t*h*w)`` over its grids;
-    * per-sample image-token slots equal ``sum(t*(h/m)*(w/m))``, so truncation
-      can never leave a cut image block;
-    * every item's token slots are contiguous in the sample.
+    * pixel data and shape metadata are all-or-nothing per sample;
+    * per-sample pixel rows equal ``sum(payload_rows_of(key))``;
+    * per-sample image-token slots equal ``sum(output_rows_of(key))``, so
+      truncation can never leave a cut image block;
+    * every item's token slots are contiguous in the sample, unless the model
+      declares ``require_contiguous_slots=False`` (layouts that interleave
+      separator tokens between an item's vision tokens).
     """
+    from examples.multimodal_dev.models.vision_base import META_PREFIX_COLUMNS
+
     meta_rows = []
     position_chunks = []
     payload_row_start = 0
-    merge = spatial_merge_size
+    width = spec.shape_key_width
     for sample_index, sample in enumerate(batch):
-        grids = sample.get("image_grid_thw")
+        grids = sample.get(spec.grid_key)
         pixels = sample.get("pixel_values")
         num_items = 0 if grids is None else int(grids.shape[0])
         pixel_rows = 0 if pixels is None else int(pixels.shape[0])
         if (num_items == 0) != (pixel_rows == 0):
             raise ValueError(
-                f"sample {sample_index}: pixel data and grid metadata must either both "
+                f"sample {sample_index}: pixel data and shape metadata must either both "
                 f"exist or both be absent (items={num_items}, pixel_rows={pixel_rows})"
             )
         input_ids = sample["input_ids"]
-        image_positions = (input_ids == image_token_id).nonzero(as_tuple=True)[0]
+        image_positions = (input_ids == spec.image_token_id).nonzero(as_tuple=True)[0]
         expected_rows = 0
         expected_slots = 0
+        shape_keys = []
         item_slot_counts = []
         for ordinal in range(num_items):
-            t, h, w = (int(v) for v in grids[ordinal])
-            if h % merge != 0 or w % merge != 0:
+            shape_key = tuple(int(v) for v in grids[ordinal])
+            try:
+                spec.check(shape_key)
+            except ValueError as exc:
                 raise ValueError(
-                    f"sample {sample_index} item {ordinal}: grid ({t},{h},{w}) not "
-                    f"divisible by spatial_merge_size={merge}"
-                )
-            expected_rows += t * h * w
-            item_slot_counts.append(t * (h // merge) * (w // merge))
+                    f"sample {sample_index} item {ordinal}: {exc}"
+                ) from None
+            shape_keys.append(shape_key)
+            expected_rows += spec.payload_rows_of(shape_key)
+            item_slot_counts.append(spec.output_rows_of(shape_key))
             expected_slots += item_slot_counts[-1]
         if expected_rows != pixel_rows:
             raise ValueError(
-                f"sample {sample_index}: pixel rows {pixel_rows} != sum(t*h*w) "
-                f"{expected_rows} over its grids"
+                f"sample {sample_index}: pixel rows {pixel_rows} != "
+                f"sum(payload_rows_of(shape_key)) {expected_rows} over its items"
             )
         if int(image_positions.numel()) != expected_slots:
             raise ValueError(
                 f"sample {sample_index}: {int(image_positions.numel())} image-token "
-                f"slots != sum(t*(h/m)*(w/m)) {expected_slots}; truncation must never "
-                "cut an image-token block"
+                f"slots != sum(output_rows_of(shape_key)) {expected_slots}; truncation "
+                "must never cut an image-token block"
             )
         slot_cursor = 0
         for ordinal in range(num_items):
-            t, h, w = (int(v) for v in grids[ordinal])
+            shape_key = shape_keys[ordinal]
             slots = item_slot_counts[ordinal]
             item_positions = image_positions[slot_cursor : slot_cursor + slots]
             slot_cursor += slots
-            if slots and int(item_positions[-1] - item_positions[0]) != slots - 1:
+            if (
+                spec.require_contiguous_slots
+                and slots
+                and int(item_positions[-1] - item_positions[0]) != slots - 1
+            ):
                 raise ValueError(
                     f"sample {sample_index} item {ordinal}: image-token slots are not "
                     "contiguous"
                 )
-            meta_rows.append(
-                [sample_index, ordinal, t, h, w, payload_row_start]
-            )
-            payload_row_start += t * h * w
+            meta_rows.append([sample_index, ordinal, payload_row_start, *shape_key])
+            payload_row_start += spec.payload_rows_of(shape_key)
             position_chunks.append(item_positions.to(torch.int64) + cu_seqlens_padded[sample_index])
     if meta_rows:
         return {
@@ -391,7 +411,9 @@ def build_vision_sidecar(
             "vision_decoder_positions": torch.cat(position_chunks),
         }
     return {
-        "vision_item_meta": torch.empty(0, 6, dtype=torch.int64),
+        "vision_item_meta": torch.empty(
+            0, META_PREFIX_COLUMNS + width, dtype=torch.int64
+        ),
         "vision_decoder_positions": torch.empty(0, dtype=torch.int64),
     }
 def seqlen_alignment_factor(tp_size: int, cp_size: int, sequence_parallel: bool) -> int:
@@ -414,8 +436,14 @@ def pack_or_pad_batch(
     include_pixel_values: bool = True,
     pad_to_multiple: Optional[int] = None,
     with_vision_sidecar: bool = False,
+    vision_collate_spec=None,
 ) -> Dict[str, Any]:
     """Pack or pad a ``[B, S]`` batch into ``[1, T]`` THD or ``[B, S]`` BSHD.
+
+    ``vision_collate_spec`` supplies the model geometry for the vision sidecar;
+    when omitted it is resolved from ``--model-arch`` through the registry.
+    Callers outside a training run (tests) must pass it explicitly -- there is no
+    default geometry, because a wrong one corrupts the sidecar silently.
 
     Must be invoked on every TP rank. On the TP source rank ``batch`` is
     the per-sample dict list from the dataset; on other TP ranks ``batch``
@@ -627,20 +655,17 @@ def pack_or_pad_batch(
                 loss_mask_list = [_packed_field("loss_mask", 0)]
 
             if with_vision_sidecar:
-                try:
-                    args = get_args()
-                    sidecar_image_token_id = getattr(args, "image_token_id", 248056)
-                    sidecar_merge = getattr(args, "vision_spatial_merge_size", None) or 2
-                except AssertionError:
-                    sidecar_image_token_id = 248056
-                    sidecar_merge = 2
+                # The spec is model-specific and comes from the registry, never
+                # from loose ``args.vision_*`` attributes: those are set as a
+                # side effect of the FLOPs-metadata helper and silently default
+                # for any architecture that forgets to set them.
+                spec = vision_collate_spec
+                if spec is None:
+                    from examples.multimodal_dev.mdp_adapter import build_vision_collate_spec
+
+                    spec = build_vision_collate_spec(get_args())
                 packed_batch.update(
-                    build_vision_sidecar(
-                        batch,
-                        cu_seqlens_padded,
-                        image_token_id=sidecar_image_token_id,
-                        spatial_merge_size=sidecar_merge,
-                    )
+                    build_vision_sidecar(batch, cu_seqlens_padded, spec)
                 )
 
             if use_pinned:
@@ -991,7 +1016,7 @@ def mdp_forward_step(runtime, data_iterator, model, return_schedule_plan: bool =
     _accumulate_workload_stats(
         model,
         record.decoder_packed_seq_params,
-        vision_items=record.vision_items,
+        shape_keys=shape_keys_from_vision_items(record.vision_items),
         real_cu_seqlens=batch.get("flops_cu_seqlens"),
     )
 
@@ -1064,7 +1089,7 @@ def forward_step(data_iterator, model, return_schedule_plan: bool = False):
     _accumulate_workload_stats(
         model,
         batch.get("packed_seq_params", None),
-        image_grid_thw=batch.get("image_grid_thw", None),
+        shape_keys=shape_keys_from_batch(batch),
         real_cu_seqlens=batch.get("flops_cu_seqlens"),
     )
 

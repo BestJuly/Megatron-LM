@@ -67,7 +67,10 @@ def add_multimodal_args(parser):
         "--model-arch",
         type=str,
         default="qwen35_vl",
-        help="Model architecture. Available: qwen35_vl",
+        help=(
+            "Model architecture; must be a key of "
+            "examples.multimodal_dev.models.MODEL_REGISTRY."
+        ),
     )
     group.add_argument(
         "--model-variant",
