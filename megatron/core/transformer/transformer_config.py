@@ -2313,10 +2313,16 @@ class TransformerConfig(ModelParallelConfig):
         if self.gdn_kernel_backend not in ("fla", "cudnn"):
             raise ValueError("gdn_kernel_backend must be one of: fla, cudnn.")
 
-        if self.gdn_kernel_backend != "fla" and self.experimental_attention_variant != "gdn":
+        if self.gdn_kernel_backend != "fla" and not (
+            self.experimental_attention_variant == "gdn" or self.has_gated_delta_net_layers
+        ):
+            # Same predicate as gdn_pre_gated_delta_rule_fusion above: the backend is read by
+            # the GatedDeltaNet module itself, so what matters is that GDN layers exist, not the
+            # global variant name (a GDN+QSA hybrid must set that to "qsa").
             raise ValueError(
-                "gdn_kernel_backend is only configurable with "
-                "experimental_attention_variant='gdn'."
+                "gdn_kernel_backend requires a model with GatedDeltaNet layers "
+                "(experimental_attention_variant='gdn', or a hybrid layer pattern "
+                "containing 'G')."
             )
 
         if self.fp8:
