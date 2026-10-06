@@ -301,6 +301,12 @@ attributes; they ask the model. Provide, usually in
 MDP core sees an item only as `payload_rows`, `output_rows`, an LPT cost and
 an opaque `shape_key`; see `megatron/core/mdp/README.md`.
 
+Shared code carries no architecture defaults: `--model-arch` is required and
+`--image-token-id` defaults to `None`, meaning "the architecture's own id".
+Resolve it once in the package (Qwen3.5-VL: `configuration.resolve_image_token_id`)
+and use that everywhere the package needs the id (factory, collate spec,
+datasets).
+
 ### Step 4 — (Optional) Add a dataset provider
 
 Create a dataset module under `data/` if the model needs custom data

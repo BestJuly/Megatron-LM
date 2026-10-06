@@ -11,6 +11,7 @@ from examples.multimodal_dev.models.qwen35_vl.configuration import (
     ROTARY_BASE,
     ROTARY_PERCENT,
     VISION_KWARGS,
+    resolve_image_token_id,
 )
 
 
@@ -152,7 +153,7 @@ def build_model(
         vision_config=vision_config,
         # Under MDP the replicated encoder domain owns the vision weights.
         build_vision_encoder=not getattr(args, "mdp_enable", False),
-        image_token_id=getattr(args, "image_token_id", 248056),
+        image_token_id=resolve_image_token_id(args),
         pre_process=pre_process,
         vp_stage=vp_stage,
     )

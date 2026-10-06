@@ -27,6 +27,7 @@ from examples.multimodal_dev.data.mdp_scenarios import build_scenarios, scenario
 from examples.multimodal_dev.models.qwen35_vl.configuration import (
     QWEN35_VL_IMAGE_TOKEN_ID,
     QWEN35_VL_VISION_START_TOKEN_ID,
+    resolve_image_token_id,
 )
 
 
@@ -223,7 +224,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     scenarios = build_scenarios(length_config=length_config)
     kwargs = dict(
         vocab_size=getattr(args, "padded_vocab_size", 1024),
-        image_token_id=getattr(args, "image_token_id", QWEN35_VL_IMAGE_TOKEN_ID),
+        image_token_id=resolve_image_token_id(args),
         scenarios=scenarios,
     )
     scale = _greedy_sample_scale(args, scenarios)

@@ -42,6 +42,17 @@ ROTARY_BASE: int = 10_000_000
 ROTARY_PERCENT: float = 0.25
 MROPE_SECTION: list = [11, 11, 10]
 
+
+def resolve_image_token_id(args) -> int:
+    """``--image-token-id`` when given, else this architecture's placeholder id.
+
+    The shared CLI default is ``None`` ("the model's own id") so that no
+    architecture's vocabulary leaks into ``arguments.py``; every Qwen3.5-VL
+    consumer (factory, collate spec, datasets) resolves through here.
+    """
+    value = getattr(args, "image_token_id", None)
+    return QWEN35_VL_IMAGE_TOKEN_ID if value is None else int(value)
+
 # ---------------------------------------------------------------------------
 # Vision config
 # ---------------------------------------------------------------------------

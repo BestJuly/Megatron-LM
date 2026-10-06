@@ -70,8 +70,6 @@ from examples.multimodal_dev.models.qwen35_vl.mdp_adapter import (
     build_mdp_adapter as _qwen35_vl_mdp_adapter,
 )
 
-DEFAULT_MODEL_ARCH = "qwen35_vl"
-
 MODEL_REGISTRY = {
     "qwen35_vl": {
         "model_factory_fn": _build_qwen35_vl_model,
@@ -100,7 +98,7 @@ MODEL_REGISTRY = {
 
 def registry_for(args) -> dict:
     """The registry entry selected by ``--model-arch``."""
-    model_arch = getattr(args, "model_arch", None) or DEFAULT_MODEL_ARCH
+    model_arch = getattr(args, "model_arch", None)
     if model_arch not in MODEL_REGISTRY:
         raise ValueError(
             f"Unknown model arch '{model_arch}'. "
