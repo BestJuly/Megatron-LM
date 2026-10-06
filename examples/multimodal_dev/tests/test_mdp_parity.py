@@ -53,6 +53,7 @@ from megatron.core.mdp.protocols import CapturedMicrobatch, CapturedVisionItem
 from megatron.core.mdp.rank_mapping import MdpRankSpec, build_rank_map
 from megatron.core.mdp.runtime import MdpRuntime
 from megatron.core.mdp.storage import MdpEmbeddingStorage
+from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
@@ -149,17 +150,25 @@ def _build_language_model(with_encoder, vision_config):
     # not an encoder was built first.
     torch.manual_seed(1234)
     model_parallel_cuda_manual_seed(1234)
-    model = MultimodalModel(
-        language_config=_language_config(),
-        language_spec=get_gpt_layer_with_transformer_engine_spec(),
-        vision_encoder=encoder,
+    # Any decoder MCore builds can sit behind MultimodalModel; a plain GPTModel
+    # keeps this test about MDP routing rather than a particular stack.
+    language_config = _language_config()
+    language_model = GPTModel(
+        config=language_config,
+        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
         vocab_size=VOCAB,
         max_sequence_length=SEQ,
-        image_token_id=IMAGE_TOKEN_ID,
         position_embedding_type="rope",
         parallel_output=False,
         pre_process=True,
         post_process=True,
+    )
+    model = MultimodalModel(
+        language_config=language_config,
+        language_model=language_model,
+        vision_encoder=encoder,
+        image_token_id=IMAGE_TOKEN_ID,
+        pre_process=True,
     )
     return model.cuda()
 

@@ -23,6 +23,15 @@ Registry entry fields
     Mutates the language TransformerConfig in-place with model-specific
     fields (e.g. ``mrope_section``).
 
+``language_model_builder_fn``  *(optional)*
+    ``(args, language_config, *, pre_process, post_process, vp_stage,
+    pg_collection, **config_overrides) -> decoder``.
+    Builds this stage's language decoder. The entry point binds it and hands
+    the factory a ``language_model_builder(**config_overrides)`` callable.
+    Default: ``models.base.build_language_model`` (``hybrid_config_from_args``
+    + ``HybridModelBuilder``), which honours ``--spec`` and the builder's
+    stack features. Override only for a decoder that is not a HybridModel.
+
 ``vision_flops_fn``  *(optional)*
     ``(args, language_config, vision_config) -> None``
     Sets vision FLOPs metadata on ``args`` for training throughput logging.
