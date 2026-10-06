@@ -79,7 +79,7 @@ class MdpRuntime:
         bridge: ModalityBridge,
         storage: MdpEmbeddingStorage,
         allocator: MdpBufferAllocator,
-        hidden_size: int,
+        output_hidden_size: int,
         params_dtype: torch.dtype,
         num_vpp_chunks: int = 1,
         device: Optional[torch.device] = None,
@@ -97,7 +97,7 @@ class MdpRuntime:
         self.bridge = bridge
         self.storage = storage
         self.allocator = allocator
-        self.hidden_size = hidden_size
+        self.output_hidden_size = output_hidden_size
         self.params_dtype = params_dtype
         self.num_vpp_chunks = num_vpp_chunks
         self.device = device or torch.device("cuda", torch.cuda.current_device())
@@ -207,6 +207,7 @@ class MdpRuntime:
                 planning_group=self.process_groups.planning_group,
                 endpoint_rank=self.rank_view.endpoint_rank,
                 num_microbatches=num_microbatches,
+                shape_key_width=self.adapter.shape_key_width,
                 text_only_flags=local_flags if self.rank_view.lane_id is not None else (),
                 device=self.device,
             )
@@ -366,7 +367,7 @@ class MdpRuntime:
                         continue
                     leaf = self.allocator.acquire(
                         rows=plan.capacity_policy.capacity_of(layout.total_output_rows),
-                        width=self.hidden_size,
+                        width=self.output_hidden_size,
                         dtype=self.params_dtype,
                         device=self.device,
                         tag="leaf",
@@ -468,7 +469,7 @@ class MdpRuntime:
                         output_dtype = self._handle.output_dtype(chunk_index)
                         grad_buffer = self.allocator.acquire(
                             rows=plan.capacity_policy.capacity_of(chunk.total_output_rows),
-                            width=self.hidden_size,
+                            width=self.output_hidden_size,
                             dtype=output_dtype,
                             device=self.device,
                             tag="grad_regroup",
@@ -767,7 +768,7 @@ class MdpRuntime:
         for route in plan.routes:
             segment = plan.segment_for_item(route.global_item_id)
             valid = segment.payload_rows if pixels else segment.output_rows
-            width = self.adapter.payload_width if pixels else self.hidden_size
+            width = self.adapter.payload_width if pixels else self.output_hidden_size
             specs[BridgeBufferKey(route.global_item_id)] = BridgeTensorSpec(
                 valid_rows=valid,
                 capacity_rows=plan.capacity_policy.capacity_of(valid),

@@ -34,11 +34,13 @@ class MdpPlanner:
         *,
         locality_slack_permille: int,
         capacity_policy: RowCapacityPolicy,
+        shape_key_width: int,
         pixel_locality: bool = False,
     ) -> None:
         self._rank_view = rank_view
         self._locality_slack_permille = locality_slack_permille
         self._capacity_policy = capacity_policy
+        self._shape_key_width = shape_key_width
         self._pixel_locality = pixel_locality
         # The logical worker hosting the owner endpoint, derived purely from the
         # view: workers partition the group ranks in fixed-width blocks.
@@ -115,13 +117,13 @@ class MdpPlanner:
                         payload_rows=descriptor.payload_rows,
                         output_row_start=output_offset,
                         output_rows=descriptor.output_rows,
-                        grid_thw=descriptor.grid_thw,
+                        shape_key=descriptor.shape_key,
                     )
                 )
                 # Offsets accumulate VALID rows: the encoder consumes a
-                # contiguous pack whose frame boundaries derive from grid_thw
-                # alone. The capacity policy sizes buffers (bridge and pack
-                # tails), never inter-segment gaps.
+                # contiguous pack whose attention boundaries the adapter derives
+                # from shape_key alone. The capacity policy sizes buffers (bridge
+                # and pack tails), never inter-segment gaps.
                 payload_offset += descriptor.payload_rows
                 output_offset += descriptor.output_rows
             encoder_layouts.append(
@@ -177,14 +179,15 @@ class MdpPlanner:
                 view.endpoint_rank,
                 descriptor.payload_rows,
                 descriptor.output_rows,
-                descriptor.grid_thw[0],
-                descriptor.grid_thw[1],
-                descriptor.grid_thw[2],
+                *(int(value) for value in descriptor.shape_key),
             )
             for descriptor in sorted(descriptors, key=lambda d: d.global_item_id)
         ]
         digest = compute_plan_digest(
-            PLAN_SCHEMA_VERSION, self._capacity_policy, digest_entries
+            PLAN_SCHEMA_VERSION,
+            self._capacity_policy,
+            digest_entries,
+            shape_key_width=self._shape_key_width,
         )
 
         plan = MdpBatchPlan(
@@ -219,11 +222,13 @@ class MdpPlanner:
                     f"MDP: estimated_cost_units={descriptor.estimated_cost_units} for item "
                     f"{item_id} violates: cost is a non-negative integer."
                 )
-            t, h, w = descriptor.grid_thw
-            if t * h * w != descriptor.payload_rows:
+            # Model geometry (how shape_key relates to the row counts) is the
+            # adapter's business and was already checked in the window; the
+            # planner only enforces the model-independent invariants it needs.
+            if len(descriptor.shape_key) != self._shape_key_width:
                 raise MdpPlanError(
-                    f"MDP: payload_rows={descriptor.payload_rows} for item {item_id} "
-                    f"violates: payload_rows == t*h*w with grid_thw={descriptor.grid_thw}."
+                    f"MDP: shape_key={descriptor.shape_key} for item {item_id} violates: "
+                    f"exactly {self._shape_key_width} slots."
                 )
             if descriptor.payload_rows <= 0 or descriptor.output_rows <= 0:
                 raise MdpPlanError(
@@ -368,7 +373,7 @@ def _canonical_plan_payload(plan: MdpBatchPlan):
                         s.payload_rows,
                         s.output_row_start,
                         s.output_rows,
-                        s.grid_thw,
+                        s.shape_key,
                     )
                     for s in e.segments
                 ),

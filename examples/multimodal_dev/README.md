@@ -9,14 +9,17 @@ vision-language models built on Megatron-Core (FSDP + EP).
 multimodal_dev/
 ├── pretrain_multimodal.py   # Training entry point (model-agnostic)
 ├── forward_step.py          # Forward step, TP broadcast, loss computation
+├── mdp_adapter.py           # Registry dispatch: MDP adapter + VisionCollateSpec
 ├── arguments.py             # Multimodal CLI arguments
 ├── data/
 │   └── mock.py              # Mock dataset for end-to-end testing
 ├── models/
 │   ├── __init__.py          # MODEL_REGISTRY — central model registry
 │   ├── base.py              # MultimodalModel base class (vision encoder + HybridModel)
+│   ├── vision_base.py       # VisionCollateSpec, BaseGridVisionAdapter (shared MDP plumbing)
 │   └── qwen35_vl/           # Qwen3.5-VL architecture
 │       ├── factory.py       # Factory functions for pretrain entry point
+│       ├── mdp_adapter.py   # Qwen3.5-VL MDP adapter + collate spec
 │       ├── model.py         # Qwen35VLModel (MRoPE, vision encoder wiring)
 │       ├── configuration.py # TransformerConfig builders and constants
 │       ├── specs.py         # Vision layer spec builders
@@ -208,17 +211,17 @@ def set_vision_flops_metadata(args, language_config, vision_config):
 
         args.vision_num_layers, vision_hidden_size, vision_ffn_hidden_size,
         vision_num_attention_heads, vision_kv_channels, vision_in_channels,
-        vision_patch_size, vision_temporal_patch_size,
-        vision_spatial_merge_size, vision_out_hidden_size
+        vision_patch_size, vision_temporal_patch_size, vision_out_hidden_size,
+        vision_merge_dim
 
-    The term assumes a ViT shaped like Qwen3.5-VL's: Conv3d patch embed
-    (kernel == stride), MHA (no GQA), bidirectional attention over
-    per-frame chunks, a non-gated MLP, and a two-layer patch merger. An
-    arch that differs structurally needs its own branch there rather than
-    just these fields.
+    plus the shape knobs ``vision_gated_mlp`` (default False) and
+    ``vision_merger_hidden_size`` (default ``vision_merge_dim``). The
+    per-batch row counts (patch rows, packed-attention ``L^2``, merged rows)
+    are not derived from these fields: the collator measures them through
+    the model's ``VisionCollateSpec.workload_of``. See
+    ``megatron/training/training.py::vision_encoder_flops``.
     """
     args.count_vision_model_flops = True
-    args.vision_flops_variant = "llava_next"
     # ... set dimension fields for FLOPs calculation
 
 def build_model(args, language_config, vision_config, **kwargs):
@@ -254,11 +257,32 @@ MODEL_REGISTRY["llava_next"] = {
     "vision_config_fn": get_llava_next_vision_config,      # required
     "post_language_config_fn": _llava_next_post_language_config,  # optional
     "vision_flops_fn": _llava_next_vision_flops,           # optional
+    "vision_collate_spec_fn": _llava_next_collate_spec,    # packed multimodal
+    "mdp_adapter_fn": _llava_next_mdp_adapter,             # --mdp-enable
     "dataset_providers": {                                  # optional
         "mock": "multimodal_dev.data.llava_mock.train_valid_test_datasets_provider",
     },
 }
 ```
+
+### Step 3b — Vision collate spec and MDP adapter
+
+The THD collator and MDP never read vision geometry from loose `args`
+attributes; they ask the model. Provide, usually in
+`models/<arch>/mdp_adapter.py`:
+
+- `build_collate_spec(args) -> VisionCollateSpec`
+  (`models/vision_base.py`): image-token id, `shape_key_width`,
+  `payload_rows_of`, `output_rows_of`, `workload_of`, `grid_key`,
+  `require_contiguous_slots`. It must be callable on every rank without a
+  model instance.
+- `build_mdp_adapter(args, language_config, vision_config)`: normally a
+  `BaseGridVisionAdapter` subclass that only implements `build_encoder` and
+  `encode`; `output_hidden_size` is the width of one encoder output row
+  (the projector output), which MDP uses for its bridge buffers.
+
+MDP core sees an item only as `payload_rows`, `output_rows`, an LPT cost and
+an opaque `shape_key`; see `megatron/core/mdp/README.md`.
 
 ### Step 4 — (Optional) Add a dataset provider
 
@@ -292,4 +316,6 @@ torchrun --nproc_per_node=8 multimodal_dev/pretrain_multimodal.py \
 | `vision_config_fn` | Yes | `(num_layers_override=None) -> TransformerConfig` |
 | `post_language_config_fn` | No | `(language_config, args) -> None` |
 | `vision_flops_fn` | No | `(args, language_config, vision_config) -> None` |
+| `vision_collate_spec_fn` | For packed (THD) training | `(args) -> VisionCollateSpec` |
+| `mdp_adapter_fn` | For `--mdp-enable` | `(args, language_config, vision_config) -> MdpModelAdapter` |
 | `dataset_providers` | No | `Dict[str, str \| callable]` |

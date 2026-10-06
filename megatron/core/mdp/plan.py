@@ -15,7 +15,7 @@ from typing import Sequence
 
 from megatron.core.mdp.errors import MdpPlanError
 
-PLAN_SCHEMA_VERSION = 5
+PLAN_SCHEMA_VERSION = 6
 
 
 @dataclass(frozen=True)
@@ -62,6 +62,9 @@ class EncoderThdSegment:
 
     ``payload_row_start/payload_rows`` index the PIXEL buffer only;
     ``output_row_start/output_rows`` index the EMBEDDING/GRADIENT buffer only.
+    ``shape_key`` is carried verbatim from the descriptor so the producer can
+    rebuild encoder metadata for items whose pixels came from another rank; core
+    never interprets it.
     """
 
     global_item_id: int
@@ -72,37 +75,17 @@ class EncoderThdSegment:
     payload_rows: int
     output_row_start: int
     output_rows: int
-    grid_thw: tuple
-
-
-def frame_lengths(segments: Sequence[EncoderThdSegment]) -> tuple:
-    """Per-frame THD lengths: each ``(t,h,w)`` contributes ``t`` frames of ``h*w``."""
-    lengths = []
-    for segment in segments:
-        t, h, w = segment.grid_thw
-        lengths.extend([h * w] * t)
-    return tuple(lengths)
-
-
-def frame_cu_seqlens(segments: Sequence[EncoderThdSegment]) -> tuple:
-    """Cumulative frame boundaries; ``(0,)`` for an empty producer.
-
-    This is vision-encoder THD metadata derived from ``grid_thw`` and is unrelated
-    to decoder sample ``cu_seqlens``.
-    """
-    cu = [0]
-    for length in frame_lengths(segments):
-        cu.append(cu[-1] + length)
-    return tuple(cu)
+    shape_key: tuple
 
 
 @dataclass(frozen=True)
 class EncoderThdLayout:
     """One producer's encoder THD pack, in that producer's plan order.
 
-    Frame boundaries and totals are derived from ``segments[].grid_thw``, never
-    stored: chunking requires rebased local boundaries, so a stored whole-producer
-    cumulative array only invites misuse.
+    Totals are derived from the segments, never stored: chunking requires rebased
+    local boundaries, so a stored whole-producer cumulative array only invites
+    misuse. Attention sub-sequence boundaries inside the pack are the adapter's
+    business -- it derives them from ``segments[].shape_key`` inside ``encode``.
     """
 
     producer_worker_id: int
@@ -164,7 +147,7 @@ def split_encoder_layout(layout: EncoderThdLayout, *, max_payload_rows) -> tuple
                     payload_rows=segment.payload_rows,
                     output_row_start=segment.output_row_start - output_base,
                     output_rows=segment.output_rows,
-                    grid_thw=segment.grid_thw,
+                    shape_key=segment.shape_key,
                 )
             )
         sub_layouts.append(
@@ -193,21 +176,43 @@ class MicrobatchLayout:
     segments: tuple
 
 
+#: Digest slots per entry that precede the model's ``shape_key``.
+DIGEST_FIXED_SLOTS = 6
+
+
 def compute_plan_digest(
-    schema_version: int, capacity_policy: RowCapacityPolicy, entries: Sequence[tuple]
+    schema_version: int,
+    capacity_policy: RowCapacityPolicy,
+    entries: Sequence[tuple],
+    *,
+    shape_key_width: int,
 ) -> bytes:
     """Digest of the minimal sufficient set with fixed-width packing plus blake2b.
 
-    ``entries`` are 9-int tuples in ascending ``global_item_id`` order:
-    ``(global_item_id, producer_worker_id, order_in_producer, endpoint_rank,
-    payload_rows, output_rows, grid_t, grid_h, grid_w)``. ``hash()`` and pickle are
-    forbidden: they vary across Python environments and would produce false
-    positives in the cross-rank consistency check.
+    ``entries`` are ``DIGEST_FIXED_SLOTS + shape_key_width`` int tuples in
+    ascending ``global_item_id`` order: ``(global_item_id, producer_worker_id,
+    order_in_producer, endpoint_rank, payload_rows, output_rows, *shape_key)``.
+    ``shape_key_width`` is folded into the header, so two models with different
+    shape-key widths can never produce the same digest for structurally different
+    plans. ``hash()`` and pickle are forbidden: they vary across Python
+    environments and would produce false positives in the cross-rank consistency
+    check.
     """
+    entry_width = DIGEST_FIXED_SLOTS + shape_key_width
     hasher = hashlib.blake2b(digest_size=16)
-    hasher.update(struct.pack("<2q", schema_version, capacity_policy.alignment_rows))
+    hasher.update(
+        struct.pack(
+            "<3q", schema_version, capacity_policy.alignment_rows, shape_key_width
+        )
+    )
+    packer = struct.Struct(f"<{entry_width}q")
     for entry in entries:
-        hasher.update(struct.pack("<9q", *entry))
+        if len(entry) != entry_width:
+            raise MdpPlanError(
+                f"MDP: digest entry {entry} violates: exactly {entry_width} slots "
+                f"(DIGEST_FIXED_SLOTS + shape_key_width={shape_key_width})."
+            )
+        hasher.update(packer.pack(*entry))
     return hasher.digest()
 
 
