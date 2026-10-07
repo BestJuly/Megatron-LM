@@ -8,12 +8,17 @@ layer captured with static THD inputs replays bit-identically to eager execution
 that differ from the one it was captured with.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
 
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import (
+    initialize_rng_tracker,
+    model_parallel_cuda_manual_seed,
+)
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -104,6 +109,9 @@ class TestPerLayerCaptureEligibility:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    # _layer_is_graphable reads only cuda_graph_modules from the config, so scope variants
+    # use a stand-in rather than a TransformerConfig: the dense test layer would make a real
+    # config reject the MoE scopes, and the gated-residual guard rejects whole-layer capture.
     @pytest.mark.parametrize(
         "modules",
         [
@@ -114,25 +122,23 @@ class TestPerLayerCaptureEligibility:
     def test_gdn_layer_is_graphable_under_attn(self, modules):
         from megatron.core.transformer.cuda_graphs import _layer_is_graphable
 
-        config = _config(cuda_graph_modules=modules)
-        wrapper = _gdn_wrapper(config)
+        wrapper = _gdn_wrapper(_config())
         assert wrapper.is_cuda_graph_capturable()
-        assert _layer_is_graphable(wrapper, config)
+        assert _layer_is_graphable(wrapper, SimpleNamespace(cuda_graph_modules=modules))
         # The MoE-only scopes leave an attention-type layer eager, as before.
-        moe_only = _config(cuda_graph_modules=[CudaGraphModule.moe_router])
+        moe_only = SimpleNamespace(cuda_graph_modules=[CudaGraphModule.moe_router])
         assert not _layer_is_graphable(wrapper, moe_only)
 
     @pytest.mark.parametrize("modules", [[CudaGraphModule.attn], []])
     def test_engram_host_stays_eager_under_every_scope(self, modules):
         from megatron.core.transformer.cuda_graphs import _layer_is_graphable
 
-        config = _config(cuda_graph_modules=modules)
-        wrapper = _gdn_wrapper(config)
+        wrapper = _gdn_wrapper(_config())
         # Stand-in for the Engram module: only its presence matters to the predicate.
         wrapper.inner_layer.engram = torch.nn.Identity()
         assert not wrapper.inner_layer.is_cuda_graph_capturable()
         assert not wrapper.is_cuda_graph_capturable()
-        assert not _layer_is_graphable(wrapper, config)
+        assert not _layer_is_graphable(wrapper, SimpleNamespace(cuda_graph_modules=modules))
 
     def test_attention_variant_declaration_is_consulted(self, monkeypatch):
         from megatron.core.transformer.cuda_graphs import _layer_is_graphable
@@ -186,6 +192,10 @@ def _cu_seqlens(lengths):
 _REPLAY_PACKINGS = [[TOKENS], [256, 256], [100, 156, 256], [37, 200, 75, 200], [TOKENS - 1, 1]]
 
 
+# Parameters whose gradients the streamed pre-GDR fusion accumulates with atomics.
+_FUSED_ATOMIC_GRADS = ("conv1d.weight", "conv1d.bias", "A_log", "dt_bias")
+
+
 class _PackedForward(torch.nn.Module):
     """Graph callable: the wrapper forward on a THD pack with a static boundary buffer."""
 
@@ -225,9 +235,15 @@ def _run(fn, wrapper, x, cu, grad_out):
 class TestGDNCaptureMatchesEager:
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
+        # Capture needs a graph-safe RNG tracker (production requires --te-rng-tracker with
+        # CUDA graphs); the default tracker's states are plain tensors TE cannot save.
+        initialize_rng_tracker(
+            use_te_rng_tracker=True, use_cudagraphable_rng=True, force_reset=True
+        )
         model_parallel_cuda_manual_seed(123)
 
     def teardown_method(self, method):
+        initialize_rng_tracker(force_reset=True)
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize("backend", ["fla", "cudnn"])
@@ -278,4 +294,9 @@ class TestGDNCaptureMatchesEager:
             assert torch.equal(out, out_ref), f"forward differs for packing {lengths}"
             assert torch.equal(dx, dx_ref), f"input grad differs for packing {lengths}"
             for name, ref in grads_ref.items():
-                assert torch.equal(grads[name], ref), f"{name} grad differs for {lengths}"
+                if fusion and name.endswith(_FUSED_ATOMIC_GRADS):
+                    # The streamed pre-GDR fusion accumulates these weight gradients with
+                    # tl.atomic_add, so they already vary run to run in eager mode.
+                    torch.testing.assert_close(grads[name], ref, msg=f"{name} for {lengths}")
+                else:
+                    assert torch.equal(grads[name], ref), f"{name} grad differs for {lengths}"
