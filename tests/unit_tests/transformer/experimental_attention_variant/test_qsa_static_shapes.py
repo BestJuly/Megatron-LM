@@ -221,12 +221,15 @@ class TestQSAStaticShapes:
         fn = self._layer_fn()
         g = torch.Generator().manual_seed(9)
         grad_outs = [torch.randn(T, 1, HIDDEN, generator=g).cuda() for _ in PACKINGS]
+        sample = torch.randn(T, 1, HIDDEN, device="cuda", requires_grad=True)
+        # Capture before the eager references: eager backward passes on the default stream
+        # would leave the parameters' AccumulateGrad nodes bound to it, which capture on TE's
+        # side stream rejects.
+        graphed = make_graphed_callables(fn, (sample, _cu([T])), num_warmup_iters=2)
         eager = [
             (self._fwd_bwd(fn, h, _cu(lengths), go), self._fwd_bwd(fn, h, _cu(lengths), go))
             for lengths, h, go in zip(PACKINGS, self.hiddens, grad_outs)
         ]
-        sample = torch.randn(T, 1, HIDDEN, device="cuda", requires_grad=True)
-        graphed = make_graphed_callables(fn, (sample, _cu([T])), num_warmup_iters=2)
         for lengths, h, go, (ref, ref_repeat) in zip(PACKINGS, self.hiddens, grad_outs, eager):
             got = self._fwd_bwd(graphed, h, _cu(lengths), go)
             self._assert_matches(ref, got, ref_repeat, lengths)

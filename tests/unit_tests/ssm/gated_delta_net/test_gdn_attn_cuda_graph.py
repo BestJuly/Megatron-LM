@@ -283,6 +283,14 @@ class TestGDNCaptureMatchesEager:
         xs = [torch.randn(shape, device="cuda", dtype=torch.bfloat16) for _ in _REPLAY_PACKINGS]
         grad_outs = [torch.randn_like(x) for x in xs]
 
+        # Captured with the static-input seed one full-length sequence + empty slots, i.e.
+        # what TransformerLayer.get_layer_static_inputs builds. Capture comes before the eager
+        # references: eager backward passes on the default stream would leave the parameters'
+        # AccumulateGrad nodes bound to it, which capture on TE's side stream rejects.
+        seed_cu = _cu_seqlens([TOKENS])
+        sample_x = torch.randn(shape, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        graphed = make_graphed_callables(fn, (sample_x, seed_cu), num_warmup_iters=2)
+
         eager = [
             _run(fn, wrapper, x, _cu_seqlens(lengths), g)
             for x, g, lengths in zip(xs, grad_outs, _REPLAY_PACKINGS)
@@ -290,12 +298,6 @@ class TestGDNCaptureMatchesEager:
         # Eager is deterministic run to run; the comparison below is exact.
         repeat = _run(fn, wrapper, xs[2], _cu_seqlens(_REPLAY_PACKINGS[2]), grad_outs[2])
         assert torch.equal(repeat[0], eager[2][0]) and torch.equal(repeat[1], eager[2][1])
-
-        # Captured with the static-input seed one full-length sequence + empty slots, i.e.
-        # what TransformerLayer.get_layer_static_inputs builds.
-        seed_cu = _cu_seqlens([TOKENS])
-        sample_x = torch.randn(shape, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-        graphed = make_graphed_callables(fn, (sample_x, seed_cu), num_warmup_iters=2)
 
         for (x, g, lengths), (out_ref, dx_ref, grads_ref) in zip(
             zip(xs, grad_outs, _REPLAY_PACKINGS), eager
