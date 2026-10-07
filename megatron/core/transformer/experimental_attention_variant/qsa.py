@@ -674,6 +674,17 @@ class QSASelfAttention(SelfAttention):
             submodules.indexer, config=self.config, pg_collection=self.pg_collection
         )
 
+    def is_cuda_graph_capturable(self) -> bool:
+        """QSA layers cannot be captured into a CUDA graph.
+
+        Block selection reads ``cu_seqlens`` on the host (``.tolist()`` in
+        :meth:`QSAIndexer.select` and :meth:`QSAIndexer._select_cp`), loops over documents in
+        Python, and sizes block-key buffers, top-k widths and sparse-kernel grids from the
+        per-document block counts. All of that is data-dependent, so a QSA layer stays eager
+        while the rest of the model is captured.
+        """
+        return False
+
     def forward(
         self,
         hidden_states: Tensor,

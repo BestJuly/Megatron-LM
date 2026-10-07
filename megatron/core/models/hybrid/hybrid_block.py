@@ -171,6 +171,16 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         if hasattr(layer, 'tp_group'):
             self.tp_group = layer.tp_group
 
+    def is_cuda_graph_capturable(self) -> bool:
+        """Delegate per-layer capture eligibility to the wrapped layer.
+
+        The wrapper itself adds only the mHC aggregate and BDA, which are capturable; whether
+        the layer as a whole may be captured is decided by the inner layer (e.g. an inner
+        layer that hosts Engram, or whose attention variant performs host synchronizations).
+        """
+        predicate = getattr(self.inner_layer, "is_cuda_graph_capturable", None)
+        return predicate is None or predicate()
+
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """Override to produce n-stream hidden_states of shape [s, b, n*C].
 

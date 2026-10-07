@@ -1306,6 +1306,30 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         return self.self_attention.linear_qkv.layer_norm_weight.data
 
+    def is_cuda_graph_capturable(self) -> bool:
+        """Whether per-layer CUDA graph capture may take this layer.
+
+        A layer that hosts an Engram module is never capturable: its hashed lookup and the
+        lookup's all-to-all have data-dependent shapes and host synchronizations. Otherwise
+        the layer defers to its attention and MLP submodules, each of which may declare
+        itself uncapturable through an ``is_cuda_graph_capturable()`` method of its own;
+        submodules that do not define one are assumed capturable.
+        """
+        if self.engram is not None:
+            return False
+        for submodule in (self.self_attention, self.cross_attention, self.mlp):
+            predicate = getattr(submodule, "is_cuda_graph_capturable", None)
+            if predicate is not None and not predicate():
+                return False
+        return True
+
+    def _attention_in_cuda_graph(self) -> bool:
+        """Whether this layer's attention is inside the configured capture scope."""
+        return not isinstance(self.self_attention, IdentityOp) and (
+            not self.config.cuda_graph_modules
+            or CudaGraphModule.attn in self.config.cuda_graph_modules
+        )
+
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """
         Get the static inputs for the transformer layer. Besides the hidden_states that is
@@ -1322,10 +1346,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         # Captured forward needs attention-side static input only when this
         # layer's attention is inside the captured scope.
-        attn_in_graph = not isinstance(self.self_attention, IdentityOp) and (
-            not self.config.cuda_graph_modules
-            or CudaGraphModule.attn in self.config.cuda_graph_modules
-        )
+        attn_in_graph = self._attention_in_cuda_graph()
         # Linear-attention variants (e.g. GatedDeltaNet) sit in the self_attention slot but
         # accept `attention_mask` only for signature compatibility and never read it, and
         # they have no `attn_mask_type`. Building a mask for them costs a persistent
