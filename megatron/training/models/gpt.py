@@ -123,6 +123,7 @@ def _te_or_local_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSp
             use_kitchen_attention=config.transformer.use_kitchen_attention,
             kitchen_attention_backend=config.transformer.kitchen_attention_backend,
             enable_hyper_connection=config.transformer.enable_hyper_connections,
+            hyper_connection_variant=config.transformer.hyper_connection_variant,
             mla_down_proj_fusion=getattr(config.transformer, "mla_down_proj_fusion", False),
             use_grouped_gemm_for_dense_mlp=config.transformer.use_grouped_gemm_for_dense_mlp,
             **kwargs,

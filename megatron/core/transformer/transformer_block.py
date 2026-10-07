@@ -388,6 +388,32 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         if self.config.cuda_graph_impl == "local":
             annotate_first_last_layer(self.layers)
 
+        # The per-sublayer hyper-connection modules come from the layer spec
+        # (hyper_connection_variant is a spec-builder argument) while the exit
+        # contract below is keyed on the config. A spec built without the
+        # matching argument would silently mix the two variants' mathematics,
+        # so verify coherence on a representative layer.
+        if self.config.enable_hyper_connections and len(self.layers) > 0:
+            from megatron.core.transformer.gated_residual import GatedResidualModule
+            from megatron.core.transformer.identity_op import IdentityOp
+
+            hc_module = getattr(self.layers[0], "self_attention_hyper_connection", None)
+            if hc_module is not None and not isinstance(hc_module, IdentityOp):
+                spec_is_gated_residual = isinstance(hc_module, GatedResidualModule)
+                config_is_gated_residual = (
+                    self.config.hyper_connection_variant == "gated_residual"
+                )
+                if spec_is_gated_residual != config_is_gated_residual:
+                    raise ValueError(
+                        f"hyper_connection_variant="
+                        f"{self.config.hyper_connection_variant!r} but the layer spec "
+                        f"built {type(hc_module).__name__} per-sublayer modules. Pass "
+                        "hyper_connection_variant=config.hyper_connection_variant to "
+                        "the layer-spec builder (e.g. "
+                        "get_gpt_layer_with_transformer_engine_spec) so the "
+                        "per-sublayer modules match the exit contract."
+                    )
+
         # @TODO: add back account_for_embedding_in_pipeline_split (see issue #293)
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
         # self.post_process and self.post_layer_norm guide this behavior
@@ -398,16 +424,29 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 eps=self.config.layernorm_epsilon,
             )
             if self.config.enable_hyper_connections:
-                hc_mult = self.config.num_residual_streams
-                hc_dim = self.config.hidden_size * hc_mult
-                self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
-                self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
-                self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
-                nn.init.xavier_uniform_(self.hc_head_fn)
-                if self.config.sequence_parallel:
-                    setattr(self.hc_head_fn, 'sequence_parallel', True)
-                    setattr(self.hc_head_base, 'sequence_parallel', True)
-                    setattr(self.hc_head_scale, 'sequence_parallel', True)
+                if self.config.hyper_connection_variant == "gated_residual":
+                    # Qwen4-Exp exit contract: the same low-rank per-channel read
+                    # gate + mean as the per-sublayer modules (use_combine=False).
+                    # HF Qwen4ExpTextModel has NO final RMSNorm after it (the mixer's
+                    # group norm is the last normalization and the released checkpoint
+                    # has no norm.weight), so the block ends with the contract.
+                    from megatron.core.transformer.gated_residual import GatedResidualModule
+
+                    self.hc_exit_contract = GatedResidualModule(
+                        self.config, layer_number=0, use_combine=False
+                    )
+                    self.final_layernorm = None
+                else:
+                    hc_mult = self.config.num_residual_streams
+                    hc_dim = self.config.hidden_size * hc_mult
+                    self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
+                    self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
+                    self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
+                    nn.init.xavier_uniform_(self.hc_head_fn)
+                    if self.config.sequence_parallel:
+                        setattr(self.hc_head_fn, 'sequence_parallel', True)
+                        setattr(self.hc_head_base, 'sequence_parallel', True)
+                        setattr(self.hc_head_scale, 'sequence_parallel', True)
         else:
             self.final_layernorm = None  # Either this or nn.Identity
 
@@ -520,16 +559,19 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                         len(extract_layer_indices) == 0
                     ), "Feature extraction is not supported with mHC + MTP."
                 mhc_multistream = hidden_states
-            # DSv4 introduced the new output contraction for mHC.
             # [s, b, n*C] -> [s, b, C]
-            hidden_states = learned_output_contract(
-                hidden_states,
-                self.hc_head_fn,
-                self.hc_head_base,
-                self.hc_head_scale,
-                self.config.num_residual_streams,
-                self.config.layernorm_epsilon,
-            )
+            if self.config.hyper_connection_variant == "gated_residual":
+                hidden_states = self.hc_exit_contract(hidden_states)
+            else:
+                # DSv4 introduced the new output contraction for mHC.
+                hidden_states = learned_output_contract(
+                    hidden_states,
+                    self.hc_head_fn,
+                    self.hc_head_base,
+                    self.hc_head_scale,
+                    self.config.num_residual_streams,
+                    self.config.layernorm_epsilon,
+                )
 
         # Final layer norm.
         if self.final_layernorm is not None:

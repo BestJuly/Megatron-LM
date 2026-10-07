@@ -470,3 +470,53 @@ def hybrid_qsa_stack_spec(config):
 
     submodules = dataclasses.replace(hybrid_stack_spec.submodules, qsa_layer=qsa_layer)
     return ModuleSpec(module=HybridStack, submodules=submodules)
+
+
+def gated_residual_hybrid_stack_spec(config):
+    """Config-aware hybrid stack spec for ``hyper_connection_variant='gated_residual'``.
+
+    Gated-residual layers carry no pre-sublayer norms (the gated-residual group
+    norm owns that role), so every layer spec is rebuilt from the default
+    ``hybrid_stack_spec`` with the input layernorm removed: fused-LN projections
+    (GDN ``in_proj``, attention ``linear_qkv``, dense-MLP ``linear_fc1``) become
+    plain column-parallel linears, and explicit ``input_layernorm`` /
+    ``pre_mlp_layernorm`` entries become ``IdentityOp``. ``hybrid_builder``
+    invokes this function with ``config`` when the spec is callable, and picks it
+    automatically when the gated-residual variant is enabled.
+    """
+    import copy as _copy
+
+    assert (
+        config.enable_hyper_connections
+        and config.hyper_connection_variant == "gated_residual"
+    ), "gated_residual_hybrid_stack_spec requires the gated_residual variant."
+
+    spec = _copy.deepcopy(hybrid_stack_spec)
+    sub = spec.submodules
+
+    sub.gdn_layer.submodules.self_attention.submodules.in_proj = TEColumnParallelLinear
+    sub.attention_layer.submodules.self_attention.submodules.linear_qkv = TEColumnParallelLinear
+    sub.moe_layer.submodules.pre_mlp_layernorm = IdentityOp
+    sub.mlp_layer.submodules.mlp = partial(
+        MLP.as_mlp_submodule,
+        submodules=MLPSubmodules(
+            linear_fc1=TEColumnParallelLinear, linear_fc2=TERowParallelLinear
+        ),
+    )
+    for layer_spec in (sub.kda_layer, sub.mla_layer, sub.dsa_layer):
+        if layer_spec is not IdentityOp and hasattr(layer_spec, "submodules"):
+            layer_spec.submodules.input_layernorm = IdentityOp
+    # Lets a builder that was handed this spec explicitly (via --spec) tell it apart from an
+    # arbitrary user spec, which must still be warned about as possibly double-normalizing.
+    spec.metainfo = {**(spec.metainfo or {}), "gated_residual_norm_free": True}
+    return spec
+
+
+def is_gated_residual_norm_free(spec) -> bool:
+    """True for stack specs built by :func:`gated_residual_hybrid_stack_spec`.
+
+    The hybrid builder warns about explicitly provided specs under the gated-residual
+    variant (fused input layernorms would normalize the residual streams twice); specs that
+    carry the ``gated_residual_norm_free`` metainfo are exempt.
+    """
+    return bool((getattr(spec, "metainfo", None) or {}).get("gated_residual_norm_free", False))

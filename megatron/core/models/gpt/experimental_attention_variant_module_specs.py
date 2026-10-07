@@ -42,6 +42,9 @@ from megatron.core.transformer.experimental_attention_variant.qsa import (
     QSASelfAttention,
     QSASelfAttentionSubmodules,
 )
+
+
+from megatron.core.transformer.gated_residual import GatedResidualModule
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -103,12 +106,27 @@ def get_gated_delta_net_module_spec(
         backend = _get_backend_spec_provider(config=config)
 
     rms_norm = config.normalization == "RMSNorm"
+    gated_residual = (
+        config.enable_hyper_connections and config.hyper_connection_variant == "gated_residual"
+    )
     if config.experimental_attention_variant == "kda":
         attention = ModuleSpec(
             module=KimiDeltaAttention,
             submodules=KimiDeltaAttentionSubmodules(
                 in_proj=backend.column_parallel_linear(),
                 beta_proj=backend.column_parallel_linear(),
+                out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
+                out_proj=backend.row_parallel_linear(),
+            ),
+            metainfo={"fuse_input_layernorm": False},
+        )
+    elif gated_residual:
+        # The gated-residual variant has no pre-sublayer norm (its group norm
+        # owns that role), so in_proj must not carry a fused input layernorm.
+        attention = ModuleSpec(
+            module=GatedDeltaNet,
+            submodules=GatedDeltaNetSubmodules(
+                in_proj=backend.column_parallel_linear(),
                 out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
                 out_proj=backend.row_parallel_linear(),
             ),
@@ -385,7 +403,26 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
     # Get GPT decoder block layer specs
     rms_norm = config.normalization == "RMSNorm"
     enable_hc = config.enable_hyper_connections
-    hc_module = HyperConnectionModule if enable_hc else IdentityOp
+    gated_residual = enable_hc and config.hyper_connection_variant == "gated_residual"
+    if gated_residual:
+        hc_module = GatedResidualModule
+        # The gated-residual variant carries no pre-sublayer norms (its group
+        # norm owns that role): un-fuse the standard attention QKV projection
+        # and reject the fused dense-MLP layernorm, which has no unfused knob.
+        if standard_attention_spec is not None and standard_attention_spec.metainfo.get(
+            "fuse_input_layernorm"
+        ):
+            standard_attention_spec.submodules.linear_qkv = backend.column_parallel_linear()
+            standard_attention_spec.metainfo["fuse_input_layernorm"] = False
+        if dense_mlp_layer_spec is not None and fuse_layernorm_pre_dense:
+            from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec_for_backend
+
+            dense_mlp_layer_spec = get_mlp_module_spec_for_backend(
+                backend=backend, num_experts=None, fuse_layernorm=False
+            )
+            fuse_layernorm_pre_dense = False
+    else:
+        hc_module = HyperConnectionModule if enable_hc else IdentityOp
     layer_module = HyperConnectionTransformerLayer if enable_hc else TransformerLayer
 
     layer_specs = []
@@ -403,12 +440,12 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
         )
         input_layernorm = (
             IdentityOp
-            if attention.metainfo["fuse_input_layernorm"]
+            if gated_residual or attention.metainfo["fuse_input_layernorm"]
             else backend.layer_norm(rms_norm=rms_norm, for_qk=False)
         )
         pre_mlp_layernorm = (
             IdentityOp
-            if fuse_pre_mlp_layernorm
+            if gated_residual or fuse_pre_mlp_layernorm
             else backend.layer_norm(rms_norm=rms_norm, for_qk=False)
         )
 
