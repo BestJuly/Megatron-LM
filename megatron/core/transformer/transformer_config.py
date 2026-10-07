@@ -527,6 +527,12 @@ class TransformerConfig(ModelParallelConfig):
     linear_conv_kernel_dim: Optional[int] = 4
     """Conv kernel dimension for the gated delta net."""
 
+    gdn_output_gate_activation: Optional[Literal['silu', 'sigmoid']] = None
+    """Activation of the GDN output gate. ``None`` keeps the historical behaviour of reusing
+    the model-wide ``activation_func`` (silu for Qwen3-Next). Qwen3.8-Flash-Next specifies
+    ``sigmoid`` for the output gate only; this knob must not change the causal-conv
+    activation or the MLP activation."""
+
     linear_key_head_dim: Optional[int] = 128
     """Query and key head dimension for the gated delta net."""
 
@@ -547,6 +553,13 @@ class TransformerConfig(ModelParallelConfig):
 
     gdn_pre_gated_delta_rule_fusion: bool = False
     """Whether to use the streamed Triton fusion for GatedDeltaNet pre-GDR preprocessing."""
+
+    has_gated_delta_net_layers: bool = False
+    """Whether the model actually builds GatedDeltaNet layers. Set for hybrid models whose
+    layer pattern contains 'G'; a pure-GDN model instead signals this through
+    experimental_attention_variant='gdn'. A hybrid stack cannot use the variant name for this:
+    it is a single global value and a GDN+attention hybrid (Qwen3.8-Flash-Next is GDN+QSA)
+    must set it to the attention family so the right layer spec is composed."""
 
     gdn_conv_pad_alignment: Optional[int] = None
     """When set, pad packed GDN causal-conv inputs to this token alignment.
@@ -2265,10 +2278,18 @@ class TransformerConfig(ModelParallelConfig):
                 "gdn_pre_gated_delta_rule_fusion is not implemented for KDA yet."
             )
 
-        if self.gdn_pre_gated_delta_rule_fusion and self.experimental_attention_variant != "gdn":
+        if self.gdn_pre_gated_delta_rule_fusion and not (
+            self.experimental_attention_variant == "gdn" or self.has_gated_delta_net_layers
+        ):
+            # The fusion is a property of the GatedDeltaNet module, which reads
+            # gdn_pre_gated_delta_rule_fusion directly and never looks at
+            # experimental_attention_variant. What it needs is that GDN layers exist at all,
+            # so gate on that: either a pure-GDN model (variant 'gdn') or a hybrid stack whose
+            # layer pattern contains 'G' (has_gated_delta_net_layers).
             raise ValueError(
-                "gdn_pre_gated_delta_rule_fusion is only supported with "
-                "experimental_attention_variant='gdn'."
+                "gdn_pre_gated_delta_rule_fusion requires a model with GatedDeltaNet layers "
+                "(experimental_attention_variant='gdn', or a hybrid layer pattern "
+                "containing 'G')."
             )
 
         if self.fp8:
