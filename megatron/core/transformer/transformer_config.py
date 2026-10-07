@@ -4116,9 +4116,13 @@ class TransformerConfig(ModelParallelConfig):
                 "attention capture, or disable pipeline parallelism."
             )
 
+        # Only a real layout edge is unsupported. GDN-family models convert when the
+        # linear layers run chunkwise CP (they need the contiguous layout) or when the
+        # block-level layout is not the zigzag one the softmax-attention layers ask for.
+        # headwise linear CP on a zigzag block layout has no conversion edge at all.
         cp_layout_conversion_required = is_gated_delta_net_variant(
             self.experimental_attention_variant
-        )
+        ) and (self.cp_partition_mode != "zigzag" or self.linear_cp_mode == "chunkwise")
         # (dsa_cp_balance_indexer does NOT belong in this predicate: the balanced DSA
         # indexer operates natively on the contiguous layout and performs no
         # module-local THD CP layout conversion.)

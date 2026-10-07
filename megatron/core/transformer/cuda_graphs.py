@@ -2377,11 +2377,10 @@ class TECudaGraphHelper:
             ), "Layer is not in the chunk"
 
             def get_rotary_pos_emb(transformer_module, transformer_input):
-                # The TE sample builder currently materializes only the regular RoPE
-                # contract. Yarn and mRoPE need different runtime inputs, while packed
-                # THD with CP>1 needs a full (not CP-sliced) RoPE table. Keep the legacy
-                # sample behavior unchanged here and warn below when one of those
-                # unsupported contracts is actually captured.
+                # The TE sample builder materializes only the regular RoPE contract
+                # (including THD's full, un-CP-sliced table). Yarn and mRoPE need
+                # different runtime inputs; warn below when one of those unsupported
+                # contracts is actually captured.
                 if (
                     transformer_module.position_embedding_type == 'rope'
                     and not self.config.multi_latent_attention
@@ -2389,11 +2388,17 @@ class TECudaGraphHelper:
                     rotary_seq_len = transformer_module.rotary_pos_emb.get_rotary_seq_len(
                         None, transformer_module.decoder, transformer_input, self.config, None
                     )
-                    if rotary_seq_len not in rotary_pos_emb_cache:
-                        rotary_pos_emb_cache[rotary_seq_len] = transformer_module.rotary_pos_emb(
-                            rotary_seq_len
+                    # THD packed sequences keep the full (un-CP-sliced) rotary table:
+                    # the models' forward passes packed_seq=True there, so the captured
+                    # static input must be built the same way or replay sees a table
+                    # cp_size times longer than the captured one.
+                    packed_seq = hasattr(layer, "_is_thd_cuda_graph") and layer._is_thd_cuda_graph()
+                    cache_key = (rotary_seq_len, packed_seq)
+                    if cache_key not in rotary_pos_emb_cache:
+                        rotary_pos_emb_cache[cache_key] = transformer_module.rotary_pos_emb(
+                            rotary_seq_len, packed_seq=packed_seq
                         )
-                    return rotary_pos_emb_cache[rotary_seq_len]
+                    return rotary_pos_emb_cache[cache_key]
                 else:
                     return None
 
@@ -2435,11 +2440,6 @@ class TECudaGraphHelper:
                     unsupported_reasons.append(
                         'mRoPE rotary embeddings are not represented in the capture sample inputs'
                     )
-                if position_embedding_type == 'rope' and is_thd and context_parallel_size > 1:
-                    unsupported_reasons.append(
-                        'THD with context parallelism captures a CP-sliced RoPE table, while '
-                        'runtime packed sequences use the full table'
-                    )
 
                 warning_key = (position_embedding_type, is_thd, context_parallel_size)
                 if unsupported_reasons and warning_key not in warned_rotary_sample_contracts:
@@ -2462,7 +2462,7 @@ class TECudaGraphHelper:
                         'mis-shape rotary_pos_emb, so numerical results are not reliable. '
                         'This is a pre-existing limitation in the sample-input path affecting '
                         f'{affected_models}. Disable TE attention capture, or use regular '
-                        'RoPE with SBHD (any supported CP) or THD with CP=1, until the shared '
+                        'RoPE (SBHD or THD), until the shared '
                         'sample-input path is fixed.',
                     )
 
