@@ -235,3 +235,23 @@ def test_hashes_match_hf_thd_packed_per_document():
         mask[0, : doc.numel()] = True
         assert torch.equal(mega[:, start : start + n_pad], _hf_hashes(row, mask))
         start += n_pad
+
+
+def test_multimodal_model_exposes_the_decoders_process_groups():
+    """Engram's --engram-verify-training reads pg_collection off the outermost model."""
+    from examples.multimodal_dev.models.base import MultimodalModel
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    class _Decoder(torch.nn.Module):
+        share_embeddings_and_output_weights = False
+
+        def __init__(self, pg_collection):
+            super().__init__()
+            self.pg_collection = pg_collection
+
+    groups = SimpleNamespace(tp="tp-group", expt_dp="expt-dp-group")
+    config = TransformerConfig(num_layers=1, hidden_size=8, num_attention_heads=1)
+    model = MultimodalModel(config, _Decoder(groups), None, image_token_id=7, pre_process=False)
+    assert model.pg_collection is groups
+    bare = MultimodalModel(config, torch.nn.Linear(2, 2), None, image_token_id=7, pre_process=False)
+    assert bare.pg_collection is None
