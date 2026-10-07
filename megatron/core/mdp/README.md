@@ -76,6 +76,7 @@ builder-side stack features apply.
 | `--model-arch` | Vision encoder | Decoder build path | Status |
 |---|---|---|---|
 | `qwen35_vl` | Qwen3.5 ViT (grid shape key `(t, h, w)`, merge 2) | default hook (`HybridModelBuilder`), RoPE fraction/base pinned | supported |
+| `qwen38_vl` | Qwen3.5 ViT, reused (HF `qwen4_exp` code identical; output width = decoder hidden 2560) | default hook; Qwen3.8 decoder (GDN + QSA + MoE, gated residual, Engram/PLE, MTP) from CLI args, RoPE fraction/base pinned | supported (proxy-validated) |
 
 Supported: one vision encoder per model, `TP=1`, decoder `CP=1`,
 `encoder_cp=1`, native PP/VPP/EP, fully replicated encoder with WORLD ZeRO-1,

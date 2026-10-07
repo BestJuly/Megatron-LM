@@ -212,6 +212,12 @@ class MultimodalModel(MegatronModule):
         self.share_embeddings_and_output_weights = bool(
             getattr(language_model, "share_embeddings_and_output_weights", False)
         )
+        # The training loop reads the model's process groups off the outermost module
+        # (``get_attr_wrapped_model(model, "pg_collection")``), and Float16Module copies this
+        # attribute at wrap time. The decoder owns them; without this, multimodal models
+        # report ``None`` and features that need the groups (Engram's
+        # ``--engram-verify-training``, the topology report) fail.
+        self.pg_collection = getattr(language_model, "pg_collection", None)
 
         # Vision encoder lives only on the first PP stage.
         self.vision_model = vision_encoder if pre_process else None

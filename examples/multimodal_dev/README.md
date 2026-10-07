@@ -17,16 +17,28 @@ multimodal_dev/
 │   ├── __init__.py          # MODEL_REGISTRY — central model registry
 │   ├── base.py              # MultimodalModel (vision encoder + built decoder), default decoder hook
 │   ├── vision_base.py       # VisionCollateSpec, BaseGridVisionAdapter (shared MDP plumbing)
-│   └── qwen35_vl/           # Qwen3.5-VL architecture
+│   ├── qwen35_vl/           # Qwen3.5-VL architecture
 │       ├── factory.py       # Factory functions for pretrain entry point
 │       ├── mdp_adapter.py   # Qwen3.5-VL MDP adapter + collate spec
 │       ├── model.py         # Qwen35VLModel (MRoPE, vision encoder wiring)
 │       ├── configuration.py # TransformerConfig builders and constants
 │       ├── specs.py         # Vision layer spec builders
 │       ├── mrope.py         # 3D MRoPE position ID computation
-│       └── vision_encoder.py# ViT encoder (patch embed, merger, RoPE)
+│   │   └── vision_encoder.py# ViT encoder (patch embed, merger, RoPE)
+│   └── qwen38_vl/           # Qwen3.8-Flash-Next VL: Qwen3.5 ViT + Qwen3.8 decoder
+│       ├── configuration.py # Token ids, RoPE constants, ViT depth per variant
+│       ├── factory.py       # Decoder-argument checks; builds Qwen38VLModel via the hook
+│       └── model.py         # Qwen38VLModel (Qwen35VLModel with Qwen3.8 defaults)
 └── scripts/                 # Launch scripts (torchrun, Slurm)
 ```
+
+Qwen3.8-Flash-Next VL (`--model-arch qwen38_vl`) reuses the Qwen3.5-VL ViT, collate spec,
+MDP adapter and data providers (HF `qwen4_exp` code is identical) and takes the Qwen3.8
+decoder from CLI arguments through the default decoder hook: gated residual
+(`--enable-hyper-connections --hyper-connection-variant gated_residual`, `--spec ...
+gated_residual_hybrid_stack_spec`), QSA (`Q` in the pattern; `--qsa-use-sparse-attention` for
+THD/MDP), Engram/PLE (`--engram-variant qwen --engram-eos-token-id 248044`), mRoPE `11 11 10`.
+`scripts/run_qwen38_vl.sh` runs the single-node proxy (MDP or native, THD or BSHD).
 
 ## Quick Start
 
