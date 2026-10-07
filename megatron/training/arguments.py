@@ -28,6 +28,7 @@ from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
+    cuda_graph_captures_attention,
     get_deprecated_cuda_graph_modules_migration,
     normalize_cuda_graph_modules,
     normalize_inference_cuda_graph_scope,
@@ -1632,6 +1633,22 @@ def validate_args(args, defaults={}):
                 f'--max-seqlen-per-dp-cp-rank ({args.max_seqlen_per_dp_cp_rank}), '
                 f'got {args.pad_packed_seq_alignment}.'
             )
+
+    # The --sft packed path has no sequence-packing scheduler, so nothing else tells the
+    # graph-capture code that attention sees packed (THD) inputs. Captured without static THD
+    # inputs, attention would replay every pack as one sequence; require the static THD
+    # contract (validated above and in TransformerConfig) instead.
+    if (
+        args.sft
+        and args.sequence_packing_scheduler is None
+        and cuda_graph_captures_attention(args)
+        and args.thd_max_packed_sequences is None
+    ):
+        raise ValueError(
+            'CUDA graph capture of attention on the --sft packed path requires '
+            '--thd-max-packed-sequences (and --pad-packed-seq-alignment max) so attention is '
+            'captured with static THD inputs.'
+        )
 
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled

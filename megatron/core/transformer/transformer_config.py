@@ -4610,7 +4610,11 @@ class TransformerConfig(ModelParallelConfig):
             ), "Batch invariant mode only supports FlashAttention"
 
         if self.cuda_graph_impl != "none" and (
-            self.sequence_packing_scheduler is not None or self.dynamic_context_parallel
+            self.sequence_packing_scheduler is not None
+            or self.dynamic_context_parallel
+            # The SFT packed path has no scheduler and opts into static THD graph inputs
+            # with thd_max_packed_sequences (see cuda_graph_uses_static_thd_inputs).
+            or self.thd_max_packed_sequences is not None
         ):
             if self.thd_max_packed_sequences is None:
                 raise ValueError("THD CUDA Graph requires --thd-max-packed-sequences to be set.")

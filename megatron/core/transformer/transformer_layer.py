@@ -1486,10 +1486,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         packed_seq_params = kwargs.pop('packed_seq_params', None)
         if packed_seq_params is None:
             return
-        kwargs['cu_seqlens_q'] = packed_seq_params.cu_seqlens_q
-        kwargs['cu_seqlens_kv'] = packed_seq_params.cu_seqlens_kv
-        kwargs['cu_seqlens_q_padded'] = packed_seq_params.cu_seqlens_q_padded
-        kwargs['cu_seqlens_kv_padded'] = packed_seq_params.cu_seqlens_kv_padded
+        kwargs.update(self._thd_graph_cu_seqlens_kwargs(packed_seq_params))
         from megatron.core.transformer.experimental_attention_variant import cp_balanced_indexer
 
         if self._uses_graph_dynamic_dsa_route():

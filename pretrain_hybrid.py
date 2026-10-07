@@ -30,7 +30,12 @@ from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, Moc
 from megatron.core.enums import ModelType
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.package_info import __version__ as mcore_version
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import (
+    PackedSeqParams,
+    get_thd_padding_kwargs,
+    pad_sequence_for_thd,
+    resolve_thd_tail_padding_policy,
+)
 from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_dynamic_data_context_parallel_groups,
@@ -260,6 +265,57 @@ def get_batch(data_iterator, vp_stage=None):
     return [batch[key] for key in batch_keys] + [None, None]
 
 
+def _uses_static_thd_contract(config) -> bool:
+    """Whether packed SFT rows must be padded to the static THD capacity.
+
+    The sequence-packing scheduler path pads its packs inside the scheduler. The SFT packed
+    path has no scheduler, so it opts into the same fixed-capacity contract by setting both
+    ``--pad-packed-seq-alignment`` and ``--thd-max-packed-sequences``; THD CUDA graphs rely on
+    it because cu_seqlens and the token dimension are graph inputs with captured shapes.
+    """
+    return (
+        getattr(config, "pad_packed_seq_alignment", None) is not None
+        and getattr(config, "thd_max_packed_sequences", None) is not None
+    )
+
+
+def _pad_packed_batch_to_static_thd(
+    config, vp_stage, tokens, labels, loss_mask, position_ids, packed_seq_params
+):
+    """Pad an SFT packed microbatch to the static THD capacity (mirrors pretrain_gpt).
+
+    Token-like tensors are padded to ``max_seqlen_per_dp_cp_rank`` (``max`` alignment) and all
+    four cu_seqlens tensors to ``thd_max_packed_sequences + 1`` entries. Returns the padded
+    tensors, the rebuilt PackedSeqParams and the padding mask (True at padded slots).
+    """
+    if not is_first_or_last_pipeline_stage(vp_stage):
+        # Middle stages carry neither token-like tensors nor a padding mask, and their
+        # hidden states already have the first stage's padded shape; padding only the
+        # boundaries there would need the first stage's padding decision.
+        raise NotImplementedError(
+            "The static THD contract (--pad-packed-seq-alignment with "
+            "--thd-max-packed-sequences) on the --sft path is not implemented for middle "
+            "pipeline stages."
+        )
+    alignment, target_len, max_num_seqs = get_thd_padding_kwargs(
+        config.pad_packed_seq_alignment,
+        config.max_seqlen_per_dp_cp_rank,
+        config.thd_max_packed_sequences,
+        config.cuda_graph_impl != "none",
+    )
+    return pad_sequence_for_thd(
+        tokens,
+        labels,
+        loss_mask,
+        position_ids,
+        packed_seq_params,
+        alignment=alignment,
+        target_len=target_len,
+        max_num_seqs=max_num_seqs,
+        tail_padding_policy=resolve_thd_tail_padding_policy(config),
+    )
+
+
 # define spiky loss as a loss that's 10x the max loss observed
 SPIKY_LOSS_FACTOR = 10
 
@@ -382,7 +438,14 @@ def forward_step(data_iterator, model: HybridModel):
             total_tokens=int(cu_seqlens_for_params[-1].item()),
             tokens_per_sample=args.seq_length,
         )
-        prepare_packed_seq_params(packed_seq_params, get_attr_wrapped_model(model, "config"))
+        config = get_attr_wrapped_model(model, "config")
+        if _uses_static_thd_contract(config):
+            (tokens, labels, loss_mask, position_ids, packed_seq_params, padding_mask) = (
+                _pad_packed_batch_to_static_thd(
+                    config, vp_stage, tokens, labels, loss_mask, position_ids, packed_seq_params
+                )
+            )
+        prepare_packed_seq_params(packed_seq_params, config)
 
     timers('batch-generator').stop()
 
