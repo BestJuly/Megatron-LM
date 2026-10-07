@@ -4614,13 +4614,14 @@ class TransformerConfig(ModelParallelConfig):
             ), "Batch invariant mode only supports FlashAttention"
 
         # cudnn-frontend caches one execution graph (and its buffers) per input shape for
-        # the whole process. When the first call for a shape happens inside graph
-        # construction (Transformer Engine's capture warmup, which runs on a temporary side
-        # stream, or the capture itself), the cached entry does not survive the graph: once
-        # that graph is released, the next GDR call with the same shape faults with an
-        # illegal memory access (reproduced with a captured GDN layer that is freed and
-        # rebuilt; an eager call before the first capture removes it). Eager training
-        # iterations before capture (cuda_graph_warmup_steps > 0) build every entry first.
+        # the whole process, and that state does not reliably survive a released CUDA graph:
+        # after a captured GDN layer is freed, the next GDR call with the same shapes can
+        # fault with an illegal memory access. It reproduces deterministically when the
+        # first call for a shape happens inside graph construction (Transformer Engine's
+        # capture warmup or the capture itself), and intermittently even after an eager
+        # call. Training is safe as long as the cache entries are built in eager iterations
+        # before capture (cuda_graph_warmup_steps > 0) and the graphs live for the whole run;
+        # releasing and re-capturing graphs in one process is not supported with cuDNN GDR.
         if (
             self.gdn_kernel_backend == "cudnn"
             and cuda_graph_captures_attention(self)
