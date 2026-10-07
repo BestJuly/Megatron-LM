@@ -120,6 +120,20 @@ class TestValidateSegmentLayers:
         with pytest.raises(ValueError):
             validate_segment_layers("MWM*-")
 
+    def test_qsa_symbol(self):
+        """'Q' (Qwen Sparse Attention) is GQA-based and NOT in the MLA family."""
+        assert Symbols.QSA == "Q"
+        assert Symbols.QSA in Symbols.VALID_LAYERS
+        assert Symbols.QSA not in Symbols.MLA_ATTENTION
+        # Parses and is counted like any other layer.
+        assert validate_segment_layers("GEGEGEQE") == list("GEGEGEQE")
+        assert get_hybrid_layer_counts("GEGEGEQE")["Q"] == 1
+        # Unlike the MLA family, 'Q' coexists with standard '*' attention...
+        validate_segment_layers("MQM*-")
+        # ...and does not trip the '*'-vs-MLA exclusivity check on its own.
+        with pytest.raises(ValueError):
+            validate_segment_layers("MQM*D")  # '*' + 'D' still forbidden
+
 
 @pytest.mark.internal
 class TestGetHybridTotalLayerCount:
@@ -331,6 +345,7 @@ class TestGetHybridLayerCounts:
             'C': 0,
             'H': 0,
             'W': 0,
+            'Q': 0,
             '*': 2,
             'D': 0,
             'G': 0,
@@ -347,6 +362,7 @@ class TestGetHybridLayerCounts:
             'C': 0,
             'H': 0,
             'W': 0,
+            'Q': 0,
             '*': 1,
             'D': 0,
             'G': 1,
@@ -360,6 +376,7 @@ class TestGetHybridLayerCounts:
             'C': 0,
             'H': 0,
             'W': 0,
+            'Q': 0,
             '*': 0,
             'D': 1,
             'G': 1,
@@ -373,6 +390,7 @@ class TestGetHybridLayerCounts:
             'C': 0,
             'H': 0,
             'W': 0,
+            'Q': 0,
             '*': 0,
             'D': 0,
             'G': 1,
@@ -389,6 +407,7 @@ class TestGetHybridLayerCounts:
             'C': 0,
             'H': 0,
             'W': 0,
+            'Q': 0,
             '*': 2,
             'D': 0,
             'G': 0,
@@ -402,6 +421,7 @@ class TestGetHybridLayerCounts:
             'C': 0,
             'H': 0,
             'W': 0,
+            'Q': 0,
             '*': 1,
             'D': 0,
             'G': 0,
@@ -418,6 +438,7 @@ class TestGetHybridLayerCounts:
             'C': 0,
             'H': 0,
             'W': 0,
+            'Q': 0,
             '*': 2,
             'D': 0,
             'G': 0,
@@ -435,6 +456,7 @@ class TestGetHybridLayerCounts:
             'C': 0,
             'H': 0,
             'W': 0,
+            'Q': 0,
             '*': 1,
             'D': 0,
             'G': 0,
@@ -450,6 +472,7 @@ class TestGetHybridLayerCounts:
             'C': 0,
             'H': 0,
             'W': 0,
+            'Q': 0,
             '*': 0,
             'D': 0,
             'G': 0,
@@ -466,6 +489,7 @@ class TestGetHybridLayerCounts:
             'C': 0,
             'H': 0,
             'W': 0,
+            'Q': 0,
             '*': 3,
             'D': 0,
             'G': 0,
@@ -481,6 +505,7 @@ class TestGetHybridLayerCounts:
             'C': 0,
             'H': 0,
             'W': 0,
+            'Q': 0,
             '*': 0,
             'D': 0,
             'G': 2,
@@ -497,6 +522,7 @@ class TestGetHybridLayerCounts:
             'C': 0,
             'H': 0,
             'W': 0,
+            'Q': 0,
             '*': 2,
             'D': 0,
             'G': 2,
@@ -512,6 +538,7 @@ class TestGetHybridLayerCounts:
             'C': 0,
             'H': 0,
             'W': 0,
+            'Q': 0,
             '*': 0,
             'D': 2,
             'G': 0,
@@ -527,6 +554,7 @@ class TestGetHybridLayerCounts:
             'C': 0,
             'H': 0,
             'W': 0,
+            'Q': 0,
             '*': 0,
             'D': 0,
             'G': 0,
@@ -542,6 +570,7 @@ class TestGetHybridLayerCounts:
             'C': 0,
             'H': 0,
             'W': 0,
+            'Q': 0,
             '*': 0,
             'D': 0,
             'G': 0,
@@ -557,6 +586,7 @@ class TestGetHybridLayerCounts:
             'C': 0,
             'H': 0,
             'W': 0,
+            'Q': 0,
             '*': 0,
             'D': 0,
             'G': 0,

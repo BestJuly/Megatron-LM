@@ -439,3 +439,34 @@ def hybrid_dsv4_stack_spec(config):
         window_layer=_wrap_dsv4_layer(compress_ratio=0),  # 'W': sliding-window-only
     )
     return ModuleSpec(module=HybridStack, submodules=submodules)
+
+
+def hybrid_qsa_stack_spec(config):
+    """Config-aware hybrid stack spec wiring the ``Q`` (QSA) layer symbol to
+    ``QSASelfAttention`` (GQA + block-sparse indexer mask), reusing GPT's own
+    ``get_qsa_module_spec_for_backend`` so the hybrid and GPT paths build the same
+    attention module. Selected via
+    ``--spec megatron.core.models.hybrid.hybrid_layer_specs hybrid_qsa_stack_spec``;
+    ``hybrid_builder`` invokes this function with ``config`` when the spec is callable.
+    """
+    import dataclasses
+
+    from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+        _get_backend_spec_provider,
+        get_qsa_module_spec_for_backend,
+    )
+
+    backend = _get_backend_spec_provider(config)
+    qsa_attention = get_qsa_module_spec_for_backend(config, backend)
+
+    qsa_layer = ModuleSpec(
+        module=TransformerLayer,
+        submodules=TransformerLayerSubmodules(
+            input_layernorm=TENorm,
+            self_attention=qsa_attention,
+            self_attn_bda=get_bias_dropout_add,
+        ),
+    )
+
+    submodules = dataclasses.replace(hybrid_stack_spec.submodules, qsa_layer=qsa_layer)
+    return ModuleSpec(module=HybridStack, submodules=submodules)
