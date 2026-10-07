@@ -1185,6 +1185,7 @@ class TestHybridTECudaGraphDiscovery:
             layers.append(layer)
 
         rotary_pos_emb = torch.ones(8, 1, 1, 2)
+        rotary_calls = []
 
         class RotaryEmbedding:
             @staticmethod
@@ -1192,7 +1193,8 @@ class TestHybridTECudaGraphDiscovery:
                 return 8
 
             @staticmethod
-            def __call__(_seq_length):
+            def __call__(_seq_length, **kwargs):
+                rotary_calls.append(kwargs)
                 return rotary_pos_emb
 
         chunk = SimpleNamespace(
@@ -1219,6 +1221,7 @@ class TestHybridTECudaGraphDiscovery:
         helper._needs_full_local_padding_mask = lambda *_args: False
         helper._uses_mhc_direct_write_arena = lambda: False
         monkeypatch.setattr(cuda_graphs_module, 'is_te_min_version', lambda _version: True)
+        helper._test_rotary_calls = rotary_calls
         return helper, rotary_pos_emb
 
     @pytest.mark.parametrize(
@@ -1269,8 +1272,9 @@ class TestHybridTECudaGraphDiscovery:
             ('transformer', 'yarn', True, False, False, 1, [CudaGraphModule.attn], 'Yarn'),
             ('hybrid', 'yarn', True, False, False, 1, [CudaGraphModule.attn], 'Yarn'),
             ('transformer', 'mrope', True, False, False, 1, [CudaGraphModule.attn], 'mRoPE'),
-            ('transformer', 'rope', True, False, True, 2, [CudaGraphModule.attn], 'THD'),
-            ('hybrid', 'rope', True, False, True, 2, [CudaGraphModule.attn], 'THD'),
+            # THD x CP now captures the full (un-CP-sliced) table, like the runtime path.
+            ('transformer', 'rope', True, False, True, 2, [CudaGraphModule.attn], None),
+            ('hybrid', 'rope', True, False, True, 2, [CudaGraphModule.attn], None),
             ('transformer', 'yarn', True, False, False, 1, [], 'Yarn'),
             ('hybrid', 'rope', True, False, True, 1, [CudaGraphModule.attn], None),
             ('transformer', 'rope', True, False, False, 2, [CudaGraphModule.attn], None),
@@ -1324,6 +1328,21 @@ class TestHybridTECudaGraphDiscovery:
             if position_embedding_type == 'mrope':
                 assert 'affecting GPTModel.' in records[0][1]
                 assert 'GPTModel and HybridModel' not in records[0][1]
+
+    @pytest.mark.parametrize('is_thd', [True, False])
+    def test_thd_static_rotary_table_is_built_as_packed(self, monkeypatch, is_thd):
+        """THD runtime builds RoPE with packed_seq=True (no CP slicing); capture must match."""
+        helper, _rotary_pos_emb = self._rotary_sample_helper(
+            monkeypatch,
+            layer_kind='hybrid',
+            position_embedding_type='rope',
+            is_thd=is_thd,
+            context_parallel_size=2,
+        )
+
+        helper._get_sample_arguments([1, -1])
+
+        assert helper._test_rotary_calls == [{'packed_seq': True} if is_thd else {}]
 
     def test_rotary_sample_contract_warning_is_deduplicated_for_yarn_thd_cp2(self, monkeypatch):
         records = []
