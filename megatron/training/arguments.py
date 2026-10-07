@@ -5037,6 +5037,15 @@ def _add_engram_args(parser):
         action='store_true',
         help='Synchronously verify and log sparse-table gradients and updates each step.',
     )
+    group.add_argument(
+        '--no-engram-token-prefetch',
+        action='store_false',
+        dest='engram_token_prefetch',
+        help='Do not wrap the data iterator in the Engram pipeline token prefetch. Only for '
+        'entry points whose forward step reads a full batch, token IDs included, on every '
+        'pipeline stage (examples/multimodal_dev sets this by default). The pretrain_gpt / '
+        'pretrain_hybrid batch paths need the prefetch and fail without it.',
+    )
     return parser
 
 

@@ -124,3 +124,35 @@ def test_eos_and_cu_seqlens_boundaries_compose():
     assert not torch.equal(both[:, 5], only_eos[:, 5])
     # Position 3 begins an EOS-delimited document and is unaffected by the packed boundary.
     torch.testing.assert_close(both[:, 3], only_eos[:, 3])
+
+
+def test_padded_layout_boundaries_come_from_cu_seqlens_q_padded():
+    """Per-document padding: tokens sit at the padded offsets, cu_seqlens_q may stay real.
+
+    multimodal_dev packs each sample padded to an alignment and keeps the real lengths in
+    cu_seqlens_q; the layout is cu_seqlens_q_padded. Reading the real boundaries would let
+    the second document's windows reach into the first document's padding.
+    """
+    from megatron.core.models.engram.engram import _row_cu_seqlens
+    from megatron.core.packed_seq_params import PackedSeqParams
+
+    torch.manual_seed(0)
+    doc_a = torch.randint(1, 16, (1, 11), dtype=torch.int64)
+    doc_b = torch.randint(1, 16, (1, 9), dtype=torch.int64)
+    pad_a = torch.full((1, 5), 3, dtype=torch.int64)  # 11 -> 16; non-boundary pad id
+    packed = torch.cat([doc_a, pad_a, doc_b], dim=1)
+    real = torch.tensor([0, 11, 20], dtype=torch.int32)
+    padded = torch.tensor([0, 16, 25], dtype=torch.int32)
+    params = PackedSeqParams(
+        qkv_format="thd", cu_seqlens_q=real, cu_seqlens_kv=real,
+        cu_seqlens_q_padded=padded, cu_seqlens_kv_padded=padded,
+    )
+    assert torch.equal(_row_cu_seqlens(params), padded)
+    hashes = _hash(packed, cu_seqlens=_row_cu_seqlens(params))
+    torch.testing.assert_close(hashes[:, :11], _hash(doc_a))
+    torch.testing.assert_close(hashes[:, 16:], _hash(doc_b))
+    # The real boundaries describe a different layout and contaminate document b.
+    assert not torch.equal(_hash(packed, cu_seqlens=real)[:, 16:], _hash(doc_b))
+    # Without a padded field the decoder-only convention (cu_seqlens_q) is used.
+    unpadded = PackedSeqParams(qkv_format="thd", cu_seqlens_q=padded, cu_seqlens_kv=padded)
+    assert torch.equal(_row_cu_seqlens(unpadded), padded)

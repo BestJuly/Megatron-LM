@@ -3308,6 +3308,27 @@ def _model_parameter_checksum(model):
     return checksum
 
 
+def _maybe_prefetch_engram_tokens(args, data_iterator, num_microbatches, micro_batch_size):
+    """Wrap ``data_iterator`` in the Engram pipeline token prefetch when the entry needs it.
+
+    pretrain_gpt / pretrain_hybrid read a batch only on the first and last pipeline stages,
+    so Engram layers on the other stages get their token IDs from this pre-schedule
+    broadcast. Entry points that collate a full batch on every stage (examples/multimodal_dev,
+    whose batches are lists of samples or packed THD rows and whose MDP schedule captures and
+    replays the iterator) already have the IDs and opt out with --no-engram-token-prefetch.
+    """
+    if not (args.engram_enabled and args.engram_token_prefetch):
+        return data_iterator
+    return prepare_tokens_for_pipeline(
+        data_iterator,
+        num_microbatches,
+        micro_batch_size,
+        args.seq_length,
+        mpu.get_pipeline_model_parallel_group(),
+        mpu.get_tensor_model_parallel_group(),
+    )
+
+
 def _capture_engram_table_training_state(model):
     """Capture scalar evidence before an Engram optimizer step.
 
@@ -3760,15 +3781,9 @@ def train_step(
                 getattr(args, "tensorboard_dir", None) or getattr(args, "wandb_project", "")
             )
             MTPLossLoggingHelper.configure_acceptance_collection(enabled=has_acceptance_consumer)
-        if args.engram_enabled:
-            forward_backward_data_iterator = prepare_tokens_for_pipeline(
-                forward_backward_data_iterator,
-                num_microbatches,
-                args.micro_batch_size,
-                args.seq_length,
-                mpu.get_pipeline_model_parallel_group(),
-                mpu.get_tensor_model_parallel_group(),
-            )
+        forward_backward_data_iterator = _maybe_prefetch_engram_tokens(
+            args, forward_backward_data_iterator, num_microbatches, args.micro_batch_size
+        )
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=forward_backward_data_iterator,
@@ -5752,15 +5767,9 @@ def evaluate(
             else:
                 packed_data_iterator = data_iterator
                 scheduled_eval_num_microbatches = eval_num_microbatches
-            if args.engram_enabled:
-                packed_data_iterator = prepare_tokens_for_pipeline(
-                    packed_data_iterator,
-                    scheduled_eval_num_microbatches,
-                    eval_micro_batch_size,
-                    args.seq_length,
-                    mpu.get_pipeline_model_parallel_group(),
-                    mpu.get_tensor_model_parallel_group(),
-                )
+            packed_data_iterator = _maybe_prefetch_engram_tokens(
+                args, packed_data_iterator, scheduled_eval_num_microbatches, eval_micro_batch_size
+            )
             loss_dicts = forward_backward_func(
                 forward_step_func=forward_step_func,
                 data_iterator=packed_data_iterator,
