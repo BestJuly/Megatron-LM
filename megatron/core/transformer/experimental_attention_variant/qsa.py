@@ -34,7 +34,10 @@ import torch
 from torch import Tensor
 
 from megatron.core.fp8_utils import get_fp8_disabled_context
-from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
+from megatron.core.models.common.embeddings.rope_utils import (
+    apply_rotary_pos_emb,
+    mrope_freqs_to_rotary_emb,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
@@ -60,6 +63,23 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_decorator
 
+
+
+def _layout_cu_seqlens(packed_seq_params, which: str) -> Optional[Tensor]:
+    """Document boundaries of the packed rows as they are laid out in memory.
+
+    QSA reads document starts off these boundaries (block grid, RoPE rows, kernel
+    block ranges), so they must describe where each document's rows physically sit.
+    When documents are padded individually that is ``cu_seqlens_*_padded``; entry
+    points differ in whether they also put it in ``cu_seqlens_*`` (pretrain_hybrid
+    does, multimodal_dev keeps the real lengths there), so prefer the padded field.
+    Padding rows then trail their own document and are never visible to its real
+    tokens under causal selection.
+    """
+    if packed_seq_params is None:
+        return None
+    padded = getattr(packed_seq_params, f"cu_seqlens_{which}_padded", None)
+    return padded if padded is not None else getattr(packed_seq_params, f"cu_seqlens_{which}")
 
 
 class QSASelection(NamedTuple):
@@ -180,6 +200,13 @@ class QSAIndexer(MegatronModule):
         # frequencies are position-deterministic, so one gather per length suffices.
         self._cp_freqs_cache = {}
 
+        # Under mRoPE (multimodal decoders) the frequencies are per token, not a 1-D
+        # table indexed by position: row i of ``rotary_pos_emb`` belongs to token i
+        # (its own T/H/W position), BSHD ``[s, b, 1, d]`` or packed THD ``[t, 1, 1, d]``.
+        # Rows must then be taken at the token's packed index, never at its in-document
+        # offset (which would reuse document 0's positions for every document).
+        self.per_token_rope = config.mrope_section is not None
+
     @nvtx_decorator(message="QSA::indexer.project")
     def _project(self, hidden_states: Tensor, rotary_pos_emb: Tensor):
         """Shared front-end: detach, SP-gather, project, norm and RoPE the queries."""
@@ -231,7 +258,10 @@ class QSAIndexer(MegatronModule):
 
         Args:
             hidden_states: ``[sq, b, h]`` post-input-layernorm hidden states.
-            rotary_pos_emb: rotary frequencies covering the longest document.
+            rotary_pos_emb: 1-D RoPE: frequency table covering the longest document.
+                mRoPE (``config.mrope_section`` set): one row per token, ``[s, b, 1, d]``
+                (BSHD) or ``[t, 1, 1, d]`` (THD); queries use their own row, pooled block
+                keys the row of the block's first token (HF ``Qwen4ExpTextQSAIndexer``).
             cu_seqlens: optional ``[n_docs + 1]`` boundaries for packed THD inputs
                 (requires b == 1). Blocks never cross documents; positions and block
                 ids restart at every boundary. Under CP the boundaries describe the
@@ -239,9 +269,22 @@ class QSAIndexer(MegatronModule):
         """
         cp_group = self.pg_collection.cp
         if cp_group is not None and cp_group.size() > 1:
+            if self.per_token_rope:
+                # The CP paths rebuild positions from the zigzag layout and index a
+                # position-deterministic table (gathered/cached per length); neither
+                # holds for per-token mRoPE frequencies.
+                raise NotImplementedError(
+                    "QSA with mRoPE (mrope_section is set) does not support context "
+                    "parallelism; run with context_parallel_size=1."
+                )
             return self._select_cp(hidden_states, rotary_pos_emb, cu_seqlens)
         q_all, raw_keys = self._project(hidden_states, rotary_pos_emb)
         s, b = q_all.shape[0], q_all.shape[1]
+        if self.per_token_rope and rotary_pos_emb.shape[0] != s:
+            raise ValueError(
+                "QSA under mRoPE expects one rotary row per token: got "
+                f"{rotary_pos_emb.shape[0]} rows for {s} tokens."
+            )
         r = self.compress_ratio
         device = q_all.device
 
@@ -297,11 +340,11 @@ class QSAIndexer(MegatronModule):
             sd = s1 - s0
             if sd == 0:
                 continue
+            # 1-D RoPE: positions restart at every document, so each document reads
+            # the table from row 0. mRoPE: the document's own per-token rows.
+            freqs_d = rotary_pos_emb[s0:s1] if self.per_token_rope else rotary_pos_emb[:sd]
             q_d = apply_rotary_pos_emb(
-                q_all[s0:s1],
-                rotary_pos_emb[:sd],
-                config=self.config,
-                cp_group=self.pg_collection.cp,
+                q_all[s0:s1], freqs_d, config=self.config, cp_group=self.pg_collection.cp
             )
             q_rot[s0:s1] = q_d
             t_d = torch.arange(sd, device=device)
@@ -317,7 +360,11 @@ class QSAIndexer(MegatronModule):
             attn_ends_parts.append(torch.clamp(bases_d + r, max=s1))
             attn_blocks_so_far += nb_attn_d
             if n_blocks_d > 0:
-                bk_d = self._block_keys(raw_keys[s0:s1], rotary_pos_emb, n_blocks_d)
+                bk_d = self._block_keys(
+                    raw_keys[s0:s1],
+                    freqs_d if self.per_token_rope else rotary_pos_emb,
+                    n_blocks_d,
+                )
                 k_d = min(self.block_topk, n_blocks_d)
                 order_d, picked_d = self._streaming_topk(q_d, bk_d, m_t_d, n_blocks_d, k_d)
                 order[:, s0:s1, :k_d] = order_d
@@ -534,7 +581,8 @@ class QSAIndexer(MegatronModule):
             hidden_states: ``[sq, b, h]`` post-input-layernorm hidden states
                 (sequence-sharded under sequence parallelism; gathered internally).
             rotary_pos_emb: rotary frequencies ``[s, 1, 1, rotary_dim]`` covering the
-                full sequence (the same tensor the main attention consumes).
+                full sequence (the same tensor the main attention consumes); per-token
+                ``[s, b, 1, rotary_dim]`` under mRoPE (see :meth:`select`).
 
         Returns:
             Bool mask ``[b, 1, sq, sq]`` in the Megatron/TE convention
@@ -691,6 +739,7 @@ class QSASelfAttention(SelfAttention):
         assert key_value_states is None, "QSA is self-attention only."
         freqs = rotary_pos_emb[0] if isinstance(rotary_pos_emb, tuple) else rotary_pos_emb
         assert freqs is not None, "QSA requires rotary position embeddings."
+        freqs = self._materialize_mrope_freqs(freqs)
 
         loss_coeff = self.config.qsa_indexer_loss_coeff or 0.0
         train_indexer = self.training and loss_coeff > 0 and torch.is_grad_enabled()
@@ -738,9 +787,7 @@ class QSASelfAttention(SelfAttention):
             )
 
         if train_indexer and selection is not None:
-            loss_cu_seqlens = (
-                packed_seq_params.cu_seqlens_q if packed_seq_params is not None else None
-            )
+            loss_cu_seqlens = _layout_cu_seqlens(packed_seq_params, "q")
             indexer_loss = self._compute_indexer_loss(
                 hidden_states, freqs, selection, loss_coeff, cu_seqlens=loss_cu_seqlens
             )
@@ -752,13 +799,40 @@ class QSASelfAttention(SelfAttention):
             )
         return output, bias
 
+    def _materialize_mrope_freqs(self, freqs: Tensor) -> Tensor:
+        """Turn raw per-axis mRoPE frequencies into the per-token embedding layout.
+
+        With RoPE fusion the model emits raw ``[3, b, s, d / 2]`` mRoPE frequencies for
+        the fused kernel. The indexer slices and strides frequencies by token, so QSA
+        works on the materialized ``[s, b, 1, d]`` form (what the unfused path uses).
+        """
+        mrope_section = self.config.mrope_section
+        if (
+            mrope_section is not None
+            and freqs.dim() == 4
+            and freqs.shape[0] == 3
+            and freqs.shape[-1] == sum(mrope_section)
+        ):
+            assert (
+                mrope_freqs_to_rotary_emb is not None
+            ), "mRoPE frequency conversion is unavailable."
+            return mrope_freqs_to_rotary_emb(
+                freqs,
+                mrope_section,
+                interleaved_mrope=self.config.mrope_interleaved,
+                rotary_interleaved=self.config.rotary_interleaved,
+            )
+        return freqs
+
     @nvtx_decorator(message="QSA::rope_qk")
     def _rope_qk(self, query, key, freqs, cu_seqlens):
         """Apply the main-attention partial RoPE to q/k ([s, b, h, d] layout).
 
         Under packed THD the Megatron rope helpers expect squeezed [t, h, d]
-        tensors plus cu_seqlens (per-document positions)."""
-        if cu_seqlens is None:
+        tensors plus cu_seqlens (per-document positions). Per-token mRoPE
+        frequencies already carry every packed token's own position, so they are
+        applied row-for-row in both layouts."""
+        if cu_seqlens is None or self.indexer.per_token_rope:
             freqs = freqs[: query.shape[0]]
             query = apply_rotary_pos_emb(
                 query, freqs, config=self.config, cp_group=self.pg_collection.cp
@@ -828,11 +902,11 @@ class QSASelfAttention(SelfAttention):
         cu_seqlens = None
         if packed_seq_params is not None:
             assert packed_seq_params.qkv_format == 'thd', "QSA supports BSHD or packed THD"
-            cu_seqlens = packed_seq_params.cu_seqlens_q
+            cu_seqlens = _layout_cu_seqlens(packed_seq_params, "q")
             # QSA is self-attention only, so q and kv boundaries must coincide. A full
             # torch.equal would force a device sync per layer; check identity/shape and
             # rely on PackedSeqParams construction for element equality.
-            cu_kv = packed_seq_params.cu_seqlens_kv
+            cu_kv = _layout_cu_seqlens(packed_seq_params, "kv")
             assert cu_kv is None or cu_kv is cu_seqlens or cu_kv.shape == cu_seqlens.shape, (
                 "QSA is self-attention only (cu_seqlens_q must equal cu_seqlens_kv)."
             )
