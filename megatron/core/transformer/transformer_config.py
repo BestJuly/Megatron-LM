@@ -3082,7 +3082,12 @@ class TransformerConfig(ModelParallelConfig):
                     "against the 4-tuple contract."
                 )
             if self.cuda_graph_impl == "transformer_engine":
+                # ``attn`` captures each attention-type hybrid layer as one whole-wrapper
+                # graph (aggregate + inner attention + n-stream BDA). The output is the
+                # n-stream hidden state only, so the 4-tuple's None h_res slot never becomes
+                # a graph output there; validated against eager on the Qwen3.8 proxy.
                 _gr_graphable_scopes = {
+                    CudaGraphModule.attn,
                     CudaGraphModule.moe,
                     CudaGraphModule.moe_router,
                     CudaGraphModule.moe_preprocess,
@@ -3097,12 +3102,10 @@ class TransformerConfig(ModelParallelConfig):
                 if not _gr_scopes or not _gr_scopes <= _gr_graphable_names:
                     raise ValueError(
                         "CUDA graphs with hyper_connection_variant='gated_residual' are "
-                        "validated only for cuda_graph_modules restricted to the MoE "
-                        "scopes (moe / moe_router / moe_preprocess), where the capture "
-                        "covers the aggregate plus the router and dispatch preprocessing; "
-                        f"got {sorted(_gr_scopes) or 'all layers'}. Wider "
-                        "scopes capture the attention-type layers too, which is untested "
-                        "for this variant."
+                        "validated only for cuda_graph_modules restricted to attn and the "
+                        "MoE scopes (moe / moe_router / moe_preprocess); "
+                        f"got {sorted(_gr_scopes) or 'all layers'}. Whole-layer capture "
+                        "and the mlp / mamba scopes are untested for this variant."
                     )
             if self.tensor_model_parallel_size > 1 and not self.sequence_parallel:
                 warnings.warn(
