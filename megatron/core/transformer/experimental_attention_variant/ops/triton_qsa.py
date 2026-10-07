@@ -56,7 +56,8 @@ def qsa_indexer_keys_kernel(
     q,  # [s, NH, DI] indexer queries (post norm/RoPE)
     bk,  # [n_blocks, DI] pooled block keys
     keys,  # [s, cb] int64 output
-    m_t,  # [s] number of visible complete blocks per query
+    m_t,  # [s] number of visible complete blocks per query (exclusive upper block id)
+    m_lo,  # [s] first visible block id per query (read only when HAS_LO)
     j0,  # first block id of this chunk
     cb,  # chunk width (number of blocks scored)
     s,
@@ -67,6 +68,7 @@ def qsa_indexer_keys_kernel(
     BM: tl.constexpr,
     BN: tl.constexpr,
     IDB: tl.constexpr,
+    HAS_LO: tl.constexpr,
 ):
     i_m, i_n = tl.program_id(0), tl.program_id(1)
     o_m = i_m * BM + tl.arange(0, BM)
@@ -93,6 +95,10 @@ def qsa_indexer_keys_kernel(
     bits = score.to(tl.int32, bitcast=True).to(tl.int64)
     key = ((bits + 1) << IDB) | (max_id_code - (j0 + o_n))[None, :]
     visible = (j0 + o_n)[None, :] < tl.load(m_t + o_m, mask=m_m, other=0)[:, None]
+    if HAS_LO:
+        # Packed documents share one block-key buffer: a query sees only its own
+        # document's blocks, i.e. ids in [m_lo, m_t).
+        visible &= (j0 + o_n)[None, :] >= tl.load(m_lo + o_m, mask=m_m, other=0)[:, None]
     key = tl.where(visible & m_n[None, :] & m_m[:, None], key, 0)
     tl.store(keys + o_m[:, None] * cb + o_n[None, :], key, mask=m_m[:, None] & m_n[None, :])
 
@@ -104,8 +110,14 @@ def qsa_indexer_keys(
     j0: int,
     cb: int,
     keys_out: torch.Tensor,  # [s, cb] int64 (reused buffer)
+    m_lo: Optional[torch.Tensor] = None,  # [s] first visible block id, default 0
 ) -> torch.Tensor:
-    """Fill ``keys_out`` with int64 (score, block_id) sort keys for blocks [j0, j0+cb)."""
+    """Fill ``keys_out`` with int64 (score, block_id) sort keys for blocks [j0, j0+cb).
+
+    Block ``j`` is visible to query ``t`` iff ``m_lo[t] <= j < m_t[t]``. ``m_lo`` lets
+    packed documents share one block-key buffer with global block ids; whether it is
+    present is a launch-time constant, never a data-dependent one.
+    """
     s, NH, DI = q.shape
     BM, BN = 64, 64
     grid = (triton.cdiv(s, BM), triton.cdiv(cb, BN))
@@ -114,6 +126,7 @@ def qsa_indexer_keys(
         bk=block_keys,
         keys=keys_out,
         m_t=m_t,
+        m_lo=m_t if m_lo is None else m_lo,
         j0=j0,
         cb=cb,
         s=s,
@@ -124,6 +137,7 @@ def qsa_indexer_keys(
         BM=BM,
         BN=BN,
         IDB=ID_BITS,
+        HAS_LO=m_lo is not None,
     )
     return keys_out
 
@@ -215,6 +229,123 @@ def build_qsa_supersets(
         n_tiles=n_tiles,
         num_entries=num_entries,
     )
+
+
+def build_qsa_supersets_static(
+    block_indices: torch.Tensor,  # [b, s, S] GLOBAL block ids
+    block_counts: torch.Tensor,  # [b, s]
+    block_bases: torch.Tensor,  # [num_blocks] token base per block
+    block_ends: torch.Tensor,  # [num_blocks]
+    num_blocks: int,
+    tile_queries: int,
+) -> QSASupersets:
+    """Fixed-shape, host-sync-free :func:`build_qsa_supersets` (CUDA-graph capturable).
+
+    The CSR is identical to the dynamic builder's -- same ``tile_offsets``, and the same
+    entries in the same order at ``[0, num_entries)`` -- but every buffer is sized by a
+    shape-only upper bound instead of the data-dependent entry count: each tile owns at
+    most ``u_cap = min(BQ * S, num_blocks)`` unique blocks, so ``E_cap = n_tiles * u_cap``.
+    Compaction uses device-computed scatter positions (invalid writes go to a dump slot
+    that is sliced off) instead of boolean-mask indexing. Entries past a tile's count are
+    never read by the kernels, which loop over ``[tile_offsets[i], tile_offsets[i + 1])``.
+    """
+    b, s, S = block_indices.shape
+    device = block_indices.device
+    BQ = tile_queries
+    n_tiles = (s + BQ - 1) // BQ
+    s_pad = n_tiles * BQ
+
+    slot_valid = torch.arange(S, device=device) < block_counts.unsqueeze(-1)
+    ids = torch.where(
+        slot_valid, block_indices.long(), torch.full_like(block_indices.long(), num_blocks)
+    )
+    if s_pad != s:
+        ids = torch.cat(
+            [ids, torch.full((b, s_pad - s, S), num_blocks, dtype=ids.dtype, device=device)], 1
+        )
+        slot_valid = torch.cat(
+            [slot_valid, torch.zeros(b, s_pad - s, S, dtype=torch.bool, device=device)], 1
+        )
+    n_flat = b * n_tiles
+    width = BQ * S
+    u_cap = max(1, min(width, num_blocks))
+    e_cap = n_flat * u_cap
+    tiles = ids.view(n_flat, width)
+    sorted_ids, _ = torch.sort(tiles, dim=-1)
+    first = torch.ones_like(sorted_ids, dtype=torch.bool)
+    first[:, 1:] = sorted_ids[:, 1:] != sorted_ids[:, :-1]
+    uniq = first & (sorted_ids < num_blocks)
+    counts_per_tile = uniq.sum(-1)  # [n_flat]
+    tile_offsets = torch.zeros(n_flat + 1, dtype=torch.long, device=device)
+    tile_offsets[1:] = counts_per_tile.cumsum(0)
+
+    rank = uniq.long().cumsum(-1) - 1
+    # Per-tile padded unions (row width u_cap) for the batched searchsorted; column u_cap
+    # is a dump slot for the non-unique positions.
+    padded = torch.full((n_flat, u_cap + 1), num_blocks, dtype=sorted_ids.dtype, device=device)
+    padded.scatter_(1, torch.where(uniq, rank, u_cap), sorted_ids)
+    padded = padded[:, :u_cap].contiguous()
+    # Global CSR entries: tile i's unique blocks land at tile_offsets[i] + rank (exactly the
+    # row-major compaction of the dynamic builder); position e_cap is the dump slot.
+    entry_pos = torch.where(uniq, tile_offsets[:-1].unsqueeze(-1) + rank, e_cap)
+    entry_block = torch.full((e_cap + 1,), num_blocks, dtype=sorted_ids.dtype, device=device)
+    entry_block.scatter_(0, entry_pos.view(-1), sorted_ids.view(-1))
+    entry_block = entry_block[:e_cap]
+
+    upos = torch.searchsorted(padded, tiles)  # [n_flat, BQ * S]
+    gpos = tile_offsets[:-1].unsqueeze(-1) + upos
+    valid_flat = slot_valid.view(n_flat, width)
+    q_local = (torch.arange(width, device=device) // S).unsqueeze(0).expand(n_flat, -1)
+    membership = torch.zeros(e_cap + 1, BQ, dtype=torch.uint8, device=device)
+    membership.index_put_(
+        (torch.where(valid_flat, gpos, e_cap), q_local),
+        torch.ones((), dtype=torch.uint8, device=device),
+    )
+    membership = membership[:e_cap]
+
+    # The sentinel id (num_blocks) of the unused trailing entries maps to an empty range.
+    pad = torch.zeros(1, dtype=block_bases.dtype, device=device)
+    entry_base = torch.cat([block_bases, pad])[entry_block].to(torch.int32)
+    entry_end = torch.cat([block_ends, pad])[entry_block].to(torch.int32)
+
+    return QSASupersets(
+        tile_offsets=tile_offsets,
+        entry_base=entry_base,
+        entry_end=entry_end,
+        membership=membership,
+        n_tiles=n_tiles,
+        num_entries=e_cap,
+    )
+
+
+def build_qsa_query_csr_static(
+    block_indices: torch.Tensor,  # [b, s, S] GLOBAL block ids
+    block_counts: torch.Tensor,  # [b, s]
+    num_blocks: int,
+):
+    """Fixed-shape, host-sync-free :func:`build_qsa_query_csr` (CUDA-graph capturable).
+
+    Invalid slots get the sentinel key ``b * num_blocks``, which sorts after every real
+    key; a stable sort of the full ``[b * s * S]`` key array therefore orders the valid
+    prefix exactly as the dynamic builder's stable sort of the valid subset does. The
+    offsets come from a ``searchsorted`` over the sorted keys instead of ``bincount``
+    (which reads the maximum key on the host).
+    """
+    b, s, S = block_indices.shape
+    device = block_indices.device
+    slot_valid = torch.arange(S, device=device) < block_counts.unsqueeze(-1)
+    batch_ix = torch.arange(b, device=device).view(b, 1, 1).expand(b, s, S)
+    t_ix = torch.arange(s, device=device).view(1, s, 1).expand(b, s, S)
+    sentinel = b * num_blocks
+    key = torch.where(slot_valid, batch_ix * num_blocks + block_indices.long(), sentinel).reshape(
+        -1
+    )
+    perm = torch.argsort(key, stable=True)
+    qsel_ids = t_ix.reshape(-1)[perm].to(torch.int32)
+    qsel_offsets = torch.searchsorted(
+        key[perm], torch.arange(sentinel + 1, device=device, dtype=key.dtype)
+    )
+    return qsel_ids, qsel_offsets
 
 
 def build_qsa_query_csr(
@@ -785,6 +916,7 @@ def qsa_sparse_attention(
     scale: Optional[float] = None,
     tile_queries: Optional[int] = None,
     q_positions: Optional[torch.Tensor] = None,
+    static_shapes: bool = False,
 ) -> torch.Tensor:
     """Sparse GQA attention over per-query selected 4-token blocks.
 
@@ -803,6 +935,9 @@ def qsa_sparse_attention(
         tile_queries: queries per shared-superset tile (default derived from G).
         q_positions: ``[TQ]`` global token position of each query row for causal
             masking. Defaults to ``arange(TQ)``; REQUIRED when ``TQ != TK``.
+        static_shapes: build the superset / query CSR structures at shape-only upper
+            bounds without host synchronization (CUDA-graph capturable). Results are
+            bit-identical to the default builders.
     """
     if scale is None:
         scale = k.shape[-1] ** -0.5
@@ -815,15 +950,15 @@ def qsa_sparse_attention(
         )
         q_positions = torch.arange(q.shape[1], device=q.device, dtype=torch.int64)
     num_blocks = block_bases.shape[0]
-    supersets = build_qsa_supersets(
+    build_supersets = build_qsa_supersets_static if static_shapes else build_qsa_supersets
+    build_query_csr = build_qsa_query_csr_static if static_shapes else build_qsa_query_csr
+    supersets = build_supersets(
         block_indices, block_counts, block_bases, block_ends, num_blocks, tile_queries
     )
     needs_grad = torch.is_grad_enabled() and (
         q.requires_grad or k.requires_grad or v.requires_grad
     )
-    query_csr = (
-        build_qsa_query_csr(block_indices, block_counts, num_blocks) if needs_grad else None
-    )
+    query_csr = build_query_csr(block_indices, block_counts, num_blocks) if needs_grad else None
     return QSASparseAttnFunction.apply(
         q.contiguous(),
         k.contiguous(),

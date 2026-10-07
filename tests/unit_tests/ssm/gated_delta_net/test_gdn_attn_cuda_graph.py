@@ -149,10 +149,20 @@ class TestPerLayerCaptureEligibility:
         monkeypatch.setattr(attention, "is_cuda_graph_capturable", lambda: False, raising=False)
         assert not _layer_is_graphable(wrapper, config)
 
-    def test_qsa_declares_itself_uncapturable(self):
+    def test_qsa_is_capturable_only_without_context_parallelism(self):
+        from types import SimpleNamespace
+
         from megatron.core.transformer.experimental_attention_variant.qsa import QSASelfAttention
 
-        assert QSASelfAttention.is_cuda_graph_capturable(object.__new__(QSASelfAttention)) is False
+        def capturable(cp_size):
+            fake = SimpleNamespace(
+                pg_collection=SimpleNamespace(cp=SimpleNamespace(size=lambda: cp_size))
+            )
+            return QSASelfAttention.is_cuda_graph_capturable(fake)
+
+        assert capturable(1) is True
+        # The allgather-CP selection still reads cu_seqlens on the host.
+        assert capturable(2) is False
 
     def test_packed_replay_into_sbhd_captured_attention_is_refused(self):
         """Attention captured with SBHD inputs must not silently replay packed data."""

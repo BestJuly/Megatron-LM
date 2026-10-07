@@ -38,6 +38,7 @@ from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_e
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
+from megatron.core.transformer.cuda_graph_config import cuda_graph_captures_attention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
@@ -180,6 +181,12 @@ class QSAIndexer(MegatronModule):
         # frequencies are position-deterministic, so one gather per length suffices.
         self._cp_freqs_cache = {}
 
+        # When the CUDA-graph scope captures attention, selection and the sparse-kernel
+        # metadata are built with device ops at shape-only upper bounds (no host syncs,
+        # no data-dependent shapes). Bit-identical to the dynamic path, which stays the
+        # default because it scans only each document's own blocks.
+        self.static_shapes = cuda_graph_captures_attention(config)
+
     @nvtx_decorator(message="QSA::indexer.project")
     def _project(self, hidden_states: Tensor, rotary_pos_emb: Tensor):
         """Shared front-end: detach, SP-gather, project, norm and RoPE the queries."""
@@ -277,6 +284,8 @@ class QSAIndexer(MegatronModule):
             )
 
         assert b == 1, "packed THD inputs must be flattened to batch size 1"
+        if self.static_shapes:
+            return self._select_thd_static(q_all, raw_keys, rotary_pos_emb, cu_seqlens)
         k = max(self.block_topk, 1)
         q_rot = torch.empty_like(q_all)
         order = torch.zeros(1, s, k, dtype=torch.long, device=device)
@@ -340,6 +349,110 @@ class QSAIndexer(MegatronModule):
             attn_block_offsets=attn_block_offsets,
             attn_block_bases=torch.cat(attn_bases_parts),
             attn_block_ends=torch.cat(attn_ends_parts),
+        )
+
+    @nvtx_decorator(message="QSA::indexer.select_thd_static")
+    def _select_thd_static(
+        self, q_all: Tensor, raw_keys: Tensor, rotary_pos_emb: Tensor, cu_seqlens: Tensor
+    ) -> QSASelection:
+        """Packed-THD selection without host synchronization, at fixed shapes.
+
+        Bit-identical to the per-document loop in :meth:`select`, but every quantity that
+        loop derives on the host from the ``cu_seqlens`` values is computed on the device
+        and every buffer is sized from shapes alone, so the selection can be captured into
+        a CUDA graph and replayed on any packing that fits the captured shapes:
+
+        * per-token document id / position / offsets via ``searchsorted`` over the
+          boundaries, and per-document block offsets via ``cumsum``;
+        * block keys for all documents in one fixed ``[s // r]`` buffer (a document of
+          length ``l`` owns ``l // r`` consecutive rows; the unused tail rows are never
+          visible to any query);
+        * one top-k scan over that buffer with the visible window ``[block_offset,
+          block_offset + own_block)`` per query, at the fixed width ``block_topk``;
+          slots beyond a short document's block count stay unpicked, as before;
+        * attention-kernel blocks in a fixed ``[s // r + n_docs]`` buffer whose unused
+          tail entries are empty token ranges.
+
+        Requires ``cu_seqlens[-1] == s`` (the static THD contract pads the pack to the
+        capacity); zero-length documents are allowed anywhere.
+        """
+        s, b = q_all.shape[0], q_all.shape[1]
+        r = self.compress_ratio
+        device = q_all.device
+        if not torch.cuda.is_current_stream_capturing():
+            # Eager-only check of the precondition (a device read; skipped under capture).
+            assert int(cu_seqlens[-1]) == s, (
+                f"static QSA selection needs the pack to fill the buffer: cu_seqlens[-1]="
+                f"{int(cu_seqlens[-1])} != {s}"
+            )
+        cu = cu_seqlens.to(device=device, dtype=torch.int64)
+        n_docs = cu.numel() - 1
+        lens = cu[1:] - cu[:-1]
+        t = torch.arange(s, device=device, dtype=torch.int64)
+        # Document of each token (empty documents are skipped by searchsorted).
+        doc = torch.searchsorted(cu[1:].contiguous(), t, right=True).clamp(max=n_docs - 1)
+        token_offsets = cu[doc]
+        pos = t - token_offsets
+        own_block = (pos + 1) // r
+
+        q_rot = self._rope_at_positions(q_all, rotary_pos_emb, pos)
+
+        # Pooled block keys: document d owns rows [blk_off[d], blk_off[d] + lens[d] // r).
+        blk_off = torch.nn.functional.pad((lens // r).cumsum(0), (1, 0))
+        block_offsets = blk_off[doc]
+        nb_max = s // r
+        k = max(self.block_topk, 1)
+        if nb_max > 0:
+            slot = torch.arange(nb_max, device=device, dtype=torch.int64)
+            bdoc = torch.searchsorted(blk_off[1:].contiguous(), slot, right=True).clamp(
+                max=n_docs - 1
+            )
+            j = slot - blk_off[bdoc]
+            start = torch.where(slot < blk_off[-1], cu[bdoc] + j * r, 0)
+            rows = (start.unsqueeze(1) + torch.arange(r, device=device)).reshape(-1)
+            pooled = raw_keys.index_select(0, rows).view(nb_max, r, b, self.head_dim)
+            pooled = pooled.float().mean(dim=1).to(raw_keys.dtype)  # [nb_max, b, d]
+            pooled = self.k_layernorm(pooled)
+            # Each block's RoPE position is its first token's document-local position.
+            block_freqs = rotary_pos_emb.index_select(0, j * r).contiguous()
+            block_keys = apply_rotary_pos_emb(
+                pooled.unsqueeze(2), block_freqs, config=self.config, cp_group=self.pg_collection.cp
+            ).squeeze(2)
+            order, picked = self._streaming_topk(
+                q_rot, block_keys, block_offsets + own_block, nb_max, k, m_lo=block_offsets
+            )
+            # Back to document-local ids (unpicked slots stay 0, as in the loop).
+            order = torch.where(picked, order - block_offsets.view(1, s, 1), 0)
+        else:
+            block_keys = raw_keys.new_zeros(0, b, self.head_dim)
+            order = torch.zeros(b, s, k, dtype=torch.long, device=device)
+            picked = torch.zeros(b, s, k, dtype=torch.bool, device=device)
+
+        # Attention-kernel block space: a non-empty document owns lens // r + 1 blocks.
+        n_attn = torch.where(lens > 0, lens // r + 1, 0)
+        attn_off = torch.nn.functional.pad(n_attn.cumsum(0), (1, 0))
+        na_max = s // r + n_docs
+        aslot = torch.arange(na_max, device=device, dtype=torch.int64)
+        adoc = torch.searchsorted(attn_off[1:].contiguous(), aslot, right=True).clamp(
+            max=n_docs - 1
+        )
+        in_use = aslot < attn_off[-1]
+        bases = cu[adoc] + (aslot - attn_off[adoc]) * r
+        ends = torch.minimum(bases + r, cu[adoc + 1])
+        attn_bases = torch.where(in_use, bases, 0).to(torch.int32)
+        attn_ends = torch.where(in_use, ends, 0).to(torch.int32)
+
+        return QSASelection(
+            q=q_rot,
+            block_keys=block_keys,
+            order=order,
+            picked=picked,
+            own_block=own_block,
+            block_offsets=block_offsets,
+            token_offsets=token_offsets,
+            attn_block_offsets=attn_off[doc],
+            attn_block_bases=attn_bases,
+            attn_block_ends=attn_ends,
         )
 
     def _rope_at_positions(self, t: Tensor, rotary_pos_emb: Tensor, positions: Tensor) -> Tensor:
@@ -578,7 +691,13 @@ class QSAIndexer(MegatronModule):
     @torch.no_grad()
     @nvtx_decorator(message="QSA::indexer.topk")
     def _streaming_topk(
-        self, q: Tensor, block_keys: Tensor, m_t: Tensor, n_blocks: int, k: int
+        self,
+        q: Tensor,
+        block_keys: Tensor,
+        m_t: Tensor,
+        n_blocks: int,
+        k: int,
+        m_lo: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor]:
         """Chunked K-scan with a deterministic running top-k merge.
 
@@ -587,7 +706,14 @@ class QSAIndexer(MegatronModule):
         lexicographic order — realized as a stable ascending sort by block id
         followed by a stable descending sort by score.
 
-        Returns (order ``[b, s, k]``, picked ``[b, s, k]``).
+        Block ``j`` is visible to query ``t`` iff ``m_lo[t] <= j < m_t[t]`` (``m_lo``
+        defaults to 0). A per-query lower bound lets packed documents share one
+        block-key buffer: shifting every visible id of a query by the same offset
+        preserves the (score desc, block_id asc) order, so the selection is the same
+        as scoring that document's blocks alone.
+
+        Returns (order ``[b, s, k]``, picked ``[b, s, k]``); ``order`` holds the ids of
+        ``block_keys`` rows.
         """
         s, b = q.shape[0], q.shape[1]
         device = q.device
@@ -613,6 +739,7 @@ class QSAIndexer(MegatronModule):
             q_c = [q[:, bi].contiguous() for bi in range(b)]
             bk_c = [block_keys[:, bi].contiguous() for bi in range(b)]
             m_t_c = m_t.contiguous()
+            m_lo_c = None if m_lo is None else m_lo.contiguous()
 
         run_keys = torch.zeros((b, s, k), dtype=torch.int64, device=device)
         for j0 in range(0, n_blocks, chunk):
@@ -621,12 +748,14 @@ class QSAIndexer(MegatronModule):
             if use_kernel:
                 key = torch.empty(b, s, w, dtype=torch.int64, device=device)
                 for bi in range(b):
-                    qsa_indexer_keys(q_c[bi], bk_c[bi], m_t_c, j0, w, key[bi])
+                    qsa_indexer_keys(q_c[bi], bk_c[bi], m_t_c, j0, w, key[bi], m_lo=m_lo_c)
             else:
                 sc = torch.einsum("sbhd,nbd->bshn", q.float(), block_keys[j0:j1].float())
                 sc = torch.relu(sc).sum(dim=2) / math.sqrt(self.head_dim)  # [b, s, w]
                 ids = torch.arange(j0, j1, device=device)
                 vis = ids.unsqueeze(0) < m_t.unsqueeze(1)  # [s, w]
+                if m_lo is not None:
+                    vis = vis & (ids.unsqueeze(0) >= m_lo.unsqueeze(1))
                 bits = sc.view(torch.int32).to(torch.int64)
                 key = ((bits + 1) << ID_BITS) | (id_code_max - ids)
                 key = torch.where(vis.unsqueeze(0), key, torch.zeros_like(key))
@@ -675,15 +804,16 @@ class QSASelfAttention(SelfAttention):
         )
 
     def is_cuda_graph_capturable(self) -> bool:
-        """QSA layers cannot be captured into a CUDA graph.
+        """QSA layers are capturable without context parallelism.
 
-        Block selection reads ``cu_seqlens`` on the host (``.tolist()`` in
-        :meth:`QSAIndexer.select` and :meth:`QSAIndexer._select_cp`), loops over documents in
-        Python, and sizes block-key buffers, top-k widths and sparse-kernel grids from the
-        per-document block counts. All of that is data-dependent, so a QSA layer stays eager
-        while the rest of the model is captured.
+        With attention in the capture scope the indexer runs its static-shape path
+        (:meth:`QSAIndexer._select_thd_static` and the fixed-capacity sparse-kernel
+        metadata). The allgather-CP selection (:meth:`QSAIndexer._select_cp`) still reads
+        ``cu_seqlens`` on the host and loops over documents, so a QSA layer stays eager
+        under context parallelism.
         """
-        return False
+        cp_group = self.pg_collection.cp
+        return cp_group is None or cp_group.size() == 1
 
     def forward(
         self,
@@ -900,6 +1030,7 @@ class QSASelfAttention(SelfAttention):
             block_ends=selection.attn_block_ends,
             scale=self.hidden_size_per_attention_head**-0.5,
             q_positions=selection.q_positions,
+            static_shapes=self.indexer.static_shapes,
         )  # [b, s, np, d_v]
         core_out = core_out.reshape(b, s, np_local * core_out.shape[-1]).permute(1, 0, 2)
 
