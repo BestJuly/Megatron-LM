@@ -164,6 +164,13 @@ class TestPerLayerCaptureEligibility:
         # The allgather-CP selection still reads cu_seqlens on the host.
         assert capturable(2) is False
 
+    def test_cudnn_gdr_capture_requires_eager_warmup_iterations(self):
+        with pytest.raises(ValueError, match="cuda_graph_warmup_steps > 0"):
+            _config(gdn_kernel_backend="cudnn", cuda_graph_warmup_steps=0)
+        # fla keeps no process-global per-shape state, and eager warmup is the default.
+        _config(gdn_kernel_backend="fla", cuda_graph_warmup_steps=0)
+        _config(gdn_kernel_backend="cudnn")
+
     def test_packed_replay_into_sbhd_captured_attention_is_refused(self):
         """Attention captured with SBHD inputs must not silently replay packed data."""
         config = _config(thd_max_packed_sequences=None)
@@ -288,6 +295,15 @@ class TestGDNCaptureMatchesEager:
         # references: eager backward passes on the default stream would leave the parameters'
         # AccumulateGrad nodes bound to it, which capture on TE's side stream rejects.
         seed_cu = _cu_seqlens([TOKENS])
+        # Training captures only after eager iterations (cuda_graph_warmup_steps > 0, enforced
+        # for cuDNN GDR), which build cuDNN's process-global per-shape GDR graphs first; an
+        # entry first built during graph construction does not outlive that graph. Mirror the
+        # eager iterations with a throwaway layer: its fresh parameters keep any
+        # AccumulateGrad stream state away from the layer that is captured.
+        warm = _gdn_wrapper(config)
+        warm_x = torch.randn(shape, device="cuda", dtype=torch.bfloat16)
+        _run(_PackedForward(warm), warm, warm_x, seed_cu, torch.randn_like(warm_x))
+        del warm
         sample_x = torch.randn(shape, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         graphed = make_graphed_callables(fn, (sample_x, seed_cu), num_warmup_iters=2)
 
