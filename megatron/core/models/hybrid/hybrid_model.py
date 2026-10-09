@@ -39,6 +39,8 @@ from megatron.core.utils import (
     deprecate_inference_params,
     is_using_quantization_scales,
     log_single_rank,
+    nvtx_range_pop,
+    nvtx_range_push,
 )
 
 logger = logging.getLogger(__name__)
@@ -782,9 +784,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 reshaped = hidden_states.squeeze(1).unsqueeze(0)
                 hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
 
+        nvtx_range_push("LM::output_layer")
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
+        nvtx_range_pop("LM::output_layer")
         logits = self._scale_logits(logits)
 
         # Restore sequence parallel execution to the output layer if necessary.

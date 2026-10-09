@@ -138,6 +138,8 @@ from megatron.core.utils import (
     get_model_config,
     get_pg_rank,
     get_pg_size,
+    nvtx_range_pop,
+    nvtx_range_push,
     unwrap_model,
 )
 from megatron.training.checkpointing import (
@@ -3600,7 +3602,9 @@ def train_step(
         _capture_engram_table_training_state(model) if args.engram_verify_training else None
     )
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
+    nvtx_range_push("train.optimizer_step")
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    nvtx_range_pop("train.optimizer_step")
     if engram_training_state is not None:
         _verify_engram_table_training_state(engram_training_state, model, iteration + 1)
     if args.record_memory_history and (iteration == 0 or iteration + 1 == args.train_iters):

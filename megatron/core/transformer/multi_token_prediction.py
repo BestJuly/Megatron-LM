@@ -40,6 +40,7 @@ from megatron.core.utils import (
     is_torch_min_version,
     make_tp_sharded_tensor_for_checkpoint,
     make_viewless_tensor,
+    nvtx_decorator,
 )
 
 if TYPE_CHECKING:
@@ -2939,6 +2940,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                 ]
             )
 
+    @nvtx_decorator(message="MTP::block")
     def forward(
         self,
         input_ids: Tensor,

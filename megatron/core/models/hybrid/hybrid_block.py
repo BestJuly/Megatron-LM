@@ -50,7 +50,13 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
+from megatron.core.utils import (
+    WrappedTensor,
+    deprecate_inference_params,
+    make_viewless_tensor,
+    nvtx_range_pop,
+    nvtx_range_push,
+)
 
 
 @dataclass
@@ -730,13 +736,16 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         # calls the sublayer helpers directly, and the fallback path is told to skip it via
         # _called_from_hybrid_mhc_wrapper.
         if getattr(self.inner_layer, "engram", None) is not None:
+            nvtx_range_push("HC::engram")
             hidden_states = self.inner_layer._maybe_apply_engram(
                 hidden_states, input_ids, packed_seq_params
             )
+            nvtx_range_pop("HC::engram")
 
         aggregated, h_res, h_post, residual = self.hyper_connection(
             hidden_states, mhc_recompute_manager=mhc_recompute_manager
         )
+        nvtx_range_push("HC::inner")
         fast_path_result = self._call_inner_transformer_layer_without_local_bda(
             aggregated,
             attention_mask,
@@ -771,6 +780,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             bias_dropout_fusion = False
         else:
             layer_output_with_bias, context, dropout_prob, bias_dropout_fusion = fast_path_result
+        nvtx_range_pop("HC::inner")
 
         layer_output = layer_output_with_bias[0]
         # Sanity check: this contract requires the branch output to preserve shape;
@@ -1341,6 +1351,10 @@ class HybridStack(MegatronModule):
                             mhc_is_last_in_recompute_block[l_no]
                         )
 
+                    # One range per layer at the call site: it stays on the host when the
+                    # layer's submodules are CUDA-graphed, so graph replays project onto it.
+                    layer_range = f"hybrid.layer{layer.layer_number:02d}.{self.layer_type_list[l_no]}"
+                    nvtx_range_push(layer_range)
                     with inner_quant_context:
                         if isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
                             layer_kwargs = dict(
@@ -1366,6 +1380,8 @@ class HybridStack(MegatronModule):
                                 inference_context=inference_context,
                                 packed_seq_params=packed_seq_params,
                             )
+
+                    nvtx_range_pop(layer_range)
 
                     if isinstance(layer, HyperConnectionHybridLayer):
                         grouped_tail_to_skip = layer._get_active_te_cuda_graph_group_tail()
