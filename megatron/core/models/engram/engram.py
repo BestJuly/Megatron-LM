@@ -677,9 +677,18 @@ class Engram(MegatronModule):
         return output
 
     def _dense_reference(
-        self, memory: Tensor, hidden_states: Tensor, row_cu_seqlens: Tensor | None
+        self,
+        memory: Tensor | None,
+        hidden_states: Tensor,
+        row_cu_seqlens: Tensor | None,
+        projections: tuple[Tensor, Tensor] | None = None,
     ) -> Tensor:
-        """Gate, conv-norm, short convolution, and residual as a PyTorch op chain."""
+        """Gate, conv-norm, short convolution, and residual as a PyTorch op chain.
+
+        ``projections`` optionally supplies precomputed ``(key, shared_value)`` projection
+        outputs in place of projecting ``memory``; tests use it to drive both paths with the
+        same tensors.
+        """
         streams = hidden_states.view(
             hidden_states.shape[0], hidden_states.shape[1], self.num_streams, self.hidden_size
         )
@@ -687,8 +696,12 @@ class Engram(MegatronModule):
         message = "engram.gate-projection"
         nvtx_range_push(message)
         try:
-            shared_value = self.value_projection(memory)
-            key = self.key_norm(self.key_projection(memory)).view_as(streams)
+            if projections is None:
+                shared_value = self.value_projection(memory)
+                key = self.key_projection(memory)
+            else:
+                key, shared_value = projections
+            key = self.key_norm(key).view_as(streams)
             query = self.query_norm(hidden_states).view_as(streams)
             score = (key * query).sum(dim=-1) / math.sqrt(self.hidden_size)
             score = score.abs().clamp_min(1e-6).sqrt() * score.sign()

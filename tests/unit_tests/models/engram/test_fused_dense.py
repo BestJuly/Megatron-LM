@@ -2,20 +2,19 @@
 
 """Fused Triton dense path vs. the PyTorch reference path of the Engram module.
 
-Both paths run on the same module (same weights, same retrieved memory) in one forward and
-one backward.
+The gate is ``sigmoid(sign(s) * sqrt(|s|))`` of a bf16 score ``s``. Its derivative grows like
+``1 / sqrt(|s|)`` near zero, so the gradients upstream of the score (key projection, key and
+query norms, the Engram input, the tables) amplify any one-ulp rounding difference in ``s``:
+two valid bf16 evaluations differ there by a few 1e-3 on random inputs, and both are 1e-2 to
+1e0 away from fp64. The tests separate that conditioning from implementation error:
 
-* The output and every gradient that does not pass through the gate score (value
-  projection, conv-norm gamma, convolution weight) must agree with the reference to
-  rel-L2 <= 1e-3.
-* The gate is ``sigmoid(sign(s) * sqrt(|s|))`` of a bf16 score; its derivative grows like
-  ``1 / sqrt(|s|)`` near zero, so the gradients upstream of the score (key projection, key
-  and query norms, the Engram input, the tables) amplify any rounding difference in ``s``.
-  For those the bar is the reference's own stability: the fused/reference difference must
-  stay within twice the change that flipping the last bit of 2 % of the input elements
-  causes in the reference (or 1e-3, whichever is larger). The printed fp64 column shows how
-  far the same perturbation moves the exact gradients. In every case the fused path must be
-  no further from fp64 than the reference.
+* ``test_fused_matches_reference_well_conditioned``: scores bounded away from zero. Every
+  output and gradient must match the reference to rel-L2 <= 1e-3.
+* ``test_fused_matches_reference``: random inputs through the whole module, including tiny
+  and batched shapes. Output and the gradients that do not pass through the score must
+  match to rel-L2 <= 1e-3. For the score-chain gradients the fused path must be no further
+  from an fp64 evaluation than the reference is; a last-bit input perturbation of the
+  reference is printed alongside for scale.
 """
 
 import pytest
@@ -23,7 +22,11 @@ import torch
 
 from megatron.core.models.engram.config import EngramConfig
 from megatron.core.models.engram.engram import Engram
-from megatron.core.models.engram.fused_dense import HAVE_TRITON, FusedEngramDense
+from megatron.core.models.engram.fused_dense import (
+    HAVE_TRITON,
+    FusedEngramDense,
+    fused_engram_dense,
+)
 
 from ._test_utils import make_module_config, make_pg_collection
 
@@ -152,13 +155,84 @@ def test_fused_matches_reference(
         "conv_norm.weight",
         "short_conv.weight",
     )
-    for name, (vs_ref, floor, _, ref_err, fused_err) in report.items():
-        bar = 1e-3 if name in well_conditioned else max(1e-3, 2.0 * floor)
+    for name, (vs_ref, _, _, ref_err, fused_err) in report.items():
+        # Score-chain gradients: a sanity cap only; the fp64 criterion below is the bar.
+        bar = 1e-3 if name in well_conditioned else 2e-2
         assert vs_ref <= bar, f"{name}: fused vs reference rel-L2 {vs_ref:.3e} > {bar:.3e}"
         assert fused_err <= 1.25 * ref_err + 1e-4, (
             f"{name}: fused is further from fp64 ({fused_err:.3e}) than the reference "
             f"({ref_err:.3e})"
         )
+
+
+@pytest.mark.parametrize("zero_centered", [True, False])
+@pytest.mark.parametrize("seq,batch", [(1024, 1), (300, 2)])
+def test_fused_matches_reference_well_conditioned(seq, batch, zero_centered):
+    """Same projections fed to both paths, with every score bounded away from zero."""
+    hidden_size, streams = 2560, 4
+    module = _build(hidden_size, streams, 1280, 8, 3, 4, 1000, torch.bfloat16)
+    with torch.no_grad():
+        module.query_norm.weight.copy_(module.key_norm.weight)
+    for norm in (module.key_norm, module.query_norm, module.conv_norm):
+        norm.zero_centered = zero_centered
+    generator = torch.Generator(device="cuda").manual_seed(11)
+    width = streams * hidden_size
+
+    def rand(*shape):
+        return torch.randn(*shape, device="cuda", generator=generator)
+
+    key = rand(seq, batch, streams, hidden_size)
+    # Query = +/- a fixed fraction of the key plus noise: with equal key/query gammas the score
+    # concentrates around +/- several standard deviations, far from zero.
+    sign = torch.where(rand(seq, batch, streams, 1) > 0, 1.0, -1.0)
+    hidden = sign * 0.25 * key + rand(seq, batch, streams, hidden_size)
+    key, hidden = key.reshape(seq, batch, width), hidden.reshape(seq, batch, width)
+    value = rand(seq, batch, hidden_size)
+    grad = rand(seq, batch, width)
+    key, hidden, value, grad = (t.bfloat16() for t in (key, hidden, value, grad))
+
+    def run(impl):
+        for parameter in module.parameters():
+            parameter.grad = None
+        leaves = [t.detach().clone().requires_grad_(True) for t in (key, hidden, value)]
+        if impl == "reference":
+            out = module._dense_reference(None, leaves[1], None, projections=(leaves[0], leaves[2]))
+        else:
+            out = fused_engram_dense(
+                leaves[0],
+                leaves[1],
+                leaves[2],
+                module.key_norm.weight,
+                module.query_norm.weight,
+                module.conv_norm.weight,
+                module.short_conv.weight,
+                streams,
+                module.key_norm.eps,
+                zero_centered,
+                module.engram_config.max_ngram_order,
+            )
+        out.backward(grad)
+        grads = {n: leaf.grad.clone() for n, leaf in zip(("key", "hidden", "value"), leaves)}
+        for name in ("key_norm", "query_norm", "conv_norm"):
+            grads[name] = getattr(module, name).weight.grad.clone()
+        grads["short_conv"] = module.short_conv.weight.grad.clone()
+        return out.detach(), grads
+
+    with torch.no_grad():
+        kn = module.key_norm(key).float().view(seq, batch, streams, hidden_size)
+        qn = module.query_norm(hidden).float().view(seq, batch, streams, hidden_size)
+        score = (kn * qn).sum(-1) / hidden_size**0.5
+    min_score = score.abs().min().item()
+    out_ref, grads_ref = run("reference")
+    out_fused, grads_fused = run("fused")
+    report = {"output": _rel_l2(out_fused, out_ref)}
+    report.update({n: _rel_l2(grads_fused[n], grads_ref[n]) for n in grads_ref})
+    print(f"\nmin |score| {min_score:.3e}; fused-vs-ref rel-L2:")
+    for name, value_ in report.items():
+        print(f"  {name}: {value_:.3e}")
+    assert min_score > 0.05, f"test setup: scores not bounded away from zero ({min_score})"
+    for name, value_ in report.items():
+        assert value_ <= 1e-3, f"{name}: fused vs reference rel-L2 {value_:.3e}"
 
 
 def _fused_inputs(seq, batch, hidden_size, streams, kernel, seed=0):

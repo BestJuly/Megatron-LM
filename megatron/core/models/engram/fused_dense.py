@@ -70,8 +70,10 @@ except ImportError:  # pragma: no cover - exercised only without Triton
     HAVE_TRITON = False
 
 
-# Tile sizes. They depend only on the model configuration, never on the data.
+# Tile sizes and warp counts. They depend only on the model configuration, never on the data.
 _BLOCK_T = 32
+_TILE_WARPS = 4
+_ROW_WARPS = 8
 _MAX_BLOCK_C = 128
 _NUM_STATS = 7  # gate, score, rstd_key, rstd_query, rstd_value, key dot, query dot
 
@@ -107,7 +109,7 @@ if HAVE_TRITON:
         stats_ptr,
         T,
         eps,
-        sqrt_h,
+        inv_sqrt_h,
         NS: tl.constexpr,
         H: tl.constexpr,
         BLOCK_H: tl.constexpr,
@@ -136,7 +138,7 @@ if HAVE_TRITON:
             qn = _rnd((q * rq) * gq, DT)
             prod = _rnd(kn * qn, DT)
             score = _rnd(tl.sum(prod, axis=0), DT)
-            score = _rnd(tl.div_rn(score, sqrt_h), DT)
+            score = _rnd(score * inv_sqrt_h, DT)
             mag = _rnd(tl.maximum(tl.abs(score), 1e-6), DT)
             root = _rnd(tl.sqrt_rn(mag), DT)
             signed = _rnd(root * _sign(score), DT)
@@ -417,7 +419,7 @@ if HAVE_TRITON:
         dgk_ptr,
         dgq_ptr,
         T,
-        sqrt_h,
+        inv_sqrt_h,
         NS: tl.constexpr,
         H: tl.constexpr,
         ZC: tl.constexpr,
@@ -457,7 +459,7 @@ if HAVE_TRITON:
         gmag = _rnd(tl.div_rn(groot, 2.0 * root), DT)
         gmag = tl.where(mag >= 1e-6, gmag, 0.0)
         gscore = _rnd(gmag * sign, DT)
-        gsum = _rnd(tl.div_rn(gscore, sqrt_h), DT)
+        gsum = _rnd(gscore * inv_sqrt_h, DT)
 
         offs = rows[:, None] * C + cols[None, :]
         k = tl.load(k_ptr + offs, mask=rmask[:, None], other=0.0).to(tl.float32)
@@ -479,7 +481,16 @@ if HAVE_TRITON:
 
 
 def _num_warps(block: int) -> int:
-    return 8 if block >= 2048 else 4
+    return _ROW_WARPS if block >= 2048 else 4
+
+
+def _inv_sqrt(hidden_size: int) -> float:
+    """``1 / sqrt(H)`` exactly as PyTorch divides a float32 tensor by a Python scalar.
+
+    The CUDA kernel casts the scalar to float32 and multiplies by its float32 reciprocal.
+    """
+    root = torch.tensor(float(hidden_size) ** 0.5, dtype=torch.float32)
+    return float(torch.reciprocal(root))
 
 
 class FusedEngramDense(torch.autograd.Function):
@@ -537,7 +548,7 @@ class FusedEngramDense(torch.autograd.Function):
                 stats,
                 tokens,
                 eps,
-                float(hidden_size) ** 0.5,
+                _inv_sqrt(hidden_size),
                 NS=num_streams,
                 H=hidden_size,
                 BLOCK_H=block_h,
@@ -560,7 +571,7 @@ class FusedEngramDense(torch.autograd.Function):
                 ZC=zero_centered,
                 BLOCK_T=_BLOCK_T,
                 BLOCK_C=block_c,
-                num_warps=4,
+                num_warps=_TILE_WARPS,
             )
         ctx.save_for_backward(
             key, hidden, value, key_gamma, query_gamma, conv_gamma, conv_weight, stats
@@ -616,7 +627,7 @@ class FusedEngramDense(torch.autograd.Function):
                 batch,
                 **common,
                 **conv,
-                num_warps=4,
+                num_warps=_TILE_WARPS,
             )
             _cnorm_dot_kernel[grid](
                 grad_conv,
@@ -631,7 +642,7 @@ class FusedEngramDense(torch.autograd.Function):
                 batch,
                 **common,
                 **conv,
-                num_warps=4,
+                num_warps=_TILE_WARPS,
             )
             grad_value_streams = grad_conv
             _gval_kernel[grid](
@@ -647,10 +658,10 @@ class FusedEngramDense(torch.autograd.Function):
                 ZC=zero_centered,
                 CT_P2=ct_p2,
                 **common,
-                num_warps=4,
+                num_warps=_TILE_WARPS,
             )
             _value_bwd_kernel[(row_tiles, col_tiles)](
-                grad_value_streams, stats, grad_value, tokens, **common, num_warps=4
+                grad_value_streams, stats, grad_value, tokens, **common, num_warps=_TILE_WARPS
             )
             _kq_bwd_kernel[grid](
                 key,
@@ -664,11 +675,11 @@ class FusedEngramDense(torch.autograd.Function):
                 dgk_partial,
                 dgq_partial,
                 tokens,
-                float(hidden_size) ** 0.5,
+                _inv_sqrt(hidden_size),
                 ZC=zero_centered,
                 CT_P2=ct_p2,
                 **common,
-                num_warps=4,
+                num_warps=_TILE_WARPS,
             )
         else:
             dw_partial.zero_()
