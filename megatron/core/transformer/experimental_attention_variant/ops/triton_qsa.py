@@ -16,10 +16,19 @@ Design (SGLang-prefill style, replacing the earlier fla-NSA adaptation):
    gather-traffic roofline that made the per-query kernels lose to dense flash.
    The union / membership / CSR structures are precomputed on the host
    (:func:`build_qsa_supersets`).
-3. **Backward**: ``dq`` mirrors the forward per query tile; ``dk``/``dv`` run one
-   program per 4-token KV block (padded to a 16-row dot tile) iterating the
-   query tiles whose union contains that block — sequential accumulation, no
-   atomics, so gradients are deterministic.
+3. **Backward**: ``dq`` mirrors the forward per query tile. ``dk``/``dv`` have two
+   deterministic implementations (sequential accumulation, no atomics):
+
+   * ``"tile"`` (default, :func:`qsa_bwd_dkv_tile_kernel`): one program per KV TILE
+     of ``KB`` consecutive selection blocks (``KB * 4`` KV rows, a full dot tile)
+     iterating the UNION of the queries that selected any block of the tile, with a
+     per-entry block bitmask, over a flattened (query, group-head) column space (no
+     power-of-two head padding). Every gathered q/dO row is reused by ``KB * 4``
+     KV rows instead of 4. Optionally the column range of a tile is split over
+     ``NSPLIT`` programs whose fp32 partials are summed in a fixed order.
+   * ``"block"`` (:func:`qsa_bwd_dkv_kernel`, the original kernel): one program per
+     4-token KV block (padded to a 16-row dot tile) iterating the queries that
+     selected that block.
 
 All varlen (packed THD) handling is folded into per-block token ``base``/``end``
 arrays and the membership bits: the kernels never see ``cu_seqlens``. Selection
@@ -31,11 +40,13 @@ The GQA group size ``G = HQ // H`` may be any value >= 1 (rows are padded to the
 next power of two in-tile); no host-side head padding is required.
 """
 
+import os
 from typing import NamedTuple, Optional
 
 import torch
 import triton
 import triton.language as tl
+from triton.runtime.errors import OutOfResources
 
 BS = 4  # tokens per selection block (qsa_indexer_compress_ratio)
 CB = 16  # union entries gathered per attention-kernel iteration (CB * BS = 64 tokens)
@@ -373,6 +384,76 @@ def build_qsa_query_csr(
     qsel_offsets = torch.zeros(b * num_blocks + 1, dtype=torch.long, device=device)
     qsel_offsets[1:] = counts.cumsum(0)
     return qsel_ids, qsel_offsets
+
+
+class QSAKVTileCSR(NamedTuple):
+    """Per-(batch, KV tile) CSR of the queries that selected any block of the tile.
+
+    A KV tile is ``tile_blocks`` consecutive selection blocks of the ``block_bases``
+    space. Entries of one tile are ordered by ascending query row, so the dkv
+    accumulation order is deterministic and independent of the slot order.
+    """
+
+    tile_offsets: torch.Tensor  # [b * n_tiles + 1] int64 — CSR into the entry arrays
+    entry_query: torch.Tensor  # [E] int32 — query ROW of the entry
+    entry_bits: torch.Tensor  # [E] int32 — bit r set iff the query selected block r of the tile
+    tile_blocks: int
+    n_tiles: int
+
+
+def build_qsa_kv_tile_csr(
+    block_indices: torch.Tensor,  # [b, s, S] GLOBAL block ids
+    block_counts: torch.Tensor,  # [b, s]
+    num_blocks: int,
+    tile_blocks: int,
+) -> QSAKVTileCSR:
+    """Build the KV-tile query CSR for :func:`qsa_bwd_dkv_tile_kernel`.
+
+    Host-sync free and fixed-shape (CUDA-graph capturable): the entry arrays are sized
+    by the shape-only bound ``b * s * S``; the ``n`` unique (tile, query) entries occupy
+    ``[0, n)`` and the kernel only reads ``[tile_offsets[i], tile_offsets[i + 1])``.
+    A query selects a block at most once, so the per-entry bitmask is the integer sum of
+    distinct powers of two (an exact, order-independent reduction).
+    """
+    assert 1 <= tile_blocks <= 30, "the block bitmask is an int32"
+    b, s, S = block_indices.shape
+    device = block_indices.device
+    n_tiles = max(1, (num_blocks + tile_blocks - 1) // tile_blocks)
+    slot_valid = torch.arange(S, device=device) < block_counts.unsqueeze(-1)
+    blk = torch.where(slot_valid, block_indices.long(), 0)
+    batch_ix = torch.arange(b, device=device).view(b, 1, 1)
+    t_ix = torch.arange(s, device=device).view(1, s, 1)
+    sentinel = b * n_tiles * s
+    key = torch.where(
+        slot_valid, (batch_ix * n_tiles + blk // tile_blocks) * s + t_ix, sentinel
+    ).reshape(-1)
+    bits = torch.where(
+        slot_valid, torch.bitwise_left_shift(torch.ones_like(blk), blk % tile_blocks), 0
+    )
+    n = key.numel()
+    sorted_key, perm = torch.sort(key)
+    sorted_bits = bits.reshape(-1)[perm]
+    valid = sorted_key < sentinel
+    first = valid.clone()
+    first[1:] &= sorted_key[1:] != sorted_key[:-1]
+    cum_first = torch.zeros(n + 1, dtype=torch.long, device=device)
+    cum_first[1:] = first.long().cumsum(0)
+    entry_ix = cum_first[1:] - 1  # entry of every sorted element (valid ones)
+    entry_query = torch.zeros(n + 1, dtype=torch.int32, device=device)
+    entry_query.scatter_(
+        0, torch.where(first, entry_ix, n), (sorted_key % s).to(torch.int32)
+    )
+    entry_bits = torch.zeros(n + 1, dtype=torch.long, device=device)
+    entry_bits.scatter_add_(0, torch.where(valid, entry_ix, n), sorted_bits)
+    bounds = torch.arange(b * n_tiles + 1, device=device, dtype=sorted_key.dtype) * s
+    tile_offsets = cum_first[torch.searchsorted(sorted_key, bounds)]
+    return QSAKVTileCSR(
+        tile_offsets=tile_offsets,
+        entry_query=entry_query[:n],
+        entry_bits=entry_bits[:n].to(torch.int32),
+        tile_blocks=tile_blocks,
+        n_tiles=n_tiles,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -749,6 +830,155 @@ def qsa_bwd_dkv_kernel(
     )
 
 
+@triton.jit
+def qsa_bwd_dkv_tile_kernel(
+    q,  # [B, TQ, HQ, K]
+    k,  # [B, TK, H, K]
+    v,  # [B, TK, H, V]
+    lse,  # [B, TQ, HQ] fp32 (log2 domain)
+    delta,  # [B, TQ, HQ] fp32
+    do,  # [B, TQ, HQ, V]
+    dk,  # NSPLIT == 1: [B, TK, H, K]; else fp32 partials [NSPLIT, B, TK, H, BK]
+    dv,  # NSPLIT == 1: [B, TK, H, V]; else fp32 partials [NSPLIT, B, TK, H, BV]
+    q_pos,  # [TQ] global position of each query row
+    entry_query,  # [E] int32 — query ROWS grouped by (batch, KV tile), ascending
+    entry_bits,  # [E] int32 — per-entry bitmask of the tile's blocks the query selected
+    tile_offsets,  # [B * NT + 1] int64
+    block_bases,
+    block_ends,
+    scale,
+    TQ,
+    TK,
+    NB,
+    NT,
+    H: tl.constexpr,
+    HQ: tl.constexpr,
+    G: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
+    BSZ: tl.constexpr,
+    KB: tl.constexpr,
+    CQ: tl.constexpr,
+    NSPLIT: tl.constexpr,
+    TRANS: tl.constexpr,
+):
+    """dk/dv for ``KB`` consecutive selection blocks (``RT = KB * BSZ`` KV rows).
+
+    Columns are the flattened (entry, group head) pairs ``c = entry * G + g`` of the
+    tile's query CSR, processed ``CQ`` at a time in ascending order (deterministic).
+    ``TRANS`` computes the transposed products (``[CQ, RT]`` scores, ``[BK, RT]``
+    accumulators) so the long dimension is the MMA M dimension.
+    """
+    i_bt = tl.program_id(0).to(tl.int64)
+    i_h = tl.program_id(1).to(tl.int64)
+    i_s = tl.program_id(2).to(tl.int64)
+    i_b = i_bt // NT
+    tile = i_bt % NT
+
+    RT: tl.constexpr = KB * BSZ
+    o_r = tl.arange(0, RT)
+    r_blk = o_r // BSZ
+    j = tile * KB + r_blk
+    m_blk = j < NB
+    base = tl.load(block_bases + j, mask=m_blk, other=0).to(tl.int64)
+    tend = tl.load(block_ends + j, mask=m_blk, other=0).to(tl.int64)
+    toks = base + (o_r % BSZ)
+    m_tok = m_blk & (toks < tend)
+    o_d = tl.arange(0, BK)
+    o_v = tl.arange(0, BV)
+    m_d = o_d < K
+    m_v = o_v < V
+
+    kv_ptr = (i_b * TK + toks) * H + i_h
+    b_k = tl.load(
+        k + kv_ptr[:, None] * K + o_d[None, :], mask=m_tok[:, None] & m_d[None, :], other=0.0
+    )
+    b_v = tl.load(
+        v + kv_ptr[:, None] * V + o_v[None, :], mask=m_tok[:, None] & m_v[None, :], other=0.0
+    )
+
+    e0 = tl.load(tile_offsets + i_bt)
+    e1 = tl.load(tile_offsets + i_bt + 1)
+    c0 = e0 * G
+    c1 = e1 * G
+    if NSPLIT > 1:
+        # Contiguous, CQ-aligned column chunk per split (shape-only split count).
+        chunk = tl.cdiv(tl.cdiv(c1 - c0, NSPLIT), CQ) * CQ
+        cs0 = c0 + i_s * chunk
+        cs1 = tl.minimum(cs0 + chunk, c1)
+    else:
+        cs0 = c0
+        cs1 = c1
+
+    if TRANS:
+        b_dk = tl.zeros([BK, RT], dtype=tl.float32)
+        b_dv = tl.zeros([BV, RT], dtype=tl.float32)
+    else:
+        b_dk = tl.zeros([RT, BK], dtype=tl.float32)
+        b_dv = tl.zeros([RT, BV], dtype=tl.float32)
+    o_c = tl.arange(0, CQ)
+    for cs in range(cs0, cs1, CQ):
+        c = cs + o_c
+        m_c = c < cs1
+        e = c // G
+        g = c % G
+        o_t = tl.load(entry_query + e, mask=m_c, other=0).to(tl.int64)
+        bits = tl.load(entry_bits + e, mask=m_c, other=0)
+        o_pt = tl.load(q_pos + o_t, mask=m_c, other=0).to(tl.int64)
+        rowptr = (i_b * TQ + o_t) * HQ + i_h * G + g
+        b_q = tl.load(
+            q + rowptr[:, None] * K + o_d[None, :], mask=m_c[:, None] & m_d[None, :], other=0.0
+        )
+        b_q = (b_q * scale).to(b_q.dtype)
+        b_do = tl.load(
+            do + rowptr[:, None] * V + o_v[None, :], mask=m_c[:, None] & m_v[None, :], other=0.0
+        )
+        b_lse = tl.load(lse + rowptr, mask=m_c, other=0.0)
+        b_delta = tl.load(delta + rowptr, mask=m_c, other=0.0)
+        if TRANS:
+            # [CQ, RT] orientation
+            mem = ((bits[:, None] >> r_blk[None, :]) & 1) != 0
+            m_all = mem & m_c[:, None] & m_tok[None, :] & (o_pt[:, None] >= toks[None, :])
+            b_s = tl.dot(b_q, tl.trans(b_k))
+            b_p = tl.where(m_all, tl.exp2(b_s * 1.4426950408889634 - b_lse[:, None]), 0.0)
+            b_dv += tl.dot(tl.trans(b_do), b_p.to(b_do.dtype))
+            b_dp = tl.dot(b_do, tl.trans(b_v))
+            b_ds = b_p * (b_dp.to(tl.float32) - b_delta[:, None])
+            b_dk += tl.dot(tl.trans(b_q), b_ds.to(b_q.dtype))
+        else:
+            # [RT, CQ] orientation (same algebra as qsa_bwd_dkv_kernel)
+            mem = ((bits[None, :] >> r_blk[:, None]) & 1) != 0
+            m_all = mem & m_c[None, :] & m_tok[:, None] & (o_pt[None, :] >= toks[:, None])
+            b_s = tl.dot(b_k, tl.trans(b_q))
+            b_p = tl.where(m_all, tl.exp2(b_s * 1.4426950408889634 - b_lse[None, :]), 0.0)
+            b_dv += tl.dot(b_p.to(b_do.dtype), b_do)
+            b_dp = tl.dot(b_v, tl.trans(b_do))
+            b_ds = b_p * (b_dp.to(tl.float32) - b_delta[None, :])
+            b_dk += tl.dot(b_ds.to(b_q.dtype), b_q)
+
+    if TRANS:
+        b_dk = tl.trans(b_dk)
+        b_dv = tl.trans(b_dv)
+    if NSPLIT > 1:
+        # fp32 partials, padded to BK/BV columns; summed over splits on the host side.
+        p_ptr = i_s * (tl.num_programs(0) // NT) * TK * H + kv_ptr
+        tl.store(dk + p_ptr[:, None] * BK + o_d[None, :], b_dk, mask=m_tok[:, None])
+        tl.store(dv + p_ptr[:, None] * BV + o_v[None, :], b_dv, mask=m_tok[:, None])
+    else:
+        tl.store(
+            dk + kv_ptr[:, None] * K + o_d[None, :],
+            b_dk.to(dk.dtype.element_ty),
+            mask=m_tok[:, None] & m_d[None, :],
+        )
+        tl.store(
+            dv + kv_ptr[:, None] * V + o_v[None, :],
+            b_dv.to(dv.dtype.element_ty),
+            mask=m_tok[:, None] & m_v[None, :],
+        )
+
+
 # ---------------------------------------------------------------------------
 # 5. Host wrappers and autograd
 # ---------------------------------------------------------------------------
@@ -772,12 +1002,206 @@ def _launch_dims(K: int, V: int, G: int):
     return BK, BV, GP
 
 
+class QSADkvTileConfig(NamedTuple):
+    """Launch configuration of :func:`qsa_bwd_dkv_tile_kernel` (shape-only, never data)."""
+
+    tile_blocks: int = 4  # selection blocks per KV tile (RT = 4 * tile_blocks KV rows)
+    cq: int = 64  # (query, group head) columns per iteration
+    num_warps: int = 4
+    num_stages: int = 2
+    trans: bool = False
+    nsplit: int = 0  # column-range splits per tile; 0 = derive from the grid size
+
+
+# Implementation of the dk/dv backward: "tile" (default) or "block" (original kernel).
+# The environment overrides exist for A/B measurements only.
+QSA_DKV_IMPL = os.environ.get("MEGATRON_QSA_DKV_IMPL", "tile")
+QSA_DKV_TILE_CONFIG = QSADkvTileConfig()
+
+
+def _parse_dkv_tile_config(spec: str) -> QSADkvTileConfig:
+    """Parse ``"kb=4,cq=64,w=4,st=2,trans=0,nsplit=0"`` (unspecified fields keep defaults)."""
+    names = {
+        "kb": "tile_blocks",
+        "cq": "cq",
+        "w": "num_warps",
+        "st": "num_stages",
+        "trans": "trans",
+        "nsplit": "nsplit",
+    }
+    kw = {}
+    for item in filter(None, (x.strip() for x in spec.split(","))):
+        key, val = item.split("=")
+        field = names[key.strip()]
+        kw[field] = bool(int(val)) if field == "trans" else int(val)
+    return QSA_DKV_TILE_CONFIG._replace(**kw)
+
+
+if os.environ.get("MEGATRON_QSA_DKV_TILE_CFG"):
+    QSA_DKV_TILE_CONFIG = _parse_dkv_tile_config(os.environ["MEGATRON_QSA_DKV_TILE_CFG"])
+
+# (dtype, BK, BV, G, config, nsplit) -> config that compiled within the shared-memory budget
+_DKV_TILE_RESOLVED = {}
+
+
+def _dkv_tile_nsplit(cfg: QSADkvTileConfig, n_programs: int, device) -> int:
+    if cfg.nsplit > 0:
+        return cfg.nsplit
+    # Shape-only: split a tile's column range until the grid fills ~2 waves.
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    nsplit = 1
+    while nsplit < 8 and n_programs * nsplit < 2 * sms:
+        nsplit *= 2
+    return nsplit
+
+
+def qsa_bwd_dkv_tile(
+    q,
+    k,
+    v,
+    lse,
+    delta,
+    do,
+    q_pos,
+    csr: QSAKVTileCSR,
+    block_bases,
+    block_ends,
+    scale,
+    config: Optional[QSADkvTileConfig] = None,
+):
+    """dk, dv via :func:`qsa_bwd_dkv_tile_kernel` (deterministic; see the module header)."""
+    cfg = QSA_DKV_TILE_CONFIG if config is None else config
+    assert cfg.tile_blocks == csr.tile_blocks, "CSR built for a different KV tile size"
+    assert cfg.tile_blocks & (cfg.tile_blocks - 1) == 0, "tile_blocks must be a power of two"
+    B, TQ, HQ, K = q.shape
+    TK, H, V = k.shape[1], k.shape[2], v.shape[-1]
+    G = HQ // H
+    BK, BV, _ = _launch_dims(K, V, G)
+    NB = block_bases.shape[0]
+    NT = csr.n_tiles
+    nsplit = _dkv_tile_nsplit(cfg, B * NT * H, q.device)
+    key = (q.dtype, BK, BV, G, cfg, nsplit)
+    run_cfg = _DKV_TILE_RESOLVED.get(key, cfg)
+    while True:
+        if nsplit > 1:
+            dk_out = torch.zeros(nsplit, B, TK, H, BK, dtype=torch.float32, device=q.device)
+            dv_out = torch.zeros(nsplit, B, TK, H, BV, dtype=torch.float32, device=q.device)
+        else:
+            dk_out = torch.zeros_like(k)
+            dv_out = torch.zeros_like(v)
+        try:
+            qsa_bwd_dkv_tile_kernel[(B * NT, H, nsplit)](
+                q=q,
+                k=k,
+                v=v,
+                lse=lse,
+                delta=delta,
+                do=do,
+                dk=dk_out,
+                dv=dv_out,
+                q_pos=q_pos,
+                entry_query=csr.entry_query,
+                entry_bits=csr.entry_bits,
+                tile_offsets=csr.tile_offsets,
+                block_bases=block_bases,
+                block_ends=block_ends,
+                scale=scale,
+                TQ=TQ,
+                TK=TK,
+                NB=NB,
+                NT=NT,
+                H=H,
+                HQ=HQ,
+                G=G,
+                K=K,
+                V=V,
+                BK=BK,
+                BV=BV,
+                BSZ=BS,
+                KB=run_cfg.tile_blocks,
+                CQ=run_cfg.cq,
+                NSPLIT=nsplit,
+                TRANS=run_cfg.trans,
+                num_warps=run_cfg.num_warps,
+                num_stages=run_cfg.num_stages,
+            )
+            break
+        except OutOfResources:
+            # Shape-only fallback (e.g. fp32 inputs at head dim 256): halve the column
+            # tile, then drop pipelining. Resolved once per key, before any capture.
+            if run_cfg.cq > 16:
+                run_cfg = run_cfg._replace(cq=run_cfg.cq // 2)
+            elif run_cfg.num_stages > 1:
+                run_cfg = run_cfg._replace(num_stages=1)
+            else:
+                raise
+    _DKV_TILE_RESOLVED[key] = run_cfg
+    if nsplit > 1:
+        # Fixed-order (deterministic) reduction of the split partials.
+        dk_out = dk_out.sum(0)[..., :K].to(k.dtype)
+        dv_out = dv_out.sum(0)[..., :V].to(v.dtype)
+    return dk_out, dv_out
+
+
+def qsa_bwd_dkv_block(q, k, v, lse, delta, do, q_pos, query_csr, block_bases, block_ends, scale):
+    """dk, dv via the original per-block :func:`qsa_bwd_dkv_kernel`."""
+    B, TQ, HQ, K = q.shape
+    TK, H, V = k.shape[1], k.shape[2], v.shape[-1]
+    G = HQ // H
+    BK, BV, GP = _launch_dims(K, V, G)
+    NB = block_bases.shape[0]
+    dk = torch.zeros_like(k)
+    dv = torch.zeros_like(v)
+    qsel_ids, qsel_offsets = query_csr
+    qsa_bwd_dkv_kernel[(B * NB, H)](
+        q=q,
+        k=k,
+        v=v,
+        lse=lse,
+        delta=delta,
+        do=do,
+        dk=dk,
+        dv=dv,
+        q_pos=q_pos,
+        qsel_ids=qsel_ids,
+        qsel_offsets=qsel_offsets,
+        block_bases=block_bases,
+        block_ends=block_ends,
+        scale=scale,
+        TQ=TQ,
+        TK=TK,
+        NB=NB,
+        H=H,
+        HQ=HQ,
+        G=G,
+        GP=GP,
+        K=K,
+        V=V,
+        BK=BK,
+        BV=BV,
+        BSZ=BS,
+        RSZ=RS,
+    )
+    return dk, dv
+
+
 class QSASparseAttnFunction(torch.autograd.Function):
     """Autograd over the query-tile shared-superset sparse GQA kernels."""
 
     @staticmethod
     def forward(
-        ctx, q, k, v, q_pos, supersets, query_csr, block_bases, block_ends, scale, tile_queries
+        ctx,
+        q,
+        k,
+        v,
+        q_pos,
+        supersets,
+        query_csr,
+        block_bases,
+        block_ends,
+        scale,
+        tile_queries,
+        dkv_tile_config=None,
     ):
         B, TQ, HQ, K = q.shape
         TK, H, V = k.shape[1], k.shape[2], v.shape[-1]
@@ -819,6 +1243,7 @@ class QSASparseAttnFunction(torch.autograd.Function):
         ctx.save_for_backward(q, k, v, o, lse, q_pos, block_bases, block_ends)
         ctx.supersets = supersets
         ctx.query_csr = query_csr
+        ctx.dkv_tile_config = dkv_tile_config
         ctx.scale = scale
         ctx.tile_queries = tile_queries
         return o
@@ -832,7 +1257,6 @@ class QSASparseAttnFunction(torch.autograd.Function):
         G = HQ // H
         BK, BV, GP = _launch_dims(K, V, G)
         BQ = ctx.tile_queries
-        NB = block_bases.shape[0]
 
         do = do.contiguous()
         # delta = rowwise sum(o * do) over the value dim, fp32
@@ -870,39 +1294,26 @@ class QSASparseAttnFunction(torch.autograd.Function):
             CBZ=CB,
         )
 
-        dk = torch.zeros_like(k)
-        dv = torch.zeros_like(v)
-        qsel_ids, qsel_offsets = ctx.query_csr
-        qsa_bwd_dkv_kernel[(B * NB, H)](
-            q=q,
-            k=k,
-            v=v,
-            lse=lse,
-            delta=delta,
-            do=do,
-            dk=dk,
-            dv=dv,
-            q_pos=q_pos,
-            qsel_ids=qsel_ids,
-            qsel_offsets=qsel_offsets,
-            block_bases=block_bases,
-            block_ends=block_ends,
-            scale=ctx.scale,
-            TQ=TQ,
-            TK=TK,
-            NB=NB,
-            H=H,
-            HQ=HQ,
-            G=G,
-            GP=GP,
-            K=K,
-            V=V,
-            BK=BK,
-            BV=BV,
-            BSZ=BS,
-            RSZ=RS,
-        )
-        return dq, dk, dv, None, None, None, None, None, None, None
+        if isinstance(ctx.query_csr, QSAKVTileCSR):
+            dk, dv = qsa_bwd_dkv_tile(
+                q,
+                k,
+                v,
+                lse,
+                delta,
+                do,
+                q_pos,
+                ctx.query_csr,
+                block_bases,
+                block_ends,
+                ctx.scale,
+                ctx.dkv_tile_config,
+            )
+        else:
+            dk, dv = qsa_bwd_dkv_block(
+                q, k, v, lse, delta, do, q_pos, ctx.query_csr, block_bases, block_ends, ctx.scale
+            )
+        return dq, dk, dv, None, None, None, None, None, None, None, None
 
 
 def qsa_sparse_attention(
@@ -917,6 +1328,8 @@ def qsa_sparse_attention(
     tile_queries: Optional[int] = None,
     q_positions: Optional[torch.Tensor] = None,
     static_shapes: bool = False,
+    dkv_impl: Optional[str] = None,
+    dkv_tile_config: Optional[QSADkvTileConfig] = None,
 ) -> torch.Tensor:
     """Sparse GQA attention over per-query selected 4-token blocks.
 
@@ -938,6 +1351,11 @@ def qsa_sparse_attention(
         static_shapes: build the superset / query CSR structures at shape-only upper
             bounds without host synchronization (CUDA-graph capturable). Results are
             bit-identical to the default builders.
+        dkv_impl: ``"tile"`` or ``"block"`` dk/dv backward (default
+            :data:`QSA_DKV_IMPL`). ``"tile"`` builds its query CSR without host
+            synchronization in both modes. Both are deterministic.
+        dkv_tile_config: launch configuration of the ``"tile"`` backward (default
+            :data:`QSA_DKV_TILE_CONFIG`).
     """
     if scale is None:
         scale = k.shape[-1] ** -0.5
@@ -958,7 +1376,17 @@ def qsa_sparse_attention(
     needs_grad = torch.is_grad_enabled() and (
         q.requires_grad or k.requires_grad or v.requires_grad
     )
-    query_csr = build_query_csr(block_indices, block_counts, num_blocks) if needs_grad else None
+    dkv_impl = QSA_DKV_IMPL if dkv_impl is None else dkv_impl
+    assert dkv_impl in ("tile", "block"), f"unknown QSA dkv implementation {dkv_impl!r}"
+    if dkv_tile_config is None:
+        dkv_tile_config = QSA_DKV_TILE_CONFIG
+    query_csr = None
+    if needs_grad and dkv_impl == "tile":
+        query_csr = build_qsa_kv_tile_csr(
+            block_indices, block_counts, num_blocks, dkv_tile_config.tile_blocks
+        )
+    elif needs_grad:
+        query_csr = build_query_csr(block_indices, block_counts, num_blocks)
     return QSASparseAttnFunction.apply(
         q.contiguous(),
         k.contiguous(),
@@ -970,4 +1398,5 @@ def qsa_sparse_attention(
         block_ends.contiguous(),
         scale,
         tile_queries,
+        dkv_tile_config,
     )
