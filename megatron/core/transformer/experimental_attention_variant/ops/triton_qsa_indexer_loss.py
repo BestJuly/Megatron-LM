@@ -214,10 +214,10 @@ def qsa_indexer_teacher(
     scale: float,
     token_offsets: Optional[torch.Tensor] = None,
     pool: bool = True,
-    block_tile: int = 32,
+    block_tile: int = 16,
     num_warps: int = 4,
     num_stages: int = 2,
-    swap_dot: bool = False,
+    swap_dot: bool = True,
     exact_exp: bool = False,
 ) -> torch.Tensor:
     """Head-summed teacher attention mass over each query's selected tokens.
@@ -236,10 +236,15 @@ def qsa_indexer_teacher(
             (no tensor parallelism); else ``[b, s, n_sel, R]`` token mass (to be summed
             over TP ranks before pooling). Neither is L1-normalized.
         block_tile / num_warps / num_stages: launch configuration (selected blocks per
-            tile, i.e. ``block_tile * R`` gathered tokens). The defaults were the fastest
-            of a sweep at the Qwen3.8 proxy shape (GB300).
-        swap_dot / exact_exp: diagnostic numerics options (keys-major dot orientation;
-            libdevice exp instead of the hardware exp).
+            tile, i.e. ``block_tile * R`` gathered tokens).
+        swap_dot: compute the logits keys-major (``keys @ q^T``). On GB300 this reproduces
+            the cuBLAS fp32 accumulation of the reference einsum, so the bf16-rounded
+            logits agree bit for bit: targets max abs 6e-8 vs the reference at the proxy
+            shape, against 2.5e-5 (rare bf16 rounding flips) for the heads-major
+            ``q @ keys^T`` dot, which is ~30 % faster (1.7 vs 2.4 ms per call with 32
+            blocks per tile). The default favors exactness; 16 blocks per tile is the
+            fastest keys-major configuration measured.
+        exact_exp: libdevice exp instead of the hardware exp (no measurable effect).
 
     Returns an fp32 tensor; runs without host synchronization (CUDA-graph capturable).
     """

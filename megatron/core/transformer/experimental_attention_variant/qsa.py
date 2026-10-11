@@ -68,7 +68,8 @@ class QSASelection(NamedTuple):
 
     q:          indexer queries ``[s, b, n_heads, head_dim]`` (grad into indexer params).
     block_keys: pooled/normed/RoPE'd block keys ``[n_blocks_total, b, head_dim]`` (grad).
-                For packed THD inputs this is the per-document concatenation.
+                For packed THD inputs this is the per-document concatenation, padded to
+                ``s // compress_ratio`` rows by unused (never visible) tail rows.
     order:      selected block ids ``[b, s, block_topk]`` (deterministic top-k order),
                 DOCUMENT-LOCAL under THD.
     picked:     bool validity of each selected slot ``[b, s, block_topk]``.
@@ -294,16 +295,20 @@ class QSAIndexer(MegatronModule):
         block_offsets = torch.zeros(s, dtype=torch.long, device=device)
         token_offsets = torch.zeros(s, dtype=torch.long, device=device)
         attn_block_offsets = torch.zeros(s, dtype=torch.long, device=device)
-        block_keys_parts = []
+        pooled_parts = []
+        freq_parts = []
+        topk_docs = []
         attn_bases_parts = []
         attn_ends_parts = []
         blocks_so_far = 0
         attn_blocks_so_far = 0
+        last_doc_blocks = 0
         # One host sync for all boundaries instead of one per document.
         cu_list = cu_seqlens.tolist()
         for d0 in range(len(cu_list) - 1):
             s0, s1 = int(cu_list[d0]), int(cu_list[d0 + 1])
             sd = s1 - s0
+            last_doc_blocks = blocks_so_far
             if sd == 0:
                 continue
             q_d = apply_rotary_pos_emb(
@@ -326,18 +331,55 @@ class QSAIndexer(MegatronModule):
             attn_ends_parts.append(torch.clamp(bases_d + r, max=s1))
             attn_blocks_so_far += nb_attn_d
             if n_blocks_d > 0:
-                bk_d = self._block_keys(raw_keys[s0:s1], rotary_pos_emb, n_blocks_d)
-                k_d = min(self.block_topk, n_blocks_d)
-                order_d, picked_d = self._streaming_topk(q_d, bk_d, m_t_d, n_blocks_d, k_d)
-                order[:, s0:s1, :k_d] = order_d
-                picked[:, s0:s1, :k_d] = picked_d
-                block_keys_parts.append(bk_d)
+                pooled_parts.append(
+                    raw_keys[s0 : s0 + n_blocks_d * r]
+                    .view(n_blocks_d, r, 1, self.head_dim)
+                    .float()
+                    .mean(dim=1)
+                    .to(raw_keys.dtype)
+                )
+                freq_parts.append(rotary_pos_emb[: n_blocks_d * r : r])
+                topk_docs.append((s0, s1, q_d, m_t_d, n_blocks_d, blocks_so_far))
                 blocks_so_far += n_blocks_d
-        block_keys = (
-            torch.cat(block_keys_parts, dim=0)
-            if block_keys_parts
-            else raw_keys.new_zeros(0, 1, self.head_dim)
-        )
+        # Block keys of all documents are normalized and rotated as ONE fixed [s // r]
+        # buffer laid out exactly like the static (graph) path's: the documents' blocks,
+        # then unused tail rows pooled from the pack's first r tokens at the static path's
+        # rotary positions. The tail is never visible to any query. Row-wise the values are
+        # the per-document ones, and the k-norm weight gradient (a reduction over rows) sees
+        # the same rows in the same order as under CUDA-graph capture, so the eager and
+        # captured paths stay bit-identical in the backward as well.
+        nb_max = s // r
+        if nb_max > 0:
+            pad = nb_max - blocks_so_far
+            if pad > 0:
+                pooled_parts.append(
+                    raw_keys[:r]
+                    .view(1, r, 1, self.head_dim)
+                    .float()
+                    .mean(dim=1)
+                    .to(raw_keys.dtype)
+                    .expand(pad, -1, -1)
+                )
+                tail_pos = (
+                    torch.arange(blocks_so_far, nb_max, device=device) - last_doc_blocks
+                ) * r
+                freq_parts.append(rotary_pos_emb.index_select(0, tail_pos))
+            pooled = self.k_layernorm(torch.cat(pooled_parts, dim=0))
+            block_keys = apply_rotary_pos_emb(
+                pooled.unsqueeze(2),
+                torch.cat(freq_parts, dim=0).contiguous(),
+                config=self.config,
+                cp_group=self.pg_collection.cp,
+            ).squeeze(2)
+        else:
+            block_keys = raw_keys.new_zeros(0, 1, self.head_dim)
+        for s0, s1, q_d, m_t_d, n_blocks_d, off in topk_docs:
+            k_d = min(self.block_topk, n_blocks_d)
+            order_d, picked_d = self._streaming_topk(
+                q_d, block_keys[off : off + n_blocks_d], m_t_d, n_blocks_d, k_d
+            )
+            order[:, s0:s1, :k_d] = order_d
+            picked[:, s0:s1, :k_d] = picked_d
         return QSASelection(
             q=q_rot,
             block_keys=block_keys,
