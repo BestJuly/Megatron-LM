@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 
 import torch
 import torch.nn.functional as F
@@ -31,9 +32,13 @@ from .cp_layout import (
     thd_partition_index,
 )
 from .distributed_embedding import EPShardedMultiTableEmbedding
+from .fused_dense import HAVE_TRITON, fused_engram_dense
 from .hashing import build_ngram_hashes, slice_hashes_for_sequence_parallel
 
 logger = logging.getLogger(__name__)
+
+_DENSE_IMPLS = ("fused", "reference")
+_DENSE_IMPL_ENV = "MEGATRON_ENGRAM_DENSE_IMPL"
 
 
 class _SequenceParallelConvHalo(torch.autograd.Function):
@@ -370,6 +375,14 @@ class Engram(MegatronModule):
         )
         self._initialize_dense_parameters()
         self._log_allocation()
+        dense_impl = os.environ.get(_DENSE_IMPL_ENV) or getattr(
+            engram_config, "dense_impl", "fused"
+        )
+        if dense_impl not in _DENSE_IMPLS:
+            raise ValueError(
+                f"Engram dense_impl must be one of {_DENSE_IMPLS}, got {dense_impl!r}."
+            )
+        self.dense_impl = dense_impl
 
     @property
     def local_sparse_parameter_count(self) -> int:
@@ -614,6 +627,57 @@ class Engram(MegatronModule):
             memory = self.embedding(hash_ids).flatten(start_dim=-2).transpose(0, 1).contiguous()
         finally:
             nvtx_range_pop(message)
+        if self._use_fused_dense(hidden_states):
+            return self._dense_fused(memory, hidden_states)
+        return self._dense_reference(memory, hidden_states, row_cu_seqlens)
+
+    def _use_fused_dense(self, hidden_states: Tensor) -> bool:
+        """Whether the Triton dense path covers this call (else the reference runs)."""
+        if self.dense_impl != "fused" or not HAVE_TRITON or not hidden_states.is_cuda:
+            return False
+        if hidden_states.dtype not in (torch.bfloat16, torch.float16):
+            return False
+        if self.short_conv.weight.dtype != hidden_states.dtype:
+            return False
+        if get_pg_size(self.cp_group) > 1:
+            return False
+        # The sequence-parallel halo needs a left context from the previous TP rank.
+        return not (self.config.sequence_parallel and get_pg_size(self.tp_group) > 1)
+
+    def _dense_fused(self, memory: Tensor, hidden_states: Tensor) -> Tensor:
+        """Projections in PyTorch, everything after them in the fused Triton kernels."""
+        message = "engram.gate-projection"
+        nvtx_range_push(message)
+        try:
+            shared_value = self.value_projection(memory)
+            key = self.key_projection(memory)
+        finally:
+            nvtx_range_pop(message)
+
+        message = "engram.fused-dense"
+        nvtx_range_push(message)
+        try:
+            output = fused_engram_dense(
+                key,
+                hidden_states,
+                shared_value,
+                self.key_norm.weight,
+                self.query_norm.weight,
+                self.conv_norm.weight,
+                self.short_conv.weight,
+                self.num_streams,
+                self.key_norm.eps,
+                self.key_norm.zero_centered,
+                self.engram_config.max_ngram_order,
+            )
+        finally:
+            nvtx_range_pop(message)
+        return output
+
+    def _dense_reference(
+        self, memory: Tensor, hidden_states: Tensor, row_cu_seqlens: Tensor | None
+    ) -> Tensor:
+        """Gate, conv-norm, short convolution, and residual as a PyTorch op chain."""
         streams = hidden_states.view(
             hidden_states.shape[0], hidden_states.shape[1], self.num_streams, self.hidden_size
         )
