@@ -1355,6 +1355,16 @@ class TransformerConfig(ModelParallelConfig):
     transformed to an empty list in __post_init__. The deprecated values "full_iteration" and
     "full_iteration_inference" are also accepted and migrated to the new API in __post_init__."""
 
+    cuda_graph_capture_engram_host: bool = False
+    """Capture the non-Engram part of each Engram-hosting layer under per-layer Transformer
+    Engine CUDA graphs. By default a layer that hosts an Engram module stays eager, because the
+    Engram hashed lookup and its all-to-all have data-dependent shapes. With this option the
+    hybrid hyper-connection wrapper (HybridStack with enable_hyper_connections) runs the Engram
+    lookup eagerly in front of the layer's graph and captures the rest of the layer (mHC
+    aggregate, attention, n-stream BDA, and a grouped MoE router prefix) like any other layer.
+    The math is unchanged: the Engram output is added to the n-stream input either way.
+    Requires cuda_graph_impl="transformer_engine" with the "attn" scope."""
+
     create_attention_mask_in_dataloader: bool = True
     """Whether training data loaders create and pass an attention_mask tensor.
 
@@ -3829,20 +3839,69 @@ class TransformerConfig(ModelParallelConfig):
                     raise ValueError(
                         "MOK does not support per-layer whole-layer CUDA Graph capture"
                     )
-                if any(
-                    scope in self.cuda_graph_modules
-                    for scope in (
-                        CudaGraphModule.moe,
-                        CudaGraphModule.moe_router,
-                        CudaGraphModule.moe_preprocess,
-                    )
-                ):
+                # The megakernel (dispatch, routed and shared experts, combine) has
+                # data-dependent work and is never captured, so 'moe' stays rejected.
+                # 'moe_preprocess' captures the native dispatcher's preprocessing, which MOK
+                # replaces. 'moe_router' is accepted for the Transformer Engine
+                # implementation only: the graph then ends after the router and the
+                # static-shape route compaction ([tokens, topk], no host synchronization),
+                # and the megakernel runs eagerly on the graph outputs
+                # (MoELayer._megakernel_capture_outputs). The local implementation drives
+                # MoE partial capture through MoETransformerLayer's intermediate-tensor
+                # protocol, which the megakernel path does not implement.
+                rejected_scopes = [CudaGraphModule.moe, CudaGraphModule.moe_preprocess]
+                if self.cuda_graph_impl == "local":
+                    rejected_scopes.append(CudaGraphModule.moe_router)
+                if any(scope in self.cuda_graph_modules for scope in rejected_scopes):
                     raise ValueError(
-                        "MOK does not support per-layer CUDA Graph scopes containing "
-                        "moe/moe_router/moe_preprocess"
+                        "MOK supports only the moe_router MoE scope, and only with "
+                        "cuda_graph_impl='transformer_engine'; per-layer CUDA Graph scopes "
+                        "containing moe/moe_preprocess (or moe_router with "
+                        "cuda_graph_impl='local') are not supported"
+                    )
+                if (
+                    CudaGraphModule.moe_router in self.cuda_graph_modules
+                    and self.recompute_granularity == "selective"
+                    and {"moe", "layernorm"} & set(self.recompute_modules or [])
+                ):
+                    # Neither combination has been validated with the megakernel graph
+                    # outputs: 'moe' would put the captured router inside the MoE
+                    # checkpoint, and the 'layernorm' recompute registers its hook on every
+                    # graph output, including the integer expert indices.
+                    raise ValueError(
+                        "MOK with the moe_router CUDA Graph scope does not support "
+                        "recompute_modules 'moe' or 'layernorm'"
                     )
             elif self.cuda_graph_impl not in ("none", "full_iteration"):
                 raise ValueError(f"MOK does not support cuda_graph_impl={self.cuda_graph_impl!r}")
+        if self.cuda_graph_capture_engram_host:
+            if not self.engram_enabled:
+                raise ValueError("cuda_graph_capture_engram_host requires Engram to be enabled")
+            if (
+                self.cuda_graph_impl != "transformer_engine"
+                or CudaGraphModule.attn not in self.cuda_graph_modules
+            ):
+                raise ValueError(
+                    "cuda_graph_capture_engram_host requires cuda_graph_impl="
+                    "'transformer_engine' with the 'attn' scope in cuda_graph_modules"
+                )
+            if not self.enable_hyper_connections:
+                # Only HyperConnectionHybridLayer moves the Engram lookup in front of the
+                # graph; plain TransformerLayer hosts would silently stay eager.
+                raise ValueError(
+                    "cuda_graph_capture_engram_host is implemented by the hybrid "
+                    "hyper-connection wrapper and requires enable_hyper_connections=True"
+                )
+            if self.recompute_granularity == "full" or (
+                self.recompute_granularity == "selective"
+                and "mhc" in (self.recompute_modules or [])
+            ):
+                # Not validated: these recompute modes re-run layers through their own
+                # schedule, and must replay the eager Engram lookup consistently.
+                raise ValueError(
+                    "cuda_graph_capture_engram_host does not support full recompute or the "
+                    "mhc selective recompute"
+                )
         if (
             self.fine_grained_activation_offloading
             and self.offload_modules
