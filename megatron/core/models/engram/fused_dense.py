@@ -29,8 +29,11 @@ backward
     ``_gval_kernel``       conv-norm backward plus the residual gradient (the gated value's
                            gradient) and per-tile partial gate gradients.
     ``_value_bwd_kernel``  gradient of the shared value (sum over streams).
-    ``_kq_bwd_kernel``     score/gate scalar chain, key and query norm backward, partial
-                           gamma gradients.
+    ``_kq_bwd_kernel``     key and query norm backward and partial gamma gradients. The
+                           backward of the scalar score chain (sigmoid, signed sqrt,
+                           scaling) runs before it on ``[T, NS]`` scalars with the
+                           reference's own PyTorch ops (``_score_chain_backward``); an
+                           in-kernel evaluation is kept behind ``_SCALAR_CHAIN = "triton"``.
 
 Numerics follow the reference op by op: every intermediate the reference holds in the
 activation dtype is rounded to it here as well (normed key/query/value, the key*query
@@ -76,6 +79,17 @@ _TILE_WARPS = 4
 _ROW_WARPS = 8
 _MAX_BLOCK_C = 128
 _NUM_STATS = 7  # gate, score, rstd_key, rstd_query, rstd_value, key dot, query dot
+
+# Where the backward of the scalar score chain (sigmoid, signed sqrt, scaling) runs: "torch"
+# replays the reference's own autograd ops on the [T, NS] scalars, "triton" evaluates it
+# inside _kq_bwd_kernel.
+_SCALAR_CHAIN = "torch"
+# With the torch chain, where the gate gradient sum(grad_value * shared_value) comes from:
+# "triton" sums the per-tile partials of _gval_kernel, "torch" recomputes it with the
+# reference's broadcast-multiply-and-sum (one extra pass over the gated-value gradient).
+_GATE_GRAD = "triton"
+# Tests set this to a dict to capture backward intermediates (stats, gate grad, score grad).
+_DEBUG = None
 
 
 def channel_block(hidden_size: int) -> int:
@@ -418,6 +432,7 @@ if HAVE_TRITON:
         dh_ptr,
         dgk_ptr,
         dgq_ptr,
+        gsum_ptr,
         T,
         inv_sqrt_h,
         NS: tl.constexpr,
@@ -426,6 +441,7 @@ if HAVE_TRITON:
         BLOCK_T: tl.constexpr,
         BLOCK_C: tl.constexpr,
         CT_P2: tl.constexpr,
+        USE_GSUM: tl.constexpr,
     ):
         DT = dk_ptr.dtype.element_ty
         C: tl.constexpr = NS * H
@@ -443,23 +459,27 @@ if HAVE_TRITON:
         rq = tl.load(stats_ptr + 3 * STAT + idx, mask=rmask, other=0.0)
         ak = tl.load(stats_ptr + 5 * STAT + idx, mask=rmask, other=0.0)
         aq = tl.load(stats_ptr + 6 * STAT + idx, mask=rmask, other=0.0)
-        ct = tl.arange(0, CT_P2)
-        partial = tl.load(
-            ggate_ptr + rows[:, None] * TILES + s * CT + ct[None, :],
-            mask=rmask[:, None] & (ct < CT)[None, :],
-            other=0.0,
-        )
-        ggate = _rnd(tl.sum(partial, axis=1), DT)
-        # Scalar chain: gate = sigmoid(sign(score) * sqrt(max(|score|, 1e-6))).
-        gsigned = _rnd(ggate * (1.0 - gate) * gate, DT)
-        sign = _sign(score)
-        mag = tl.abs(score)
-        root = _rnd(tl.sqrt_rn(_rnd(tl.maximum(mag, 1e-6), DT)), DT)
-        groot = _rnd(gsigned * sign, DT)
-        gmag = _rnd(tl.div_rn(groot, 2.0 * root), DT)
-        gmag = tl.where(mag >= 1e-6, gmag, 0.0)
-        gscore = _rnd(gmag * sign, DT)
-        gsum = _rnd(gscore * inv_sqrt_h, DT)
+        if USE_GSUM:
+            # Score gradient precomputed by the caller (``_score_chain_backward``).
+            gsum = tl.load(gsum_ptr + idx, mask=rmask, other=0.0)
+        else:
+            ct = tl.arange(0, CT_P2)
+            partial = tl.load(
+                ggate_ptr + rows[:, None] * TILES + s * CT + ct[None, :],
+                mask=rmask[:, None] & (ct < CT)[None, :],
+                other=0.0,
+            )
+            ggate = _rnd(tl.sum(partial, axis=1), DT)
+            # Scalar chain: gate = sigmoid(sign(score) * sqrt(max(|score|, 1e-6))).
+            gsigned = _rnd(ggate * (1.0 - gate) * gate, DT)
+            sign = _sign(score)
+            mag = tl.abs(score)
+            root = _rnd(tl.sqrt_rn(_rnd(tl.maximum(mag, 1e-6), DT)), DT)
+            groot = _rnd(gsigned * sign, DT)
+            gmag = _rnd(tl.div_rn(groot, 2.0 * root), DT)
+            gmag = tl.where(mag >= 1e-6, gmag, 0.0)
+            gscore = _rnd(gmag * sign, DT)
+            gsum = _rnd(gscore * inv_sqrt_h, DT)
 
         offs = rows[:, None] * C + cols[None, :]
         k = tl.load(k_ptr + offs, mask=rmask[:, None], other=0.0).to(tl.float32)
@@ -482,6 +502,23 @@ if HAVE_TRITON:
 
 def _num_warps(block: int) -> int:
     return _ROW_WARPS if block >= 2048 else 4
+
+
+def _score_chain_backward(grad_gate: Tensor, gate: Tensor, score: Tensor, hidden_size: int):
+    """Gradient of ``sum(key * query)`` from the gate gradient, with the reference's own ops.
+
+    The reference computes ``gate = sigmoid(sign(s) * sqrt(clamp_min(|s|, 1e-6)))`` with
+    ``s = sum(key * query) / sqrt(H)``; these are the autograd formulas of exactly those ops,
+    in the activation dtype, on ``[T, NS]`` tensors.
+    """
+    magnitude = score.abs()
+    root = magnitude.clamp_min(1e-6).sqrt()
+    grad_signed = torch.ops.aten.sigmoid_backward(grad_gate, gate)
+    grad_root = grad_signed * score.sign()
+    grad_clamped = grad_root / (2 * root)
+    grad_magnitude = torch.where(magnitude >= 1e-6, grad_clamped, torch.zeros_like(grad_clamped))
+    grad_score = grad_magnitude * score.sgn()
+    return grad_score / float(hidden_size) ** 0.5
 
 
 def _inv_sqrt(hidden_size: int) -> float:
@@ -663,6 +700,27 @@ class FusedEngramDense(torch.autograd.Function):
             _value_bwd_kernel[(row_tiles, col_tiles)](
                 grad_value_streams, stats, grad_value, tokens, **common, num_warps=_TILE_WARPS
             )
+            use_gsum = _SCALAR_CHAIN == "torch" or _DEBUG is not None
+            if use_gsum:
+                dtype = hidden.dtype
+                if _GATE_GRAD == "torch":
+                    grad_gate = (
+                        grad_value_streams.view(tokens, num_streams, hidden_size)
+                        * value.view(tokens, 1, hidden_size)
+                    ).sum(-1)
+                else:
+                    grad_gate = (
+                        ggate_partial.view(tokens, num_streams, col_tiles).sum(-1).to(dtype)
+                    )
+                gate_act, score_act = stats[0].to(dtype), stats[1].to(dtype)
+                grad_sum = _score_chain_backward(grad_gate, gate_act, score_act, hidden_size)
+                if _DEBUG is not None:
+                    _DEBUG.update(
+                        stats=stats.clone(), grad_gate=grad_gate.clone(), grad_sum=grad_sum.clone()
+                    )
+                grad_sum = grad_sum.float()
+            else:
+                grad_sum = stats[0]  # unused placeholder pointer
             _kq_bwd_kernel[grid](
                 key,
                 hidden,
@@ -674,10 +732,12 @@ class FusedEngramDense(torch.autograd.Function):
                 grad_hidden,
                 dgk_partial,
                 dgq_partial,
+                grad_sum,
                 tokens,
                 _inv_sqrt(hidden_size),
                 ZC=zero_centered,
                 CT_P2=ct_p2,
+                USE_GSUM=_SCALAR_CHAIN == "torch",
                 **common,
                 num_warps=_TILE_WARPS,
             )

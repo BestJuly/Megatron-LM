@@ -17,6 +17,8 @@ two valid bf16 evaluations differ there by a few 1e-3 on random inputs, and both
   reference is printed alongside for scale.
 """
 
+import math
+
 import pytest
 import torch
 
@@ -165,10 +167,48 @@ def test_fused_matches_reference(
         )
 
 
+def _reference_intermediates(module, key, hidden, value, grad):
+    """Reference forward/backward with the score-chain intermediates retained."""
+    seq, batch, width = hidden.shape
+    hidden_size = module.hidden_size
+    shape = (seq, batch, width // hidden_size, hidden_size)
+    key = key.detach().clone().requires_grad_(True)
+    hidden = hidden.detach().clone().requires_grad_(True)
+    key_n = module.key_norm(key).view(shape)
+    query_n = module.query_norm(hidden).view(shape)
+    dot = (key_n * query_n).sum(dim=-1)
+    dot.retain_grad()
+    score = dot / math.sqrt(hidden_size)
+    gate = (score.abs().clamp_min(1e-6).sqrt() * score.sign()).sigmoid()
+    gate.retain_grad()
+    gated = gate.unsqueeze(-1) * value.unsqueeze(2)
+    output = gated + module._short_convolution(gated, None)
+    output.reshape(seq, batch, width).backward(grad)
+    for parameter in module.parameters():
+        parameter.grad = None
+    return dict(score=score.detach(), gate=gate.detach(), grad_gate=gate.grad, grad_sum=dot.grad)
+
+
+def _mismatch(name, fused, reference):
+    fused, reference = fused.reshape(-1).float(), reference.reshape(-1).float()
+    differ = (fused != reference).float().mean().item()
+    print(f"  {name}: differing fraction {differ:.3e}, rel-L2 {_rel_l2(fused, reference):.3e}")
+
+
+@pytest.mark.parametrize("chain", ["torch", "torch+gate-grad", "triton"])
 @pytest.mark.parametrize("zero_centered", [True, False])
 @pytest.mark.parametrize("seq,batch", [(1024, 1), (300, 2)])
-def test_fused_matches_reference_well_conditioned(seq, batch, zero_centered):
-    """Same projections fed to both paths, with every score bounded away from zero."""
+def test_fused_matches_reference_well_conditioned(seq, batch, zero_centered, chain, monkeypatch):
+    """Same projections fed to both paths, with every score bounded away from zero.
+
+    ``chain`` selects where the scalar score-chain backward runs (``_SCALAR_CHAIN``) and
+    where the gate gradient is summed (``_GATE_GRAD``). The default ("torch") must meet the
+    bar; the other variants are reported (xfail) for comparison.
+    """
+    from megatron.core.models.engram import fused_dense
+
+    monkeypatch.setattr(fused_dense, "_SCALAR_CHAIN", chain.split("+")[0])
+    monkeypatch.setattr(fused_dense, "_GATE_GRAD", "torch" if "gate-grad" in chain else "triton")
     hidden_size, streams = 2560, 4
     module = _build(hidden_size, streams, 1280, 8, 3, 4, 1000, torch.bfloat16)
     with torch.no_grad():
@@ -224,13 +264,26 @@ def test_fused_matches_reference_well_conditioned(seq, batch, zero_centered):
         score = (kn * qn).sum(-1) / hidden_size**0.5
     min_score = score.abs().min().item()
     out_ref, grads_ref = run("reference")
+    debug = {}
+    monkeypatch.setattr(fused_dense, "_DEBUG", debug)
     out_fused, grads_fused = run("fused")
+    monkeypatch.setattr(fused_dense, "_DEBUG", None)
+    inter = _reference_intermediates(module, key, hidden, value, grad)
+    print(f"\n[{chain}] fused vs reference score-chain intermediates:")
+    shape = inter["score"].shape
+    _mismatch("score", debug["stats"][1].view(shape), inter["score"])
+    _mismatch("gate", debug["stats"][0].view(shape), inter["gate"])
+    _mismatch("grad_gate", debug["grad_gate"].view(shape), inter["grad_gate"])
+    _mismatch("grad_sum (torch chain)", debug["grad_sum"].view(shape), inter["grad_sum"])
     report = {"output": _rel_l2(out_fused, out_ref)}
     report.update({n: _rel_l2(grads_fused[n], grads_ref[n]) for n in grads_ref})
     print(f"\nmin |score| {min_score:.3e}; fused-vs-ref rel-L2:")
     for name, value_ in report.items():
         print(f"  {name}: {value_:.3e}")
     assert min_score > 0.05, f"test setup: scores not bounded away from zero ({min_score})"
+    worst = max(report, key=report.get)
+    if chain != "torch" and report[worst] > 1e-3:
+        pytest.xfail(f"variant {chain}: {worst} rel-L2 {report[worst]:.3e}")
     for name, value_ in report.items():
         assert value_ <= 1e-3, f"{name}: fused vs reference rel-L2 {value_:.3e}"
 
