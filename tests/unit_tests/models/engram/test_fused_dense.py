@@ -3,9 +3,19 @@
 """Fused Triton dense path vs. the PyTorch reference path of the Engram module.
 
 Both paths run on the same module (same weights, same retrieved memory) in one forward and
-one backward. The bar is the one the reference itself sets against an fp64 evaluation: the
-fused path must agree with the reference to rel-L2 <= 1e-3 on the output and on every
-gradient, and must not be further from fp64 than the reference is.
+one backward.
+
+* The output and every gradient that does not pass through the gate score (value
+  projection, conv-norm gamma, convolution weight) must agree with the reference to
+  rel-L2 <= 1e-3.
+* The gate is ``sigmoid(sign(s) * sqrt(|s|))`` of a bf16 score; its derivative grows like
+  ``1 / sqrt(|s|)`` near zero, so the gradients upstream of the score (key projection, key
+  and query norms, the Engram input, the tables) amplify any rounding difference in ``s``.
+  For those the bar is the reference's own stability: the fused/reference difference must
+  stay within twice the change that flipping the last bit of 2 % of the input elements
+  causes in the reference (or 1e-3, whichever is larger). The printed fp64 column shows how
+  far the same perturbation moves the exact gradients. In every case the fused path must be
+  no further from fp64 than the reference.
 """
 
 import pytest
@@ -102,26 +112,50 @@ def test_fused_matches_reference(
     assert module._use_fused_dense(hidden)
     out_ref, grads_ref = _run(module, "reference", hidden, tokens, grad)
     out_fused, grads_fused = _run(module, "fused", hidden, tokens, grad)
+    # Noise floor: flip the last mantissa bit of 2 % of the input elements.
+    flip = torch.rand(hidden.shape, device="cuda", generator=generator) < 0.02
+    hidden_flipped = (hidden.view(torch.int16) ^ flip.to(torch.int16)).view(torch.bfloat16)
+    _, grads_flip = _run(module, "reference", hidden_flipped, tokens, grad)
 
     # fp64 evaluation of the same module, as the accuracy anchor for both bf16 paths.
     module64 = module.double()
     out_64, grads_64 = _run(module64, "reference", hidden.double(), tokens, grad.double())
+    _, grads_64_flip = _run(module64, "reference", hidden_flipped.double(), tokens, grad.double())
     module.bfloat16()
 
-    report = {"output": (_rel_l2(out_fused, out_ref), _rel_l2(out_ref, out_64),
-                         _rel_l2(out_fused, out_64))}
+    report = {
+        "output": (
+            _rel_l2(out_fused, out_ref),
+            0.0,
+            0.0,
+            _rel_l2(out_ref, out_64),
+            _rel_l2(out_fused, out_64),
+        )
+    }
     for name in grads_ref:
         report[name] = (
             _rel_l2(grads_fused[name], grads_ref[name]),
+            _rel_l2(grads_flip[name], grads_ref[name]),
+            _rel_l2(grads_64_flip[name], grads_64[name]),
             _rel_l2(grads_ref[name], grads_64[name]),
             _rel_l2(grads_fused[name], grads_64[name]),
         )
-    print("\nname: fused-vs-ref, ref-vs-fp64, fused-vs-fp64")
+    print(
+        "\nname: fused-vs-ref, ref-floor(1ulp input flip), fp64-floor, ref-vs-fp64, fused-vs-fp64"
+    )
     for name, values in report.items():
         print(f"  {name}: " + ", ".join(f"{v:.3e}" for v in values))
-    for name, (vs_ref, ref_err, fused_err) in report.items():
-        assert vs_ref <= 1e-3, f"{name}: fused vs reference rel-L2 {vs_ref:.3e}"
-        assert fused_err <= 2.0 * ref_err + 1e-4, (
+    well_conditioned = (
+        "output",
+        "value_projection.weight",
+        "value_projection.bias",
+        "conv_norm.weight",
+        "short_conv.weight",
+    )
+    for name, (vs_ref, floor, _, ref_err, fused_err) in report.items():
+        bar = 1e-3 if name in well_conditioned else max(1e-3, 2.0 * floor)
+        assert vs_ref <= bar, f"{name}: fused vs reference rel-L2 {vs_ref:.3e} > {bar:.3e}"
+        assert fused_err <= 1.25 * ref_err + 1e-4, (
             f"{name}: fused is further from fp64 ({fused_err:.3e}) than the reference "
             f"({ref_err:.3e})"
         )
@@ -223,7 +257,8 @@ def test_token_count_does_not_recompile():
         fused_dense._gate_fwd_kernel,
         fused_dense._conv_fwd_kernel,
         fused_dense._conv_bwd_kernel,
-        fused_dense._cnorm_bwd_kernel,
+        fused_dense._cnorm_dot_kernel,
+        fused_dense._gval_kernel,
         fused_dense._value_bwd_kernel,
         fused_dense._kq_bwd_kernel,
     ]

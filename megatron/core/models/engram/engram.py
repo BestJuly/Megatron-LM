@@ -32,7 +32,7 @@ from .cp_layout import (
     thd_partition_index,
 )
 from .distributed_embedding import EPShardedMultiTableEmbedding
-from .fused_dense import HAVE_TRITON, fused_engram_dense
+from .fused_dense import HAVE_TRITON, channel_block, fused_engram_dense
 from .hashing import build_ngram_hashes, slice_hashes_for_sequence_parallel
 
 logger = logging.getLogger(__name__)
@@ -638,6 +638,8 @@ class Engram(MegatronModule):
         if hidden_states.dtype not in (torch.bfloat16, torch.float16):
             return False
         if self.short_conv.weight.dtype != hidden_states.dtype:
+            return False
+        if channel_block(self.hidden_size) == 0:
             return False
         if get_pg_size(self.cp_group) > 1:
             return False
