@@ -1003,11 +1003,17 @@ def _launch_dims(K: int, V: int, G: int):
 
 
 class QSADkvTileConfig(NamedTuple):
-    """Launch configuration of :func:`qsa_bwd_dkv_tile_kernel` (shape-only, never data)."""
+    """Launch configuration of :func:`qsa_bwd_dkv_tile_kernel` (shape-only, never data).
 
-    tile_blocks: int = 4  # selection blocks per KV tile (RT = 4 * tile_blocks KV rows)
+    The default was the fastest in a GB300 sweep at the Qwen3.8 proxy shape (THD 4096,
+    24 query / 2 KV heads, head dim 256, budget 2048): 1.15-1.22 ms vs 9.2 ms for the
+    per-block kernel. Larger KV tiles amortize each gathered q/dO row over more KV rows;
+    the column split balances the early tiles, which almost every query selects.
+    """
+
+    tile_blocks: int = 16  # selection blocks per KV tile (RT = 4 * tile_blocks KV rows)
     cq: int = 64  # (query, group head) columns per iteration
-    num_warps: int = 4
+    num_warps: int = 8
     num_stages: int = 2
     trans: bool = False
     nsplit: int = 0  # column-range splits per tile; 0 = derive from the grid size
@@ -1042,15 +1048,18 @@ if os.environ.get("MEGATRON_QSA_DKV_TILE_CFG"):
 
 # (dtype, BK, BV, G, config, nsplit) -> config that compiled within the shared-memory budget
 _DKV_TILE_RESOLVED = {}
+# same key -> last compiled kernel (register / spill / shared-memory introspection)
+_DKV_TILE_LAST_KERNEL = {}
 
 
 def _dkv_tile_nsplit(cfg: QSADkvTileConfig, n_programs: int, device) -> int:
     if cfg.nsplit > 0:
         return cfg.nsplit
-    # Shape-only: split a tile's column range until the grid fills ~2 waves.
+    # Shape-only: split a tile's column range until the grid fills ~4 waves (the per-tile
+    # work is very uneven: early KV tiles are selected by almost every later query).
     sms = torch.cuda.get_device_properties(device).multi_processor_count
     nsplit = 1
-    while nsplit < 8 and n_programs * nsplit < 2 * sms:
+    while nsplit < 8 and n_programs * nsplit < 4 * sms:
         nsplit *= 2
     return nsplit
 
@@ -1090,7 +1099,7 @@ def qsa_bwd_dkv_tile(
             dk_out = torch.zeros_like(k)
             dv_out = torch.zeros_like(v)
         try:
-            qsa_bwd_dkv_tile_kernel[(B * NT, H, nsplit)](
+            _DKV_TILE_LAST_KERNEL[key] = qsa_bwd_dkv_tile_kernel[(B * NT, H, nsplit)](
                 q=q,
                 k=k,
                 v=v,

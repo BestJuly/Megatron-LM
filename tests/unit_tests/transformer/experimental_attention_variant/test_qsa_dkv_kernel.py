@@ -133,6 +133,8 @@ CONFIGS = {
     "trans": tq.QSADkvTileConfig(trans=True),
     "kb8_split2": tq.QSADkvTileConfig(tile_blocks=8, nsplit=2),
     "kb16_split4_cq32": tq.QSADkvTileConfig(tile_blocks=16, cq=32, nsplit=4, num_warps=8),
+    "kb4_nosplit": tq.QSADkvTileConfig(tile_blocks=4, cq=64, num_warps=4, nsplit=1),
+    "kb16_split8_cq128": tq.QSADkvTileConfig(tile_blocks=16, cq=128, nsplit=8),
 }
 
 
