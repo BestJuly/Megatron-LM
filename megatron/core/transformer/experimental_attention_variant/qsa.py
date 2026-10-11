@@ -68,7 +68,8 @@ class QSASelection(NamedTuple):
 
     q:          indexer queries ``[s, b, n_heads, head_dim]`` (grad into indexer params).
     block_keys: pooled/normed/RoPE'd block keys ``[n_blocks_total, b, head_dim]`` (grad).
-                For packed THD inputs this is the per-document concatenation.
+                For packed THD inputs this is the per-document concatenation, padded to
+                ``s // compress_ratio`` rows by unused (never visible) tail rows.
     order:      selected block ids ``[b, s, block_topk]`` (deterministic top-k order),
                 DOCUMENT-LOCAL under THD.
     picked:     bool validity of each selected slot ``[b, s, block_topk]``.
@@ -294,16 +295,20 @@ class QSAIndexer(MegatronModule):
         block_offsets = torch.zeros(s, dtype=torch.long, device=device)
         token_offsets = torch.zeros(s, dtype=torch.long, device=device)
         attn_block_offsets = torch.zeros(s, dtype=torch.long, device=device)
-        block_keys_parts = []
+        pooled_parts = []
+        freq_parts = []
+        topk_docs = []
         attn_bases_parts = []
         attn_ends_parts = []
         blocks_so_far = 0
         attn_blocks_so_far = 0
+        last_doc_blocks = 0
         # One host sync for all boundaries instead of one per document.
         cu_list = cu_seqlens.tolist()
         for d0 in range(len(cu_list) - 1):
             s0, s1 = int(cu_list[d0]), int(cu_list[d0 + 1])
             sd = s1 - s0
+            last_doc_blocks = blocks_so_far
             if sd == 0:
                 continue
             q_d = apply_rotary_pos_emb(
@@ -326,18 +331,55 @@ class QSAIndexer(MegatronModule):
             attn_ends_parts.append(torch.clamp(bases_d + r, max=s1))
             attn_blocks_so_far += nb_attn_d
             if n_blocks_d > 0:
-                bk_d = self._block_keys(raw_keys[s0:s1], rotary_pos_emb, n_blocks_d)
-                k_d = min(self.block_topk, n_blocks_d)
-                order_d, picked_d = self._streaming_topk(q_d, bk_d, m_t_d, n_blocks_d, k_d)
-                order[:, s0:s1, :k_d] = order_d
-                picked[:, s0:s1, :k_d] = picked_d
-                block_keys_parts.append(bk_d)
+                pooled_parts.append(
+                    raw_keys[s0 : s0 + n_blocks_d * r]
+                    .view(n_blocks_d, r, 1, self.head_dim)
+                    .float()
+                    .mean(dim=1)
+                    .to(raw_keys.dtype)
+                )
+                freq_parts.append(rotary_pos_emb[: n_blocks_d * r : r])
+                topk_docs.append((s0, s1, q_d, m_t_d, n_blocks_d, blocks_so_far))
                 blocks_so_far += n_blocks_d
-        block_keys = (
-            torch.cat(block_keys_parts, dim=0)
-            if block_keys_parts
-            else raw_keys.new_zeros(0, 1, self.head_dim)
-        )
+        # Block keys of all documents are normalized and rotated as ONE fixed [s // r]
+        # buffer laid out exactly like the static (graph) path's: the documents' blocks,
+        # then unused tail rows pooled from the pack's first r tokens at the static path's
+        # rotary positions. The tail is never visible to any query. Row-wise the values are
+        # the per-document ones, and the k-norm weight gradient (a reduction over rows) sees
+        # the same rows in the same order as under CUDA-graph capture, so the eager and
+        # captured paths stay bit-identical in the backward as well.
+        nb_max = s // r
+        if nb_max > 0:
+            pad = nb_max - blocks_so_far
+            if pad > 0:
+                pooled_parts.append(
+                    raw_keys[:r]
+                    .view(1, r, 1, self.head_dim)
+                    .float()
+                    .mean(dim=1)
+                    .to(raw_keys.dtype)
+                    .expand(pad, -1, -1)
+                )
+                tail_pos = (
+                    torch.arange(blocks_so_far, nb_max, device=device) - last_doc_blocks
+                ) * r
+                freq_parts.append(rotary_pos_emb.index_select(0, tail_pos))
+            pooled = self.k_layernorm(torch.cat(pooled_parts, dim=0))
+            block_keys = apply_rotary_pos_emb(
+                pooled.unsqueeze(2),
+                torch.cat(freq_parts, dim=0).contiguous(),
+                config=self.config,
+                cp_group=self.pg_collection.cp,
+            ).squeeze(2)
+        else:
+            block_keys = raw_keys.new_zeros(0, 1, self.head_dim)
+        for s0, s1, q_d, m_t_d, n_blocks_d, off in topk_docs:
+            k_d = min(self.block_topk, n_blocks_d)
+            order_d, picked_d = self._streaming_topk(
+                q_d, block_keys[off : off + n_blocks_d], m_t_d, n_blocks_d, k_d
+            )
+            order[:, s0:s1, :k_d] = order_d
+            picked[:, s0:s1, :k_d] = picked_d
         return QSASelection(
             q=q_rot,
             block_keys=block_keys,
@@ -1061,96 +1103,32 @@ class QSASelfAttention(SelfAttention):
         selected-set L1 absorbs, so it is omitted. Student: log-softmax of the
         indexer's fp32 block scores restricted to the same set (Eq. 20). The indexer
         input is detached, so this loss trains only the indexer parameters.
+
+        ``config.qsa_indexer_loss_impl`` selects how the same loss is computed:
+
+        * ``"reference"``: the original eager path (gathers the selected keys and the
+          selected block keys, einsum per chunk).
+        * ``"layout"``: identical math and rounding, without materializing the
+          gathered keys: per chunk, one GEMM of the chunk's queries against the keys of
+          its causal key range, then a gather of the bf16 logits at the selected tokens
+          (no ``[b, chunk, budget, groups, d]`` key tensor, no einsum transpose copy).
+        * ``"fused"``: the Triton teacher kernel (``ops/triton_qsa_indexer_loss.py``)
+          plus the student scores as one GEMM against all block keys of the chunk's
+          causal range followed by a gather at the selected blocks (fp32-accumulated,
+          deterministic gradients instead of bf16 atomic scatter-adds).
         """
+        impl = self.config.qsa_indexer_loss_impl
         r = self.indexer.compress_ratio
         order, picked = selection.order, selection.picked  # [b, s, k]
         b, s, k = order.shape
-
-        # Detached teacher q/k: re-run the QKV projection (+ qk norms inside) and RoPE.
-        with torch.no_grad():
-            qkv = self.get_query_key_value_tensors(
-                hidden_states.detach(),
-                None,
-                split_qkv=True,
-                output_gate=self.config.attention_output_gate,
-                head_wise_gate=False,
-            )
-            query, key = qkv[0], qkv[1]  # [s, b, np, d], [s, b, ng, d]
-            cp = self.pg_collection.cp
-            if cp is not None and cp.size() > 1 and selection.q_positions is not None:
-                # Teacher under allgather CP: local queries at their true positions,
-                # keys gathered to global order (the token gather below uses global
-                # ids). No grad here, so the gather carries no backward cost.
-                query, key = self._rope_qk_cp(query, key, freqs, selection)
-                (key,) = self._cp_gather_kv([key], selection)
-            else:
-                query, key = self._rope_qk(query, key, freqs, cu_seqlens)
-        q_bt = query.permute(1, 0, 2, 3)  # [b, s, np, d]
-        k_bt = key.permute(1, 0, 2, 3)  # [b, s, ng, d]
-        np_local, ng_local = q_bt.shape[2], k_bt.shape[2]
-        hpg = np_local // ng_local
-        d = q_bt.shape[-1]
-        scale = self.hidden_size_per_attention_head**-0.5
-
-        tp_group = self.pg_collection.tp
-        tp_size = tp_group.size() if tp_group is not None else 1
-
-        # Query-chunk size for the two passes below. Pure memory staging: the softmax is over
-        # the last (token) axis and `mass` accumulates per chunk, so the chunk size cannot
-        # change any result - it only trades peak memory for kernel launches.
         chunk = max(1, int(self.config.qsa_indexer_loss_chunk))
-        arange_r = torch.arange(r, device=order.device)
+        # Without CP every selected block of a query lies before it, so a chunk ending at
+        # row c1 only reads blocks [0, ceil(c1 / r)). Under allgather CP the local rows
+        # are not a prefix of the global token space.
+        causal_prefix = selection.q_positions is None
 
-        # Pass 1 (no grad): local-head teacher, block-max-pooled into a small
-        # [b, s, k] fp32 buffer. The Eq.(17) MaxPool is nonlinear, so the TP head-sum
-        # must complete BEFORE pooling (deferring a single block-level reduce would
-        # be exact only for sum pooling) — but the reduce granularity is free: the
-        # token-level mass is staged over several einsum chunks and all-reduced per
-        # stage, keeping the collective count low without growing the einsum tile.
-        # Normalization still commutes (it happens after the reduce).
-        targets = torch.zeros(b, s, k, dtype=torch.float32, device=order.device)
-        stage = chunk * 8
-        with torch.no_grad():
-            for g0 in range(0, s, stage):
-                g1 = min(g0 + stage, s)
-                mass = torch.zeros(
-                    b, g1 - g0, k, r, dtype=torch.float32, device=order.device
-                )
-                for c0 in range(g0, g1, chunk):
-                    c1 = min(c0 + chunk, g1)
-                    order_c = order[:, c0:c1]  # [b, c, k]
-                    picked_c = picked[:, c0:c1]  # [b, c, k]
-                    c = c1 - c0
-
-                    tok = order_c.unsqueeze(-1) * r + arange_r  # [b, c, k, r] doc-local
-                    if selection.token_offsets is not None:
-                        tok = tok + selection.token_offsets[c0:c1].view(1, c, 1, 1)
-                    tok = tok.reshape(b, c * k * r)
-                    k_sel = torch.gather(
-                        k_bt, 1, tok[..., None, None].expand(-1, -1, ng_local, d)
-                    ).view(b, c, k * r, ng_local, d)
-
-                    q_c = q_bt[:, c0:c1].view(b, c, ng_local, hpg, d)
-                    # Operands stay in the model dtype; cuBLAS accumulates bf16 matmuls in
-                    # fp32, and the result is promoted before the softmax so every reduction
-                    # below is still fp32. Upcasting the operands instead doubled the tensor
-                    # traffic of the two gathers above and pushed this matmul onto TF32.
-                    teacher = torch.einsum(
-                        "bcghd,bctgd->bcght", q_c, k_sel
-                    ).float() * scale  # [b, c, g, h, T]
-                    valid_t = picked_c.repeat_interleave(r, dim=-1)  # [b, c, T]
-                    probs = masked_softmax(
-                        teacher, valid_t[:, :, None, None, :].expand_as(teacher)
-                    )
-                    # [b, c, T] — head sum (local heads), staged before the TP reduce
-                    mass[:, c0 - g0 : c1 - g0] = probs.sum(dim=(2, 3)).view(b, c, k, r)
-                if tp_size > 1:
-                    torch.distributed.all_reduce(mass, group=tp_group)
-                # Eq.(17) block MaxPool; probs are >= 0 and invalid slots are exactly
-                # 0 from the masked softmax, so amax over the r token slots is the max
-                # over the valid ones.
-                targets[:, g0:g1] = mass.amax(dim=-1).masked_fill(~picked[:, g0:g1], 0.0)
-            normalize_indexer_target_(targets)
+        q_bt, k_bt = self._indexer_teacher_qk(hidden_states, freqs, selection, cu_seqlens)
+        targets = self._indexer_targets(q_bt, k_bt, selection, impl)
 
         # Pass 2 (grad into the indexer): student scores recomputed at the selected
         # blocks only, chunked, against the reduced+normalized teacher.
@@ -1158,6 +1136,9 @@ class QSASelfAttention(SelfAttention):
         valid_rows = torch.zeros((), device=order.device, dtype=torch.float32)
         bk_bt = selection.block_keys.permute(1, 0, 2)  # [b, n_blocks_total, d_idx]
         d_idx = bk_bt.shape[-1]
+        n_blocks_total = bk_bt.shape[1]
+        q_idx_all = selection.q.permute(1, 0, 2, 3)  # [b, s, nh, d_idx]
+        nh = q_idx_all.shape[2]
         for c0 in range(0, s, chunk):
             c1 = min(c0 + chunk, s)
             order_c = order[:, c0:c1]
@@ -1168,15 +1149,32 @@ class QSASelfAttention(SelfAttention):
             blk = order_c
             if selection.block_offsets is not None:
                 blk = blk + selection.block_offsets[c0:c1].view(1, c, 1)
-            bk_sel = torch.gather(
-                bk_bt, 1, blk.reshape(b, c * k)[..., None].expand(-1, -1, d_idx)
-            ).view(b, c, k, d_idx)
-            q_idx = selection.q.permute(1, 0, 2, 3)[:, c0:c1]  # [b, c, nh, d_idx]
-            # Same policy as the teacher: bf16 operands, fp32 accumulation inside the
-            # matmul, promoted before the relu/head-sum so the reduction and the
-            # log-softmax below are unchanged. This one carries the indexer gradient, so
-            # the promotion happens before any nonlinearity.
-            student = torch.einsum("bchd,bckd->bchk", q_idx, bk_sel).float()
+            q_idx = q_idx_all[:, c0:c1]  # [b, c, nh, d_idx]
+            if impl == "fused":
+                # One GEMM against the block keys of the chunk's causal range, then a
+                # gather of the bf16 scores: same per-element products and rounding as
+                # the per-slot einsum, but the backward is two dense GEMMs plus a
+                # collision-free scatter (unpicked slots carry exact zeros) instead of
+                # a bf16 atomic scatter-add into the block keys.
+                nb_hi = (
+                    min(n_blocks_total, -(-c1 // r)) if causal_prefix else n_blocks_total
+                )
+                blk = blk.clamp_max(max(nb_hi - 1, 0))
+                dense = torch.matmul(
+                    q_idx.reshape(b, c * nh, d_idx), bk_bt[:, :nb_hi].transpose(1, 2)
+                ).view(b, c, nh, nb_hi)
+                student = torch.gather(
+                    dense, 3, blk.unsqueeze(2).expand(b, c, nh, k)
+                ).float()  # [b, c, nh, k]
+            else:
+                bk_sel = torch.gather(
+                    bk_bt, 1, blk.reshape(b, c * k)[..., None].expand(-1, -1, d_idx)
+                ).view(b, c, k, d_idx)
+                # Same policy as the teacher: bf16 operands, fp32 accumulation inside the
+                # matmul, promoted before the relu/head-sum so the reduction and the
+                # log-softmax below are unchanged. This one carries the indexer gradient,
+                # so the promotion happens before any nonlinearity.
+                student = torch.einsum("bchd,bckd->bchk", q_idx, bk_sel).float()
             student = torch.relu(student).sum(dim=2) / math.sqrt(d_idx)  # [b, c, k]
             log_probs = masked_log_softmax(student, picked_c)
 
@@ -1188,3 +1186,194 @@ class QSASelfAttention(SelfAttention):
 
         loss = kl_sum / valid_rows.clamp_min(1.0) * loss_coeff
         return loss
+
+    @torch.no_grad()
+    def _indexer_teacher_qk(
+        self,
+        hidden_states: Tensor,
+        freqs: Tensor,
+        selection: QSASelection,
+        cu_seqlens: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        """Detached teacher q/k ``[b, s, np, d]`` / ``[b, s_kv, ng, d]``: re-run the QKV
+        projection (+ qk norms inside) and RoPE."""
+        qkv = self.get_query_key_value_tensors(
+            hidden_states.detach(),
+            None,
+            split_qkv=True,
+            output_gate=self.config.attention_output_gate,
+            head_wise_gate=False,
+        )
+        query, key = qkv[0], qkv[1]  # [s, b, np, d], [s, b, ng, d]
+        cp = self.pg_collection.cp
+        if cp is not None and cp.size() > 1 and selection.q_positions is not None:
+            # Teacher under allgather CP: local queries at their true positions,
+            # keys gathered to global order (the token gather below uses global
+            # ids). No grad here, so the gather carries no backward cost.
+            query, key = self._rope_qk_cp(query, key, freqs, selection)
+            (key,) = self._cp_gather_kv([key], selection)
+        else:
+            query, key = self._rope_qk(query, key, freqs, cu_seqlens)
+        return query.permute(1, 0, 2, 3), key.permute(1, 0, 2, 3)
+
+    @torch.no_grad()
+    def _indexer_targets(
+        self, q_bt: Tensor, k_bt: Tensor, selection: QSASelection, impl: str
+    ) -> Tensor:
+        """L1-normalized teacher targets ``[b, s, k]`` (fp32) with the chosen impl."""
+        scale = self.hidden_size_per_attention_head**-0.5
+        tp_group = self.pg_collection.tp
+        tp_size = tp_group.size() if tp_group is not None else 1
+        if impl == "fused":
+            return self._indexer_targets_fused(q_bt, k_bt, selection, scale, tp_group, tp_size)
+        # Query-chunk size: pure memory staging. The softmax is over the last (token) axis
+        # and `mass` accumulates per chunk, so the chunk size cannot change any result - it
+        # only trades peak memory for kernel launches.
+        chunk = max(1, int(self.config.qsa_indexer_loss_chunk))
+        return self._indexer_targets_chunked(
+            q_bt,
+            k_bt,
+            selection,
+            scale,
+            tp_group,
+            tp_size,
+            chunk,
+            layout=(impl == "layout"),
+            causal_prefix=selection.q_positions is None,
+        )
+
+    @torch.no_grad()
+    def _indexer_targets_chunked(
+        self,
+        q_bt: Tensor,
+        k_bt: Tensor,
+        selection: QSASelection,
+        scale: float,
+        tp_group,
+        tp_size: int,
+        chunk: int,
+        layout: bool,
+        causal_prefix: bool,
+    ) -> Tensor:
+        """Eager teacher targets ``[b, s, k]`` (normalized), chunked over queries.
+
+        ``layout=False`` is the original reference (gather the selected keys, einsum).
+        ``layout=True`` produces the same bf16 logits from one GEMM of the chunk's
+        queries against the keys of its causal range followed by a gather at the selected
+        tokens; everything after the logits is the same code.
+        """
+        r = self.indexer.compress_ratio
+        order, picked = selection.order, selection.picked  # [b, s, k]
+        b, s, k = order.shape
+        np_local, ng_local = q_bt.shape[2], k_bt.shape[2]
+        hpg = np_local // ng_local
+        d = q_bt.shape[-1]
+        s_kv = k_bt.shape[1]
+        arange_r = torch.arange(r, device=order.device)
+        if layout:
+            # Group-major contiguous operands, built once per call (queries ~s*np*d,
+            # keys ~s*ng*d): every chunk's GEMM operands are then plain views.
+            q_g = q_bt.reshape(b, s, ng_local, hpg, d).permute(0, 2, 1, 3, 4).contiguous()
+            k_g = k_bt.permute(0, 2, 1, 3).contiguous()  # [b, ng, s_kv, d]
+
+        # Pass 1 (no grad): local-head teacher, block-max-pooled into a small
+        # [b, s, k] fp32 buffer. The Eq.(17) MaxPool is nonlinear, so the TP head-sum
+        # must complete BEFORE pooling (deferring a single block-level reduce would
+        # be exact only for sum pooling) — but the reduce granularity is free: the
+        # token-level mass is staged over several einsum chunks and all-reduced per
+        # stage, keeping the collective count low without growing the einsum tile.
+        # Normalization still commutes (it happens after the reduce).
+        targets = torch.zeros(b, s, k, dtype=torch.float32, device=order.device)
+        stage = chunk * 8
+        for g0 in range(0, s, stage):
+            g1 = min(g0 + stage, s)
+            mass = torch.zeros(b, g1 - g0, k, r, dtype=torch.float32, device=order.device)
+            for c0 in range(g0, g1, chunk):
+                c1 = min(c0 + chunk, g1)
+                order_c = order[:, c0:c1]  # [b, c, k]
+                picked_c = picked[:, c0:c1]  # [b, c, k]
+                c = c1 - c0
+
+                tok = order_c.unsqueeze(-1) * r + arange_r  # [b, c, k, r] doc-local
+                if selection.token_offsets is not None:
+                    tok = tok + selection.token_offsets[c0:c1].view(1, c, 1, 1)
+                tok = tok.reshape(b, c * k * r)
+                if layout:
+                    kv_hi = min(s_kv, c1) if causal_prefix else s_kv
+                    # Unpicked slots may point past the causal range; their logits are
+                    # masked below, so any in-range index is fine.
+                    tok = tok.clamp_max(kv_hi - 1)
+                    scores = torch.bmm(
+                        q_g[:, :, c0:c1].reshape(b * ng_local, c * hpg, d),
+                        k_g[:, :, :kv_hi].reshape(b * ng_local, kv_hi, d).transpose(1, 2),
+                    ).view(b, ng_local, c, hpg, kv_hi)
+                    logits = torch.gather(
+                        scores.permute(0, 2, 1, 3, 4),
+                        4,
+                        tok.view(b, c, 1, 1, k * r).expand(b, c, ng_local, hpg, k * r),
+                    ).contiguous()  # [b, c, g, h, T] bf16
+                    teacher = logits.float() * scale
+                else:
+                    k_sel = torch.gather(
+                        k_bt, 1, tok[..., None, None].expand(-1, -1, ng_local, d)
+                    ).view(b, c, k * r, ng_local, d)
+
+                    q_c = q_bt[:, c0:c1].view(b, c, ng_local, hpg, d)
+                    # Operands stay in the model dtype; cuBLAS accumulates bf16 matmuls
+                    # in fp32, and the result is promoted before the softmax so every
+                    # reduction below is still fp32. Upcasting the operands instead
+                    # doubled the tensor traffic of the two gathers above and pushed this
+                    # matmul onto TF32.
+                    teacher = torch.einsum(
+                        "bcghd,bctgd->bcght", q_c, k_sel
+                    ).float() * scale  # [b, c, g, h, T]
+                valid_t = picked_c.repeat_interleave(r, dim=-1)  # [b, c, T]
+                probs = masked_softmax(
+                    teacher, valid_t[:, :, None, None, :].expand_as(teacher)
+                )
+                # [b, c, T] — head sum (local heads), staged before the TP reduce
+                mass[:, c0 - g0 : c1 - g0] = probs.sum(dim=(2, 3)).view(b, c, k, r)
+            if tp_size > 1:
+                torch.distributed.all_reduce(mass, group=tp_group)
+            # Eq.(17) block MaxPool; probs are >= 0 and invalid slots are exactly
+            # 0 from the masked softmax, so amax over the r token slots is the max
+            # over the valid ones.
+            targets[:, g0:g1] = mass.amax(dim=-1).masked_fill(~picked[:, g0:g1], 0.0)
+        normalize_indexer_target_(targets)
+        return targets
+
+    @torch.no_grad()
+    def _indexer_targets_fused(
+        self,
+        q_bt: Tensor,
+        k_bt: Tensor,
+        selection: QSASelection,
+        scale: float,
+        tp_group,
+        tp_size: int,
+    ) -> Tensor:
+        """Teacher targets ``[b, s, k]`` (normalized) from the fused Triton kernel."""
+        from megatron.core.transformer.experimental_attention_variant.ops.triton_qsa_indexer_loss import (  # pylint: disable=line-too-long
+            qsa_indexer_teacher,
+        )
+
+        picked = selection.picked
+        pool = tp_size == 1
+        out = qsa_indexer_teacher(
+            q_bt,
+            k_bt,
+            selection.order,
+            picked,
+            compress_ratio=self.indexer.compress_ratio,
+            scale=scale,
+            token_offsets=selection.token_offsets,
+            pool=pool,
+        )
+        if pool:
+            targets = out
+        else:
+            # Token-level head mass is summed over TP ranks before the block max-pool.
+            torch.distributed.all_reduce(out, group=tp_group)
+            targets = out.amax(dim=-1).masked_fill(~picked, 0.0)
+        normalize_indexer_target_(targets)
+        return targets
