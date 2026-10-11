@@ -37,6 +37,39 @@ import torch
 import triton
 import triton.language as tl
 
+try:  # accurate exp (diagnostic option); the default path uses tl.exp
+    from triton.language.extra import libdevice
+except ImportError:  # pragma: no cover
+    libdevice = None
+
+
+@triton.jit
+def _exp(x, EXACT_EXP: tl.constexpr):
+    if EXACT_EXP:
+        return libdevice.exp(x)
+    else:
+        return tl.exp(x)
+
+
+@triton.jit
+def _teacher_logits(q, kt, scale, IEEE: tl.constexpr, SWAP: tl.constexpr):
+    """``[HP, BN]`` fp32 logits of the head tile ``q`` against the gathered key tile."""
+    if IEEE:
+        if SWAP:
+            x = tl.trans(tl.dot(kt, tl.trans(q), input_precision="ieee"))
+        else:
+            x = tl.dot(q, tl.trans(kt), input_precision="ieee")
+        x = x * scale
+    else:
+        # Reference rounding: the matmul output is in the input dtype (bf16), promoted to
+        # fp32 before the scale.
+        if SWAP:
+            x = tl.trans(tl.dot(kt, tl.trans(q)))
+        else:
+            x = tl.dot(q, tl.trans(kt))
+        x = x.to(q.dtype).to(tl.float32) * scale
+    return x
+
 
 @triton.jit
 def _qsa_indexer_teacher_kernel(
@@ -73,6 +106,8 @@ def _qsa_indexer_teacher_kernel(
     HAS_TOKOFF: tl.constexpr,
     POOL: tl.constexpr,
     IEEE: tl.constexpr,
+    SWAP: tl.constexpr,
+    EXACT_EXP: tl.constexpr,
 ):
     t = tl.program_id(0)
     bi = tl.program_id(1).to(tl.int64)
@@ -115,16 +150,13 @@ def _qsa_indexer_teacher_kernel(
                 mask=pk[:, None],
                 other=0.0,
             )
-            if IEEE:
-                x = tl.dot(q, tl.trans(kt), input_precision="ieee") * scale
-            else:
-                # Reference rounding: the matmul output is in the input dtype (bf16),
-                # promoted to fp32 before the scale.
-                x = tl.dot(q, tl.trans(kt)).to(Q.dtype.element_ty).to(tl.float32) * scale
+            x = _teacher_logits(q, kt, scale, IEEE, SWAP)
             x = tl.where(pk[None, :], x, float("-inf"))
             m_new = tl.maximum(m_i, tl.max(x, 1))
             m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
-            l_i = l_i * tl.exp(m_i - m_safe) + tl.sum(tl.exp(x - m_safe[:, None]), 1)
+            l_i = l_i * _exp(m_i - m_safe, EXACT_EXP) + tl.sum(
+                _exp(x - m_safe[:, None], EXACT_EXP), 1
+            )
             m_i = m_new
         m_fin = tl.where(m_i == float("-inf"), 0.0, m_i)
         l_fin = tl.maximum(l_i, 1e-10)
@@ -140,12 +172,9 @@ def _qsa_indexer_teacher_kernel(
                 mask=pk[:, None],
                 other=0.0,
             )
-            if IEEE:
-                x = tl.dot(q, tl.trans(kt), input_precision="ieee") * scale
-            else:
-                x = tl.dot(q, tl.trans(kt)).to(Q.dtype.element_ty).to(tl.float32) * scale
+            x = _teacher_logits(q, kt, scale, IEEE, SWAP)
             x = tl.where(pk[None, :], x, float("-inf"))
-            p = tl.exp(x - m_fin[:, None]) / l_fin[:, None]
+            p = _exp(x - m_fin[:, None], EXACT_EXP) / l_fin[:, None]
             p = tl.where(m_h[:, None] & pk[None, :], p, 0.0)
             mass = tl.sum(p, 0)  # [BN]
             ptr = acc_row + j0 * R + o_n
@@ -185,9 +214,11 @@ def qsa_indexer_teacher(
     scale: float,
     token_offsets: Optional[torch.Tensor] = None,
     pool: bool = True,
-    block_tile: int = 16,
+    block_tile: int = 32,
     num_warps: int = 4,
     num_stages: int = 2,
+    swap_dot: bool = False,
+    exact_exp: bool = False,
 ) -> torch.Tensor:
     """Head-summed teacher attention mass over each query's selected tokens.
 
@@ -204,6 +235,11 @@ def qsa_indexer_teacher(
         pool: return ``[b, s, n_sel]`` block-max-pooled mass with unpicked slots zeroed
             (no tensor parallelism); else ``[b, s, n_sel, R]`` token mass (to be summed
             over TP ranks before pooling). Neither is L1-normalized.
+        block_tile / num_warps / num_stages: launch configuration (selected blocks per
+            tile, i.e. ``block_tile * R`` gathered tokens). The defaults were the fastest
+            of a sweep at the Qwen3.8 proxy shape (GB300).
+        swap_dot / exact_exp: diagnostic numerics options (keys-major dot orientation;
+            libdevice exp instead of the hardware exp).
 
     Returns an fp32 tensor; runs without host synchronization (CUDA-graph capturable).
     """
@@ -270,6 +306,8 @@ def qsa_indexer_teacher(
             HAS_TOKOFF=has_tokoff,
             POOL=pool,
             IEEE=q.dtype == torch.float32,
+            SWAP=swap_dot,
+            EXACT_EXP=exact_exp,
             num_warps=num_warps,
             num_stages=num_stages,
         )

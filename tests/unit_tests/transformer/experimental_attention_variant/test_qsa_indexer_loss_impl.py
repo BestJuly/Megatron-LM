@@ -136,17 +136,56 @@ class TestQSAIndexerLossImpl:
         return attn, hidden, rope(max_len), cu
 
     @staticmethod
-    def _run(attn, impl, hidden, freqs, cu):
+    def _run(attn, impl, hidden, freqs, cu, deterministic=False):
         attn.config.qsa_indexer_loss_impl = impl
         attn.zero_grad(set_to_none=True)
-        sel = attn.indexer.select(hidden, freqs, cu_seqlens=cu)
-        loss = attn._compute_indexer_loss(hidden, freqs, sel, COEFF, cu_seqlens=cu)
-        loss.backward()
+        prev = torch.are_deterministic_algorithms_enabled()
+        torch.use_deterministic_algorithms(deterministic, warn_only=True)
+        try:
+            sel = attn.indexer.select(hidden, freqs, cu_seqlens=cu)
+            # Student inputs: their gradients isolate the loss backward from the indexer's
+            # own (shared, impl-independent) projection backward.
+            sel.q.retain_grad()
+            sel.block_keys.retain_grad()
+            loss = attn._compute_indexer_loss(hidden, freqs, sel, COEFF, cu_seqlens=cu)
+            loss.backward()
+        finally:
+            torch.use_deterministic_algorithms(prev)
         grads = {n: p.grad.detach().float().clone() for n, p in attn.indexer.named_parameters()}
+        grads["d_student_q"] = sel.q.grad.detach().float().clone()
+        grads["d_block_keys"] = sel.block_keys.grad.detach().float().clone()
         with torch.no_grad():
             q_bt, k_bt = attn._indexer_teacher_qk(hidden, freqs, sel, cu)
             targets = attn._indexer_targets(q_bt, k_bt, sel, impl)
-        return loss.detach().double().item(), targets, grads, sel.picked
+        return loss.detach().double().item(), targets, grads, sel
+
+    @staticmethod
+    def _gold_student_grads(sel, targets):
+        """fp64 gradients of the KL w.r.t. the student inputs (``selection.q`` and
+        ``selection.block_keys``) for fixed targets: the exact value both bf16 paths
+        approximate."""
+        q = sel.q.detach().double().requires_grad_(True)  # [s, b, nh, d]
+        bk = sel.block_keys.detach().double().requires_grad_(True)  # [nb, b, d]
+        order, picked = sel.order, sel.picked
+        b, s, k = order.shape
+        blk = order
+        if sel.block_offsets is not None:
+            blk = blk + sel.block_offsets.view(1, s, 1)
+        bk_bt = bk.permute(1, 0, 2)
+        d = bk_bt.shape[-1]
+        bk_sel = torch.gather(
+            bk_bt, 1, blk.clamp_max(bk_bt.shape[1] - 1).reshape(b, s * k)[..., None].expand(-1, -1, d)
+        ).view(b, s, k, d)
+        st = torch.einsum("bshd,bskd->bshk", q.permute(1, 0, 2, 3), bk_sel)
+        st = torch.relu(st).sum(dim=2) / d**0.5
+        st = st.masked_fill(~picked, torch.finfo(torch.float64).min)
+        has = picked.any(-1, keepdim=True)
+        logp = torch.log_softmax(torch.where(has, st, torch.zeros_like(st)), dim=-1)
+        t = targets.double()
+        terms = torch.where(picked, t * (torch.log(t.clamp_min(1e-10)) - logp), 0.0)
+        loss = terms.sum() / picked.any(-1).sum().clamp_min(1) * COEFF
+        dq, dbk = torch.autograd.grad(loss, [q, bk])
+        return {"d_student_q": dq, "d_block_keys": dbk}
 
     @pytest.mark.parametrize("case", list(CASES))
     def test_impls_match_reference(self, case):
@@ -156,35 +195,96 @@ class TestQSAIndexerLossImpl:
         lay = self._run(attn, "layout", hidden, freqs, cu)
         fus = self._run(attn, "fused", hidden, freqs, cu)
         fus2 = self._run(attn, "fused", hidden, freqs, cu)
-        picked = ref[3]
-        assert picked.any(), "the case selects nothing"
+        assert ref[3].picked.any(), "the case selects nothing"
 
-        # Reference run-to-run noise (bf16 atomic scatter-add in the student backward).
-        ref_noise = max(_rel_l2(ref2[2][n], ref[2][n]) for n in ref[2])
-        _report(case, "ref_vs_ref_grad_relL2", ref_noise)
+        # Reference run-to-run noise: its student backward is a bf16 atomic scatter-add.
+        for n in ref[2]:
+            _report(case, f"ref_vs_ref_grad_relL2[{n}]", _rel_l2(ref2[2][n], ref[2][n]))
         assert torch.equal(ref[1], ref2[1]) and ref[0] == ref2[0]
 
-        for name, got, t_tol, l_tol, g_tol in (
-            ("layout", lay, 1e-6, 1e-6, max(1e-5, 2 * ref_noise)),
-            ("fused", fus, 1e-5, 1e-4, 1e-3),
-        ):
+        # Targets and loss.
+        for name, got, t_tol, l_tol in (("layout", lay, 1e-6, 1e-6), ("fused", fus, 1e-5, 1e-4)):
             t_err = (got[1] - ref[1]).abs().max().item()
             l_err = abs(got[0] - ref[0]) / max(abs(ref[0]), 1e-30)
-            g_err = {n: _rel_l2(got[2][n], ref[2][n]) for n in ref[2]}
             _report(case, f"{name}_targets_maxabs", t_err)
+            _report(case, f"{name}_targets_n_gt_1e-6", float((got[1] - ref[1]).abs().gt(1e-6).sum()))
             _report(case, f"{name}_loss_rel", l_err)
-            for n, e in g_err.items():
-                _report(case, f"{name}_grad_relL2[{n}]", e)
+            for n in ref[2]:
+                _report(case, f"{name}_vs_ref_grad_relL2[{n}]", _rel_l2(got[2][n], ref[2][n]))
             assert t_err <= t_tol, f"{name}: targets max abs {t_err:.3e} > {t_tol:.0e}"
             assert l_err <= l_tol, f"{name}: loss rel {l_err:.3e} > {l_tol:.0e}"
-            for n, e in g_err.items():
-                assert e <= g_tol, f"{name}: grad {n} rel-L2 {e:.3e} > {g_tol:.1e}"
+
+        # 1a: with deterministic algorithms (sorted, non-atomic scatter-add) the layout
+        # impl's gradients equal the reference's bit for bit (same student code, same
+        # targets).
+        ref_det = self._run(attn, "reference", hidden, freqs, cu, deterministic=True)
+        ref_det2 = self._run(attn, "reference", hidden, freqs, cu, deterministic=True)
+        lay_det = self._run(attn, "layout", hidden, freqs, cu, deterministic=True)
+        for n in ref_det[2]:
+            rep = torch.equal(ref_det[2][n], ref_det2[2][n])
+            e = _rel_l2(lay_det[2][n], ref_det[2][n])
+            _report(case, f"det_layout_vs_ref_grad_relL2[{n}]", e)
+            if rep:
+                assert e == 0.0, f"layout grad {n} differs from deterministic reference"
+            else:
+                assert e <= 2 * max(_rel_l2(ref_det2[2][n], ref_det[2][n]), 1e-5)
+
+        # 1b: accuracy against the fp64 gradient of the same loss (fixed targets). The
+        # reference's bf16 atomic accumulation into the block keys is the least accurate
+        # step; the fused GEMM-and-gather student accumulates in fp32.
+        gold = self._gold_student_grads(ref[3], ref[1])
+        for n in gold:
+            e_ref = _rel_l2(ref[2][n], gold[n])
+            e_fus = _rel_l2(fus[2][n], gold[n])
+            _report(case, f"ref_vs_fp64_relL2[{n}]", e_ref)
+            _report(case, f"fused_vs_fp64_relL2[{n}]", e_fus)
+            assert e_fus <= 1e-2, f"fused {n} rel-L2 vs fp64 {e_fus:.3e}"
+            assert e_fus <= e_ref * 1.05 + 1e-5, f"fused {n} less accurate than reference"
 
         # The fused path is deterministic: no atomics anywhere in the loss.
         assert fus[0] == fus2[0]
         assert torch.equal(fus[1], fus2[1])
         for n in fus[2]:
             assert torch.equal(fus[2][n], fus2[2][n]), f"fused grad {n} not repeatable"
+
+    @pytest.mark.parametrize("case", ["thd_multidoc", "bshd_batch2"])
+    def test_layer_trunk_is_independent_of_impl(self, case):
+        """The loss is attached through a forward-identity autoscaler and its inputs are
+        detached, so the layer output and the trunk input gradient must be bitwise equal
+        for every impl (no aliasing or in-place effects on the main path)."""
+        attn, hidden, freqs, cu = self._build(CASES[case])
+        psp = None
+        if cu is not None:
+            psp = PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=cu,
+                cu_seqlens_kv=cu,
+                max_seqlen_q=freqs.shape[0],
+                max_seqlen_kv=freqs.shape[0],
+            )
+        g = torch.Generator().manual_seed(4)
+        grad_out = torch.randn(hidden.shape, generator=g).to(hidden.device, hidden.dtype)
+        res = {}
+        for impl in ("reference", "layout", "fused", "reference"):
+            attn.config.qsa_indexer_loss_impl = impl
+            attn.zero_grad(set_to_none=True)
+            h = hidden.detach().clone().requires_grad_(True)
+            out, _ = attn(h, attention_mask=None, rotary_pos_emb=freqs, packed_seq_params=psp)
+            out.backward(grad_out)
+            trunk = {
+                n: p.grad.detach().clone()
+                for n, p in attn.named_parameters()
+                if "indexer" not in n and p.grad is not None
+            }
+            got = (out.detach().clone(), h.grad.detach().clone(), trunk)
+            if impl in res:
+                assert torch.equal(res[impl][0], got[0])
+            res[impl] = got
+        for impl in ("layout", "fused"):
+            assert torch.equal(res[impl][0], res["reference"][0]), f"{impl}: output differs"
+            assert torch.equal(res[impl][1], res["reference"][1]), f"{impl}: input grad differs"
+            for n, gr in res["reference"][2].items():
+                assert torch.equal(res[impl][2][n], gr), f"{impl}: trunk grad {n} differs"
 
     def test_fused_teacher_unpooled_matches_pooled(self):
         """``pool=False`` (the tensor-parallel path) returns the token mass whose block

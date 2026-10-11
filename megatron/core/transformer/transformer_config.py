@@ -503,14 +503,15 @@ class TransformerConfig(ModelParallelConfig):
     Measured on the Qwen3.8-Flash-Next performance proxy: 256 1292 ms, 1024 1247 ms (-3.5 %)
     for +0.8 GiB, 4096 1238 ms (-4.2 %) for +13.1 GiB."""
 
-    qsa_indexer_loss_impl: Literal["reference", "layout", "fused"] = "reference"
+    qsa_indexer_loss_impl: Literal["reference", "layout", "fused"] = "fused"
     """Implementation of the QSA indexer distillation loss (same loss definition for all).
 
     ``reference``: the original eager path (materializes the gathered selected keys).
     ``layout``: eager, bit-identical teacher targets without materializing the gathered
     keys (one GEMM per query chunk over its causal key range, then a logit gather).
     ``fused``: fused Triton teacher kernel plus a GEMM-and-gather student; CUDA-graph
-    capturable, deterministic indexer gradients."""
+    capturable, deterministic indexer gradients. Qwen3.8 perf proxy (X2, GB300): loss
+    374 ms/step (reference) -> 135 (layout) -> 39 (fused); step 935 -> 703 -> 601 ms."""
 
     qsa_use_sparse_attention: bool = False
     """Use the sparse GQA Triton kernel path (gathered block-sparse attention over the
