@@ -118,11 +118,15 @@ def copy_weights_to_oracle(attn, config):
 
 
 class TestQSAAttentionParity:
+    # The indexer's trainability is fixed at build time (frozen without the loss), so
+    # subclasses that train it set the coefficient here rather than after construction.
+    INDEXER_LOSS_COEFF = None
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
         self.config = make_config()
+        self.config.qsa_indexer_loss_coeff = self.INDEXER_LOSS_COEFF
         spec = get_qsa_module_spec_for_backend(self.config)
         assert spec.metainfo == {"fuse_input_layernorm": False}
         self.attn = build_module(spec, config=self.config, layer_number=1).cuda()
@@ -188,6 +192,17 @@ class TestQSAAttentionParity:
         # non-differentiable selection); its training signal arrives with the KL loss.
         assert self.attn.indexer.index_qk_proj.weight.grad is None
         assert self.attn.linear_qkv.weight.grad is not None
+
+    def test_indexer_trainability_follows_loss_coeff(self):
+        # Without the KL loss the indexer has no gradient path, so it is frozen and
+        # DDP / the optimizer never track it; the rest of the layer stays trainable.
+        expect = bool(self.config.qsa_indexer_loss_coeff)
+        assert all(p.requires_grad == expect for p in self.attn.indexer.parameters())
+        assert all(
+            p.requires_grad
+            for n, p in self.attn.named_parameters()
+            if not n.startswith("indexer.")
+        )
 
     def test_hybrid_stack_builds_qsa_layer(self):
         """The 'Q' hybrid symbol builds a TransformerLayer wrapping QSASelfAttention."""
@@ -452,10 +467,10 @@ class TestQSASparseKernel(TestQSAAttentionParity):
 class TestQSAIndexerSparseKL(TestQSAAttentionParity):
     """QSA-3: sparse-KL distillation trains the indexer."""
 
+    INDEXER_LOSS_COEFF = 0.01
+
     def setup_method(self, method):
         super().setup_method(method)
-        # Enable the indexer loss on the same module/config.
-        self.config.qsa_indexer_loss_coeff = 0.01
         self.attn.train()
         self.freqs = self.rope(SEQ)
 
@@ -614,6 +629,49 @@ class TestQSAIndexerSparseKL(TestQSAAttentionParity):
         )
 
 
+class TestQSADDPOverlapGradReduce:
+    """With overlap_grad_reduce, DDP records in step 1 which params reported a grad and
+    asserts in step 2 that every bucketed param did. Without the KL loss the indexer
+    gets no grad, so it must be frozen (excluded from DDP) for training to proceed."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("indexer_loss_coeff", [None, 0.0, 0.01])
+    def test_two_steps(self, indexer_loss_coeff):
+        from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+
+        config = make_config()
+        config.qsa_indexer_loss_coeff = indexer_loss_coeff
+        spec = get_qsa_module_spec_for_backend(config)
+        attn = build_module(spec, config=config, layer_number=1).cuda()
+        model = DistributedDataParallel(
+            config,
+            ddp_config=DistributedDataParallelConfig(
+                overlap_grad_reduce=True, grad_reduce_in_fp32=True
+            ),
+            module=attn,
+        )
+        model.train()
+        indexer_params = {id(p) for p in attn.indexer.parameters()}
+        tracked = {id(p) for p in model.params_with_grad}
+        assert indexer_params.isdisjoint(tracked) != bool(indexer_loss_coeff)
+
+        freqs = RotaryEmbedding(
+            kv_channels=HEAD_DIM, rotary_percent=ROTARY_PERCENT, rotary_base=ROPE_THETA
+        )(SEQ)
+        hidden = torch.randn(SEQ, BATCH, HIDDEN, generator=torch.Generator().manual_seed(7)).cuda()
+        for _ in range(2):
+            model.zero_grad_buffer()  # step 2 runs the per-param readiness assert
+            out, _ = model(hidden, attention_mask=None, rotary_pos_emb=freqs)
+            out.float().square().mean().backward()
+            model.finish_grad_sync()
+
+
 class TestQSAContextParallel:
     """Allgather-CP sharding consistency vs the single-rank path (2 distributed ranks).
 
@@ -630,10 +688,11 @@ class TestQSAContextParallel:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def _build(self, layout="per_document"):
+    def _build(self, layout="per_document", indexer_loss_coeff=None):
         Utils.initialize_model_parallel(1, 1, context_parallel_size=2)
         model_parallel_cuda_manual_seed(123)
         config = make_config()
+        config.qsa_indexer_loss_coeff = indexer_loss_coeff
         config.context_parallel_size = 2
         config.cp_comm_type = "all_gather"
         config.qsa_use_sparse_attention = True
@@ -762,8 +821,7 @@ class TestQSAContextParallel:
             build_zigzag_cp_local_positions,
         )
 
-        config, attn, cp_rank = self._build()
-        config.qsa_indexer_loss_coeff = 0.01
+        config, attn, cp_rank = self._build(indexer_loss_coeff=0.01)
         attn.train()
         g = torch.Generator().manual_seed(7)
         full = torch.randn(SEQ, BATCH, HIDDEN, generator=g).cuda()

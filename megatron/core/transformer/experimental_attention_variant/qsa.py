@@ -844,6 +844,14 @@ class QSASelfAttention(SelfAttention):
         self.indexer = build_module(
             submodules.indexer, config=self.config, pg_collection=self.pg_collection
         )
+        # The indexer's only gradient source is the sparse-KL loss (its input is detached
+        # and top-k selection is not differentiable). Without that loss its parameters
+        # never receive gradients, so freeze them: otherwise DDP still registers them in
+        # its buckets and overlap_grad_reduce asserts at the start of the second step,
+        # and the optimizer would carry state for parameters it never updates.
+        if not self.config.qsa_indexer_loss_coeff:
+            for param in self.indexer.parameters():
+                param.requires_grad_(False)
 
     def is_cuda_graph_capturable(self) -> bool:
         """QSA layers are capturable without context parallelism.
