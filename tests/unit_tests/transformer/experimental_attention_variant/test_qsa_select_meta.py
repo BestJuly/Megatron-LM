@@ -15,6 +15,9 @@ from megatron.core.transformer.experimental_attention_variant.ops.triton_qsa_sel
     qsa_build_kv_tile_csr_fused,
     qsa_build_supersets_fused,
 )
+from tests.unit_tests.transformer.experimental_attention_variant.test_qsa_cute_attn import (
+    _make_case,
+)
 
 
 def _random_case(b, s, S, nb, seed, distinct=True):
@@ -124,3 +127,25 @@ class TestQSAFusedMetadata:
         ref = tq.build_qsa_kv_tile_csr_torch(ids, counts, nb, 16)
         for name in ("tile_offsets", "entry_query", "entry_bits"):
             assert torch.equal(getattr(ref, name), getattr(kv, name)), name
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+class TestQSAKVTileCSR:
+    def test_tile_csr_matches_brute_force(self):
+        c = _make_case([3, 101, 0, 216, 1, 2, 57], 4, 2, 32, 8, torch.bfloat16, seed=5)
+        nb = c["bases"].numel()
+        idx, counts = c["idx"].cpu(), c["counts"].cpu()
+        for kb in (1, 4, 5, 16):
+            csr = tq.build_qsa_kv_tile_csr(c["idx"], c["counts"], nb, kb)
+            nt = (nb + kb - 1) // kb
+            assert csr.n_tiles == nt
+            want = [dict() for _ in range(nt)]
+            for t in range(idx.shape[1]):
+                for j in idx[0, t, : counts[0, t]].tolist():
+                    want[j // kb][t] = want[j // kb].get(t, 0) | (1 << (j % kb))
+            off = csr.tile_offsets.cpu()
+            eq, eb = csr.entry_query.cpu(), csr.entry_bits.cpu()
+            for i in range(nt):
+                got_q = eq[off[i] : off[i + 1]].tolist()
+                assert got_q == sorted(want[i]), f"kb={kb} tile {i} queries"
+                assert eb[off[i] : off[i + 1]].tolist() == [want[i][t] for t in got_q]

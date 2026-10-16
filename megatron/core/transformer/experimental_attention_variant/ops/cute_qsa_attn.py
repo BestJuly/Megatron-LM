@@ -4,9 +4,9 @@
 
 :func:`qsa_sparse_attention` is the attention entry point of :class:`QSASelfAttention`. It
 builds the sparse-attention metadata of :mod:`triton_qsa` (query-tile supersets, KV-tile query
-CSR) and runs the forward and dq as the CuTe DSL kernels of :mod:`cute_qsa_attn_kernels`. dk/dv
-still run the Triton kernel of :mod:`triton_qsa`, fed with the log2-domain LSE and the ``delta``
-that the dq kernel emits.
+CSR) and runs the forward, dq and dk/dv CuTe DSL kernels of :mod:`cute_qsa_attn_kernels`. The
+LSE is kept in the log2 domain; the dq kernel also emits ``delta = rowsum(o * do)`` for dk/dv;
+dk/dv are fp32 split partials summed in a fixed order (deterministic, no atomics).
 
 Compilation: one compiled kernel per (kernel, dtype, head dim, GQA group, tile) key; every
 sequence-dependent size (``B``, ``TQ``, ``TK``, the entry count) is a runtime argument, so the
@@ -20,11 +20,15 @@ bf16 / fp16, head dim 128 / 256, and a GQA group of at most 128 query heads per 
 from typing import Optional
 
 import torch
+import triton
+import triton.language as tl
 
 from megatron.core.transformer.experimental_attention_variant.ops import triton_qsa as tq
 
 # Gathered KV rows per forward step (16 union entries of 4-token blocks).
 FWD_N_BLOCK = 128
+# KV-tile size of the dk/dv kernel (64 KV rows = 16 selection blocks).
+DKV_TILE_BLOCKS = 16
 
 _COMPILED = {}
 
@@ -162,8 +166,96 @@ def qsa_cute_dq(q, k, v, o, do, lse, q_pos, ss: tq.QSASupersets, scale: float, t
     return dq, delta
 
 
+def _compiled_dkv(dtype: torch.dtype, D: int, G: int):
+    key = ("dkv", dtype, D, G)
+    fn = _COMPILED.get(key)
+    if fn is None:
+        import cutlass
+        import cutlass.cute as cute
+
+        from megatron.core.transformer.experimental_attention_variant.ops.cute_qsa_attn_kernels import (  # pylint: disable=line-too-long
+            QSADkvSm100,
+        )
+
+        cdt = _cutlass_dtype(dtype)
+        kernel = QSADkvSm100(D, G, DKV_TILE_BLOCKS)
+        bf = lambda: _fake(cdt, 4, D, 8, 16)  # noqa: E731
+        args = [
+            bf(),  # q
+            bf(),  # k
+            bf(),  # v
+            _fake(cutlass.Float32, 3),  # lse
+            _fake(cutlass.Float32, 3),  # delta
+            bf(),  # do
+            _fake(cutlass.Float32, 5, D, 8, 16),  # dk partials
+            _fake(cutlass.Float32, 5, D, 8, 16),  # dv partials
+            _fake(cutlass.Int64, 1, align=8),  # q_pos
+            _fake(cutlass.Int32, 1),  # entry_query
+            _fake(cutlass.Int32, 1),  # entry_bits
+            _fake(cutlass.Int64, 1, align=8),  # tile_offsets
+            _fake(cutlass.Int32, 1),  # block_bases
+            _fake(cutlass.Int32, 1),  # block_ends
+            cutlass.Float32(1.0),
+            cutlass.Int32(1),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        ]
+        fn = cute.compile(kernel, *args, options="--enable-tvm-ffi")
+        _COMPILED[key] = fn
+    return fn
+
+
+def _dkv_nsplit(n_programs: int, device) -> int:
+    """Column splits per KV tile, from the shape only: split until the grid fills ~4 waves (the
+    per-tile work is very uneven: early KV tiles are selected by almost every later query)."""
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    nsplit = 1
+    while nsplit < 8 and n_programs * nsplit < 4 * sms:
+        nsplit *= 2
+    return nsplit
+
+
+@triton.jit
+def _split_sum_cast_kernel(part, out, N, NS: tl.constexpr, BLOCK: tl.constexpr):
+    """out = cast(sum_s part[s]) over the flattened tensor, splits summed in ascending order."""
+    o = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    m = o < N
+    acc = tl.load(part + o, mask=m, other=0.0)
+    for s in tl.static_range(1, NS):
+        acc += tl.load(part + s * N + o, mask=m, other=0.0)
+    tl.store(out + o, acc.to(out.dtype.element_ty), mask=m)
+
+
+def _split_sum_cast(part: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Fixed-order sum of the fp32 split partials fused with the cast (K6)."""
+    out = torch.empty(part.shape[1:], dtype=dtype, device=part.device)
+    N = out.numel()
+    BLOCK = 2048
+    _split_sum_cast_kernel[(triton.cdiv(N, BLOCK),)](
+        part, out, N, NS=part.shape[0], BLOCK=BLOCK, num_warps=8
+    )
+    return out
+
+
+def qsa_cute_dkv(
+    q, k, v, lse, delta, do, q_pos, csr: tq.QSAKVTileCSR, block_bases, block_ends, scale
+):
+    """Deterministic dk, dv (fp32 split partials summed in a fixed order, no atomics)."""
+    assert csr.tile_blocks == DKV_TILE_BLOCKS
+    B, TQ, HQ, D = q.shape
+    TK, H = k.shape[1], k.shape[2]
+    G = HQ // H
+    NT = csr.n_tiles
+    nsplit = _dkv_nsplit(B * NT * H, q.device)
+    dk_p = torch.zeros(nsplit, B, TK, H, D, dtype=torch.float32, device=q.device)
+    dv_p = torch.zeros(nsplit, B, TK, H, D, dtype=torch.float32, device=q.device)
+    fn = _compiled_dkv(q.dtype, D, G)
+    fn(q, k, v, lse, delta, do, dk_p, dv_p, q_pos, csr.entry_query, csr.entry_bits,
+       csr.tile_offsets, block_bases, block_ends, float(scale), NT)
+    return _split_sum_cast(dk_p, k.dtype), _split_sum_cast(dv_p, v.dtype)
+
+
 class QSASparseAttnFunction(torch.autograd.Function):
-    """Autograd over the sparse GQA kernels (forward, dq: CuTe DSL; dk/dv: Triton)."""
+    """Autograd over the CuTe DSL sparse GQA kernels (forward, dq, dk/dv)."""
 
     @staticmethod
     def forward(ctx, q, k, v, q_pos, ss, kv_csr, block_bases, block_ends, scale, bq):
@@ -180,7 +272,7 @@ class QSASparseAttnFunction(torch.autograd.Function):
         q, k, v, o, lse, q_pos, block_bases, block_ends = ctx.saved_tensors
         do = do.contiguous()
         dq, delta = qsa_cute_dq(q, k, v, o, do, lse, q_pos, ctx.ss, ctx.scale, ctx.bq)
-        dk, dv = tq.qsa_bwd_dkv_tile(
+        dk, dv = qsa_cute_dkv(
             q, k, v, lse, delta, do, q_pos, ctx.kv_csr, block_bases, block_ends, ctx.scale
         )
         return dq, dk, dv, None, None, None, None, None, None, None
@@ -248,9 +340,7 @@ def qsa_sparse_attention(
     needs_grad = torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad)
     kv_csr = None
     if needs_grad:
-        kv_csr = tq.build_qsa_kv_tile_csr(
-            block_indices, block_counts, num_blocks, tq.QSA_DKV_TILE_CONFIG.tile_blocks
-        )
+        kv_csr = tq.build_qsa_kv_tile_csr(block_indices, block_counts, num_blocks, DKV_TILE_BLOCKS)
     return QSASparseAttnFunction.apply(
         q.contiguous(),
         k.contiguous(),

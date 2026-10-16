@@ -21,8 +21,6 @@ from megatron.core.tensor_parallel.random import (
     model_parallel_cuda_manual_seed,
 )
 from megatron.core.transformer.experimental_attention_variant.ops.triton_qsa import (
-    build_qsa_query_csr,
-    build_qsa_query_csr_static,
     build_qsa_supersets,
     build_qsa_supersets_static,
 )
@@ -143,10 +141,6 @@ class TestQSAStaticShapes:
             assert torch.equal(dyn.entry_base, sta.entry_base[:e])
             assert torch.equal(dyn.entry_end, sta.entry_end[:e])
             assert torch.equal(dyn.membership[:e], sta.membership[:e])
-        ids_d, off_d = build_qsa_query_csr(block_indices, block_counts, nb)
-        ids_s, off_s = build_qsa_query_csr_static(block_indices, block_counts, nb)
-        assert torch.equal(off_d, off_s)
-        assert torch.equal(ids_d, ids_s[: ids_d.shape[0]])
 
     def _fwd_bwd(self, fn, hidden, cu, grad_out):
         self.attn.zero_grad(set_to_none=True)

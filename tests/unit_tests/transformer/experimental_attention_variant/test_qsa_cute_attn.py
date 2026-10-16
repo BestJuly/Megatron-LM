@@ -20,15 +20,61 @@ from megatron.core.transformer.experimental_attention_variant.ops.cute_qsa_attn 
 from tests.unit_tests.transformer.experimental_attention_variant.test_attention_variant_qsa import (
     requires_qsa_kernels,
 )
-from tests.unit_tests.transformer.experimental_attention_variant.test_qsa_dkv_kernel import (
-    _make_case,
-)
 
 pytestmark = requires_qsa_kernels
 
 BS = tq.BS
 # rel-L2 vs fp64 gold; measured on GB200 at the proxy shape: o 2.1e-3, dq 2.4e-3, dk/dv 2.4e-3
 ERR_BOUND = 5e-3
+
+
+def _make_case(doc_lens, hq, h, d, budget_blocks, dtype, seed=0, q_rows=None):
+    """Packed documents; every query selects its own block plus a random subset of at
+    most ``budget_blocks`` visible complete blocks of its document (global block ids)."""
+    g = torch.Generator().manual_seed(seed)
+    s = sum(doc_lens)
+    bases, ends, rows = [], [], []
+    tok0 = blk0 = 0
+    for sd in doc_lens:
+        nb_d = sd // BS + 1
+        b_d = [tok0 + BS * j for j in range(nb_d)]
+        bases += b_d
+        ends += [min(x + BS, tok0 + sd) for x in b_d]
+        for t in range(sd):
+            m_t = (t + 1) // BS
+            k = min(budget_blocks, m_t)
+            picked = torch.randperm(m_t, generator=g)[:k].tolist() if m_t else []
+            rows.append([blk0 + m_t] + [blk0 + j for j in picked])
+        tok0 += sd
+        blk0 += nb_d
+    S = 1 + budget_blocks
+    idx = torch.zeros(1, s, S, dtype=torch.long)
+    counts = torch.zeros(1, s, dtype=torch.long)
+    for t, r in enumerate(rows):
+        idx[0, t, : len(r)] = torch.tensor(r)
+        # garbage beyond the count must be ignored
+        idx[0, t, len(r):] = torch.randint(0, blk0, (S - len(r),), generator=g)
+        counts[0, t] = len(r)
+    q_pos = torch.arange(s)
+    if q_rows is not None:  # CP-style shard: local query rows against the full K/V
+        idx, counts, q_pos = idx[:, q_rows], counts[:, q_rows], q_pos[q_rows]
+    tq_ = q_pos.numel()
+    q = torch.randn(1, tq_, hq, d, generator=g).to(dtype)
+    k = torch.randn(1, s, h, d, generator=g).to(dtype)
+    v = torch.randn(1, s, h, d, generator=g).to(dtype)
+    do = torch.randn(1, tq_, hq, d, generator=g).to(dtype)
+    dev = "cuda"
+    return dict(
+        idx=idx.to(dev),
+        counts=counts.to(dev),
+        bases=torch.tensor(bases, dtype=torch.int32, device=dev),
+        ends=torch.tensor(ends, dtype=torch.int32, device=dev),
+        q_pos=q_pos.to(dev),
+        q=q.to(dev),
+        k=k.to(dev),
+        v=v.to(dev),
+        do=do.to(dev),
+    )
 
 
 def _rel(a, b):
