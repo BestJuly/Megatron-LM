@@ -10,7 +10,7 @@ parameter gradients:
 * ``layout`` (eager, no gathered-key materialization) must reproduce the reference
   targets within fp32 rounding and its gradients within the reference's own run-to-run
   noise (the reference student's ``torch.gather`` backward is a bf16 atomic scatter-add);
-* ``fused`` (CuTe DSL teacher kernel + GEMM-and-gather student) must match within the
+* ``fused`` (CuTe DSL teacher and sparse student kernels) must match within the
   documented tolerances and be bitwise repeatable.
 
 A last test captures a whole QSA layer (selection, sparse attention, indexer loss and its
@@ -234,7 +234,7 @@ class TestQSAIndexerLossImpl:
 
         # 1b: accuracy against the fp64 gradient of the same loss (fixed targets). The
         # reference's bf16 atomic accumulation into the block keys is the least accurate
-        # step; the fused GEMM-and-gather student accumulates in fp32.
+        # step; the fused sparse student accumulates in fp32.
         gold = self._gold_student_grads(ref[3], ref[1])
         for n in gold:
             e_ref = _rel_l2(ref[2][n], gold[n])

@@ -870,6 +870,14 @@ def _require_qsa_kernel_support(config: TransformerConfig, tp_size: int) -> None
                 f"{config.kv_channels}, ratio={r}, heads per group={hpg}, KV heads={ng}. "
                 "Use qsa_indexer_loss_impl='layout'."
             )
+        d_idx = config.qsa_indexer_head_dim
+        if config.qsa_indexer_n_heads > 8 or d_idx % 8 or d_idx > 256 or n_sel > 2048:
+            raise ValueError(
+                "qsa_indexer_loss_impl='fused' (sparse student kernel) supports at most 8 "
+                "indexer heads, an indexer head dim that is a multiple of 8 and at most 256, "
+                f"and at most 2048 selected blocks; got {config.qsa_indexer_n_heads} heads, "
+                f"head dim {d_idx}, {n_sel} blocks. Use qsa_indexer_loss_impl='layout'."
+            )
         if teacher_tmem_columns(n_sel, r, ng, hpg) > 512:
             raise ValueError(
                 f"qsa_indexer_loss_impl='fused': the teacher logits of {n_sel} selected blocks "
@@ -1212,9 +1220,9 @@ class QSASelfAttention(SelfAttention):
         * ``"fused"``: the CuTe DSL teacher kernel (``ops/cute_qsa_indexer_loss.py``,
           Blackwell) on the main path's detached q/k (``teacher_qk``, or the pair stashed
           by :meth:`_sparse_forward`; no QKV projection or RoPE recompute), gathering the
-          selected keys once, plus the student scores as one GEMM against all block keys
-          of the chunk's causal range followed by a gather at the selected blocks
-          (fp32-accumulated, deterministic gradients instead of bf16 atomic scatter-adds).
+          selected keys once, and the CuTe DSL sparse student: scores, KL and gradients at
+          the selected blocks only, gradients computed in the forward (deterministic, no
+          atomics, no GEMM over the chunk's whole causal block range).
         """
         impl = self.config.qsa_indexer_loss_impl
         r = self.indexer.compress_ratio
@@ -1236,15 +1244,35 @@ class QSASelfAttention(SelfAttention):
         targets = self._indexer_targets(q_bt, k_bt, selection, impl)
         del q_bt, k_bt
 
+        if impl == "fused":
+            from megatron.core.transformer.experimental_attention_variant.ops.cute_qsa_indexer_loss import (  # pylint: disable=line-too-long
+                qsa_indexer_student_sparse,
+            )
+
+            n_blocks_total = selection.block_keys.shape[0]
+            return qsa_indexer_student_sparse(
+                selection.q.permute(1, 0, 2, 3),
+                selection.block_keys.permute(1, 0, 2),
+                order,
+                picked,
+                targets,
+                loss_coeff,
+                block_offsets=selection.block_offsets,
+                chunk=chunk,
+                nb_hi_fn=(
+                    (lambda c1: min(n_blocks_total, -(-c1 // r)))
+                    if causal_prefix
+                    else (lambda c1: n_blocks_total)
+                ),
+            )
+
         # Pass 2 (grad into the indexer): student scores recomputed at the selected
         # blocks only, chunked, against the reduced+normalized teacher.
         kl_sum = torch.zeros((), device=order.device, dtype=torch.float32)
         valid_rows = torch.zeros((), device=order.device, dtype=torch.float32)
         bk_bt = selection.block_keys.permute(1, 0, 2)  # [b, n_blocks_total, d_idx]
         d_idx = bk_bt.shape[-1]
-        n_blocks_total = bk_bt.shape[1]
         q_idx_all = selection.q.permute(1, 0, 2, 3)  # [b, s, nh, d_idx]
-        nh = q_idx_all.shape[2]
         for c0 in range(0, s, chunk):
             c1 = min(c0 + chunk, s)
             order_c = order[:, c0:c1]
@@ -1256,31 +1284,14 @@ class QSASelfAttention(SelfAttention):
             if selection.block_offsets is not None:
                 blk = blk + selection.block_offsets[c0:c1].view(1, c, 1)
             q_idx = q_idx_all[:, c0:c1]  # [b, c, nh, d_idx]
-            if impl == "fused":
-                # One GEMM against the block keys of the chunk's causal range, then a
-                # gather of the bf16 scores: same per-element products and rounding as
-                # the per-slot einsum, but the backward is two dense GEMMs plus a
-                # collision-free scatter (unpicked slots carry exact zeros) instead of
-                # a bf16 atomic scatter-add into the block keys.
-                nb_hi = (
-                    min(n_blocks_total, -(-c1 // r)) if causal_prefix else n_blocks_total
-                )
-                blk = blk.clamp_max(max(nb_hi - 1, 0))
-                dense = torch.matmul(
-                    q_idx.reshape(b, c * nh, d_idx), bk_bt[:, :nb_hi].transpose(1, 2)
-                ).view(b, c, nh, nb_hi)
-                student = torch.gather(
-                    dense, 3, blk.unsqueeze(2).expand(b, c, nh, k)
-                ).float()  # [b, c, nh, k]
-            else:
-                bk_sel = torch.gather(
-                    bk_bt, 1, blk.reshape(b, c * k)[..., None].expand(-1, -1, d_idx)
-                ).view(b, c, k, d_idx)
-                # Same policy as the teacher: bf16 operands, fp32 accumulation inside the
-                # matmul, promoted before the relu/head-sum so the reduction and the
-                # log-softmax below are unchanged. This one carries the indexer gradient,
-                # so the promotion happens before any nonlinearity.
-                student = torch.einsum("bchd,bckd->bchk", q_idx, bk_sel).float()
+            bk_sel = torch.gather(
+                bk_bt, 1, blk.reshape(b, c * k)[..., None].expand(-1, -1, d_idx)
+            ).view(b, c, k, d_idx)
+            # Same policy as the teacher: bf16 operands, fp32 accumulation inside the
+            # matmul, promoted before the relu/head-sum so the reduction and the
+            # log-softmax below are unchanged. This one carries the indexer gradient,
+            # so the promotion happens before any nonlinearity.
+            student = torch.einsum("bchd,bckd->bchk", q_idx, bk_sel).float()
             student = torch.relu(student).sum(dim=2) / math.sqrt(d_idx)  # [b, c, k]
             log_probs = masked_log_softmax(student, picked_c)
 

@@ -509,8 +509,8 @@ class TransformerConfig(ModelParallelConfig):
     ``reference``: the original eager path (materializes the gathered selected keys).
     ``layout``: eager, bit-identical teacher targets without materializing the gathered
     keys (one GEMM per query chunk over its causal key range, then a logit gather).
-    ``fused``: CuTe DSL teacher kernel (Blackwell, bf16) on the main path's q/k plus a
-    GEMM-and-gather student; CUDA-graph capturable, deterministic indexer gradients.
+    ``fused``: CuTe DSL teacher kernel (Blackwell, bf16) on the main path's q/k plus the
+    CuTe DSL sparse student; CUDA-graph capturable, deterministic indexer gradients.
     Qwen3.8 perf proxy (X2, GB300): loss 374 ms/step (reference) -> 135 (layout) -> 39
     (fused, Triton teacher); step 935 -> 703 -> 601 ms."""
 

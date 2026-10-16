@@ -6,7 +6,7 @@
 # NVIDIA CORPORATION & AFFILIATES).
 
 
-"""CuTe DSL (SM100) kernels for the QSA indexer distillation loss (``qsa_indexer_loss_impl='fused'``).
+"""CuTe DSL (SM100) kernels of the QSA indexer distillation loss (``qsa_indexer_loss_impl='fused'``).
 
 Teacher (:func:`qsa_indexer_teacher`): per query row and head, the softmax of the bf16-rounded
 logits ``bf16(q . k) * scale`` over the tokens of the row's picked blocks, summed over heads
@@ -34,6 +34,12 @@ rows (long documents, or rows whose tile spans two documents):
   token) keep a per-column online max / sum-exp while chunks arrive, reduce it over the CTA,
   then re-read TMEM for the probabilities, sum heads and groups per token, max-pool over the
   ``R`` lanes of a block and store.
+
+Student (:func:`qsa_indexer_student_sparse`, K8): the KL against the teacher at the selected
+blocks only. The row kernel (:class:`_StudentRowSm100`) gathers each selected block key once,
+forms the indexer scores, the student logit and the KL, and computes the query gradient in the
+same pass; the block-key gradient is one GEMM per query chunk over a collision-free dense
+scatter of the per-slot gradients. The loss's backward only scales the saved gradients.
 
 Deterministic (fixed reduction trees, no atomics) and free of host synchronization; all
 compile-time parameters are model constants. Compiled kernels are cached per
@@ -1009,6 +1015,248 @@ class _TeacherTileSm100:
         tmem.free(tmem_ptr)
 
 
+class _StudentRowSm100:
+    """Sparse student (K8), one 128-thread CTA per query row (persistent, several per SM).
+
+    For each 128-slot chunk of the row's selection, thread ``j`` (slot) loads its block key,
+    computes the indexer scores ``z_h = bf16(q_h . k)`` (fp32 FMA), the student logit
+    ``st = sum_h relu(z_h) / sqrt(d)`` and its KL partials; the chunk's keys are staged in
+    SMEM, and thread ``d`` (head dim) accumulates the gradient sums
+    ``u_h = sum_j exp(st_j - m) [z_hj > 0] k_jd`` (online-rescaled) and
+    ``v_h = sum_j T_j [z_hj > 0] k_jd``. Then ``dq = w / sqrt(d) * (C u / l - v)`` with
+    ``C = sum_j T_j``, ``l = sum_j exp(st_j - m)``. Outputs per row: ``dq`` (fp32), the
+    student logits and positivity bits (for the block-key gradient), LSE, ``C`` and the row KL.
+    """
+
+    def __init__(self, nh, d, k, has_boff):
+        assert d % 8 == 0 and d <= 256 and nh <= 8 and k <= 2048
+        self.nh, self.d, self.k, self.has_boff = nh, d, k, has_boff
+        self.dpt = (d + 127) // 128  # head-dim elements per thread in the gradient phase
+        self.ld = d + 8  # SMEM row stride (bf16 elements) of the staged keys
+
+    @cute.jit
+    def __call__(
+        self,
+        mQ: cute.Tensor,  # [b, s, nh, d] bf16
+        mBK: cute.Tensor,  # [b, nb, d] bf16
+        mOrder: cute.Tensor,  # [b, s, k] int64
+        mPicked: cute.Tensor,  # [b, s, k] uint8
+        mBoff: cute.Tensor,  # [s] int64 (dummy when absent)
+        mNhi: cute.Tensor,  # [b, s] int32
+        mTgt: cute.Tensor,  # [b, s, k] fp32
+        mW: cute.Tensor,  # [1] fp32  (loss_coeff / n_valid_rows)
+        mDQ: cute.Tensor,  # [b, s, nh, d] fp32 out
+        mGH: cute.Tensor,  # [b, s, nh, k] bf16 out: d loss / d score_h at each slot
+        mRow: cute.Tensor,  # [b, s, 4] fp32 out: lse, csum, row KL, -
+        scale: Float32,  # 1 / sqrt(d)
+        n_ctas: Int32,
+        stream,
+    ):
+        self.kernel(mQ, mBK, mOrder, mPicked, mBoff, mNhi, mTgt, mW, mDQ, mGH, mRow, scale).launch(
+            grid=(n_ctas, 1, 1), block=(128, 1, 1), stream=stream
+        )
+
+    @cute.jit
+    def _block_reduce(self, val, red, slot, is_max: cutlass.Constexpr):
+        """CTA-wide (128 threads) max / sum; ``red`` holds 4 floats per ``slot``."""
+        if const_expr(is_max):
+            wv = cute.arch.warp_reduction_max(val)
+        else:
+            wv = cute.arch.warp_reduction_sum(val)
+        tidx, _, _ = cute.arch.thread_idx()
+        if tidx % 32 == 0:
+            red[slot, tidx // 32] = wv
+        cute.arch.sync_threads()
+        r = red[slot, 0]
+        for w in cutlass.range_constexpr(1, 4):
+            if const_expr(is_max):
+                r = cute.arch.fmax(r, red[slot, w])
+            else:
+                r = r + red[slot, w]
+        return r
+
+    @cute.jit
+    def _issue_rows(self, mBK, mOrder, mPicked, sbk, bi, t, c, nhi, boff, nb, tidx):
+        # cp.async this thread's key row of chunk c (16 B pieces; zero-filled if unpicked)
+        j = c * 128 + tidx
+        ok = j < nhi
+        blk = Int32(0)
+        if ok:
+            ok = mPicked[bi, t, j] != cutlass.Uint8(0)
+            blk = cutlass.min(Int32(mOrder[bi, t, j]) + boff, nb - 1)
+        nbytes = Int32(16) if ok else Int32(0)
+        g_base = mBK[bi, blk, None].iterator
+        s_base = sbk[c % 2, tidx, None].iterator
+        for i in cutlass.range_constexpr(self.d // 8):
+            cute.arch.cp_async_shared_global(s_base + i * 8, g_base + i * 8, 16, "cg", cp_size=nbytes)
+        cute.arch.cp_async_commit_group()
+
+    @cute.kernel
+    def kernel(self, mQ, mBK, mOrder, mPicked, mBoff, mNhi, mTgt, mW, mDQ, mGH, mRow, scale: Float32):
+        tidx, _, _ = cute.arch.thread_idx()
+        bid, _, _ = cute.arch.block_idx()
+        nctas, _, _ = cute.arch.grid_dim()
+        b_sz = mOrder.shape[0]
+        s_sz = mOrder.shape[1]
+        n_rows = b_sz * s_sz
+        nb = mBK.shape[1]
+        NH = const_expr(self.nh)
+        D = const_expr(self.d)
+        DPT = const_expr(self.dpt)
+        LD = const_expr(self.ld)
+        LOG2E = Float32(math.log2(math.e))
+        LN2 = Float32(math.log(2.0))
+        NEG_INF = -Float32.inf
+
+        @cute.struct
+        class SharedStorage:
+            sq: cute.struct.MemRange[Float32, self.nh * self.d]
+            wgt: cute.struct.MemRange[Float32, 128 * 2 * self.nh]
+            red: cute.struct.MemRange[Float32, 8 * 4]
+            sst: cute.struct.MemRange[Float32, self.k]
+            spos: cute.struct.MemRange[cutlass.Uint8, self.k]
+            sbk: cute.struct.Align[cute.struct.MemRange[cutlass.BFloat16, 2 * 128 * self.ld], 16]
+
+        smem = utils.SmemAllocator()
+        storage = smem.allocate(SharedStorage)
+        sq = storage.sq.get_tensor(cute.make_layout((NH, D), stride=(D, 1)))
+        wgt = storage.wgt.get_tensor(cute.make_layout((128, 2, NH), stride=(2 * NH, NH, 1)))
+        red = storage.red.get_tensor(cute.make_layout((8, 4), stride=(4, 1)))
+        sbk = storage.sbk.get_tensor(cute.make_layout((2, 128, LD), stride=(128 * LD, LD, 1)))
+        sst = storage.sst.get_tensor(cute.make_layout((self.k,)))
+        spos = storage.spos.get_tensor(cute.make_layout((self.k,)))
+        KS = const_expr(self.k)
+        z = cute.make_rmem_tensor((NH,), Float32)
+        u = cute.make_rmem_tensor((NH * DPT,), Float32)
+        v = cute.make_rmem_tensor((NH * DPT,), Float32)
+        w_loss = mW[0]
+        inv_sqrt_d = scale
+
+        rr = bid
+        while rr < n_rows:
+            row = n_rows - 1 - rr
+            bi = row // s_sz
+            t = row - bi * s_sz
+            nhi = mNhi[bi, t]
+            boff = Int32(0)
+            if const_expr(self.has_boff):
+                boff = Int32(mBoff[t])
+            for e in cutlass.range_constexpr((NH * D + 127) // 128):
+                idx = e * 128 + tidx
+                if idx < NH * D:
+                    sq[idx // D, idx % D] = Float32(mQ[bi, t, idx // D, idx % D])
+            for i in cutlass.range_constexpr(NH * DPT):
+                u[i] = Float32(0.0)
+                v[i] = Float32(0.0)
+            m_run = NEG_INF
+            l_t = Float32(0.0)
+            a_t = Float32(0.0)
+            b_t = Float32(0.0)
+            c_t = Float32(0.0)
+            cute.arch.sync_threads()
+            n_chunks = (nhi + 127) // 128
+            # key rows of chunk c are cp.async'ed into sbk[c % 2] one chunk ahead (zero-filled
+            # for unpicked slots, so the gradient phase multiplies exact zeros)
+            if n_chunks > 0:
+                self._issue_rows(mBK, mOrder, mPicked, sbk, bi, t, Int32(0), nhi, boff, nb, tidx)
+            for c in range(n_chunks):
+                buf = c % 2
+                if c + 1 < n_chunks:
+                    self._issue_rows(mBK, mOrder, mPicked, sbk, bi, t, c + 1, nhi, boff, nb, tidx)
+                    cute.arch.cp_async_wait_group(1)
+                else:
+                    cute.arch.cp_async_wait_group(0)
+                cute.arch.sync_threads()
+                j = c * 128 + tidx
+                ok = j < nhi
+                if ok:
+                    ok = mPicked[bi, t, j] != cutlass.Uint8(0)
+                st = Float32(0.0)
+                tg = Float32(0.0)
+                posb = Int32(0)
+                if ok:
+                    tg = mTgt[bi, t, j]
+                    for h in cutlass.range_constexpr(NH):
+                        z[h] = Float32(0.0)
+                    for dd in cutlass.range_constexpr(D):
+                        kv = Float32(sbk[buf, tidx, dd])
+                        for h in cutlass.range_constexpr(NH):
+                            z[h] = z[h] + sq[h, dd] * kv
+                    for h in cutlass.range_constexpr(NH):
+                        zb = Float32(z[h].to(cutlass.BFloat16))
+                        if zb > Float32(0.0):
+                            st = st + zb
+                            posb = posb | Int32(1 << h)
+                    st = st * inv_sqrt_d
+                if j < nhi:
+                    sst[j] = st
+                    spos[j] = cutlass.Uint8(posb)
+                a_t = a_t + tg * cute.math.log(cute.arch.fmax(tg, Float32(1e-10)))
+                b_t = b_t + (tg * st if ok else Float32(0.0))
+                c_t = c_t + tg
+                cm = self._block_reduce(st if ok else NEG_INF, red, c % 2, True)
+                m_new = cute.arch.fmax(m_run, cm)
+                m_s = m_new if m_new != NEG_INF else Float32(0.0)
+                alpha = cute.math.exp2((m_run - m_s) * LOG2E, fastmath=True)
+                ev = cute.math.exp2((st - m_s) * LOG2E, fastmath=True) if ok else Float32(0.0)
+                l_t = l_t * alpha + ev
+                for h in cutlass.range_constexpr(NH):
+                    hit = (posb >> h) & 1
+                    wgt[tidx, 0, h] = ev if hit != 0 else Float32(0.0)
+                    wgt[tidx, 1, h] = tg if hit != 0 else Float32(0.0)
+                cute.arch.sync_threads()
+                for i in cutlass.range_constexpr(NH * DPT):
+                    u[i] = u[i] * alpha
+                for jj in cutlass.range(128, unroll=4):
+                    for p in cutlass.range_constexpr(DPT):
+                        dd = p * 128 + tidx
+                        if dd < D:
+                            kv = Float32(sbk[buf, jj, dd])
+                            for h in cutlass.range_constexpr(NH):
+                                u[p * NH + h] = u[p * NH + h] + wgt[jj, 0, h] * kv
+                                v[p * NH + h] = v[p * NH + h] + wgt[jj, 1, h] * kv
+                cute.arch.sync_threads()
+                m_run = m_new
+            L = self._block_reduce(l_t, red, 2, False)
+            A = self._block_reduce(a_t, red, 3, False)
+            B = self._block_reduce(b_t, red, 4, False)
+            C = self._block_reduce(c_t, red, 5, False)
+            has = L > Float32(0.0)
+            m_s = m_run if m_run != NEG_INF else Float32(0.0)
+            lse = m_s + cute.math.log2(cute.arch.fmax(L, Float32(1e-30)), fastmath=False) * LN2
+            lse = lse if has else Float32(0.0)
+            inv_l = Float32(1.0) / cute.arch.fmax(L, Float32(1e-30))
+            gsc = w_loss * inv_sqrt_d
+            for p in cutlass.range_constexpr(DPT):
+                dd = p * 128 + tidx
+                if dd < D:
+                    for h in cutlass.range_constexpr(NH):
+                        g = gsc * (C * u[p * NH + h] * inv_l - v[p * NH + h])
+                        mDQ[bi, t, h, dd] = g if has else Float32(0.0)
+            if tidx == 0:
+                mRow[bi, t, 0] = lse
+                mRow[bi, t, 1] = C
+                mRow[bi, t, 2] = (A - B + C * lse) if has else Float32(0.0)
+            # per-slot score gradient (bf16, the block-key GEMM operand):
+            # d loss / d s_hj = w / sqrt(d) * (p_j * C - T_j) * [z_hj > 0]
+            for jj in cutlass.range_constexpr((KS + 127) // 128):
+                j = jj * 128 + tidx
+                if j < KS:
+                    gv = Float32(0.0)
+                    pb = Int32(0)
+                    if j < nhi:
+                        if mPicked[bi, t, j] != cutlass.Uint8(0):
+                            pj = cute.math.exp2((sst[j] - lse) * LOG2E, fastmath=True)
+                            gv = gsc * (pj * C - mTgt[bi, t, j])
+                            pb = Int32(spos[j])
+                    if not has:
+                        gv = Float32(0.0)
+                    for h in cutlass.range_constexpr(NH):
+                        mGH[bi, t, h, j] = (gv if ((pb >> h) & 1) != 0 else Float32(0.0)).to(cutlass.BFloat16)
+            cute.arch.sync_threads()
+            rr += nctas
+
+
 # ---------------------------------------------------------------------------- host side
 _COMPILED = {}
 _NUM_SMS = {}
@@ -1164,3 +1412,124 @@ def qsa_indexer_teacher(
     if pool:
         return out
     return out.view(b, s, n_sel, r)
+
+
+class QSASparseStudentKLCute(torch.autograd.Function):
+    """KL(targets || softmax(student)) at the selected blocks with the CuTe row kernel;
+    gradients computed in forward (deterministic, no atomics), scaled in backward."""
+
+    @staticmethod
+    def forward(ctx, q_idx, bk, order, picked, block_offsets, targets, loss_coeff, chunk, nb_hi_fn):
+        import cuda.bindings.driver as cuda_drv
+
+        b, s, nh, d = q_idx.shape
+        nb = bk.shape[1]
+        k = order.shape[-1]
+        device = q_idx.device
+        order = order.contiguous()
+        picked_u8 = picked.contiguous().view(torch.uint8)
+        slot = torch.arange(1, k + 1, device=device, dtype=torch.int32)
+        n_hi = torch.where(picked, slot, 0).amax(dim=-1).to(torch.int32).contiguous()
+        valid_rows = picked.any(dim=-1)
+        w = (loss_coeff / valid_rows.sum().clamp_min(1).float()).reshape(1).contiguous()
+        targets = targets.contiguous()
+        dq = torch.empty(b, s, nh, d, dtype=torch.float32, device=device)
+        gh = torch.empty(b, s, nh, k, dtype=q_idx.dtype, device=device)
+        rowv = torch.empty(b, s, 4, dtype=torch.float32, device=device)
+        has_boff = block_offsets is not None
+        boff = (
+            block_offsets.to(torch.int64).contiguous()
+            if has_boff
+            else torch.zeros(1, dtype=torch.int64, device=device)
+        )
+        sqrt_d = math.sqrt(d)
+        if s > 0 and b > 0 and k > 0 and nb > 0:
+            stream = cuda_drv.CUstream(torch.cuda.current_stream(device).cuda_stream)
+            key = ("student", nh, d, k, has_boff)
+            args = (q_idx, bk, order, picked_u8, boff, n_hi, targets, w, dq, gh, rowv)
+            n_ctas = min(b * s, _num_sms(device) * STUDENT_CTAS_PER_SM)
+            if key not in _COMPILED:
+                _COMPILED[key] = cute.compile(
+                    _StudentRowSm100(nh, d, k, has_boff),
+                    *[_to_cute(a) for a in args],
+                    Float32(1.0 / sqrt_d),
+                    Int32(n_ctas),
+                    stream,
+                    options="--enable-tvm-ffi",
+                )
+            _COMPILED[key](*args, Float32(1.0 / sqrt_d), Int32(n_ctas), stream)
+        else:
+            dq.zero_()
+            gh.zero_()
+            rowv.zero_()
+        loss = rowv[..., 2].sum() * w[0]
+
+        # d loss / d block keys: per query chunk, the kernel's per-(row, head, slot) gradient is
+        # scattered into a dense [rows*heads, blocks] matrix of the chunk's block range (a row
+        # picks a block once; unpicked slots carry exact zeros, so the scatter-add is exact and
+        # order-independent), then one GEMM against the queries; chunk results accumulate in
+        # fp32. The dense buffer is allocated once and cleared by scattering zeros back.
+        blk_all = order
+        if has_boff:
+            blk_all = blk_all + block_offsets.view(1, s, 1)
+        blk_all = torch.where(picked, blk_all, 0)
+        dbk = torch.zeros(b, nb, d, dtype=torch.float32, device=device)
+        c_max = min(chunk, s)
+        dense_buf = torch.zeros(b, c_max * nh * nb, dtype=q_idx.dtype, device=device)
+        for c0 in range(0, s, chunk):
+            c1 = min(c0 + chunk, s)
+            c = c1 - c0
+            nb_hi = nb_hi_fn(c1)
+            if nb_hi <= 0:
+                continue
+            dense = dense_buf[:, : c * nh * nb_hi].view(b, c, nh, nb_hi)
+            idx = blk_all[:, c0:c1, None, :].clamp_max(nb_hi - 1).expand(b, c, nh, k)
+            dense.scatter_add_(3, idx, gh[:, c0:c1])
+            dbk[:, :nb_hi] += torch.matmul(
+                dense.view(b, c * nh, nb_hi).transpose(1, 2), q_idx[:, c0:c1].reshape(b, c * nh, d)
+            ).float()
+            dense.scatter_(3, idx, 0.0)
+        ctx.save_for_backward(dq, dbk)
+        ctx.dtypes = (q_idx.dtype, bk.dtype)
+        return loss
+
+    @staticmethod
+    def backward(ctx, grad_loss):
+        dq, dbk = ctx.saved_tensors
+        dq = (dq * grad_loss).to(ctx.dtypes[0])
+        dbk = (dbk * grad_loss).to(ctx.dtypes[1])
+        return dq, dbk, None, None, None, None, None, None, None
+
+
+STUDENT_CTAS_PER_SM = 3  # 70 KB of double-buffered key rows per CTA
+
+
+def qsa_indexer_student_sparse(
+    q_idx: torch.Tensor,
+    block_keys: torch.Tensor,
+    order: torch.Tensor,
+    picked: torch.Tensor,
+    targets: torch.Tensor,
+    loss_coeff: float,
+    block_offsets: Optional[torch.Tensor] = None,
+    chunk: int = 1024,
+    nb_hi_fn=None,
+) -> torch.Tensor:
+    """Sparse-KL student loss of the indexer: ``KL(targets || softmax(student))`` at the
+    selected blocks, mean over rows with a selection, times ``loss_coeff``.
+
+    Args:
+        q_idx: ``[b, s, nh, d]`` bf16 indexer queries; block_keys: ``[b, n_blocks, d]`` bf16.
+        order / picked: ``[b, s, k]`` selected block ids (document-local when
+            ``block_offsets`` ``[s]`` is given) and validity; targets: ``[b, s, k]`` teacher.
+        chunk / nb_hi_fn: query chunk of the block-key gradient GEMM, and the number of
+            blocks a chunk ending at row ``c1`` can read (default: all).
+    """
+    assert q_idx.dtype == block_keys.dtype == torch.bfloat16, "the student kernel takes bf16"
+    assert block_keys.stride(-1) == 1 and block_keys.stride(1) % 8 == 0
+    nb = block_keys.shape[1]
+    if nb_hi_fn is None:
+        nb_hi_fn = lambda c1: nb  # noqa: E731
+    return QSASparseStudentKLCute.apply(
+        q_idx, block_keys, order, picked, block_offsets, targets, loss_coeff, chunk, nb_hi_fn
+    )
