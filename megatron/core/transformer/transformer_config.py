@@ -514,8 +514,10 @@ class TransformerConfig(ModelParallelConfig):
     374 ms/step (reference) -> 135 (layout) -> 39 (fused); step 935 -> 703 -> 601 ms."""
 
     qsa_use_sparse_attention: bool = False
-    """Use the sparse GQA Triton kernel path (gathered block-sparse attention over the
-    selected 4-token blocks; supports BSHD and packed THD). When False, the dense-mask
+    """Use the sparse GQA kernel path (gathered block-sparse attention over the selected
+    4-token blocks; supports BSHD and packed THD). The kernels are CuTe DSL kernels for
+    Blackwell (SM100-class) GPUs with bf16/fp16 inputs; building a QSA layer elsewhere
+    raises. When False, the dense-mask
     bridge is used: the selection is materialized as a [b, s, s] bool mask fed to dense
     core attention — functionally identical, no sparsity speedup, BSHD only."""
 

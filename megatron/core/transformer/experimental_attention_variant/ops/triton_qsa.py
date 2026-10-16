@@ -1,10 +1,11 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Self-contained Triton kernels for the QSA sparse-GQA attention path.
+"""Sparse-attention metadata and Triton backward kernels of the QSA sparse-GQA attention.
+
+The attention entry point and the forward kernel (CuTe DSL) live in :mod:`cute_qsa_attn`; the
+indexer's block scoring and exact top-k live in :mod:`triton_qsa_select`.
 
 Design (SGLang-prefill style, replacing the earlier fla-NSA adaptation):
-
-The indexer's block scoring and exact top-k live in :mod:`triton_qsa_select`.
 
 1. **Query-tile shared-superset gather**: the sparse attention kernels process
    ``BQ`` consecutive queries per program against the UNION of their selected
@@ -447,128 +448,7 @@ def build_qsa_kv_tile_csr(
 
 
 # ---------------------------------------------------------------------------
-# 2. Sparse GQA forward
-# ---------------------------------------------------------------------------
-
-
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=w, num_stages=st) for w in [4, 8] for st in [1, 2, 3]
-    ],
-    key=['BK', 'BV', 'GP', 'BQ'],
-)
-@triton.jit
-def qsa_fwd_kernel(
-    q,  # [B, TQ, HQ, K]
-    k,  # [B, TK, H, K]
-    v,  # [B, TK, H, V]
-    o,  # [B, TQ, HQ, V]
-    lse,  # [B, TQ, HQ] fp32
-    q_pos,  # [TQ] global token position of each query row (arange when TQ == TK)
-    tile_offsets,
-    entry_base,
-    entry_end,
-    membership,
-    scale,
-    TQ,
-    TK,
-    n_tiles,
-    H: tl.constexpr,
-    HQ: tl.constexpr,
-    G: tl.constexpr,
-    GP: tl.constexpr,
-    BQ: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    BSZ: tl.constexpr,
-    CBZ: tl.constexpr,
-):
-    i_tile = tl.program_id(0).to(tl.int64)
-    i_v = tl.program_id(1)
-    i_h = tl.program_id(2).to(tl.int64)
-    i_b = i_tile // n_tiles
-    tile = i_tile % n_tiles
-
-    R: tl.constexpr = BQ * GP
-    CBT: tl.constexpr = CBZ * BSZ
-    o_r = tl.arange(0, R)
-    q_loc = o_r // GP
-    g = o_r % GP
-    o_t = tile * BQ + q_loc  # query ROW within the (possibly CP-local) sample
-    m_row = (o_t < TQ) & (g < G)
-    # global position of each query row (for causal masking against K tokens)
-    b_pos = tl.load(q_pos + o_t, mask=o_t < TQ, other=0).to(tl.int64)
-    head = i_h * G + g
-    o_d = tl.arange(0, BK)
-    o_v = i_v * BV + tl.arange(0, BV)
-    m_d = o_d < K
-    m_v = o_v < V
-
-    p_q = q + ((i_b * TQ + o_t) * HQ + head)[:, None] * K + o_d[None, :]
-    b_q = tl.load(p_q, mask=m_row[:, None] & m_d[None, :], other=0.0)
-    # log2-domain online softmax: fold scale * log2(e) into q so exp/log become
-    # exp2/log2 (the LSE is stored in the log2 domain; only these kernels read it).
-    b_q = (b_q * (scale * 1.4426950408889634)).to(b_q.dtype)
-
-    e0 = tl.load(tile_offsets + i_tile)
-    e1 = tl.load(tile_offsets + i_tile + 1)
-
-    b_o = tl.zeros([R, BV], dtype=tl.float32)
-    b_m = tl.full([R], float('-inf'), dtype=tl.float32)
-    b_acc = tl.zeros([R], dtype=tl.float32)
-    for es in range(e0, e1, CBZ):
-        o_e = es + tl.arange(0, CBZ)
-        m_e = o_e < e1
-        base = tl.load(entry_base + o_e, mask=m_e, other=0).to(tl.int64)
-        tend = tl.load(entry_end + o_e, mask=m_e, other=0).to(tl.int64)
-        offs2 = base[:, None] + tl.arange(0, BSZ)[None, :]
-        val2 = (offs2 < tend[:, None]) & m_e[:, None]
-        offs = tl.reshape(offs2, [CBT])
-        m_tok = tl.reshape(val2, [CBT])
-
-        p_k = k + ((i_b * TK + offs) * H + i_h)[None, :] * K + o_d[:, None]
-        b_k = tl.load(p_k, mask=m_tok[None, :] & m_d[:, None], other=0.0)
-        p_v = v + ((i_b * TK + offs) * H + i_h)[:, None] * V + o_v[None, :]
-        b_v = tl.load(p_v, mask=m_tok[:, None] & m_v[None, :], other=0.0)
-
-        # [R, CBT] scores
-        b_s = tl.dot(b_q, b_k)
-        # membership: [BQ, CB] -> broadcast to [R, CBT]
-        mem = tl.load(
-            membership + o_e[None, :] * BQ + tl.arange(0, BQ)[:, None],
-            mask=m_e[None, :],
-            other=0,
-        )
-        m_mem = (
-            tl.reshape(
-                tl.broadcast_to(tl.reshape(mem, [BQ, 1, CBZ, 1]), [BQ, GP, CBZ, BSZ]), [R, CBT]
-            )
-            != 0
-        )
-        causal = offs[None, :] <= b_pos[:, None]
-        m_all = m_tok[None, :] & m_mem & causal & m_row[:, None]
-        b_s = tl.where(m_all, b_s, float('-inf'))
-
-        b_m_new = tl.maximum(b_m, tl.max(b_s, 1))
-        b_r = tl.where(b_m == float('-inf'), 0.0, tl.exp2(b_m - b_m_new))
-        b_p = tl.where(b_s == float('-inf'), 0.0, tl.exp2(b_s - b_m_new[:, None]))
-        b_acc = b_acc * b_r + tl.sum(b_p, 1)
-        b_o = b_o * b_r[:, None] + tl.dot(b_p.to(b_v.dtype), b_v)
-        b_m = b_m_new
-
-    b_o = b_o / tl.maximum(b_acc, 1e-10)[:, None]
-    b_lse = tl.where(b_m == float('-inf'), 0.0, b_m + tl.log2(tl.maximum(b_acc, 1e-10)))
-    p_o = o + ((i_b * TQ + o_t) * HQ + head)[:, None] * V + o_v[None, :]
-    tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=m_row[:, None] & m_v[None, :])
-    if i_v == 0:
-        p_lse = lse + (i_b * TQ + o_t) * HQ + head
-        tl.store(p_lse, b_lse, mask=m_row)
-
-
-# ---------------------------------------------------------------------------
-# 3. Backward: dq (per query tile) and dkv (per KV block, no atomics)
+# 2. Backward: dq (per query tile) and dkv (per KV block, no atomics)
 # ---------------------------------------------------------------------------
 
 
@@ -970,7 +850,7 @@ def qsa_bwd_dkv_tile_kernel(
 
 
 # ---------------------------------------------------------------------------
-# 4. Host wrappers and autograd
+# 3. Host wrappers
 # ---------------------------------------------------------------------------
 
 
@@ -1184,218 +1064,41 @@ def qsa_bwd_dkv_block(q, k, v, lse, delta, do, q_pos, query_csr, block_bases, bl
     return dk, dv
 
 
-class QSASparseAttnFunction(torch.autograd.Function):
-    """Autograd over the query-tile shared-superset sparse GQA kernels."""
-
-    @staticmethod
-    def forward(
-        ctx,
-        q,
-        k,
-        v,
-        q_pos,
-        supersets,
-        query_csr,
-        block_bases,
-        block_ends,
-        scale,
-        tile_queries,
-        dkv_tile_config=None,
-    ):
-        B, TQ, HQ, K = q.shape
-        TK, H, V = k.shape[1], k.shape[2], v.shape[-1]
-        G = HQ // H
-        BK, BV, GP = _launch_dims(K, V, G)
-        NV = triton.cdiv(V, BV)
-        assert NV == 1
-
-        o = torch.empty(B, TQ, HQ, V, dtype=v.dtype, device=q.device)
-        lse = torch.empty(B, TQ, HQ, dtype=torch.float32, device=q.device)
-        n_tiles_total = B * supersets.n_tiles
-        qsa_fwd_kernel[(n_tiles_total, NV, H)](
-            q=q,
-            k=k,
-            v=v,
-            o=o,
-            lse=lse,
-            q_pos=q_pos,
-            tile_offsets=supersets.tile_offsets,
-            entry_base=supersets.entry_base,
-            entry_end=supersets.entry_end,
-            membership=supersets.membership,
-            scale=scale,
-            TQ=TQ,
-            TK=TK,
-            n_tiles=supersets.n_tiles,
-            H=H,
-            HQ=HQ,
-            G=G,
-            GP=GP,
-            BQ=tile_queries,
-            K=K,
-            V=V,
-            BK=BK,
-            BV=BV,
-            BSZ=BS,
-            CBZ=CB,
-        )
-        ctx.save_for_backward(q, k, v, o, lse, q_pos, block_bases, block_ends)
-        ctx.supersets = supersets
-        ctx.query_csr = query_csr
-        ctx.dkv_tile_config = dkv_tile_config
-        ctx.scale = scale
-        ctx.tile_queries = tile_queries
-        return o
-
-    @staticmethod
-    def backward(ctx, do):
-        q, k, v, o, lse, q_pos, block_bases, block_ends = ctx.saved_tensors
-        ss: QSASupersets = ctx.supersets
-        B, TQ, HQ, K = q.shape
-        TK, H, V = k.shape[1], k.shape[2], v.shape[-1]
-        G = HQ // H
-        BK, BV, GP = _launch_dims(K, V, G)
-        BQ = ctx.tile_queries
-
-        do = do.contiguous()
-        # delta = rowwise sum(o * do) over the value dim, fp32
-        delta = (o.float() * do.float()).sum(-1)
-
-        dq = torch.empty_like(q)
-        n_tiles_total = B * ss.n_tiles
-        qsa_bwd_dq_kernel[(n_tiles_total, H)](
-            q=q,
-            k=k,
-            v=v,
-            lse=lse,
-            delta=delta,
-            do=do,
-            dq=dq,
-            q_pos=q_pos,
-            tile_offsets=ss.tile_offsets,
-            entry_base=ss.entry_base,
-            entry_end=ss.entry_end,
-            membership=ss.membership,
-            scale=ctx.scale,
-            TQ=TQ,
-            TK=TK,
-            n_tiles=ss.n_tiles,
-            H=H,
-            HQ=HQ,
-            G=G,
-            GP=GP,
-            BQ=BQ,
-            K=K,
-            V=V,
-            BK=BK,
-            BV=BV,
-            BSZ=BS,
-            CBZ=CB,
-        )
-
-        if isinstance(ctx.query_csr, QSAKVTileCSR):
-            dk, dv = qsa_bwd_dkv_tile(
-                q,
-                k,
-                v,
-                lse,
-                delta,
-                do,
-                q_pos,
-                ctx.query_csr,
-                block_bases,
-                block_ends,
-                ctx.scale,
-                ctx.dkv_tile_config,
-            )
-        else:
-            dk, dv = qsa_bwd_dkv_block(
-                q, k, v, lse, delta, do, q_pos, ctx.query_csr, block_bases, block_ends, ctx.scale
-            )
-        return dq, dk, dv, None, None, None, None, None, None, None, None
-
-
-def qsa_sparse_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    block_indices: torch.Tensor,
-    block_counts: torch.Tensor,
-    block_bases: torch.Tensor,
-    block_ends: torch.Tensor,
-    scale: Optional[float] = None,
-    tile_queries: Optional[int] = None,
-    q_positions: Optional[torch.Tensor] = None,
-    static_shapes: bool = False,
-    dkv_impl: Optional[str] = None,
-    dkv_tile_config: Optional[QSADkvTileConfig] = None,
-) -> torch.Tensor:
-    """Sparse GQA attention over per-query selected 4-token blocks.
-
-    Args:
-        q: ``[B, TQ, HQ, K]`` (no head padding required; any ``HQ/H >= 1``).
-        k/v: ``[B, TK, H, K/V]``. ``TK`` may exceed ``TQ`` under allgather context
-            parallelism (local queries against the globally gathered K/V).
-        block_indices: ``[B, TQ, S]`` GLOBAL block ids in the ``block_bases`` space
-            (document-local ids must be offset by the caller under packed THD).
-            Slots beyond ``block_counts`` are ignored.
-        block_counts: ``[B, TQ]`` valid slots per query.
-        block_bases / block_ends: ``[num_blocks]`` first token and one-past-last
-            valid token of every block (encodes ragged document tails and
-            fully-future own blocks; the kernels never see cu_seqlens).
-        scale: attention scale, default ``K ** -0.5``.
-        tile_queries: queries per shared-superset tile (default derived from G).
-        q_positions: ``[TQ]`` global token position of each query row for causal
-            masking. Defaults to ``arange(TQ)``; REQUIRED when ``TQ != TK``.
-        static_shapes: build the superset / query CSR structures at shape-only upper
-            bounds without host synchronization (CUDA-graph capturable). Results are
-            bit-identical to the default builders.
-        dkv_impl: ``"tile"`` or ``"block"`` dk/dv backward (default
-            :data:`QSA_DKV_IMPL`). ``"tile"`` builds its query CSR without host
-            synchronization in both modes. Both are deterministic.
-        dkv_tile_config: launch configuration of the ``"tile"`` backward (default
-            :data:`QSA_DKV_TILE_CONFIG`).
-    """
-    if scale is None:
-        scale = k.shape[-1] ** -0.5
-    HQ, H = q.shape[2], k.shape[2]
-    if tile_queries is None:
-        tile_queries = qsa_choose_tile_queries(HQ, H)
-    if q_positions is None:
-        assert q.shape[1] == k.shape[1], (
-            "q_positions is required when the query rows are a CP shard (TQ != TK)."
-        )
-        q_positions = torch.arange(q.shape[1], device=q.device, dtype=torch.int64)
-    num_blocks = block_bases.shape[0]
-    build_supersets = build_qsa_supersets_static if static_shapes else build_qsa_supersets
-    build_query_csr = build_qsa_query_csr_static if static_shapes else build_qsa_query_csr
-    supersets = build_supersets(
-        block_indices, block_counts, block_bases, block_ends, num_blocks, tile_queries
+def qsa_bwd_dq(q, k, v, lse, delta, do, q_pos, supersets: QSASupersets, scale, tile_queries):
+    """dq via :func:`qsa_bwd_dq_kernel` over the query-tile supersets (``tile_queries`` per tile;
+    ``lse`` in the log2 domain, ``delta = rowsum(o * do)`` in fp32)."""
+    B, TQ, HQ, K = q.shape
+    TK, H, V = k.shape[1], k.shape[2], v.shape[-1]
+    G = HQ // H
+    BK, BV, GP = _launch_dims(K, V, G)
+    dq = torch.empty_like(q)
+    qsa_bwd_dq_kernel[(B * supersets.n_tiles, H)](
+        q=q,
+        k=k,
+        v=v,
+        lse=lse,
+        delta=delta,
+        do=do,
+        dq=dq,
+        q_pos=q_pos,
+        tile_offsets=supersets.tile_offsets,
+        entry_base=supersets.entry_base,
+        entry_end=supersets.entry_end,
+        membership=supersets.membership,
+        scale=scale,
+        TQ=TQ,
+        TK=TK,
+        n_tiles=supersets.n_tiles,
+        H=H,
+        HQ=HQ,
+        G=G,
+        GP=GP,
+        BQ=tile_queries,
+        K=K,
+        V=V,
+        BK=BK,
+        BV=BV,
+        BSZ=BS,
+        CBZ=CB,
     )
-    needs_grad = torch.is_grad_enabled() and (
-        q.requires_grad or k.requires_grad or v.requires_grad
-    )
-    dkv_impl = QSA_DKV_IMPL if dkv_impl is None else dkv_impl
-    assert dkv_impl in ("tile", "block"), f"unknown QSA dkv implementation {dkv_impl!r}"
-    if dkv_tile_config is None:
-        dkv_tile_config = QSA_DKV_TILE_CONFIG
-    query_csr = None
-    if needs_grad and dkv_impl == "tile":
-        query_csr = build_qsa_kv_tile_csr(
-            block_indices, block_counts, num_blocks, dkv_tile_config.tile_blocks
-        )
-    elif needs_grad:
-        query_csr = build_query_csr(block_indices, block_counts, num_blocks)
-    return QSASparseAttnFunction.apply(
-        q.contiguous(),
-        k.contiguous(),
-        v.contiguous(),
-        q_positions.contiguous(),
-        supersets,
-        query_csr,
-        block_bases.contiguous(),
-        block_ends.contiguous(),
-        scale,
-        tile_queries,
-        dkv_tile_config,
-    )
+    return dq

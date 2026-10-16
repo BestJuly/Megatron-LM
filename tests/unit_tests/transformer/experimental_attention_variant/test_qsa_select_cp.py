@@ -34,12 +34,13 @@ from megatron.core.transformer.experimental_attention_variant.ops.triton_qsa_sel
 from megatron.core.transformer.spec_utils import build_module
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.experimental_attention_variant.test_attention_variant_qsa import (
-    HEAD_DIM,
     HIDDEN,
     RATIO,
     ROPE_THETA,
     ROTARY_PERCENT,
-    make_config,
+    SPARSE_HEAD_DIM,
+    make_sparse_config,
+    requires_qsa_kernels,
 )
 
 T = 320
@@ -85,7 +86,7 @@ def test_static_cp_layout_matches_dsa_builder(layout):
             assert torch.equal(r, ref_r), (lengths, rank)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@requires_qsa_kernels
 class TestQSASelectCP:
     def teardown_method(self, method):
         # Captured graphs hold NCCL work on the CP communicator; free them (they sit in
@@ -105,10 +106,9 @@ class TestQSASelectCP:
             use_te_rng_tracker=True, use_cudagraphable_rng=True, force_reset=True
         )
         model_parallel_cuda_manual_seed(123)
-        config = make_config()
+        config = make_sparse_config()
         config.context_parallel_size = CP
         config.cp_comm_type = "all_gather"
-        config.qsa_use_sparse_attention = True
         config.qsa_cp_packing_layout = layout
         config.qsa_indexer_loss_coeff = loss_coeff
         spec = get_qsa_module_spec_for_backend(config)
@@ -128,7 +128,7 @@ class TestQSASelectCP:
         self.cp_group = ps.get_context_parallel_group()
         self.layout = layout
         rope = RotaryEmbedding(
-            kv_channels=HEAD_DIM, rotary_percent=ROTARY_PERCENT, rotary_base=ROPE_THETA
+            kv_channels=SPARSE_HEAD_DIM, rotary_percent=ROTARY_PERCENT, rotary_base=ROPE_THETA
         )
         self.freqs = rope(T, packed_seq=True)
         world = torch.distributed.get_world_size()
@@ -156,7 +156,7 @@ class TestQSASelectCP:
         idx = self.attn.indexer
         for lengths in packings:
             cu = _cu(lengths)
-            h = torch.randn(T, 1, HIDDEN, generator=g).cuda()
+            h = torch.randn(T, 1, HIDDEN, generator=g).cuda().bfloat16()
             rows = self._rows(cu)
             shard = h.index_select(0, rows).contiguous()
             with torch.no_grad():
@@ -201,7 +201,7 @@ class TestQSASelectCP:
         g = torch.Generator().manual_seed(6)
         for lengths in PACKINGS_DOC:
             cu = _cu(lengths)
-            shard = torch.randn(T // CP, 1, HIDDEN, generator=g).cuda()
+            shard = torch.randn(T // CP, 1, HIDDEN, generator=g).cuda().bfloat16()
             with torch.no_grad():
                 sel = self.attn.indexer.select(shard, self.freqs, cu_seqlens=cu)
             shapes.add(tuple(tuple(t.shape) for t in sel if isinstance(t, torch.Tensor)))
@@ -217,7 +217,7 @@ class TestQSASelectCP:
         g = torch.Generator().manual_seed(11)
         for lengths in ([T], [120, 200], [8, 104, 0, 208]):
             cu = _cu(lengths)
-            h = torch.randn(T, 1, HIDDEN, generator=g).cuda()
+            h = torch.randn(T, 1, HIDDEN, generator=g).cuda().bfloat16()
             rows = self._rows(cu)
             shard = h.index_select(0, rows).contiguous()
 
@@ -245,10 +245,13 @@ class TestQSASelectCP:
             for p, r in zip(params, ref_grads):
                 gp = p.grad.detach().clone()
                 torch.distributed.all_reduce(gp, group=self.cp_group)
-                # fp32 summation-order noise only: the CP split regroups the student GEMMs
-                # and the cross-rank gradient sum (measured max |diff| ~5e-5 of max |g|).
+                # Summation-order noise only: the CP split regroups the gradient sums, and
+                # with bf16 parameters each rank's gradient and the all-reduce round to
+                # bf16, so the bar is bf16 resolution (measured max |diff| ~1e-2 of max |g|).
+                rel = float((gp.float() - r.float()).norm() / r.float().norm().clamp_min(1e-30))
+                assert rel <= 1e-2, f"indexer grad rel-L2 {rel:.3e}"
                 torch.testing.assert_close(
-                    gp, r, rtol=1e-4, atol=2e-4 * float(r.abs().max().clamp_min(1e-30))
+                    gp, r, rtol=1.6e-2, atol=2e-2 * float(r.abs().max().clamp_min(1e-30))
                 )
 
     def _layer_fn(self):
@@ -305,8 +308,8 @@ class TestQSASelectCP:
         g = torch.Generator().manual_seed(9)
         for lengths in PACKINGS_DOC:
             cu = _cu(lengths)
-            h = torch.randn(T // CP, 1, HIDDEN, generator=g).cuda()
-            go = torch.randn(T // CP, 1, HIDDEN, generator=g).cuda()
+            h = torch.randn(T // CP, 1, HIDDEN, generator=g).cuda().bfloat16()
+            go = torch.randn(T // CP, 1, HIDDEN, generator=g).cuda().bfloat16()
             self.attn.indexer.static_shapes = False
             ref = self._fwd_bwd(fn, h, cu, go)
             ref_repeat = self._fwd_bwd(fn, h, cu, go)
@@ -323,9 +326,11 @@ class TestQSASelectCP:
         self.attn.indexer.static_shapes = True
         fn = self._layer_fn()
         g = torch.Generator().manual_seed(9)
-        hs = [torch.randn(T // CP, 1, HIDDEN, generator=g).cuda() for _ in PACKINGS_DOC]
-        gos = [torch.randn(T // CP, 1, HIDDEN, generator=g).cuda() for _ in PACKINGS_DOC]
-        sample = torch.randn(T // CP, 1, HIDDEN, device="cuda", requires_grad=True)
+        hs = [torch.randn(T // CP, 1, HIDDEN, generator=g).cuda().bfloat16() for _ in PACKINGS_DOC]
+        gos = [torch.randn(T // CP, 1, HIDDEN, generator=g).cuda().bfloat16() for _ in PACKINGS_DOC]
+        sample = torch.randn(
+            T // CP, 1, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
         graphed = make_graphed_callables(fn, (sample, _cu([T])), num_warmup_iters=2)
         eager = [
             (self._fwd_bwd(fn, h, _cu(lengths), go), self._fwd_bwd(fn, h, _cu(lengths), go))

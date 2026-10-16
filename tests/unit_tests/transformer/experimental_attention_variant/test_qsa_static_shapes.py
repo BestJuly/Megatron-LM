@@ -29,12 +29,13 @@ from megatron.core.transformer.experimental_attention_variant.ops.triton_qsa imp
 from megatron.core.transformer.spec_utils import build_module
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.experimental_attention_variant.test_attention_variant_qsa import (
-    HEAD_DIM,
     HIDDEN,
     RATIO,
     ROPE_THETA,
     ROTARY_PERCENT,
-    make_config,
+    SPARSE_HEAD_DIM,
+    make_sparse_config,
+    requires_qsa_kernels,
 )
 
 T = 320
@@ -53,7 +54,7 @@ def _cu(lengths):
     return torch.tensor(cu, dtype=torch.int32, device="cuda")
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@requires_qsa_kernels
 class TestQSAStaticShapes:
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
@@ -63,8 +64,7 @@ class TestQSAStaticShapes:
             use_te_rng_tracker=True, use_cudagraphable_rng=True, force_reset=True
         )
         model_parallel_cuda_manual_seed(123)
-        self.config = make_config()
-        self.config.qsa_use_sparse_attention = True
+        self.config = make_sparse_config()
         self.config.qsa_indexer_loss_coeff = 0.01
         spec = get_qsa_module_spec_for_backend(self.config)
         self.attn = build_module(spec, config=self.config, layer_number=1).cuda()
@@ -78,11 +78,11 @@ class TestQSAStaticShapes:
                 norm.weight.uniform_(-0.1, 0.1)
         self.attn.train()
         rope = RotaryEmbedding(
-            kv_channels=HEAD_DIM, rotary_percent=ROTARY_PERCENT, rotary_base=ROPE_THETA
+            kv_channels=SPARSE_HEAD_DIM, rotary_percent=ROTARY_PERCENT, rotary_base=ROPE_THETA
         )
         self.freqs = rope(T)
         g = torch.Generator().manual_seed(5)
-        self.hiddens = [torch.randn(T, 1, HIDDEN, generator=g).cuda() for _ in PACKINGS]
+        self.hiddens = [torch.randn(T, 1, HIDDEN, generator=g).cuda().bfloat16() for _ in PACKINGS]
 
     def teardown_method(self, method):
         initialize_rng_tracker(force_reset=True)
@@ -206,7 +206,7 @@ class TestQSAStaticShapes:
         g = torch.Generator().manual_seed(9)
         for lengths, hidden in zip(PACKINGS, self.hiddens):
             cu = _cu(lengths)
-            grad_out = torch.randn(T, 1, HIDDEN, generator=g).cuda()
+            grad_out = torch.randn(T, 1, HIDDEN, generator=g).cuda().bfloat16()
             self.attn.indexer.static_shapes = False
             ref = self._fwd_bwd(fn, hidden, cu, grad_out)
             ref_repeat = self._fwd_bwd(fn, hidden, cu, grad_out)
@@ -220,8 +220,10 @@ class TestQSAStaticShapes:
         self.attn.indexer.static_shapes = True
         fn = self._layer_fn()
         g = torch.Generator().manual_seed(9)
-        grad_outs = [torch.randn(T, 1, HIDDEN, generator=g).cuda() for _ in PACKINGS]
-        sample = torch.randn(T, 1, HIDDEN, device="cuda", requires_grad=True)
+        grad_outs = [torch.randn(T, 1, HIDDEN, generator=g).cuda().bfloat16() for _ in PACKINGS]
+        sample = torch.randn(
+            T, 1, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
         # Capture before the eager references: eager backward passes on the default stream
         # would leave the parameters' AccumulateGrad nodes bound to it, which capture on TE's
         # side stream rejects.

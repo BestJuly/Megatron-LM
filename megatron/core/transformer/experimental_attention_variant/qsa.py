@@ -830,6 +830,37 @@ class QSAIndexer(MegatronModule):
         return order, picked
 
 
+def _require_qsa_kernel_support(config: TransformerConfig) -> None:
+    """The sparse QSA kernels are CuTe DSL kernels for Blackwell (SM100-class) GPUs.
+
+    Checked once, when a QSA layer that uses them is built, so that an unsupported device or
+    shape fails with its cause instead of inside a kernel launch.
+    """
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        raise RuntimeError(
+            "qsa_use_sparse_attention requires a Blackwell (SM100-class: B200, GB200, B300, "
+            "GB300) GPU; the QSA sparse kernels are CuTe DSL tcgen05 kernels."
+        )
+    try:
+        import cutlass  # noqa: F401  # pylint: disable=unused-import
+    except ImportError as e:
+        raise RuntimeError(
+            "qsa_use_sparse_attention requires nvidia-cutlass-dsl (CuTe DSL)."
+        ) from e
+    if not (config.bf16 or config.fp16):
+        raise ValueError("qsa_use_sparse_attention requires bf16 or fp16 training.")
+    if config.kv_channels not in (64, 128, 256):
+        raise ValueError(
+            f"qsa_use_sparse_attention supports head dims 64, 128 and 256, got "
+            f"kv_channels={config.kv_channels}."
+        )
+    group = config.num_attention_heads // config.num_query_groups
+    if group > 128:
+        raise ValueError(
+            f"qsa_use_sparse_attention supports at most 128 query heads per KV head, got {group}."
+        )
+
+
 @dataclass
 class QSASelfAttentionSubmodules(SelfAttentionSubmodules):
     """Self-attention submodules plus the QSA indexer."""
@@ -871,6 +902,8 @@ class QSASelfAttention(SelfAttention):
         if not self.config.qsa_indexer_loss_coeff:
             for param in self.indexer.parameters():
                 param.requires_grad_(False)
+        if self.config.qsa_use_sparse_attention:
+            _require_qsa_kernel_support(self.config)
 
     def is_cuda_graph_capturable(self) -> bool:
         """QSA layers are capturable, with or without (allgather) context parallelism.
@@ -1029,7 +1062,7 @@ class QSASelfAttention(SelfAttention):
         so packed varlen needs no cu_seqlens on the kernel side, and any GQA group
         size works without head padding.
         """
-        from megatron.core.transformer.experimental_attention_variant.ops.triton_qsa import (
+        from megatron.core.transformer.experimental_attention_variant.ops.cute_qsa_attn import (
             qsa_sparse_attention,
         )
 

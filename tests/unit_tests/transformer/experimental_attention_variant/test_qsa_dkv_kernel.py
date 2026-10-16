@@ -8,13 +8,18 @@ reproduce the ``"block"`` implementation within bf16 tolerance, be no less accur
 against an fp32 dense reference, and be bitwise repeatable. Shapes cover GQA group sizes
 that are not powers of two, packed THD documents with ragged and empty blocks, block counts
 that are not a multiple of the tile, a context-parallel style query shard (TQ < TK), and
-the split-column (fp32 partial) path.
+the split-column (fp32 partial) path. Both run on the output and LSE of the CuTe DSL
+forward (bf16), so the tests need an SM100-class GPU.
 """
 
 import pytest
 import torch
 
+from megatron.core.transformer.experimental_attention_variant.ops import cute_qsa_attn as ca
 from megatron.core.transformer.experimental_attention_variant.ops import triton_qsa as tq
+from tests.unit_tests.transformer.experimental_attention_variant.test_attention_variant_qsa import (
+    requires_qsa_kernels,
+)
 
 BS = tq.BS
 
@@ -74,22 +79,30 @@ def _make_case(doc_lens, hq, h, d, budget_blocks, dtype, seed=0, q_rows=None):
 
 
 def _grads(c, dkv_impl, cfg=None, static_shapes=True):
-    q, k, v = (c[n].clone().requires_grad_(True) for n in ("q", "k", "v"))
-    out = tq.qsa_sparse_attention(
-        q,
-        k,
-        v,
-        block_indices=c["idx"],
-        block_counts=c["counts"],
-        block_bases=c["bases"],
-        block_ends=c["ends"],
-        q_positions=c["q_pos"],
-        static_shapes=static_shapes,
-        dkv_impl=dkv_impl,
-        dkv_tile_config=cfg,
+    """(o, dq, dk, dv): CuTe forward, Triton dq, and the ``dkv_impl`` Triton dk/dv."""
+    q, k, v, do, q_pos = (c[n].contiguous() for n in ("q", "k", "v", "do", "q_pos"))
+    idx, counts, bases, ends = c["idx"], c["counts"], c["bases"], c["ends"]
+    HQ, H, nb = q.shape[2], k.shape[2], bases.shape[0]
+    scale = q.shape[-1] ** -0.5
+    build = tq.build_qsa_supersets_static if static_shapes else tq.build_qsa_supersets
+    bq = ca.cute_tile_queries(HQ, H)
+    o, lse = ca.qsa_cute_fwd(
+        q, k, v, q_pos, ca._superset_builder(static_shapes, bq)(idx, counts, bases, ends, nb, bq),
+        scale, bq,
     )
-    out.backward(c["do"])
-    return out.detach(), q.grad, k.grad, v.grad
+    delta = (o.float() * do.float()).sum(-1)
+    bq_dq = tq.qsa_choose_tile_queries(HQ, H)
+    ss_dq = build(idx, counts, bases, ends, nb, bq_dq)
+    dq = tq.qsa_bwd_dq(q, k, v, lse, delta, do, q_pos, ss_dq, scale, bq_dq)
+    if dkv_impl == "tile":
+        cfg = cfg or tq.QSA_DKV_TILE_CONFIG
+        csr = tq.build_qsa_kv_tile_csr(idx, counts, nb, cfg.tile_blocks)
+        dk, dv = tq.qsa_bwd_dkv_tile(q, k, v, lse, delta, do, q_pos, csr, bases, ends, scale, cfg)
+    else:
+        build_csr = tq.build_qsa_query_csr_static if static_shapes else tq.build_qsa_query_csr
+        query_csr = build_csr(idx, counts, nb)
+        dk, dv = tq.qsa_bwd_dkv_block(q, k, v, lse, delta, do, q_pos, query_csr, bases, ends, scale)
+    return o, dq, dk, dv
 
 
 def _dense_reference(c):
@@ -138,7 +151,7 @@ CONFIGS = {
 }
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@requires_qsa_kernels
 class TestQSADkvTileKernel:
     def test_tile_csr_matches_brute_force(self):
         c = _make_case([3, 101, 0, 216, 1, 2, 57], 4, 2, 32, 8, torch.bfloat16, seed=5)
@@ -178,16 +191,6 @@ class TestQSADkvTileKernel:
         for name, got, base, ref in (("dk", dk_t, dk_b, rdk), ("dv", dv_t, dv_b, rdv)):
             assert _rel_l2(got, ref) <= 1.25 * _rel_l2(base, ref) + 1e-4, name
 
-    @pytest.mark.parametrize("case", ["g3_hd128", "thd_ragged", "cp_shard"])
-    def test_tile_matches_reference_fp32(self, case):
-        doc_lens, hq, h, d, budget, q_rows = CASES[case]
-        c = _make_case(doc_lens, hq, h, d, budget, torch.float32, q_rows=q_rows)
-        _, _, dk_b, dv_b = _grads(c, "block")
-        _, _, dk_t, dv_t = _grads(c, "tile")
-        rdk, rdv = _dense_reference(c)
-        for name, got, base, ref in (("dk", dk_t, dk_b, rdk), ("dv", dv_t, dv_b, rdv)):
-            assert _rel_l2(got, ref) <= 1.25 * _rel_l2(base, ref) + 1e-4, name
-
     @pytest.mark.parametrize("cfg_name", list(CONFIGS))
     def test_bitwise_repeatable(self, cfg_name):
         c = _make_case([600, 424], 24, 2, 256, 32, torch.bfloat16, seed=3)
@@ -212,7 +215,7 @@ class TestQSADkvTileKernel:
         def step():
             for t in (q, k, v):
                 t.grad = None
-            out = tq.qsa_sparse_attention(
+            out = ca.qsa_sparse_attention(
                 q,
                 k,
                 v,
@@ -222,7 +225,6 @@ class TestQSADkvTileKernel:
                 block_ends=c["ends"],
                 q_positions=c["q_pos"],
                 static_shapes=True,
-                dkv_impl="tile",
             )
             out.backward(c["do"])
             return k.grad, v.grad

@@ -32,6 +32,9 @@ from megatron.core.tensor_parallel.random import (
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.transformer.experimental_attention_variant.test_attention_variant_qsa import (
+    requires_qsa_kernels,
+)
 
 ROPE_THETA = 10000000.0
 ROTARY_PERCENT = 0.25
@@ -95,7 +98,7 @@ def _report(case, what, value):
     print(f"IDXLOSS_METRIC case={case} {what}={value:.3e}")
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@requires_qsa_kernels
 class TestQSAIndexerLossImpl:
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
@@ -320,7 +323,7 @@ def _cu(lengths):
     return torch.tensor(cu, dtype=torch.int32, device="cuda")
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@requires_qsa_kernels
 class TestQSAIndexerLossCapture:
     """The ``layout`` / ``fused`` loss paths inside a captured QSA layer (as in the X2
     attention-scope CUDA graph) replay to the eager results on new packings."""
@@ -335,11 +338,11 @@ class TestQSAIndexerLossCapture:
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize("impl", ["layout", "fused"])
-    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-    def test_capture_replays_eager(self, impl, dtype):
+    def test_capture_replays_eager(self, impl):
         from transformer_engine.pytorch import make_graphed_callables
 
-        case = dict(hidden=256, heads=8, groups=2, kv=32, budget=64, chunk=96)
+        dtype = torch.bfloat16  # the sparse kernels take bf16 / fp16
+        case = dict(hidden=256, heads=8, groups=2, kv=128, budget=64, chunk=96)
         config = _config(case, dtype=dtype)
         config.qsa_indexer_loss_impl = impl
         spec = get_qsa_module_spec_for_backend(config)
