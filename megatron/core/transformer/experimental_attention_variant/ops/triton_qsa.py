@@ -2,8 +2,9 @@
 
 """Sparse-attention metadata and Triton backward kernels of the QSA sparse-GQA attention.
 
-The attention entry point and the forward kernel (CuTe DSL) live in :mod:`cute_qsa_attn`; the
-indexer's block scoring and exact top-k live in :mod:`triton_qsa_select`.
+The attention entry point and the forward and dq kernels (CuTe DSL) live in
+:mod:`cute_qsa_attn`; the indexer's block scoring and exact top-k live in
+:mod:`triton_qsa_select`.
 
 Design (SGLang-prefill style, replacing the earlier fla-NSA adaptation):
 
@@ -14,8 +15,8 @@ Design (SGLang-prefill style, replacing the earlier fla-NSA adaptation):
    gather-traffic roofline that made the per-query kernels lose to dense flash.
    The union / membership / CSR structures are precomputed on the device
    (:func:`build_qsa_supersets`; sort-free Triton builders in :mod:`triton_qsa_select`).
-2. **Backward**: ``dq`` mirrors the forward per query tile. ``dk``/``dv`` have two
-   deterministic implementations (sequential accumulation, no atomics):
+2. **Backward**: ``dk``/``dv`` have two deterministic implementations (sequential
+   accumulation, no atomics):
 
    * ``"tile"`` (default, :func:`qsa_bwd_dkv_tile_kernel`): one program per KV TILE
      of ``KB`` consecutive selection blocks (``KB * 4`` KV rows, a full dot tile)
@@ -47,7 +48,6 @@ import triton.language as tl
 from triton.runtime.errors import OutOfResources
 
 BS = 4  # tokens per selection block (qsa_indexer_compress_ratio)
-CB = 16  # union entries gathered per attention-kernel iteration (CB * BS = 64 tokens)
 RS = 16  # padded KV rows per dkv program (>= 16 for tl.dot; BS rows are valid)
 
 
@@ -448,129 +448,8 @@ def build_qsa_kv_tile_csr(
 
 
 # ---------------------------------------------------------------------------
-# 2. Backward: dq (per query tile) and dkv (per KV block, no atomics)
+# 2. Backward: dk/dv (no atomics)
 # ---------------------------------------------------------------------------
-
-
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=w, num_stages=st) for w in [4, 8] for st in [1, 2]
-    ],
-    key=['BK', 'BV', 'GP', 'BQ'],
-)
-@triton.jit
-def qsa_bwd_dq_kernel(
-    q,
-    k,
-    v,
-    lse,
-    delta,
-    do,
-    dq,
-    q_pos,
-    tile_offsets,
-    entry_base,
-    entry_end,
-    membership,
-    scale,
-    TQ,
-    TK,
-    n_tiles,
-    H: tl.constexpr,
-    HQ: tl.constexpr,
-    G: tl.constexpr,
-    GP: tl.constexpr,
-    BQ: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
-    BSZ: tl.constexpr,
-    CBZ: tl.constexpr,
-):
-    i_tile = tl.program_id(0).to(tl.int64)
-    i_h = tl.program_id(1).to(tl.int64)
-    i_b = i_tile // n_tiles
-    tile = i_tile % n_tiles
-
-    R: tl.constexpr = BQ * GP
-    CBT: tl.constexpr = CBZ * BSZ
-    o_r = tl.arange(0, R)
-    q_loc = o_r // GP
-    g = o_r % GP
-    o_t = tile * BQ + q_loc
-    m_row = (o_t < TQ) & (g < G)
-    b_pos = tl.load(q_pos + o_t, mask=o_t < TQ, other=0).to(tl.int64)
-    head = i_h * G + g
-    o_d = tl.arange(0, BK)
-    o_v = tl.arange(0, BV)
-    m_d = o_d < K
-    m_v = o_v < V
-
-    rowptr = (i_b * TQ + o_t) * HQ + head
-    b_q = tl.load(
-        q + rowptr[:, None] * K + o_d[None, :], mask=m_row[:, None] & m_d[None, :], other=0.0
-    )
-    # scores in the log2 domain, matching the forward's log2-domain LSE
-    b_q = (b_q * (scale * 1.4426950408889634)).to(b_q.dtype)
-    b_do = tl.load(
-        do + rowptr[:, None] * V + o_v[None, :], mask=m_row[:, None] & m_v[None, :], other=0.0
-    )
-    b_lse = tl.load(lse + rowptr, mask=m_row, other=0.0)
-    b_delta = tl.load(delta + rowptr, mask=m_row, other=0.0)
-
-    e0 = tl.load(tile_offsets + i_tile)
-    e1 = tl.load(tile_offsets + i_tile + 1)
-
-    b_dq = tl.zeros([R, BK], dtype=tl.float32)
-    for es in range(e0, e1, CBZ):
-        o_e = es + tl.arange(0, CBZ)
-        m_e = o_e < e1
-        base = tl.load(entry_base + o_e, mask=m_e, other=0).to(tl.int64)
-        tend = tl.load(entry_end + o_e, mask=m_e, other=0).to(tl.int64)
-        offs2 = base[:, None] + tl.arange(0, BSZ)[None, :]
-        val2 = (offs2 < tend[:, None]) & m_e[:, None]
-        offs = tl.reshape(offs2, [CBT])
-        m_tok = tl.reshape(val2, [CBT])
-
-        b_k = tl.load(
-            k + ((i_b * TK + offs) * H + i_h)[None, :] * K + o_d[:, None],
-            mask=m_tok[None, :] & m_d[:, None],
-            other=0.0,
-        )
-        b_v = tl.load(
-            v + ((i_b * TK + offs) * H + i_h)[None, :] * V + o_v[:, None],
-            mask=m_tok[None, :] & m_v[:, None],
-            other=0.0,
-        )
-
-        b_s = tl.dot(b_q, b_k)
-        mem = tl.load(
-            membership + o_e[None, :] * BQ + tl.arange(0, BQ)[:, None],
-            mask=m_e[None, :],
-            other=0,
-        )
-        m_mem = (
-            tl.reshape(
-                tl.broadcast_to(tl.reshape(mem, [BQ, 1, CBZ, 1]), [BQ, GP, CBZ, BSZ]), [R, CBT]
-            )
-            != 0
-        )
-        causal = offs[None, :] <= b_pos[:, None]
-        m_all = m_tok[None, :] & m_mem & causal & m_row[:, None]
-
-        b_p = tl.where(m_all, tl.exp2(b_s - b_lse[:, None]), 0.0)
-        # [R, BV] @ [BV, CBT] -> [R, CBT]
-        b_dp = tl.dot(b_do, b_v)
-        b_ds = b_p * (b_dp.to(tl.float32) - b_delta[:, None])
-        b_dq += tl.dot(b_ds.to(b_k.dtype), tl.trans(b_k))
-    b_dq *= scale
-
-    tl.store(
-        dq + rowptr[:, None] * K + o_d[None, :],
-        b_dq.to(dq.dtype.element_ty),
-        mask=m_row[:, None] & m_d[None, :],
-    )
 
 
 def _prune_dkv_bq(configs, nargs, **kwargs):
@@ -858,12 +737,6 @@ def _pow2(x: int) -> int:
     return 1 << (max(int(x), 1) - 1).bit_length()
 
 
-def qsa_choose_tile_queries(num_q_heads: int, num_kv_heads: int) -> int:
-    """Queries per tile so the row dim BQ * next_pow2(G) is a >=16 dot tile."""
-    gp = _pow2(num_q_heads // num_kv_heads)
-    return max(4, 16 // gp)
-
-
 def _launch_dims(K: int, V: int, G: int):
     BK = max(16, _pow2(K))
     BV = max(16, _pow2(V))
@@ -1062,43 +935,3 @@ def qsa_bwd_dkv_block(q, k, v, lse, delta, do, q_pos, query_csr, block_bases, bl
         RSZ=RS,
     )
     return dk, dv
-
-
-def qsa_bwd_dq(q, k, v, lse, delta, do, q_pos, supersets: QSASupersets, scale, tile_queries):
-    """dq via :func:`qsa_bwd_dq_kernel` over the query-tile supersets (``tile_queries`` per tile;
-    ``lse`` in the log2 domain, ``delta = rowsum(o * do)`` in fp32)."""
-    B, TQ, HQ, K = q.shape
-    TK, H, V = k.shape[1], k.shape[2], v.shape[-1]
-    G = HQ // H
-    BK, BV, GP = _launch_dims(K, V, G)
-    dq = torch.empty_like(q)
-    qsa_bwd_dq_kernel[(B * supersets.n_tiles, H)](
-        q=q,
-        k=k,
-        v=v,
-        lse=lse,
-        delta=delta,
-        do=do,
-        dq=dq,
-        q_pos=q_pos,
-        tile_offsets=supersets.tile_offsets,
-        entry_base=supersets.entry_base,
-        entry_end=supersets.entry_end,
-        membership=supersets.membership,
-        scale=scale,
-        TQ=TQ,
-        TK=TK,
-        n_tiles=supersets.n_tiles,
-        H=H,
-        HQ=HQ,
-        G=G,
-        GP=GP,
-        BQ=tile_queries,
-        K=K,
-        V=V,
-        BK=BK,
-        BV=BV,
-        BSZ=BS,
-        CBZ=CB,
-    )
-    return dq

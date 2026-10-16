@@ -849,15 +849,20 @@ def _require_qsa_kernel_support(config: TransformerConfig) -> None:
         ) from e
     if not (config.bf16 or config.fp16):
         raise ValueError("qsa_use_sparse_attention requires bf16 or fp16 training.")
-    if config.kv_channels not in (64, 128, 256):
+    if config.kv_channels not in (128, 256):
         raise ValueError(
-            f"qsa_use_sparse_attention supports head dims 64, 128 and 256, got "
+            f"qsa_use_sparse_attention supports head dims 128 and 256, got "
             f"kv_channels={config.kv_channels}."
         )
     group = config.num_attention_heads // config.num_query_groups
     if group > 128:
         raise ValueError(
             f"qsa_use_sparse_attention supports at most 128 query heads per KV head, got {group}."
+        )
+    if config.kv_channels == 256 and group == 1:
+        # The dq kernel's 128-query tile at G = 1 needs 1 KB more shared memory than SM100 has.
+        raise ValueError(
+            "qsa_use_sparse_attention with head dim 256 needs at least 2 query heads per KV head."
         )
 
 

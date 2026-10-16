@@ -8,8 +8,8 @@ reproduce the ``"block"`` implementation within bf16 tolerance, be no less accur
 against an fp32 dense reference, and be bitwise repeatable. Shapes cover GQA group sizes
 that are not powers of two, packed THD documents with ragged and empty blocks, block counts
 that are not a multiple of the tile, a context-parallel style query shard (TQ < TK), and
-the split-column (fp32 partial) path. Both run on the output and LSE of the CuTe DSL
-forward (bf16), so the tests need an SM100-class GPU.
+the split-column (fp32 partial) path. Both run on the output, LSE and ``delta`` of the CuTe
+DSL forward and dq (bf16), so the tests need an SM100-class GPU.
 """
 
 import pytest
@@ -79,21 +79,15 @@ def _make_case(doc_lens, hq, h, d, budget_blocks, dtype, seed=0, q_rows=None):
 
 
 def _grads(c, dkv_impl, cfg=None, static_shapes=True):
-    """(o, dq, dk, dv): CuTe forward, Triton dq, and the ``dkv_impl`` Triton dk/dv."""
+    """(o, dq, dk, dv): CuTe forward and dq, and the ``dkv_impl`` Triton dk/dv."""
     q, k, v, do, q_pos = (c[n].contiguous() for n in ("q", "k", "v", "do", "q_pos"))
     idx, counts, bases, ends = c["idx"], c["counts"], c["bases"], c["ends"]
     HQ, H, nb = q.shape[2], k.shape[2], bases.shape[0]
     scale = q.shape[-1] ** -0.5
-    build = tq.build_qsa_supersets_static if static_shapes else tq.build_qsa_supersets
     bq = ca.cute_tile_queries(HQ, H)
-    o, lse = ca.qsa_cute_fwd(
-        q, k, v, q_pos, ca._superset_builder(static_shapes, bq)(idx, counts, bases, ends, nb, bq),
-        scale, bq,
-    )
-    delta = (o.float() * do.float()).sum(-1)
-    bq_dq = tq.qsa_choose_tile_queries(HQ, H)
-    ss_dq = build(idx, counts, bases, ends, nb, bq_dq)
-    dq = tq.qsa_bwd_dq(q, k, v, lse, delta, do, q_pos, ss_dq, scale, bq_dq)
+    ss = ca._superset_builder(static_shapes, bq)(idx, counts, bases, ends, nb, bq)
+    o, lse = ca.qsa_cute_fwd(q, k, v, q_pos, ss, scale, bq)
+    dq, delta = ca.qsa_cute_dq(q, k, v, o, do, lse, q_pos, ss, scale, bq)
     if dkv_impl == "tile":
         cfg = cfg or tq.QSA_DKV_TILE_CONFIG
         csr = tq.build_qsa_kv_tile_csr(idx, counts, nb, cfg.tile_blocks)
@@ -136,10 +130,10 @@ def _dense_reference(c):
 CASES = {
     # name: (doc_lens, hq, h, d, budget_blocks, q_rows)
     "proxy_like_g12": ([1024], 24, 2, 256, 64, None),
-    "g1": ([300], 2, 2, 64, 16, None),
+    "g1": ([300], 2, 2, 128, 16, None),
     "g3_hd128": ([333], 6, 2, 128, 16, None),
-    "thd_ragged": ([3, 101, 0, 216, 1, 2, 57], 8, 2, 64, 8, None),
-    "cp_shard": ([512], 8, 2, 64, 16, list(range(0, 128)) + list(range(384, 512))),
+    "thd_ragged": ([3, 101, 0, 216, 1, 2, 57], 8, 2, 128, 8, None),
+    "cp_shard": ([512], 8, 2, 128, 16, list(range(0, 128)) + list(range(384, 512))),
 }
 CONFIGS = {
     "default": None,
@@ -202,7 +196,7 @@ class TestQSADkvTileKernel:
                 assert torch.equal(a, b)
 
     def test_dynamic_and_static_builders_agree(self):
-        c = _make_case([3, 101, 0, 216, 1, 2, 57], 8, 2, 64, 8, torch.bfloat16)
+        c = _make_case([3, 101, 0, 216, 1, 2, 57], 8, 2, 128, 8, torch.bfloat16)
         a = _grads(c, "tile", static_shapes=False)
         b = _grads(c, "tile", static_shapes=True)
         for x, y in zip(a, b):

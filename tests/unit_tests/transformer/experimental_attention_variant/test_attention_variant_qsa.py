@@ -919,6 +919,10 @@ class TestQSAKernelRequirements:
             self._build(make_config(head_dim=SPARSE_HEAD_DIM, sparse=True))
         with pytest.raises(ValueError, match="head dims"):
             self._build(make_config(head_dim=HEAD_DIM, dtype=torch.bfloat16, sparse=True))
+        mha = make_config(head_dim=256, dtype=torch.bfloat16, sparse=True)
+        mha.num_query_groups = N_HEADS
+        with pytest.raises(ValueError, match="at least 2 query heads"):
+            self._build(mha)
 
     def test_dense_bridge_needs_no_sparse_kernels(self, monkeypatch):
         monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (9, 0))

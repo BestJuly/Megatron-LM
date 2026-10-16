@@ -4,9 +4,9 @@
 
 :func:`qsa_sparse_attention` is the attention entry point of :class:`QSASelfAttention`. It
 builds the sparse-attention metadata of :mod:`triton_qsa` (query-tile supersets, KV-tile query
-CSR) and runs the forward as the CuTe DSL kernel of :mod:`cute_qsa_attn_kernels`. The backward
-still runs the Triton dq and dk/dv kernels of :mod:`triton_qsa`, fed with this forward's output
-and log2-domain LSE.
+CSR) and runs the forward and dq as the CuTe DSL kernels of :mod:`cute_qsa_attn_kernels`. dk/dv
+still run the Triton kernel of :mod:`triton_qsa`, fed with the log2-domain LSE and the ``delta``
+that the dq kernel emits.
 
 Compilation: one compiled kernel per (kernel, dtype, head dim, GQA group, tile) key; every
 sequence-dependent size (``B``, ``TQ``, ``TK``, the entry count) is a runtime argument, so the
@@ -14,7 +14,7 @@ static-shape proxy never recompiles in steady state. Run one eager step before C
 capture so that compilation happens outside the capture. ``cutlass`` is imported on first use.
 
 Supported inputs (validated once when a QSA layer is built, see ``qsa.py``): an SM100-class GPU,
-bf16 / fp16, head dim 64 / 128 / 256, and a GQA group of at most 128 query heads per KV head.
+bf16 / fp16, head dim 128 / 256, and a GQA group of at most 128 query heads per KV head.
 """
 
 from typing import Optional
@@ -110,30 +110,80 @@ def qsa_cute_fwd(q, k, v, q_pos, ss: tq.QSASupersets, scale: float, tile_queries
     return o, lse
 
 
+def _compiled_dq(dtype: torch.dtype, D: int, G: int, BQ: int):
+    key = ("dq", dtype, D, G, BQ)
+    fn = _COMPILED.get(key)
+    if fn is None:
+        import cutlass
+        import cutlass.cute as cute
+
+        from megatron.core.transformer.experimental_attention_variant.ops.cute_qsa_attn_kernels import (  # pylint: disable=line-too-long
+            QSADqSm100,
+        )
+
+        cdt = _cutlass_dtype(dtype)
+        kernel = QSADqSm100(D, G, BQ)
+        bf = lambda: _fake(cdt, 4, D, 8, 16)  # noqa: E731
+        args = [
+            bf(),  # q
+            bf(),  # k
+            bf(),  # v
+            bf(),  # o
+            bf(),  # do
+            _fake(cutlass.Float32, 3),  # lse
+            _fake(cutlass.Float32, 3),  # delta (out)
+            bf(),  # dq (out)
+            _fake(cutlass.Int64, 1, align=8),  # q_pos
+            _fake(cutlass.Int64, 1, align=8),  # tile_offsets
+            _fake(cutlass.Int32, 1),  # entry_base
+            _fake(cutlass.Int32, 1),  # entry_end
+            _fake(cutlass.Uint8, 2, BQ, align=1),  # membership
+            cutlass.Float32(1.0),
+            cutlass.Int32(1),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        ]
+        fn = cute.compile(kernel, *args, options="--enable-tvm-ffi")
+        _COMPILED[key] = fn
+    return fn
+
+
+def qsa_cute_dq(q, k, v, o, do, lse, q_pos, ss: tq.QSASupersets, scale: float, tile_queries: int):
+    """dq and the fused ``delta = rowsum(o * do)`` (fp32) -> ``(dq, delta)``."""
+    B, TQ, HQ, D = q.shape
+    G = HQ // k.shape[2]
+    dq = torch.empty_like(q)
+    delta = torch.empty(B, TQ, HQ, dtype=torch.float32, device=q.device)
+    fn = _compiled_dq(q.dtype, D, G, tile_queries)
+    membership = ss.membership
+    if membership.shape[0] == 0:
+        membership = torch.zeros(1, tile_queries, dtype=torch.uint8, device=q.device)
+    fn(q, k, v, o, do, lse, delta, dq, q_pos, ss.tile_offsets, ss.entry_base, ss.entry_end,
+       membership, float(scale), ss.n_tiles)
+    return dq, delta
+
+
 class QSASparseAttnFunction(torch.autograd.Function):
-    """Autograd over the sparse GQA kernels (forward: CuTe DSL; dq, dk/dv: Triton)."""
+    """Autograd over the sparse GQA kernels (forward, dq: CuTe DSL; dk/dv: Triton)."""
 
     @staticmethod
-    def forward(ctx, q, k, v, q_pos, ss, ss_dq, kv_csr, block_bases, block_ends, scale, bq, bq_dq):
+    def forward(ctx, q, k, v, q_pos, ss, kv_csr, block_bases, block_ends, scale, bq):
         o, lse = qsa_cute_fwd(q, k, v, q_pos, ss, scale, bq)
         ctx.save_for_backward(q, k, v, o, lse, q_pos, block_bases, block_ends)
-        ctx.ss_dq = ss_dq
+        ctx.ss = ss
         ctx.kv_csr = kv_csr
         ctx.scale = scale
-        ctx.bq_dq = bq_dq
+        ctx.bq = bq
         return o
 
     @staticmethod
     def backward(ctx, do):
         q, k, v, o, lse, q_pos, block_bases, block_ends = ctx.saved_tensors
         do = do.contiguous()
-        # delta = rowwise sum(o * do) over the value dim, fp32
-        delta = (o.float() * do.float()).sum(-1)
-        dq = tq.qsa_bwd_dq(q, k, v, lse, delta, do, q_pos, ctx.ss_dq, ctx.scale, ctx.bq_dq)
+        dq, delta = qsa_cute_dq(q, k, v, o, do, lse, q_pos, ctx.ss, ctx.scale, ctx.bq)
         dk, dv = tq.qsa_bwd_dkv_tile(
             q, k, v, lse, delta, do, q_pos, ctx.kv_csr, block_bases, block_ends, ctx.scale
         )
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None
 
 
 # The sort-free superset builder packs a tile's query bits into an int32 (tile_queries <= 30).
@@ -196,11 +246,8 @@ def qsa_sparse_attention(
         block_indices, block_counts, block_bases, block_ends, num_blocks, bq
     )
     needs_grad = torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad)
-    ss_dq = kv_csr = None
-    bq_dq = tq.qsa_choose_tile_queries(HQ, H)
+    kv_csr = None
     if needs_grad:
-        build = tq.build_qsa_supersets_static if static_shapes else tq.build_qsa_supersets
-        ss_dq = build(block_indices, block_counts, block_bases, block_ends, num_blocks, bq_dq)
         kv_csr = tq.build_qsa_kv_tile_csr(
             block_indices, block_counts, num_blocks, tq.QSA_DKV_TILE_CONFIG.tile_blocks
         )
@@ -210,11 +257,9 @@ def qsa_sparse_attention(
         v.contiguous(),
         q_positions.contiguous(),
         ss,
-        ss_dq,
         kv_csr,
         block_bases.contiguous(),
         block_ends.contiguous(),
         scale,
         bq,
-        bq_dq,
     )
