@@ -149,7 +149,7 @@ class TestPerLayerCaptureEligibility:
         monkeypatch.setattr(attention, "is_cuda_graph_capturable", lambda: False, raising=False)
         assert not _layer_is_graphable(wrapper, config)
 
-    def test_qsa_is_capturable_only_without_context_parallelism(self):
+    def test_qsa_is_capturable_with_and_without_context_parallelism(self):
         from types import SimpleNamespace
 
         from megatron.core.transformer.experimental_attention_variant.qsa import QSASelfAttention
@@ -161,8 +161,23 @@ class TestPerLayerCaptureEligibility:
             return QSASelfAttention.is_cuda_graph_capturable(fake)
 
         assert capturable(1) is True
-        # The allgather-CP selection still reads cu_seqlens on the host.
-        assert capturable(2) is False
+        # The allgather-CP selection is host-sync free (test_qsa_select_cp.py replays a CP2
+        # capture bitwise against eager).
+        assert capturable(2) is True
+
+    def test_gdn_is_not_capturable_under_chunkwise_context_parallelism(self):
+        from types import SimpleNamespace
+
+        from megatron.core.ssm.gated_delta_net.common import _GDNBase
+
+        def capturable(cp_size, mode):
+            fake = SimpleNamespace(cp_size=cp_size, config=SimpleNamespace(linear_cp_mode=mode))
+            return _GDNBase.is_cuda_graph_capturable(fake)
+
+        assert capturable(1, "chunkwise") is True
+        assert capturable(2, "headwise") is True
+        # The chunkwise layout swap builds its all-to-all route on the host.
+        assert capturable(2, "chunkwise") is False
 
     def test_cudnn_gdr_capture_requires_eager_warmup_iterations(self):
         with pytest.raises(ValueError, match="cuda_graph_warmup_steps > 0"):

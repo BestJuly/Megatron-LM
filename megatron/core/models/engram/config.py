@@ -561,22 +561,10 @@ class EngramConfig:
     def _validate_packed_sequences(self, transformer_config: Any, packed_sequences: bool) -> None:
         if not packed_sequences:
             return
-        if transformer_config.context_parallel_size != 1:
-            # The memory itself handles this: packed rows zigzag per document, and the
-            # all-gather convolution path restores that layout from cu_seqlens (verified at
-            # module level to 5.6e-17 against the un-sharded result at CP2 and CP4).
-            # The blocker is upstream and independent of Engram: get_thd_batch_on_this_cp_rank
-            # hands cu_seqlens_padded=None to tex.thd_get_partitioned_indices, so the run dies
-            # in the data path before any layer is reached. A controlled experiment with every
-            # Engram flag removed fails identically. Reject here so the failure names its cause
-            # instead of surfacing as a TypeError from Transformer Engine.
-            raise ValueError(
-                "Engram does not support context parallelism with packed (THD) sequences: "
-                "upstream get_thd_batch_on_this_cp_rank passes cu_seqlens_padded=None to "
-                "thd_get_partitioned_indices, which fails with or without Engram. The memory's "
-                "own per-document layout handling is implemented and will work once that is "
-                "fixed."
-            )
+        # Context parallelism with packed rows is supported: packed rows zigzag per document,
+        # and the all-gather convolution path restores that layout from cu_seqlens (verified at
+        # module level to 5.6e-17 against the un-sharded result at CP2 and CP4). The CP data path
+        # partitions unpadded packs by cu_seqlens when cu_seqlens_padded is None.
         if transformer_config.pipeline_model_parallel_size > 2:
             # TODO(upstream): middle pipeline stages receive no cu_seqlens/max_seqlen from the
             # TP batch broadcast, so packed training crashes there with or without Engram.

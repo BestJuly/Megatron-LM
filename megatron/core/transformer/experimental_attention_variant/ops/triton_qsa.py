@@ -4,19 +4,16 @@
 
 Design (SGLang-prefill style, replacing the earlier fla-NSA adaptation):
 
-1. **Index-score kernel** (:func:`qsa_indexer_keys`): fused block scoring
-   (``relu(q @ k).sum(heads) / sqrt(d)`` in fp32), causal-visibility masking and
-   int64 sort-key encoding in one kernel — no ``[s, chunk, heads]`` intermediate is
-   ever materialized. The keys feed the deterministic int64 ``torch.topk`` merge
-   (valid keys are unique integers, so selection is deterministic by construction).
-2. **Query-tile shared-superset gather**: the sparse attention kernels process
+The indexer's block scoring and exact top-k live in :mod:`triton_qsa_select`.
+
+1. **Query-tile shared-superset gather**: the sparse attention kernels process
    ``BQ`` consecutive queries per program against the UNION of their selected
    blocks (plus per-query membership bits), so each gathered K/V tile is reused
    across the whole query tile instead of being re-fetched per query — the
    gather-traffic roofline that made the per-query kernels lose to dense flash.
-   The union / membership / CSR structures are precomputed on the host
-   (:func:`build_qsa_supersets`).
-3. **Backward**: ``dq`` mirrors the forward per query tile. ``dk``/``dv`` have two
+   The union / membership / CSR structures are precomputed on the device
+   (:func:`build_qsa_supersets`; sort-free Triton builders in :mod:`triton_qsa_select`).
+2. **Backward**: ``dq`` mirrors the forward per query tile. ``dk``/``dv`` have two
    deterministic implementations (sequential accumulation, no atomics):
 
    * ``"tile"`` (default, :func:`qsa_bwd_dkv_tile_kernel`): one program per KV TILE
@@ -51,110 +48,10 @@ from triton.runtime.errors import OutOfResources
 BS = 4  # tokens per selection block (qsa_indexer_compress_ratio)
 CB = 16  # union entries gathered per attention-kernel iteration (CB * BS = 64 tokens)
 RS = 16  # padded KV rows per dkv program (>= 16 for tl.dot; BS rows are valid)
-ID_BITS = 21  # block-id field width in the int64 sort keys (supports 2M blocks)
 
 
 # ---------------------------------------------------------------------------
-# 1. Index-score kernel: fused scoring + visibility + int64 key encoding
-# ---------------------------------------------------------------------------
-
-
-@triton.autotune(
-    configs=[triton.Config({}, num_warps=w) for w in [4, 8]], key=['BM', 'BN', 'DI']
-)
-@triton.jit
-def qsa_indexer_keys_kernel(
-    q,  # [s, NH, DI] indexer queries (post norm/RoPE)
-    bk,  # [n_blocks, DI] pooled block keys
-    keys,  # [s, cb] int64 output
-    m_t,  # [s] number of visible complete blocks per query (exclusive upper block id)
-    m_lo,  # [s] first visible block id per query (read only when HAS_LO)
-    j0,  # first block id of this chunk
-    cb,  # chunk width (number of blocks scored)
-    s,
-    scale,  # 1 / sqrt(DI)
-    max_id_code,  # (1 << IDB) - 1
-    NH: tl.constexpr,
-    DI: tl.constexpr,
-    BM: tl.constexpr,
-    BN: tl.constexpr,
-    IDB: tl.constexpr,
-    HAS_LO: tl.constexpr,
-):
-    i_m, i_n = tl.program_id(0), tl.program_id(1)
-    o_m = i_m * BM + tl.arange(0, BM)
-    o_n = i_n * BN + tl.arange(0, BN)
-    o_d = tl.arange(0, DI)
-    m_m = o_m < s
-    m_n = o_n < cb
-
-    # [DI, BN] block-key tile for this chunk
-    b_k = tl.load(
-        bk + (j0 + o_n)[None, :] * DI + o_d[:, None], mask=m_n[None, :], other=0.0
-    ).to(tl.float32)
-
-    b_acc = tl.zeros([BM, BN], dtype=tl.float32)
-    for h in tl.static_range(NH):
-        b_q = tl.load(
-            q + (o_m[:, None] * NH + h) * DI + o_d[None, :], mask=m_m[:, None], other=0.0
-        ).to(tl.float32)
-        # fp32 IEEE dot: keeps scores reproducible and tie behavior stable
-        b_acc += tl.maximum(tl.dot(b_q, b_k, input_precision="ieee"), 0.0)
-
-    score = b_acc * scale
-    # relu scores are >= 0, so the fp32 bit pattern is order-isomorphic to the value
-    bits = score.to(tl.int32, bitcast=True).to(tl.int64)
-    key = ((bits + 1) << IDB) | (max_id_code - (j0 + o_n))[None, :]
-    visible = (j0 + o_n)[None, :] < tl.load(m_t + o_m, mask=m_m, other=0)[:, None]
-    if HAS_LO:
-        # Packed documents share one block-key buffer: a query sees only its own
-        # document's blocks, i.e. ids in [m_lo, m_t).
-        visible &= (j0 + o_n)[None, :] >= tl.load(m_lo + o_m, mask=m_m, other=0)[:, None]
-    key = tl.where(visible & m_n[None, :] & m_m[:, None], key, 0)
-    tl.store(keys + o_m[:, None] * cb + o_n[None, :], key, mask=m_m[:, None] & m_n[None, :])
-
-
-def qsa_indexer_keys(
-    q: torch.Tensor,  # [s, NH, DI]
-    block_keys: torch.Tensor,  # [n_blocks, DI]
-    m_t: torch.Tensor,  # [s]
-    j0: int,
-    cb: int,
-    keys_out: torch.Tensor,  # [s, cb] int64 (reused buffer)
-    m_lo: Optional[torch.Tensor] = None,  # [s] first visible block id, default 0
-) -> torch.Tensor:
-    """Fill ``keys_out`` with int64 (score, block_id) sort keys for blocks [j0, j0+cb).
-
-    Block ``j`` is visible to query ``t`` iff ``m_lo[t] <= j < m_t[t]``. ``m_lo`` lets
-    packed documents share one block-key buffer with global block ids; whether it is
-    present is a launch-time constant, never a data-dependent one.
-    """
-    s, NH, DI = q.shape
-    BM, BN = 64, 64
-    grid = (triton.cdiv(s, BM), triton.cdiv(cb, BN))
-    qsa_indexer_keys_kernel[grid](
-        q=q,
-        bk=block_keys,
-        keys=keys_out,
-        m_t=m_t,
-        m_lo=m_t if m_lo is None else m_lo,
-        j0=j0,
-        cb=cb,
-        s=s,
-        scale=DI**-0.5,
-        max_id_code=(1 << ID_BITS) - 1,
-        NH=NH,
-        DI=DI,
-        BM=BM,
-        BN=BN,
-        IDB=ID_BITS,
-        HAS_LO=m_lo is not None,
-    )
-    return keys_out
-
-
-# ---------------------------------------------------------------------------
-# 2. Host-side superset precompute
+# 1. Sparse-attention metadata: query-tile supersets and the KV-tile query CSR
 # ---------------------------------------------------------------------------
 
 
@@ -176,7 +73,7 @@ class QSASupersets(NamedTuple):
     num_entries: int
 
 
-def build_qsa_supersets(
+def build_qsa_supersets_torch(
     block_indices: torch.Tensor,  # [b, s, S] GLOBAL block ids
     block_counts: torch.Tensor,  # [b, s]
     block_bases: torch.Tensor,  # [num_blocks] token base per block
@@ -242,7 +139,7 @@ def build_qsa_supersets(
     )
 
 
-def build_qsa_supersets_static(
+def build_qsa_supersets_static_torch(
     block_indices: torch.Tensor,  # [b, s, S] GLOBAL block ids
     block_counts: torch.Tensor,  # [b, s]
     block_bases: torch.Tensor,  # [num_blocks] token base per block
@@ -401,7 +298,7 @@ class QSAKVTileCSR(NamedTuple):
     n_tiles: int
 
 
-def build_qsa_kv_tile_csr(
+def build_qsa_kv_tile_csr_torch(
     block_indices: torch.Tensor,  # [b, s, S] GLOBAL block ids
     block_counts: torch.Tensor,  # [b, s]
     num_blocks: int,
@@ -456,8 +353,101 @@ def build_qsa_kv_tile_csr(
     )
 
 
+# Sort-free (K3) builders: dense bitmask + count + compaction Triton kernels in
+# ops/triton_qsa_select.py, bit-identical to the sort-based ``*_torch`` builders above
+# (which remain the CPU path and the reference).
+
+
+def _use_fused_meta(t: torch.Tensor) -> bool:
+    return t.is_cuda
+
+
+def build_qsa_supersets_static(
+    block_indices: torch.Tensor,  # [b, s, S] GLOBAL block ids
+    block_counts: torch.Tensor,  # [b, s]
+    block_bases: torch.Tensor,  # [num_blocks] token base per block
+    block_ends: torch.Tensor,  # [num_blocks]
+    num_blocks: int,
+    tile_queries: int,
+) -> QSASupersets:
+    """Fixed-shape, host-sync-free supersets (CUDA-graph capturable); see
+    :func:`build_qsa_supersets_static_torch` for the contract."""
+    if not _use_fused_meta(block_indices):
+        return build_qsa_supersets_static_torch(
+            block_indices, block_counts, block_bases, block_ends, num_blocks, tile_queries
+        )
+    from megatron.core.transformer.experimental_attention_variant.ops.triton_qsa_select import (
+        qsa_build_supersets_fused,
+    )
+
+    tile_offsets, entry_base, entry_end, membership, n_tiles, e_cap = qsa_build_supersets_fused(
+        block_indices, block_counts, block_bases, block_ends, num_blocks, tile_queries
+    )
+    return QSASupersets(
+        tile_offsets=tile_offsets,
+        entry_base=entry_base,
+        entry_end=entry_end,
+        membership=membership,
+        n_tiles=n_tiles,
+        num_entries=e_cap,
+    )
+
+
+def build_qsa_supersets(
+    block_indices: torch.Tensor,  # [b, s, S] GLOBAL block ids
+    block_counts: torch.Tensor,  # [b, s]
+    block_bases: torch.Tensor,  # [num_blocks] token base per block
+    block_ends: torch.Tensor,  # [num_blocks]
+    num_blocks: int,
+    tile_queries: int,
+) -> QSASupersets:
+    """Per-query-tile block unions, membership bits (exact-size buffers; one host sync)."""
+    if not _use_fused_meta(block_indices):
+        return build_qsa_supersets_torch(
+            block_indices, block_counts, block_bases, block_ends, num_blocks, tile_queries
+        )
+    ss = build_qsa_supersets_static(
+        block_indices, block_counts, block_bases, block_ends, num_blocks, tile_queries
+    )
+    num_entries = int(ss.tile_offsets[-1])  # single host sync (allocation sizes)
+    return QSASupersets(
+        tile_offsets=ss.tile_offsets,
+        entry_base=ss.entry_base[:num_entries],
+        entry_end=ss.entry_end[:num_entries],
+        membership=ss.membership[: max(num_entries, 1)],
+        n_tiles=ss.n_tiles,
+        num_entries=num_entries,
+    )
+
+
+def build_qsa_kv_tile_csr(
+    block_indices: torch.Tensor,  # [b, s, S] GLOBAL block ids
+    block_counts: torch.Tensor,  # [b, s]
+    num_blocks: int,
+    tile_blocks: int,
+) -> "QSAKVTileCSR":
+    """KV-tile query CSR for :func:`qsa_bwd_dkv_tile_kernel` (host-sync free, fixed
+    shape); see :func:`build_qsa_kv_tile_csr_torch` for the contract."""
+    if not _use_fused_meta(block_indices):
+        return build_qsa_kv_tile_csr_torch(block_indices, block_counts, num_blocks, tile_blocks)
+    from megatron.core.transformer.experimental_attention_variant.ops.triton_qsa_select import (
+        qsa_build_kv_tile_csr_fused,
+    )
+
+    tile_offsets, entry_query, entry_bits, n_tiles = qsa_build_kv_tile_csr_fused(
+        block_indices, block_counts, num_blocks, tile_blocks
+    )
+    return QSAKVTileCSR(
+        tile_offsets=tile_offsets,
+        entry_query=entry_query,
+        entry_bits=entry_bits,
+        tile_blocks=tile_blocks,
+        n_tiles=n_tiles,
+    )
+
+
 # ---------------------------------------------------------------------------
-# 3. Sparse GQA forward
+# 2. Sparse GQA forward
 # ---------------------------------------------------------------------------
 
 
@@ -578,7 +568,7 @@ def qsa_fwd_kernel(
 
 
 # ---------------------------------------------------------------------------
-# 4. Backward: dq (per query tile) and dkv (per KV block, no atomics)
+# 3. Backward: dq (per query tile) and dkv (per KV block, no atomics)
 # ---------------------------------------------------------------------------
 
 
@@ -980,7 +970,7 @@ def qsa_bwd_dkv_tile_kernel(
 
 
 # ---------------------------------------------------------------------------
-# 5. Host wrappers and autograd
+# 4. Host wrappers and autograd
 # ---------------------------------------------------------------------------
 
 
