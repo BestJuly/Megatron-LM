@@ -151,12 +151,16 @@ class TestQSAAttentionParity:
     # The indexer's trainability is fixed at build time (frozen without the loss), so
     # subclasses that train it set the coefficient here rather than after construction.
     INDEXER_LOSS_COEFF = None
+    # fp32 / head dim 32 against the oracle: the loss runs the eager layout implementation
+    # (the fused CuTe kernels take bf16; they are covered by test_qsa_indexer_loss_*.py).
+    INDEXER_LOSS_IMPL = "layout"
 
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
         self.config = make_config()
         self.config.qsa_indexer_loss_coeff = self.INDEXER_LOSS_COEFF
+        self.config.qsa_indexer_loss_impl = self.INDEXER_LOSS_IMPL
         spec = get_qsa_module_spec_for_backend(self.config)
         assert spec.metainfo == {"fuse_input_layernorm": False}
         self.attn = build_module(spec, config=self.config, layer_number=1).cuda()
@@ -311,16 +315,19 @@ class TestQSATensorParallel:
         out, _ = attn(shard, attention_mask=None, rotary_pos_emb=freqs)
         assert out.shape == (SEQ // 2, BATCH, HIDDEN) and torch.isfinite(out.float()).all()
 
+    @requires_qsa_kernels
     def test_tp2_kl_teacher_reduce_before_maxpool(self):
         """The Eq.(17) block MaxPool is nonlinear, so the teacher's TP head-sum must
-        complete before pooling. With a replicated indexer and a correctly reduced
-        teacher, the KL loss gradient must be identical on every TP rank."""
+        complete before pooling (the fused teacher's unpooled output is all-reduced).
+        With a replicated indexer and a correctly reduced teacher, the KL loss gradient
+        must be identical on every TP rank. bf16 / head dim 128: the fused teacher's
+        inputs."""
         if Utils.world_size < 2:
             pytest.skip("QSA TP2 KL parity requires at least 2 distributed ranks")
         Utils.initialize_model_parallel(tensor_model_parallel_size=2)
         model_parallel_cuda_manual_seed(123)
 
-        config = make_config()
+        config = make_config(head_dim=SPARSE_HEAD_DIM, dtype=torch.bfloat16)
         config.tensor_model_parallel_size = 2
         config.sequence_parallel = True
         config.qsa_indexer_loss_coeff = 0.01
@@ -334,10 +341,10 @@ class TestQSATensorParallel:
         tp_rank = ps.get_tensor_model_parallel_rank()
 
         g = torch.Generator().manual_seed(7)
-        full = torch.randn(SEQ, BATCH, HIDDEN, generator=g).cuda()
+        full = torch.randn(SEQ, BATCH, HIDDEN, generator=g).cuda().bfloat16()
         shard = full.chunk(2, dim=0)[tp_rank].contiguous()
         rope = RotaryEmbedding(
-            kv_channels=HEAD_DIM, rotary_percent=ROTARY_PERCENT, rotary_base=ROPE_THETA
+            kv_channels=SPARSE_HEAD_DIM, rotary_percent=ROTARY_PERCENT, rotary_base=ROPE_THETA
         )
         # The sharp assertion: the LOSS is bitwise identical across TP ranks. The
         # teacher's local-head softmax differs per rank, so this only holds if the
@@ -548,7 +555,12 @@ class TestQSASparseKernel:
 
 
 class TestQSAIndexerSparseKL(TestQSAAttentionParity):
-    """QSA-3: sparse-KL distillation trains the indexer."""
+    """QSA-3: sparse-KL distillation trains the indexer.
+
+    fp32 / head dim 32 against the oracle, so the loss runs the eager ``layout``
+    implementation (the same teacher targets as the reference); the fused kernels are
+    covered by test_qsa_indexer_loss_impl.py / test_qsa_indexer_loss_cute.py.
+    """
 
     INDEXER_LOSS_COEFF = 0.01
 
@@ -704,6 +716,7 @@ class TestQSADDPOverlapGradReduce:
 
         config = make_config()
         config.qsa_indexer_loss_coeff = indexer_loss_coeff
+        config.qsa_indexer_loss_impl = "layout"  # fp32 / head dim 32: the eager loss
         spec = get_qsa_module_spec_for_backend(config)
         attn = build_module(spec, config=config, layer_number=1).cuda()
         model = DistributedDataParallel(

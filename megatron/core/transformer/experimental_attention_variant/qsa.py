@@ -830,23 +830,54 @@ class QSAIndexer(MegatronModule):
         return order, picked
 
 
-def _require_qsa_kernel_support(config: TransformerConfig) -> None:
-    """The sparse QSA kernels are CuTe DSL kernels for Blackwell (SM100-class) GPUs.
+def _require_qsa_kernel_support(config: TransformerConfig, tp_size: int) -> None:
+    """The QSA kernels (sparse attention, fused indexer loss) are CuTe DSL kernels for
+    Blackwell (SM100-class) GPUs.
 
     Checked once, when a QSA layer that uses them is built, so that an unsupported device or
     shape fails with its cause instead of inside a kernel launch.
     """
+    sparse = config.qsa_use_sparse_attention
+    fused_loss = config.qsa_indexer_loss_impl == "fused" and bool(config.qsa_indexer_loss_coeff)
+    if not (sparse or fused_loss):
+        return
+    what = "qsa_use_sparse_attention" if sparse else "qsa_indexer_loss_impl='fused'"
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         raise RuntimeError(
-            "qsa_use_sparse_attention requires a Blackwell (SM100-class: B200, GB200, B300, "
-            "GB300) GPU; the QSA sparse kernels are CuTe DSL tcgen05 kernels."
+            f"{what} requires a Blackwell (SM100-class: B200, GB200, B300, GB300) GPU; the "
+            "QSA kernels are CuTe DSL tcgen05 kernels."
         )
     try:
         import cutlass  # noqa: F401  # pylint: disable=unused-import
     except ImportError as e:
-        raise RuntimeError(
-            "qsa_use_sparse_attention requires nvidia-cutlass-dsl (CuTe DSL)."
-        ) from e
+        raise RuntimeError(f"{what} requires nvidia-cutlass-dsl (CuTe DSL).") from e
+    if fused_loss:
+        from megatron.core.transformer.experimental_attention_variant.ops.cute_qsa_indexer_loss import (  # pylint: disable=line-too-long
+            teacher_tmem_columns,
+        )
+
+        r = config.qsa_indexer_compress_ratio
+        ng = max(1, config.num_query_groups // tp_size)
+        hpg = config.num_attention_heads // config.num_query_groups
+        n_sel = config.qsa_indexer_budget // r
+        if not config.bf16:
+            raise ValueError("qsa_indexer_loss_impl='fused' requires bf16 training.")
+        if config.kv_channels % 64 or 128 % r or hpg > 256 or ng * (config.kv_channels // 64) < 2:
+            raise ValueError(
+                "qsa_indexer_loss_impl='fused' requires a head dim that is a multiple of 64, "
+                "a compress ratio dividing 128, at most 256 query heads per KV head and "
+                f"(KV heads per TP rank) x (head dim / 64) >= 2; got kv_channels="
+                f"{config.kv_channels}, ratio={r}, heads per group={hpg}, KV heads={ng}. "
+                "Use qsa_indexer_loss_impl='layout'."
+            )
+        if teacher_tmem_columns(n_sel, r, ng, hpg) > 512:
+            raise ValueError(
+                f"qsa_indexer_loss_impl='fused': the teacher logits of {n_sel} selected blocks "
+                f"x {ng} KV heads x {hpg} heads per group do not fit in tensor memory. Use "
+                "qsa_indexer_loss_impl='layout'."
+            )
+    if not sparse:
+        return
     if not (config.bf16 or config.fp16):
         raise ValueError("qsa_use_sparse_attention requires bf16 or fp16 training.")
     if config.kv_channels not in (128, 256):
@@ -907,8 +938,7 @@ class QSASelfAttention(SelfAttention):
         if not self.config.qsa_indexer_loss_coeff:
             for param in self.indexer.parameters():
                 param.requires_grad_(False)
-        if self.config.qsa_use_sparse_attention:
-            _require_qsa_kernel_support(self.config)
+        _require_qsa_kernel_support(self.config, self.pg_collection.tp.size())
 
     def is_cuda_graph_capturable(self) -> bool:
         """QSA layers are capturable, with or without (allgather) context parallelism.
@@ -1113,6 +1143,9 @@ class QSASelfAttention(SelfAttention):
         q_bt = query.permute(1, 0, 2, 3)
         k_bt = key.permute(1, 0, 2, 3)
         v_bt = value.permute(1, 0, 2, 3)
+        if self._indexer_teacher_reuses_main_qk():
+            # The fused teacher reuses these (bit-identical to its own re-projection).
+            self._indexer_main_qk = (q_bt.detach(), k_bt.detach())
 
         # Selection: the query's own block leads; the deterministic top-k follows.
         # In-kernel token [base, end) + causal masking makes the own-block entry
@@ -1152,6 +1185,7 @@ class QSASelfAttention(SelfAttention):
         selection: QSASelection,
         loss_coeff: float,
         cu_seqlens: Optional[Tensor] = None,
+        teacher_qk: Optional[Tuple[Tensor, Tensor]] = None,
     ) -> Tensor:
         """Sparse-KL distillation loss for the indexer (block granularity).
 
@@ -1175,10 +1209,12 @@ class QSASelfAttention(SelfAttention):
           gathered keys: per chunk, one GEMM of the chunk's queries against the keys of
           its causal key range, then a gather of the bf16 logits at the selected tokens
           (no ``[b, chunk, budget, groups, d]`` key tensor, no einsum transpose copy).
-        * ``"fused"``: the Triton teacher kernel (``ops/triton_qsa_indexer_loss.py``)
-          plus the student scores as one GEMM against all block keys of the chunk's
-          causal range followed by a gather at the selected blocks (fp32-accumulated,
-          deterministic gradients instead of bf16 atomic scatter-adds).
+        * ``"fused"``: the CuTe DSL teacher kernel (``ops/cute_qsa_indexer_loss.py``,
+          Blackwell) on the main path's detached q/k (``teacher_qk``, or the pair stashed
+          by :meth:`_sparse_forward`; no QKV projection or RoPE recompute), gathering the
+          selected keys once, plus the student scores as one GEMM against all block keys
+          of the chunk's causal range followed by a gather at the selected blocks
+          (fp32-accumulated, deterministic gradients instead of bf16 atomic scatter-adds).
         """
         impl = self.config.qsa_indexer_loss_impl
         r = self.indexer.compress_ratio
@@ -1190,8 +1226,15 @@ class QSASelfAttention(SelfAttention):
         # are not a prefix of the global token space.
         causal_prefix = selection.q_positions is None
 
-        q_bt, k_bt = self._indexer_teacher_qk(hidden_states, freqs, selection, cu_seqlens)
+        main_qk, self._indexer_main_qk = getattr(self, "_indexer_main_qk", None), None
+        if teacher_qk is None and impl == "fused":
+            teacher_qk = main_qk
+        if teacher_qk is not None:
+            q_bt, k_bt = teacher_qk[0].detach(), teacher_qk[1].detach()
+        else:
+            q_bt, k_bt = self._indexer_teacher_qk(hidden_states, freqs, selection, cu_seqlens)
         targets = self._indexer_targets(q_bt, k_bt, selection, impl)
+        del q_bt, k_bt
 
         # Pass 2 (grad into the indexer): student scores recomputed at the selected
         # blocks only, chunked, against the reduced+normalized teacher.
@@ -1249,6 +1292,15 @@ class QSASelfAttention(SelfAttention):
 
         loss = kl_sum / valid_rows.clamp_min(1.0) * loss_coeff
         return loss
+
+    def _indexer_teacher_reuses_main_qk(self) -> bool:
+        """True when the coming indexer loss will consume the main path's q/k."""
+        return (
+            self.training
+            and (self.config.qsa_indexer_loss_coeff or 0.0) > 0
+            and torch.is_grad_enabled()
+            and self.config.qsa_indexer_loss_impl == "fused"
+        )
 
     @torch.no_grad()
     def _indexer_teacher_qk(
@@ -1415,8 +1467,8 @@ class QSASelfAttention(SelfAttention):
         tp_group,
         tp_size: int,
     ) -> Tensor:
-        """Teacher targets ``[b, s, k]`` (normalized) from the fused Triton kernel."""
-        from megatron.core.transformer.experimental_attention_variant.ops.triton_qsa_indexer_loss import (  # pylint: disable=line-too-long
+        """Teacher targets ``[b, s, k]`` (normalized) from the CuTe DSL teacher kernel."""
+        from megatron.core.transformer.experimental_attention_variant.ops.cute_qsa_indexer_loss import (  # pylint: disable=line-too-long
             qsa_indexer_teacher,
         )
 

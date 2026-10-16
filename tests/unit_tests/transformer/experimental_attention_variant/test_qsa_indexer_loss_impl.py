@@ -10,7 +10,7 @@ parameter gradients:
 * ``layout`` (eager, no gathered-key materialization) must reproduce the reference
   targets within fp32 rounding and its gradients within the reference's own run-to-run
   noise (the reference student's ``torch.gather`` backward is a bf16 atomic scatter-add);
-* ``fused`` (Triton teacher kernel + GEMM-and-gather student) must match within the
+* ``fused`` (CuTe DSL teacher kernel + GEMM-and-gather student) must match within the
   documented tolerances and be bitwise repeatable.
 
 A last test captures a whole QSA layer (selection, sparse attention, indexer loss and its
@@ -292,7 +292,7 @@ class TestQSAIndexerLossImpl:
     def test_fused_teacher_unpooled_matches_pooled(self):
         """``pool=False`` (the tensor-parallel path) returns the token mass whose block
         max is exactly the pooled kernel output."""
-        from megatron.core.transformer.experimental_attention_variant.ops.triton_qsa_indexer_loss import (  # pylint: disable=line-too-long
+        from megatron.core.transformer.experimental_attention_variant.ops.cute_qsa_indexer_loss import (  # pylint: disable=line-too-long
             qsa_indexer_teacher,
         )
 
