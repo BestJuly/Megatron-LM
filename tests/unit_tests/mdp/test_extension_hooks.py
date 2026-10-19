@@ -62,12 +62,10 @@ def test_bridge_supports_two_slices_of_one_item():
     slice_id, coalesced on the same edge. The reassembled halves must equal
     the source rows exactly.
 
-    Deliberately constructed at the ledger layer: in v1 the plan cannot
-    represent a split (RouteSlice gains item_row_start/item_rows only when a
-    real split lands, API design 6.2), so build_ledger emits one entry per
-    route by definition. When decoder CP adds those fields, this test MUST be
-    extended to drive the split through MdpBatchPlan and build_ledger and to
-    assert the generated ledger before exchanging it.
+    The companion test below now drives the same split through MdpBatchPlan and
+    build_ledger, as this test's original note required once decoder CP landed;
+    this one stays as the transport-layer check that two slices of one item
+    survive coalescing on a single edge.
     """
     rank = torch.distributed.get_rank()
     world = torch.distributed.get_world_size()
@@ -138,6 +136,102 @@ def test_bridge_supports_two_slices_of_one_item():
     else:
         assert received == {}
     bridge.assert_idle()
+
+
+def test_build_ledger_emits_one_entry_per_plan_slice():
+    """Decoder-CP hook, plan layer: the split is generated, not hand-built.
+
+    A 32-row item spanning a whole 32-row sample at cp=2 splits into three runs
+    (chunks 0 | 1+2 | 3), two of which land on cp_rank 0. The ledger must carry
+    three EMBEDDING entries with distinct slice_ids, and exactly ONE PIXEL entry
+    -- pixels are per item and CP-invariant, so per-slice routing there would
+    multiply pixel traffic.
+    """
+    from megatron.core.mdp.bridge import BridgePhase
+    from megatron.core.mdp.plan import RowCapacityPolicy
+    from megatron.core.mdp.planner import MdpPlanner
+    from megatron.core.mdp.protocols import VisionDescriptor
+    from megatron.core.mdp.rank_mapping import MdpRankSpec, build_rank_map
+
+    cp_size = 2
+    rank_map = build_rank_map(
+        MdpRankSpec(world_size=4, tp=1, pp=2, cp=cp_size, ep=1, encoder_cp=1)
+    )
+    view = rank_map.view(rank_map.planning_groups()[0][0])
+    descriptor = VisionDescriptor(
+        global_item_id=0,
+        sample_id=0,
+        image_ordinal=0,
+        owner_dp_lane=0,
+        microbatch_id=0,
+        estimated_cost_units=10,
+        payload_rows=128,
+        output_rows=32,
+        grid_thw=(2, 8, 8),
+        owner_worker_id=0,
+        sample_padded_start=0,
+        sample_padded_len=32,
+        decoder_offset_in_sample=0,
+    )
+    plan = MdpPlanner(
+        view, locality_slack_permille=10, capacity_policy=RowCapacityPolicy()
+    ).build_plan(0, [descriptor], [0])
+
+    assert [(r.slice_id, r.item_row_start, r.item_rows) for r in plan.routes] == [
+        (0, 0, 8),
+        (1, 8, 16),
+        (2, 24, 8),
+    ]
+    endpoints = [r.endpoint_rank for r in plan.routes]
+    assert endpoints == [view.decoder_endpoint_ranks[0], view.decoder_endpoint_ranks[1],
+                         view.decoder_endpoint_ranks[0]]
+
+    bridge = ModalityBridge(DirectBufferAllocator())
+    device = torch.device("cuda")
+    emb_specs = {
+        BridgeBufferKey(0, route.slice_id): BridgeTensorSpec(
+            valid_rows=route.item_rows,
+            capacity_rows=route.item_rows,
+            width=WIDTH,
+            dtype=torch.float32,
+            device=device,
+        )
+        for route in plan.routes
+    }
+    emb_ledger = bridge.build_ledger(
+        BridgePhase.EMBEDDING, plan, rank_map, emb_specs
+    )
+    assert len(emb_ledger.entries) == 3
+    assert sorted(e.key.slice_id for e in emb_ledger.entries) == [0, 1, 2]
+    assert sum(e.element_count for e in emb_ledger.entries) == 32 * WIDTH
+    # Per-edge offsets must not collide: the two slices bound for cp_rank 0
+    # share one (src, dst) edge and have to occupy disjoint byte ranges.
+    by_edge = {}
+    for entry in emb_ledger.entries:
+        by_edge.setdefault(
+            (entry.src_global_rank, entry.dst_global_rank), []
+        ).append(entry)
+    for edge_entries in by_edge.values():
+        spans = sorted(
+            (e.plan_offset, e.plan_offset + e.element_count) for e in edge_entries
+        )
+        for (_, prev_end), (next_start, _) in zip(spans, spans[1:]):
+            assert prev_end == next_start
+
+    pixel_specs = {
+        BridgeBufferKey(0): BridgeTensorSpec(
+            valid_rows=128,
+            capacity_rows=128,
+            width=WIDTH,
+            dtype=torch.float32,
+            device=device,
+        )
+    }
+    pixel_ledger = bridge.build_ledger(
+        BridgePhase.PIXEL, plan, rank_map, pixel_specs
+    )
+    assert len(pixel_ledger.entries) == 1
+    assert pixel_ledger.entries[0].key == BridgeBufferKey(0)
 
 
 def test_full_iteration_at_row_alignment_16():

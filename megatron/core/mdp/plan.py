@@ -11,11 +11,11 @@ never enters the digest.
 import hashlib
 import struct
 from dataclasses import dataclass, field
-from typing import Sequence
+from typing import Optional, Sequence
 
 from megatron.core.mdp.errors import MdpPlanError
 
-PLAN_SCHEMA_VERSION = 5
+PLAN_SCHEMA_VERSION = 6
 
 
 @dataclass(frozen=True)
@@ -39,21 +39,33 @@ class RowCapacityPolicy:
 
 @dataclass(frozen=True)
 class RouteSlice:
-    """One routed slice: which item, which logical worker produces it, which
-    endpoint rank receives it. Offsets are looked up in the encoder layout;
-    decoder positions live only in the endpoint-local window record.
+    """One routed slice: which rows of which item, produced by which logical
+    worker, received by which endpoint rank.
 
     ``owner_worker_id`` is the logical worker holding the item's pixels at
     dispatch time and is always the PIXEL phase source.
 
-    In v1 every item has exactly one slice. When a real split lands (decoder CP),
-    the route gains explicit sub-interval fields; they are not added speculatively.
+    ``slice_id`` / ``item_row_start`` / ``item_rows`` are the sub-interval
+    fields decoder CP needs. At CP=1 every item still has exactly one slice,
+    with ``slice_id == 0``, ``item_row_start == 0`` and
+    ``item_rows == output_rows``, so the plan is unchanged. At CP>1 the decoder
+    sequence is zigzag-sharded and an item's rows split across endpoints; one
+    endpoint can hold two disjoint runs of the same item, which is why the
+    slice — not the item — is the routed unit and why the transport key
+    (:class:`~megatron.core.mdp.bridge.BridgeBufferKey`) carries ``slice_id``.
+
+    ``item_row_start`` is in the item's own output-row space, so it indexes the
+    producer's encoder output directly; the destination-side offset lives in the
+    endpoint's :class:`MicrobatchLayout`.
     """
 
     global_item_id: int
     producer_worker_id: int
     endpoint_rank: int
     owner_worker_id: int
+    slice_id: int = 0
+    item_row_start: int = 0
+    item_rows: int = 0
 
 
 @dataclass(frozen=True)
@@ -175,39 +187,67 @@ def split_encoder_layout(layout: EncoderThdLayout, *, max_payload_rows) -> tuple
 
 @dataclass(frozen=True)
 class LayoutSegment:
-    """One vision item's row interval inside a microbatch's endpoint leaf."""
+    """One route slice's row interval inside a microbatch's endpoint leaf.
+
+    ``slice_id`` pairs this segment with its :class:`RouteSlice`; ``output_rows``
+    is that slice's row count, not necessarily the whole item's.
+    """
 
     global_item_id: int
     leaf_row_start: int
     output_rows: int
+    slice_id: int = 0
 
 
 @dataclass(frozen=True)
 class MicrobatchLayout:
-    """Endpoint leaf layout for one decoder microbatch, ordered by
-    ``(sample_id, image_ordinal)`` — never by LPT assignment order."""
+    """One endpoint's leaf layout for one decoder microbatch.
+
+    At CP=1 there is one layout per microbatch, ordered by
+    ``(sample_id, image_ordinal)`` — never by LPT assignment order.
+
+    At CP>1 there is one layout per ``(microbatch_id, endpoint_rank)``, and the
+    order is the endpoint's **rank-local** row order. That is the order the
+    decoder's image-token mask sees after the CP split, and ``masked_scatter``
+    consumes the leaf in exactly that order. It coincides with
+    ``(sample_id, image_ordinal)`` at CP=1.
+
+    ``text_only`` means this microbatch has no vision rows *for this endpoint*.
+    """
 
     microbatch_id: int
     text_only: bool
     total_output_rows: int
     segments: tuple
+    endpoint_rank: int = -1
 
 
 def compute_plan_digest(
-    schema_version: int, capacity_policy: RowCapacityPolicy, entries: Sequence[tuple]
+    schema_version: int,
+    capacity_policy: RowCapacityPolicy,
+    entries: Sequence[tuple],
+    cp_size: int = 1,
 ) -> bytes:
     """Digest of the minimal sufficient set with fixed-width packing plus blake2b.
 
-    ``entries`` are 9-int tuples in ascending ``global_item_id`` order:
-    ``(global_item_id, producer_worker_id, order_in_producer, endpoint_rank,
-    payload_rows, output_rows, grid_t, grid_h, grid_w)``. ``hash()`` and pickle are
-    forbidden: they vary across Python environments and would produce false
-    positives in the cross-rank consistency check.
+    ``entries`` are 12-int tuples in ascending ``(global_item_id, slice_id)``
+    order: ``(global_item_id, slice_id, producer_worker_id, order_in_producer,
+    endpoint_rank, item_row_start, item_rows, payload_rows, output_rows, grid_t,
+    grid_h, grid_w)``. ``hash()`` and pickle are forbidden: they vary across
+    Python environments and would produce false positives in the cross-rank
+    consistency check.
+
+    The slice fields are in the digest deliberately. At decoder CP>1 the split
+    is derived arithmetic, and a member that derives it differently would
+    otherwise post a mismatched ``all_to_all_single`` — a hang rather than a
+    diagnosable error.
     """
     hasher = hashlib.blake2b(digest_size=16)
-    hasher.update(struct.pack("<2q", schema_version, capacity_policy.alignment_rows))
+    hasher.update(
+        struct.pack("<3q", schema_version, capacity_policy.alignment_rows, cp_size)
+    )
     for entry in entries:
-        hasher.update(struct.pack("<9q", *entry))
+        hasher.update(struct.pack("<12q", *entry))
     return hasher.digest()
 
 
@@ -229,6 +269,7 @@ class MdpBatchPlan:
     digest: bytes
     _routes_by_producer: dict = field(init=False, repr=False, compare=False)
     _routes_by_endpoint: dict = field(init=False, repr=False, compare=False)
+    _routes_by_item: dict = field(init=False, repr=False, compare=False)
     _encoder_layout_by_producer: dict = field(init=False, repr=False, compare=False)
     _layout_by_microbatch: dict = field(init=False, repr=False, compare=False)
     _segment_by_item: dict = field(init=False, repr=False, compare=False)
@@ -236,9 +277,18 @@ class MdpBatchPlan:
     def __post_init__(self):
         routes_by_producer = {}
         routes_by_endpoint = {}
+        routes_by_item = {}
+        seen_slices = set()
         for route in self.routes:
+            key = (route.global_item_id, route.slice_id)
+            if key in seen_slices:
+                raise MdpPlanError(
+                    f"MDP: route {key} violates: one route per (item, slice_id)."
+                )
+            seen_slices.add(key)
             routes_by_producer.setdefault(route.producer_worker_id, []).append(route)
             routes_by_endpoint.setdefault(route.endpoint_rank, []).append(route)
+            routes_by_item.setdefault(route.global_item_id, []).append(route)
         encoder_layout_by_producer = {}
         segment_by_item = {}
         for layout in self.encoder_layouts:
@@ -257,17 +307,23 @@ class MdpBatchPlan:
                 segment_by_item[segment.global_item_id] = segment
         layout_by_microbatch = {}
         for layout in self.layouts:
-            if layout.microbatch_id in layout_by_microbatch:
+            key = (layout.microbatch_id, layout.endpoint_rank)
+            if key in layout_by_microbatch:
                 raise MdpPlanError(
-                    f"MDP: microbatch_id={layout.microbatch_id} violates: one layout per "
-                    "microbatch."
+                    f"MDP: (microbatch_id, endpoint_rank)={key} violates: one layout "
+                    "per microbatch per endpoint."
                 )
-            layout_by_microbatch[layout.microbatch_id] = layout
+            layout_by_microbatch[key] = layout
         object.__setattr__(
             self, "_routes_by_producer", {k: tuple(v) for k, v in routes_by_producer.items()}
         )
         object.__setattr__(
             self, "_routes_by_endpoint", {k: tuple(v) for k, v in routes_by_endpoint.items()}
+        )
+        object.__setattr__(
+            self,
+            "_routes_by_item",
+            {k: tuple(sorted(v, key=lambda r: r.slice_id)) for k, v in routes_by_item.items()},
         )
         object.__setattr__(self, "_encoder_layout_by_producer", encoder_layout_by_producer)
         object.__setattr__(self, "_layout_by_microbatch", layout_by_microbatch)
@@ -278,8 +334,27 @@ class MdpBatchPlan:
         return self._routes_by_producer.get(worker_id, ())
 
     def routes_for_endpoint(self, rank: int) -> Sequence[RouteSlice]:
-        """Routes received by one endpoint rank."""
+        """Route slices received by one endpoint rank."""
         return self._routes_by_endpoint.get(rank, ())
+
+    def routes_for_item(self, item_id: int) -> Sequence[RouteSlice]:
+        """One item's route slices in ascending ``slice_id`` order.
+
+        One entry at CP=1; at CP>1 one per endpoint run of the item's rows.
+        """
+        return self._routes_by_item.get(item_id, ())
+
+    def layouts_for_endpoint(self, rank: int) -> Sequence["MicrobatchLayout"]:
+        """This endpoint's leaf layouts, in ascending ``microbatch_id`` order.
+
+        The runtime builds leaves only for its own endpoint; at CP>1 iterating
+        ``plan.layouts`` would allocate every CP peer's leaf on every rank.
+        """
+        return tuple(
+            layout
+            for layout in self.layouts
+            if layout.endpoint_rank == rank
+        )
 
     def encoder_layout_for_producer(self, worker_id: int) -> EncoderThdLayout:
         """One producer's encoder THD layout; empty layout if it has no work."""
@@ -288,13 +363,37 @@ class MdpBatchPlan:
             return EncoderThdLayout(producer_worker_id=worker_id, segments=())
         return layout
 
-    def layout_for_microbatch(self, mb_id: int) -> MicrobatchLayout:
-        """The endpoint leaf layout for one decoder microbatch."""
+    def layout_for_microbatch(
+        self, mb_id: int, endpoint_rank: Optional[int] = None
+    ) -> MicrobatchLayout:
+        """One endpoint's leaf layout for one decoder microbatch.
+
+        ``endpoint_rank`` may be omitted only when the microbatch has exactly one
+        layout, which is always the case at CP=1. Omitting it at CP>1 is a
+        programming error, not a defaulted-to-cp0 read.
+        """
+        if endpoint_rank is None:
+            matches = [
+                layout for layout in self.layouts if layout.microbatch_id == mb_id
+            ]
+            if len(matches) == 1:
+                return matches[0]
+            if not matches:
+                raise MdpPlanError(
+                    f"MDP: microbatch_id={mb_id} violates: microbatch is part of "
+                    "this plan."
+                )
+            raise MdpPlanError(
+                f"MDP: microbatch_id={mb_id} has {len(matches)} endpoint layouts "
+                "violates: endpoint_rank is required when the decoder is "
+                "context-parallel."
+            )
         try:
-            return self._layout_by_microbatch[mb_id]
+            return self._layout_by_microbatch[(mb_id, endpoint_rank)]
         except KeyError:
             raise MdpPlanError(
-                f"MDP: microbatch_id={mb_id} violates: microbatch is part of this plan."
+                f"MDP: (microbatch_id={mb_id}, endpoint_rank={endpoint_rank}) violates: "
+                "the pair is part of this plan."
             ) from None
 
     def segment_for_item(self, item_id: int) -> EncoderThdSegment:
