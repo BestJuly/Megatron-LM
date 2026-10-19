@@ -58,9 +58,18 @@ def draw_total_token_lengths(length_config, count, seed=GENERATOR_SEED):
 
     from megatron.training.datasets.sft_dataset import MockSFTLowLevelDataset
 
+    # MockSFTLowLevelDataset refuses "file"/"distribution" mode without
+    # vocab_size >= 2, because it can also synthesize token ids. MDP reads only
+    # ``.sequence_lengths``, which is drawn from the length distribution alone
+    # and never touches the vocabulary, so supply a nominal value when the
+    # config does not carry one. This cannot shift the draw: vocab_size is not
+    # an input to generate_lognormal_samples().
+    kwargs = dict(length_config)
+    kwargs.setdefault("vocab_size", 2)
+
     state = np.random.get_state()
     try:
-        low_level = MockSFTLowLevelDataset(**dict(length_config))
+        low_level = MockSFTLowLevelDataset(**kwargs)
     finally:
         np.random.set_state(state)
     lengths = low_level.sequence_lengths
