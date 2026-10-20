@@ -1434,6 +1434,23 @@ class TransformerConfig(ModelParallelConfig):
     num_residual_streams: int = 4
     """Number of residual streams (n in paper)."""
 
+    hyper_connection_variant: str = "mhc"
+    """Which hyper-connection mathematics to use when enable_hyper_connections=True.
+
+    "mhc": Manifold-Constrained Hyper-Connections (Sinkhorn doubly-stochastic
+    cross-stream mixing + per-stream scalar read gate). The default; existing
+    behaviour is unchanged.
+    "gated_residual": the Qwen4-Exp variant — low-rank per-channel read gate
+    over group-RMS-normalized streams, per-stream scalar write gate, identity
+    residual (no cross-stream mixing). Removes the per-sublayer pre-norms
+    (the gated-residual group norm takes over that role).
+    """
+
+    hc_lowrank: int = 320
+    """Bottleneck width of the gated-residual read gate's two projections
+    ((n*C) -> hc_lowrank -> (n*C)). Only used with
+    hyper_connection_variant="gated_residual"."""
+
     mhc_sinkhorn_iterations: int = 20
     """Number of Sinkhorn-Knopp iterations for doubly stochastic projection."""
 
@@ -3093,6 +3110,94 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "mhc_init_gating_factor must be non-negative, got "
                     f"{self.mhc_init_gating_factor}."
+                )
+
+        # Validation for hyper_connection_variant
+        if self.hyper_connection_variant not in ("mhc", "gated_residual"):
+            raise ValueError(
+                f"hyper_connection_variant must be 'mhc' or 'gated_residual', got "
+                f"{self.hyper_connection_variant!r}."
+            )
+        if self.hyper_connection_variant != "mhc" and not self.enable_hyper_connections:
+            warnings.warn(
+                f"hyper_connection_variant={self.hyper_connection_variant!r} has no "
+                "effect without enable_hyper_connections=True.",
+                UserWarning,
+                stacklevel=2,
+            )
+        if self.enable_hyper_connections and self.hyper_connection_variant == "gated_residual":
+            if (
+                not isinstance(self.hc_lowrank, int)
+                or isinstance(self.hc_lowrank, bool)
+                or (self.hc_lowrank < 1)
+            ):
+                raise ValueError("hc_lowrank must be a positive integer for gated_residual.")
+            if self.transformer_impl != "transformer_engine":
+                raise ValueError(
+                    "hyper_connection_variant='gated_residual' requires "
+                    "transformer_impl='transformer_engine': the norm-free layer specs are "
+                    "only built for the TE backend."
+                )
+            if self.use_fused_mhc:
+                raise ValueError(
+                    "use_fused_mhc applies only to hyper_connection_variant='mhc'; the "
+                    "gated-residual variant uses its own native kernels."
+                )
+            if self.mhc_recompute_attn_cuda_graph_split:
+                raise ValueError(
+                    "mhc_recompute_attn_cuda_graph_split is mHC-only; the gated-residual "
+                    "variant does not implement the attention-only split."
+                )
+            # The partial-MoE capture path used to pack the 4-tuple's h_res slot as a graph
+            # output unconditionally, which a None cannot be, so CUDA graphs were rejected
+            # outright for this variant. The capture/replay pair now keys on
+            # HyperConnectionModule.produces_h_res and omits the slot for identity-residual
+            # variants, so the gated residual no longer blocks capture. Only the
+            # TE-backed partial capture is exercised: the `local` implementation captures
+            # the whole layer, which has not been validated against the 4-tuple contract.
+            if (
+                self.cuda_graph_impl not in ("none", "transformer_engine")
+                or self.enable_cuda_graph
+                or self.external_cuda_graph
+            ):
+                raise ValueError(
+                    "CUDA graphs with hyper_connection_variant='gated_residual' are "
+                    "supported only as cuda_graph_impl='transformer_engine' partial "
+                    f"capture, got cuda_graph_impl={self.cuda_graph_impl!r}"
+                    f"{', enable_cuda_graph' if self.enable_cuda_graph else ''}"
+                    f"{', external_cuda_graph' if self.external_cuda_graph else ''}. "
+                    "Whole-layer and full-iteration capture have not been validated "
+                    "against the 4-tuple contract."
+                )
+            if self.cuda_graph_impl == "transformer_engine":
+                _gr_graphable_scopes = {
+                    CudaGraphModule.moe,
+                    CudaGraphModule.moe_router,
+                    CudaGraphModule.moe_preprocess,
+                }
+                # cuda_graph_modules entries may still be plain strings here: this guard runs
+                # before the generic CUDA-graph normalization, and only arguments.py converts
+                # the CLI values to enum members. Compare on names so both forms work.
+                _gr_graphable_names = {m.name for m in _gr_graphable_scopes}
+                _gr_scopes = {getattr(m, "name", m) for m in (self.cuda_graph_modules or [])}
+                if not _gr_scopes or not _gr_scopes <= _gr_graphable_names:
+                    raise ValueError(
+                        "CUDA graphs with hyper_connection_variant='gated_residual' are "
+                        "validated only for cuda_graph_modules restricted to the MoE "
+                        "scopes (moe / moe_router / moe_preprocess), where the capture "
+                        "covers the aggregate plus the router and dispatch preprocessing; "
+                        f"got {sorted(_gr_scopes) or 'all layers'}. Wider "
+                        "scopes capture the attention-type layers too, which is untested "
+                        "for this variant."
+                    )
+            if self.tensor_model_parallel_size > 1 and not self.sequence_parallel:
+                warnings.warn(
+                    "hyper_connection_variant='gated_residual' with tensor parallelism "
+                    "but without sequence_parallel duplicates the gated-residual "
+                    "computation (~10% of forward FLOPs) on every TP rank. Enable "
+                    "sequence_parallel so each rank processes s/TP of the sequence.",
+                    UserWarning,
+                    stacklevel=2,
                 )
 
         if self.fine_grained_activation_offloading:

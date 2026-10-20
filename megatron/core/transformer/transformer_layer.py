@@ -2682,7 +2682,14 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 for tensor in mlp_output_with_bias:
                     self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(tensor)
             # Append HC state (mlp_hc_h_post, mlp_h_res, residual) for replay.
-            return list(mlp_output_with_bias) + [mlp_hc_h_post, mlp_h_res, residual]
+            # Variants whose residual is the identity (gated_residual) leave the h_res slot
+            # None, and None cannot be a CUDA graph output, so the slot is omitted for them
+            # and the replay side reconstructs it. Keyed on the module, not on the variant
+            # name, so a future identity-residual variant needs no change here.
+            hc_state = [mlp_hc_h_post]
+            if self.mlp_hyper_connection.produces_h_res:
+                hc_state.append(mlp_h_res)
+            return list(mlp_output_with_bias) + hc_state + [residual]
 
         return self._forward_post_mlp_with_fused_hyper_connection(
             mlp_output_with_bias, mlp_h_res, residual, mlp_hc_h_post, mhc_mlp_bda_manager
@@ -3016,9 +3023,12 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             assert not self.config.overlap_moe_expert_parallel_comm, "EP overlap must be \
                 disabled when CUDA graph captures the whole MLP/MoE part."
         elif self.is_moe_layer and CudaGraphModule.moe_router in self.config.cuda_graph_modules:
-            # Pop HC state (appended during capture in _forward_mlp).
+            # Pop HC state (appended during capture in _forward_mlp). The h_res slot is only
+            # packed by variants that produce one; see the capture side.
             residual = cuda_graph_output.pop()
-            mlp_h_res = cuda_graph_output.pop()
+            mlp_h_res = (
+                cuda_graph_output.pop() if self.mlp_hyper_connection.produces_h_res else None
+            )
             mlp_hc_h_post = cuda_graph_output.pop()
 
             shared_expert_output, routing_map = None, None

@@ -14,6 +14,7 @@ from megatron.core.models.backends import (
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
+from megatron.core.transformer.gated_residual import GatedResidualModule
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
@@ -197,6 +198,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
     mla_down_proj_fusion: bool = False,
     dense_grouped_gemm: bool = False,
     use_grouped_gemm_for_dense_mlp: bool = False,
+    hyper_connection_variant: str = "mhc",
 ) -> TransformerLayerSubmodules:
     """Use these submodules to use lower-level Transformer Engine modules (required for fp8
     training).
@@ -213,6 +215,10 @@ def get_gpt_layer_with_transformer_engine_submodules(
                                           enable certain operation fusions. Defaults to False.
         enable_hyper_connection (bool): Use HyperConnectionTransformerLayer with
             HyperConnectionModule instead of plain TransformerLayer. Defaults to False.
+        hyper_connection_variant (str): 'mhc' (default) or 'gated_residual'. The
+            gated-residual variant removes the pre-sublayer norms (its group norm owns
+            that role), so the QKV projection is built without the fused input layernorm
+            and pre_mlp_layernorm is IdentityOp.
         mla_down_proj_fusion (bool, optional): Enable fused q/kv down-projection and fused input
                                                layernorm when backend supports. Otherwise fall back
                                                to the unfused MLA.
@@ -243,6 +249,12 @@ def get_gpt_layer_with_transformer_engine_submodules(
             fallback_to_eager_attn=fallback_to_eager_attn, use_flex_attention=flex_attention
         )
 
+    gated_residual = enable_hyper_connection and hyper_connection_variant == "gated_residual"
+    if gated_residual:
+        hc_module = GatedResidualModule
+    else:
+        hc_module = HyperConnectionModule if enable_hyper_connection else IdentityOp
+
     mlp = get_mlp_module_spec_for_backend(
         backend=backend,
         num_experts=num_experts,
@@ -251,11 +263,16 @@ def get_gpt_layer_with_transformer_engine_submodules(
         use_te_activation_func=use_te_activation_func,
         dense_grouped_gemm=dense_grouped_gemm,
         use_grouped_gemm_for_dense_mlp=use_grouped_gemm_for_dense_mlp,
+        # Gated-residual layers have no pre-MLP norm to fold into linear_fc1.
+        fuse_layernorm=False if gated_residual else None,
     )
 
-    hc_module = HyperConnectionModule if enable_hyper_connection else IdentityOp
-
     if multi_latent_attention:
+        if gated_residual:
+            raise ValueError(
+                "hyper_connection_variant='gated_residual' is not supported with MLA; "
+                "the Qwen4-Exp architecture uses GQA/GDN layers."
+            )
         assert qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
         linear_q_up_proj = (
             backend.column_parallel_layer_norm_linear()
@@ -338,7 +355,13 @@ def get_gpt_layer_with_transformer_engine_submodules(
                 module=SelfAttention,
                 params={"attn_mask_type": AttnMaskType.causal},
                 submodules=SelfAttentionSubmodules(
-                    linear_qkv=backend.column_parallel_layer_norm_linear(),
+                    # The gated-residual variant has no pre-attention norm, so the
+                    # QKV projection must not carry a fused input layernorm.
+                    linear_qkv=(
+                        backend.column_parallel_linear()
+                        if gated_residual
+                        else backend.column_parallel_layer_norm_linear()
+                    ),
                     core_attention=backend.core_attention(),
                     linear_proj=backend.row_parallel_linear(),
                     q_layernorm=(
@@ -351,7 +374,11 @@ def get_gpt_layer_with_transformer_engine_submodules(
             ),
             self_attn_bda=get_bias_dropout_add,
             self_attention_hyper_connection=hc_module,
-            pre_mlp_layernorm=backend.layer_norm(has_residual=True) if num_experts else IdentityOp,
+            pre_mlp_layernorm=(
+                IdentityOp
+                if gated_residual
+                else (backend.layer_norm(has_residual=True) if num_experts else IdentityOp)
+            ),
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
             mlp_hyper_connection=hc_module,
@@ -559,8 +586,14 @@ def get_mlp_module_spec_for_backend(
     use_te_activation_func: bool = False,
     dense_grouped_gemm: bool = False,
     use_grouped_gemm_for_dense_mlp: bool = False,
+    fuse_layernorm: Optional[bool] = None,
 ) -> MlpBuilder:
-    """Helper function to get module spec for MLP/MoE"""
+    """Helper function to get module spec for MLP/MoE.
+
+    fuse_layernorm overrides whether the dense MLP folds the pre-MLP layernorm
+    into linear_fc1 (None = backend default). Pass False for layers that have
+    no pre-MLP norm at all (e.g. the gated-residual hyper-connection variant).
+    """
 
     linear_fc2 = backend.row_parallel_linear()
     activation_func = backend.activation_func() if use_te_activation_func else None
@@ -575,7 +608,10 @@ def get_mlp_module_spec_for_backend(
             module = not_none(TEFusedMLP).as_mlp_submodule
         else:
             module = MLP.as_mlp_submodule
-        if backend.fuse_layernorm_and_linear():
+        should_fuse = (
+            backend.fuse_layernorm_and_linear() if fuse_layernorm is None else fuse_layernorm
+        )
+        if should_fuse:
             linear_fc1 = backend.column_parallel_layer_norm_linear()
             assert linear_fc1 is not None
         else:
@@ -621,6 +657,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
             enable_hyper_connection=config.enable_hyper_connections,
+            hyper_connection_variant=config.hyper_connection_variant,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
@@ -634,6 +671,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen=config.use_kitchen,
             use_te_activation_func=config.use_te_activation_func,
             enable_hyper_connection=config.enable_hyper_connections,
+            hyper_connection_variant=config.hyper_connection_variant,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
