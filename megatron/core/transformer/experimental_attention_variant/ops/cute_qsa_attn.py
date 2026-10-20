@@ -2,8 +2,9 @@
 
 """QSA sparse GQA attention on Blackwell (SM100): host wrappers.
 
-:func:`qsa_cute_fwd` launches the forward CuTe DSL kernel of :mod:`cute_qsa_attn_kernels` over
-the query-tile supersets of :mod:`triton_qsa`. The LSE is kept in the log2 domain.
+:func:`qsa_cute_fwd` and :func:`qsa_cute_dq` launch the forward and dq CuTe DSL kernels of
+:mod:`cute_qsa_attn_kernels` over the query-tile supersets of :mod:`triton_qsa`. The LSE is kept
+in the log2 domain; the dq kernel also emits ``delta = rowsum(o * do)`` for dk/dv.
 
 Compilation: one compiled kernel per (kernel, dtype, head dim, GQA group, tile) key; every
 sequence-dependent size (``B``, ``TQ``, ``TK``, the entry count) is a runtime argument, so the
@@ -105,3 +106,70 @@ def qsa_cute_fwd(q, k, v, q_pos, ss: tq.QSASupersets, scale: float, tile_queries
         ss.n_tiles,
     )
     return o, lse
+
+
+def _compiled_dq(dtype: torch.dtype, D: int, G: int, BQ: int):
+    key = ("dq", dtype, D, G, BQ)
+    fn = _COMPILED.get(key)
+    if fn is None:
+        import cutlass
+        import cutlass.cute as cute
+
+        from megatron.core.transformer.experimental_attention_variant.ops.cute_qsa_attn_kernels import (  # pylint: disable=line-too-long
+            QSADqSm100,
+        )
+
+        cdt = _cutlass_dtype(dtype)
+        kernel = QSADqSm100(D, G, BQ)
+        bf = lambda: _fake(cdt, 4, D, 8, 16)  # noqa: E731
+        args = [
+            bf(),  # q
+            bf(),  # k
+            bf(),  # v
+            bf(),  # o
+            bf(),  # do
+            _fake(cutlass.Float32, 3),  # lse
+            _fake(cutlass.Float32, 3),  # delta (out)
+            bf(),  # dq (out)
+            _fake(cutlass.Int64, 1, align=8),  # q_pos
+            _fake(cutlass.Int64, 1, align=8),  # tile_offsets
+            _fake(cutlass.Int32, 1),  # entry_base
+            _fake(cutlass.Int32, 1),  # entry_end
+            _fake(cutlass.Uint8, 2, BQ, align=1),  # membership
+            cutlass.Float32(1.0),
+            cutlass.Int32(1),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        ]
+        fn = cute.compile(kernel, *args, options="--enable-tvm-ffi")
+        _COMPILED[key] = fn
+    return fn
+
+
+def qsa_cute_dq(q, k, v, o, do, lse, q_pos, ss: tq.QSASupersets, scale: float, tile_queries: int):
+    """dq and the fused ``delta = rowsum(o * do)`` (fp32) -> ``(dq, delta)``."""
+    B, TQ, HQ, D = q.shape
+    G = HQ // k.shape[2]
+    dq = torch.empty_like(q)
+    delta = torch.empty(B, TQ, HQ, dtype=torch.float32, device=q.device)
+    fn = _compiled_dq(q.dtype, D, G, tile_queries)
+    membership = ss.membership
+    if membership.shape[0] == 0:
+        membership = torch.zeros(1, tile_queries, dtype=torch.uint8, device=q.device)
+    fn(
+        q,
+        k,
+        v,
+        o,
+        do,
+        lse,
+        delta,
+        dq,
+        q_pos,
+        ss.tile_offsets,
+        ss.entry_base,
+        ss.entry_end,
+        membership,
+        float(scale),
+        ss.n_tiles,
+    )
+    return dq, delta
