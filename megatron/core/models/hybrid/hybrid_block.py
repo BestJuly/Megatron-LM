@@ -168,6 +168,9 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
                 "TransformerLayer with IdentityOp cross-attention and MLP."
             )
         self._offload_module_in_cuda_graph_cached: Optional[bool] = None
+        # Set by __call__ while it drives a layer whose Engram lookup it has already applied
+        # in front of the CUDA graph (cuda_graph_capture_engram_host); forward then skips it.
+        self._engram_applied_by_caller = False
         if config.hyper_connection_variant == "gated_residual":
             self.hyper_connection = GatedResidualModule(
                 config=config, layer_number=self.layer_number
@@ -204,8 +207,25 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         the layer as a whole may be captured is decided by the inner layer (e.g. an inner
         layer that hosts Engram, or whose attention variant performs host synchronizations).
         """
+        if self._engram_outside_cuda_graph():
+            # The Engram lookup runs eagerly in __call__, in front of the graph; whether the
+            # rest of the layer may be captured is decided by its other submodules.
+            predicate = getattr(self.inner_layer, "submodules_are_cuda_graph_capturable", None)
+            return predicate is None or predicate()
         predicate = getattr(self.inner_layer, "is_cuda_graph_capturable", None)
         return predicate is None or predicate()
+
+    def _engram_outside_cuda_graph(self) -> bool:
+        """Whether this wrapper runs its inner layer's Engram lookup outside the layer graph.
+
+        Opt-in (``cuda_graph_capture_engram_host``). The Engram residual is added to the
+        n-stream input before the read gate in either case; the lookup's data-dependent
+        shapes and all-to-all simply stay outside the captured region, which then starts at
+        the mHC aggregate and covers the rest of the layer.
+        """
+        return bool(getattr(self.config, "cuda_graph_capture_engram_host", False)) and (
+            getattr(self.inner_layer, "engram", None) is not None
+        )
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """Use one stream for split attention, and n streams for whole-wrapper capture.
@@ -301,7 +321,28 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         # Keep non-tensor recompute state out of TE CUDA graph inputs; the GPT
         # hyper-connection path follows the same pattern.
         self._mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
-        return super().__call__(*args, **kwargs)
+        if not self._engram_outside_cuda_graph():
+            return super().__call__(*args, **kwargs)
+
+        from megatron.core.transformer.cuda_graphs import is_graph_capturing
+
+        # Run the Engram lookup eagerly here, then hand the post-Engram n-stream tensor to the
+        # (captured or eager) rest of the layer. During capture the static sample input
+        # stands for that post-Engram tensor, so nothing is applied.
+        if not is_graph_capturing():
+            hidden_states = args[0] if args else kwargs["hidden_states"]
+            hidden_states = self.inner_layer._maybe_apply_engram(
+                hidden_states, kwargs.get("input_ids"), kwargs.get("packed_seq_params")
+            )
+            if args:
+                args = (hidden_states,) + tuple(args[1:])
+            else:
+                kwargs["hidden_states"] = hidden_states
+        self._engram_applied_by_caller = True
+        try:
+            return super().__call__(*args, **kwargs)
+        finally:
+            self._engram_applied_by_caller = False
 
     def _inner_is_moe(self) -> bool:
         """True when the inner layer is an MoE ``TransformerLayer``. Such layers use the
@@ -371,6 +412,9 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         use different layer scheduling and retain the existing per-layer graphs.
         """
         if not isinstance(next_layer, HyperConnectionHybridLayer):
+            return False
+        if getattr(next_layer.inner_layer, "engram", None) is not None:
+            # A tail's Engram lookup would have to run eagerly in the middle of the group.
             return False
         if self.config.recompute_granularity == 'full' or (
             self.config.recompute_granularity == 'selective'
@@ -856,7 +900,10 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         # both inner paths below bypass that part of TransformerLayer.forward -- the fast path
         # calls the sublayer helpers directly, and the fallback path is told to skip it via
         # _called_from_hybrid_mhc_wrapper.
-        if getattr(self.inner_layer, "engram", None) is not None:
+        if (
+            getattr(self.inner_layer, "engram", None) is not None
+            and not self._engram_applied_by_caller
+        ):
             hidden_states = self.inner_layer._maybe_apply_engram(
                 hidden_states, input_ids, packed_seq_params
             )

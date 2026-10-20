@@ -1462,13 +1462,36 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         itself uncapturable through an ``is_cuda_graph_capturable()`` method of its own;
         submodules that do not define one are assumed capturable.
         """
-        if self.engram is not None:
+        if getattr(self, "engram", None) is not None:
             return False
+        return self.submodules_are_cuda_graph_capturable()
+
+    def submodules_are_cuda_graph_capturable(self) -> bool:
+        """Whether the attention and MLP submodules allow per-layer CUDA graph capture.
+
+        This is ``is_cuda_graph_capturable`` without the Engram rule. A caller that runs the
+        Engram lookup itself, outside the layer's graph (``HyperConnectionHybridLayer`` with
+        ``cuda_graph_capture_engram_host``), consults it for the remaining part of the layer.
+        """
         for submodule in (self.self_attention, self.cross_attention, self.mlp):
             predicate = getattr(submodule, "is_cuda_graph_capturable", None)
             if predicate is not None and not predicate():
                 return False
         return True
+
+    def _moe_cuda_graph_outputs_shared_expert(self) -> bool:
+        """Whether a ``moe_router`` partial CUDA graph of this MoE layer outputs the shared
+        expert's result.
+
+        True when the shared expert runs inside the graph: it exists and is not overlapped
+        with the expert-parallel communication. A megakernel backend fuses the shared expert
+        into the eager megakernel, so its graph has no shared-expert output.
+        """
+        return (
+            self.config.moe_shared_expert_intermediate_size is not None
+            and not self.config.moe_shared_expert_overlap
+            and getattr(self.mlp, "megakernel_experts", None) is None
+        )
 
     def _attention_in_cuda_graph(self) -> bool:
         """Whether this layer's attention is inside the configured capture scope."""
@@ -1614,10 +1637,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             submodules += [self.pre_mlp_layernorm, self.mlp]
         elif self.is_moe_layer and CudaGraphModule.moe_router in self.config.cuda_graph_modules:
             submodules += [self.pre_mlp_layernorm, self.mlp.router]
-            if (
-                self.config.moe_shared_expert_intermediate_size is not None
-                and not self.config.moe_shared_expert_overlap
-            ):
+            if self._moe_cuda_graph_outputs_shared_expert():
                 submodules += [self.mlp.shared_experts]
         return submodules
 
@@ -1840,10 +1860,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # The inner residual is the last captured element; the mHC wrapper does not use it
         # (the n-stream BDA combines residual), so drop it.
         cuda_graph_output.pop()
-        if (
-            self.config.moe_shared_expert_intermediate_size is not None
-            and not self.config.moe_shared_expert_overlap
-        ):
+        if self._moe_cuda_graph_outputs_shared_expert():
             shared_expert_output = cuda_graph_output.pop()
 
         if CudaGraphModule.moe_preprocess in self.config.cuda_graph_modules:
@@ -1902,10 +1919,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             shared_expert_output, routing_map = None, None
             # residual is the last element in the CUDA graph output.
             residual = cuda_graph_output.pop()
-            if (
-                self.config.moe_shared_expert_intermediate_size is not None
-                and not self.config.moe_shared_expert_overlap
-            ):
+            if self._moe_cuda_graph_outputs_shared_expert():
                 # The shared expert output is the last second element in the CUDA graph output.
                 shared_expert_output = cuda_graph_output.pop()
 
@@ -3099,10 +3113,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             mlp_hc_h_post = cuda_graph_output.pop()
 
             shared_expert_output, routing_map = None, None
-            if (
-                self.config.moe_shared_expert_intermediate_size is not None
-                and not self.config.moe_shared_expert_overlap
-            ):
+            if self._moe_cuda_graph_outputs_shared_expert():
                 shared_expert_output = cuda_graph_output.pop()
 
             if CudaGraphModule.moe_preprocess in self.config.cuda_graph_modules:
