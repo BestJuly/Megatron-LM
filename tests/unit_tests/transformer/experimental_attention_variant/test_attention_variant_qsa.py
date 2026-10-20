@@ -66,7 +66,7 @@ def max_rel_err(got, ref):
     return ((got - ref).abs().max() / ref.abs().max().clamp_min(1e-30)).item()
 
 
-def make_config(head_dim=HEAD_DIM, dtype=torch.float32):
+def make_config(head_dim=HEAD_DIM, dtype=torch.float32, sparse=False):
     return TransformerConfig(
         num_layers=1,
         hidden_size=HIDDEN,
@@ -76,6 +76,7 @@ def make_config(head_dim=HEAD_DIM, dtype=torch.float32):
         use_cpu_initialization=False,
         params_dtype=dtype,
         bf16=dtype == torch.bfloat16,
+        qsa_use_sparse_attention=sparse,
         normalization="RMSNorm",
         layernorm_zero_centered_gamma=True,
         layernorm_epsilon=1e-6,
@@ -88,6 +89,11 @@ def make_config(head_dim=HEAD_DIM, dtype=torch.float32):
         qsa_indexer_budget=BUDGET,
         qsa_indexer_compress_ratio=RATIO,
     )
+
+
+def make_sparse_config():
+    """A config whose QSA layers run the sparse kernels (bf16, head dim 128)."""
+    return make_config(head_dim=SPARSE_HEAD_DIM, dtype=torch.bfloat16, sparse=True)
 
 
 def copy_weights_to_oracle(attn, config):
@@ -354,6 +360,189 @@ class TestQSATensorParallel:
         ), "indexer KL gradients diverge across TP ranks beyond scatter-add noise"
 
 
+@requires_qsa_kernels
+class TestQSASparseKernel:
+    """QSA-4: the sparse kernel path matches the dense-mask bridge (bf16, head dim 128)."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        self.config = make_sparse_config()
+        spec = get_qsa_module_spec_for_backend(self.config)
+        self.attn = build_module(spec, config=self.config, layer_number=1).cuda()
+        with torch.no_grad():
+            for norm in (
+                self.attn.q_layernorm,
+                self.attn.k_layernorm,
+                self.attn.indexer.q_layernorm,
+                self.attn.indexer.k_layernorm,
+            ):
+                norm.weight.uniform_(-0.1, 0.1)
+        self.rope = RotaryEmbedding(
+            kv_channels=SPARSE_HEAD_DIM, rotary_percent=ROTARY_PERCENT, rotary_base=ROPE_THETA
+        )
+        g = torch.Generator().manual_seed(7)
+        self.hidden = torch.randn(SEQ, BATCH, HIDDEN, generator=g).cuda().bfloat16()
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _fwd(self, sparse, hidden=None, requires_grad=False):
+        self.config.qsa_use_sparse_attention = sparse
+        h = (hidden if hidden is not None else self.hidden).detach().clone()
+        if requires_grad:
+            h.requires_grad_()
+        out, _ = self.attn(h, attention_mask=None, rotary_pos_emb=self.rope(h.shape[0]))
+        return out, h
+
+    @property
+    def freqs(self):
+        return self.rope(SEQ)
+
+    def test_sparse_matches_bridge_bshd(self):
+        with torch.no_grad():
+            bridge, _ = self._fwd(sparse=False)
+            sparse, _ = self._fwd(sparse=True)
+        # bf16 on both paths: a few output ulps
+        err = max_rel_err(sparse, bridge)
+        assert err < 2e-2, f"sparse vs bridge max rel err {err:.3e}"
+
+    def test_sparse_backward_matches_bridge(self):
+        bridge, h1 = self._fwd(sparse=False, requires_grad=True)
+        bridge.float().square().mean().backward()
+        g1 = h1.grad.clone()
+        w1 = self.attn.linear_qkv.weight.grad.clone()
+        self.attn.zero_grad(set_to_none=True)
+        sparse, h2 = self._fwd(sparse=True, requires_grad=True)
+        sparse.float().square().mean().backward()
+        g2 = h2.grad
+        w2 = self.attn.linear_qkv.weight.grad
+        assert max_rel_err(g2, g1) < 2e-2, f"dgrad max rel err {max_rel_err(g2, g1):.3e}"
+        assert max_rel_err(w2, w1) < 2e-2, f"wgrad max rel err {max_rel_err(w2, w1):.3e}"
+
+    def test_sparse_repeat_bitwise(self):
+        with torch.no_grad():
+            a, _ = self._fwd(sparse=True)
+            b, _ = self._fwd(sparse=True)
+        assert torch.equal(a, b)
+
+    def test_kernel_slot_order_invariance(self):
+        """``block_indices`` is a multiset contract: shuffling a query's selected
+        slots must not change the kernel output or any gradient. The superset union
+        is id-sorted and the dkv CSR is keyed by (batch, block), so this holds
+        bitwise — a regression here means the kernels started depending on slot
+        order (e.g. an own-block-first assumption leaking in)."""
+        from megatron.core.transformer.experimental_attention_variant.ops.cute_qsa_attn import (
+            qsa_sparse_attention,
+        )
+
+        with torch.no_grad():
+            sel = self.attn.indexer.select(self.hidden, self.freqs)
+        b, s, _ = sel.order.shape
+        own = sel.own_block.view(1, s, 1).expand(b, s, 1)
+        block_indices = torch.cat([own, sel.order], dim=-1)
+        block_indices = block_indices + sel.attn_block_offsets.view(1, s, 1)
+        block_counts = 1 + sel.picked.sum(dim=-1)
+
+        # Shuffle each row's valid slots (invalid slots stay behind the count).
+        S = block_indices.shape[-1]
+        g = torch.Generator(device="cuda").manual_seed(11)
+        rand = torch.rand(b, s, S, generator=g, device="cuda")
+        slot_valid = torch.arange(S, device="cuda") < block_counts.unsqueeze(-1)
+        perm = rand.masked_fill(~slot_valid, float("inf")).argsort(-1)
+        shuffled = torch.gather(block_indices, -1, perm)
+        assert not torch.equal(shuffled, block_indices)
+
+        gq = torch.Generator(device="cuda").manual_seed(13)
+        d = SPARSE_HEAD_DIM
+        q = torch.randn(b, s, N_HEADS, d, generator=gq, device="cuda").bfloat16()
+        k = torch.randn(b, s, N_KV_HEADS, d, generator=gq, device="cuda").bfloat16()
+        v = torch.randn(b, s, N_KV_HEADS, d, generator=gq, device="cuda").bfloat16()
+
+        def run(indices):
+            qq, kk, vv = (t.clone().requires_grad_() for t in (q, k, v))
+            out = qsa_sparse_attention(
+                qq,
+                kk,
+                vv,
+                block_indices=indices,
+                block_counts=block_counts,
+                block_bases=sel.attn_block_bases,
+                block_ends=sel.attn_block_ends,
+            )
+            out.float().square().mean().backward()
+            return out.detach(), qq.grad, kk.grad, vv.grad
+
+        ref = run(block_indices)
+        alt = run(shuffled)
+        for name, r, a in zip(("out", "dq", "dk", "dv"), ref, alt):
+            assert torch.equal(r, a), f"slot order changed {name}"
+
+    def test_thd_matches_per_document_bridge(self):
+        from megatron.core.packed_seq_params import PackedSeqParams
+
+        doc_lens = [120, 180]
+        T = sum(doc_lens)
+        g = torch.Generator().manual_seed(17)
+        h = torch.randn(T, 1, HIDDEN, generator=g).cuda().bfloat16()
+        cu = torch.tensor([0, 120, 300], dtype=torch.int32).cuda()
+        psp = PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=cu,
+            cu_seqlens_kv=cu,
+            max_seqlen_q=max(doc_lens),
+            max_seqlen_kv=max(doc_lens),
+        )
+        self.config.qsa_use_sparse_attention = True
+        freqs = self.rope(max(doc_lens))
+        with torch.no_grad():
+            packed, _ = self.attn(
+                h, attention_mask=None, rotary_pos_emb=freqs, packed_seq_params=psp
+            )
+        # reference: each document processed standalone through the dense bridge
+        self.config.qsa_use_sparse_attention = False
+        errs = []
+        with torch.no_grad():
+            for d in range(2):
+                s0, s1 = int(cu[d]), int(cu[d + 1])
+                solo, _ = self.attn(
+                    h[s0:s1], attention_mask=None, rotary_pos_emb=self.rope(s1 - s0)
+                )
+                errs.append(max_rel_err(packed[s0:s1], solo))
+        assert max(errs) < 2e-2, f"THD vs per-doc bridge max rel errs {errs}"
+
+    def test_kl_identical_on_sparse_and_bridge_paths(self):
+        """The KL is selection-driven and path-independent: enabling the sparse
+        kernel path must leave the indexer gradients unchanged vs the dense-mask
+        bridge (KL x sparse combination coverage)."""
+        # The indexer's trainability is fixed at build time: rebuild with the loss enabled.
+        self.config.qsa_indexer_loss_coeff = 0.01
+        self.attn = build_module(
+            get_qsa_module_spec_for_backend(self.config), config=self.config, layer_number=1
+        ).cuda()
+        self.attn.train()
+        freqs = self.rope(SEQ)
+
+        def run(sparse):
+            self.attn.zero_grad(set_to_none=True)
+            self.config.qsa_use_sparse_attention = sparse
+            out, _ = self.attn(self.hidden, attention_mask=None, rotary_pos_emb=freqs)
+            out.float().square().mean().backward()
+            return self.attn.indexer.index_qk_proj.weight.grad.clone()
+
+        try:
+            g_bridge = run(sparse=False)
+            g_sparse = run(sparse=True)
+        finally:
+            self.config.qsa_use_sparse_attention = True
+        assert torch.isfinite(g_sparse).all() and g_sparse.abs().sum() > 0
+        # allclose, not bitwise: the loss's torch.gather backward is a scatter-add
+        # (atomic) outside deterministic mode, so even one path is not repeatable
+        # at the last bit. The selection and the loss inputs are identical by
+        # construction; anything beyond atomic noise means the paths diverged.
+        torch.testing.assert_close(g_sparse, g_bridge)
+
+
 class TestQSAIndexerSparseKL(TestQSAAttentionParity):
     """QSA-3: sparse-KL distillation trains the indexer."""
 
@@ -531,6 +720,204 @@ class TestQSADDPOverlapGradReduce:
             out, _ = model(hidden, attention_mask=None, rotary_pos_emb=freqs)
             out.float().square().mean().backward()
             model.finish_grad_sync()
+
+
+@requires_qsa_kernels
+class TestQSAContextParallel:
+    """Allgather-CP sharding consistency vs the single-rank path (2 distributed ranks).
+
+    The reference is the SAME module (same weights, same kernels) run on the full
+    sequence with a size-1 CP group: the non-CP path is already oracle-verified, so
+    the CP contract is exact sharding consistency. Selections must be bitwise equal
+    at the local rows (the score pipeline is row-independent); the attention output
+    is allclose only, because the shared-superset query tiles regroup under a
+    different local length (summation-order noise, a few bf16 ulps). A pure-torch-oracle
+    comparison is deliberately NOT used here: at top-k boundary near-ties, oracle
+    (CPU einsum) and kernel (Triton ieee dot) fp32 rounding legitimately disagree.
+    """
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _build(self, layout="per_document", indexer_loss_coeff=None):
+        Utils.initialize_model_parallel(1, 1, context_parallel_size=2)
+        model_parallel_cuda_manual_seed(123)
+        config = make_sparse_config()
+        config.qsa_indexer_loss_coeff = indexer_loss_coeff
+        config.context_parallel_size = 2
+        config.cp_comm_type = "all_gather"
+        config.qsa_cp_packing_layout = layout
+        spec = get_qsa_module_spec_for_backend(config)
+        attn = build_module(spec, config=config, layer_number=1).cuda()
+        import megatron.core.parallel_state as ps
+
+        return config, attn, ps.get_context_parallel_rank()
+
+    @staticmethod
+    def _self_group():
+        """A size-1 group per rank, to run the module's non-CP path as reference."""
+        world = torch.distributed.get_world_size()
+        groups = [torch.distributed.new_group([r]) for r in range(world)]
+        return groups[torch.distributed.get_rank()]
+
+    def _reference_full(self, attn, full, freqs_full, psp=None):
+        """Run the same module on the FULL sequence via the non-CP path."""
+        own = self._self_group()
+        pg = attn.pg_collection
+        old_cp = pg.cp
+        pg.cp = own
+        try:
+            with torch.no_grad():
+                sel = attn.indexer.select(
+                    full, freqs_full, cu_seqlens=psp.cu_seqlens_q if psp else None
+                )
+                out, _ = attn(
+                    full, attention_mask=None, rotary_pos_emb=freqs_full, packed_seq_params=psp
+                )
+        finally:
+            pg.cp = old_cp
+        return out, sel
+
+    def test_cp2_bshd_matches_single_rank(self):
+        if Utils.world_size < 2:
+            pytest.skip("QSA CP2 parity requires at least 2 distributed ranks")
+        from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
+            build_zigzag_cp_local_positions,
+        )
+
+        config, attn, cp_rank = self._build()
+        g = torch.Generator().manual_seed(7)
+        full = torch.randn(SEQ, BATCH, HIDDEN, generator=g).cuda().bfloat16()
+        rows = build_zigzag_cp_local_positions(SEQ, 2, cp_rank, full.device)
+        shard = full.index_select(0, rows).clone().requires_grad_()
+        rope = RotaryEmbedding(
+            kv_channels=SPARSE_HEAD_DIM, rotary_percent=ROTARY_PERCENT, rotary_base=ROPE_THETA
+        )
+        with torch.no_grad():
+            sel_cp = attn.indexer.select(shard, rope(SEQ))
+        out, _ = attn(shard, attention_mask=None, rotary_pos_emb=rope(SEQ))
+
+        ref_out, ref_sel = self._reference_full(
+            attn, full, rope(SEQ, packed_seq=True)[:SEQ].contiguous()
+        )
+        # Selection is bitwise identical at the local rows (row-independent scores).
+        assert torch.equal(sel_cp.order, ref_sel.order[:, rows]), "CP selection diverged"
+        assert torch.equal(sel_cp.picked, ref_sel.picked[:, rows])
+        err = max_rel_err(out.detach(), ref_out.index_select(0, rows))
+        assert err < 2e-2, f"CP2 BSHD vs single-rank max rel err {err:.3e}"
+
+        # Backward exercises the differentiable K/V gather (reduce-scatter grads).
+        out.float().square().mean().backward()
+        assert shard.grad is not None and torch.isfinite(shard.grad).all()
+        assert torch.isfinite(attn.linear_qkv.weight.grad).all()
+
+    def _thd_case(self, layout, cu_list):
+        from megatron.core.packed_seq_params import PackedSeqParams
+        from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
+            build_packed_allgather_cp_local_positions,
+        )
+
+        config, attn, cp_rank = self._build(layout)
+        T = cu_list[-1]
+        max_len = max(b - a for a, b in zip(cu_list[:-1], cu_list[1:]))
+        g = torch.Generator().manual_seed(17)
+        h = torch.randn(T, 1, HIDDEN, generator=g).cuda().bfloat16()
+        cu = torch.tensor(cu_list, dtype=torch.int32).cuda()
+        rows = build_packed_allgather_cp_local_positions(
+            cu, 2, cp_rank, h.device, cp_packing_layout=layout
+        )
+        shard = h.index_select(0, rows).contiguous()
+        psp = PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=cu,
+            cu_seqlens_kv=cu,
+            max_seqlen_q=max_len,
+            max_seqlen_kv=max_len,
+        )
+        rope = RotaryEmbedding(
+            kv_channels=SPARSE_HEAD_DIM, rotary_percent=ROTARY_PERCENT, rotary_base=ROPE_THETA
+        )
+        # packed_seq=True: THD uses the FULL frequency table on every rank.
+        freqs = rope(max_len, packed_seq=True)
+        with torch.no_grad():
+            sel_cp = attn.indexer.select(shard, freqs, cu_seqlens=cu)
+            out, _ = attn(shard, attention_mask=None, rotary_pos_emb=freqs, packed_seq_params=psp)
+
+        ref_out, ref_sel = self._reference_full(attn, h, freqs, psp=psp)
+        assert torch.equal(
+            sel_cp.order, ref_sel.order[:, rows]
+        ), f"CP selection diverged ({layout})"
+        assert torch.equal(sel_cp.picked, ref_sel.picked[:, rows])
+        err = max_rel_err(out, ref_out.index_select(0, rows))
+        assert err < 2e-2, f"CP2 THD ({layout}) vs single-rank max rel err {err:.3e}"
+
+    def test_cp2_thd_per_document_matches_single_rank(self):
+        if Utils.world_size < 2:
+            pytest.skip("QSA CP2 parity requires at least 2 distributed ranks")
+        self._thd_case("per_document", [0, 120, 300])  # doc lens divisible by 2 * cp
+
+    def test_cp2_thd_per_sequence_matches_single_rank(self):
+        if Utils.world_size < 2:
+            pytest.skip("QSA CP2 parity requires at least 2 distributed ranks")
+        # doc len 90 is NOT divisible by 2 * cp — only the flattened pack is.
+        self._thd_case("per_sequence", [0, 90, 300])
+
+    def test_cp2_kl_trains_indexer(self):
+        if Utils.world_size < 2:
+            pytest.skip("QSA CP2 parity requires at least 2 distributed ranks")
+        from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
+            build_zigzag_cp_local_positions,
+        )
+
+        config, attn, cp_rank = self._build(indexer_loss_coeff=0.01)
+        attn.train()
+        g = torch.Generator().manual_seed(7)
+        full = torch.randn(SEQ, BATCH, HIDDEN, generator=g).cuda().bfloat16()
+        rows = build_zigzag_cp_local_positions(SEQ, 2, cp_rank, full.device)
+        shard = full.index_select(0, rows).contiguous()
+        rope = RotaryEmbedding(
+            kv_channels=SPARSE_HEAD_DIM, rotary_percent=ROTARY_PERCENT, rotary_base=ROPE_THETA
+        )
+        out, _ = attn(shard, attention_mask=None, rotary_pos_emb=rope(SEQ))
+        out.float().square().mean().backward()
+        grad = attn.indexer.index_qk_proj.weight.grad
+        assert grad is not None and torch.isfinite(grad).all() and grad.abs().sum() > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+class TestQSAKernelRequirements:
+    """A QSA layer on the sparse path checks the device and shapes once, when it is built."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _build(config):
+        return build_module(get_qsa_module_spec_for_backend(config), config=config, layer_number=1)
+
+    def test_non_blackwell_device_is_rejected(self, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (9, 0))
+        with pytest.raises(RuntimeError, match="Blackwell"):
+            self._build(make_sparse_config())
+
+    @requires_qsa_kernels
+    def test_unsupported_shapes_are_rejected(self):
+        with pytest.raises(ValueError, match="bf16 or fp16"):
+            self._build(make_config(head_dim=SPARSE_HEAD_DIM, sparse=True))
+        with pytest.raises(ValueError, match="head dims"):
+            self._build(make_config(head_dim=HEAD_DIM, dtype=torch.bfloat16, sparse=True))
+        mha = make_config(head_dim=256, dtype=torch.bfloat16, sparse=True)
+        mha.num_query_groups = N_HEADS
+        with pytest.raises(ValueError, match="at least 2 query heads"):
+            self._build(mha)
+
+    def test_dense_bridge_needs_no_sparse_kernels(self, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (9, 0))
+        self._build(make_config())
 
 
 class TestQSAIndexerCheckpointStrictLoad:

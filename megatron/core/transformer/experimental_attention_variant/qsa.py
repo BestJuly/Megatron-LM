@@ -38,6 +38,7 @@ from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_e
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
+from megatron.core.transformer.cuda_graph_config import cuda_graph_captures_attention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
@@ -45,6 +46,10 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_indexer_loss import (
     normalize_indexer_target_,
+)
+from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
+    build_zigzag_allgather_cp_key_reorder,
+    build_zigzag_cp_local_positions,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_masking import (
     masked_log_softmax,
@@ -171,6 +176,16 @@ class QSAIndexer(MegatronModule):
         for param in self.parameters():
             setattr(param, "average_gradients_across_tp_domain", True)
 
+        # Gathered-global BSHD frequency tables per (s_local, dtype); rotary
+        # frequencies are position-deterministic, so one gather per length suffices.
+        self._cp_freqs_cache = {}
+
+        # When the CUDA-graph scope captures attention, selection and the sparse-kernel
+        # metadata are built with device ops at shape-only upper bounds (no host syncs,
+        # no data-dependent shapes). Bit-identical to the dynamic path, which stays the
+        # default because it scans only each document's own blocks.
+        self.static_shapes = cuda_graph_captures_attention(config)
+
     @nvtx_decorator(message="QSA::indexer.project")
     def _project(self, hidden_states: Tensor, rotary_pos_emb: Tensor):
         """Shared front-end: detach, SP-gather, project, norm and RoPE the queries."""
@@ -222,8 +237,12 @@ class QSAIndexer(MegatronModule):
             rotary_pos_emb: rotary frequencies covering the longest document.
             cu_seqlens: optional ``[n_docs + 1]`` boundaries for packed THD inputs
                 (requires b == 1). Blocks never cross documents; positions and block
-                ids restart at every boundary.
+                ids restart at every boundary. Under CP the boundaries describe the
+                GLOBAL pack; the local shard is the config-declared zigzag layout.
         """
+        cp_group = self.pg_collection.cp
+        if cp_group is not None and cp_group.size() > 1:
+            return self._select_cp(hidden_states, rotary_pos_emb, cu_seqlens)
         q_all, raw_keys = self._project(hidden_states, rotary_pos_emb)
         s, b = q_all.shape[0], q_all.shape[1]
         r = self.compress_ratio
@@ -261,6 +280,8 @@ class QSAIndexer(MegatronModule):
             )
 
         assert b == 1, "packed THD inputs must be flattened to batch size 1"
+        if self.static_shapes:
+            return self._select_thd_static(q_all, raw_keys, rotary_pos_emb, cu_seqlens)
         k = max(self.block_topk, 1)
         q_rot = torch.empty_like(q_all)
         order = torch.zeros(1, s, k, dtype=torch.long, device=device)
@@ -367,6 +388,302 @@ class QSAIndexer(MegatronModule):
             attn_block_ends=torch.cat(attn_ends_parts),
         )
 
+    @nvtx_decorator(message="QSA::indexer.select_thd_static")
+    def _select_thd_static(
+        self, q_all: Tensor, raw_keys: Tensor, rotary_pos_emb: Tensor, cu_seqlens: Tensor
+    ) -> QSASelection:
+        """Packed-THD selection without host synchronization, at fixed shapes.
+
+        Bit-identical to the per-document loop in :meth:`select`, but every quantity that
+        loop derives on the host from the ``cu_seqlens`` values is computed on the device
+        and every buffer is sized from shapes alone, so the selection can be captured into
+        a CUDA graph and replayed on any packing that fits the captured shapes:
+
+        * per-token document id / position / offsets via ``searchsorted`` over the
+          boundaries, and per-document block offsets via ``cumsum``;
+        * block keys for all documents in one fixed ``[s // r]`` buffer (a document of
+          length ``l`` owns ``l // r`` consecutive rows; the unused tail rows are never
+          visible to any query);
+        * one top-k scan over that buffer with the visible window ``[block_offset,
+          block_offset + own_block)`` per query, at the fixed width ``block_topk``;
+          slots beyond a short document's block count stay unpicked, as before;
+        * attention-kernel blocks in a fixed ``[s // r + n_docs]`` buffer whose unused
+          tail entries are empty token ranges.
+
+        Requires ``cu_seqlens[-1] == s`` (the static THD contract pads the pack to the
+        capacity); zero-length documents are allowed anywhere.
+        """
+        s, b = q_all.shape[0], q_all.shape[1]
+        r = self.compress_ratio
+        device = q_all.device
+        if not torch.cuda.is_current_stream_capturing():
+            # Eager-only check of the precondition (a device read; skipped under capture).
+            assert int(cu_seqlens[-1]) == s, (
+                f"static QSA selection needs the pack to fill the buffer: cu_seqlens[-1]="
+                f"{int(cu_seqlens[-1])} != {s}"
+            )
+        cu = cu_seqlens.to(device=device, dtype=torch.int64)
+        n_docs = cu.numel() - 1
+        lens = cu[1:] - cu[:-1]
+        t = torch.arange(s, device=device, dtype=torch.int64)
+        # Document of each token (empty documents are skipped by searchsorted).
+        doc = torch.searchsorted(cu[1:].contiguous(), t, right=True).clamp(max=n_docs - 1)
+        token_offsets = cu[doc]
+        pos = t - token_offsets
+        own_block = (pos + 1) // r
+
+        q_rot = self._rope_at_positions(q_all, rotary_pos_emb, pos)
+
+        # Pooled block keys: document d owns rows [blk_off[d], blk_off[d] + lens[d] // r).
+        blk_off = torch.nn.functional.pad((lens // r).cumsum(0), (1, 0))
+        block_offsets = blk_off[doc]
+        nb_max = s // r
+        k = max(self.block_topk, 1)
+        if nb_max > 0:
+            block_keys = self._packed_block_keys(raw_keys, rotary_pos_emb, cu, blk_off, nb_max)
+            order, picked = self._streaming_topk(
+                q_rot, block_keys, block_offsets + own_block, nb_max, k, m_lo=block_offsets
+            )
+            # Back to document-local ids (unpicked slots stay 0, as in the loop).
+            order = torch.where(picked, order - block_offsets.view(1, s, 1), 0)
+        else:
+            block_keys = raw_keys.new_zeros(0, b, self.head_dim)
+            order = torch.zeros(b, s, k, dtype=torch.long, device=device)
+            picked = torch.zeros(b, s, k, dtype=torch.bool, device=device)
+
+        # Attention-kernel block space: a non-empty document owns lens // r + 1 blocks.
+        n_attn = torch.where(lens > 0, lens // r + 1, 0)
+        attn_off = torch.nn.functional.pad(n_attn.cumsum(0), (1, 0))
+        na_max = s // r + n_docs
+        aslot = torch.arange(na_max, device=device, dtype=torch.int64)
+        adoc = torch.searchsorted(attn_off[1:].contiguous(), aslot, right=True).clamp(
+            max=n_docs - 1
+        )
+        in_use = aslot < attn_off[-1]
+        bases = cu[adoc] + (aslot - attn_off[adoc]) * r
+        ends = torch.minimum(bases + r, cu[adoc + 1])
+        attn_bases = torch.where(in_use, bases, 0).to(torch.int32)
+        attn_ends = torch.where(in_use, ends, 0).to(torch.int32)
+
+        return QSASelection(
+            q=q_rot,
+            block_keys=block_keys,
+            order=order,
+            picked=picked,
+            own_block=own_block,
+            block_offsets=block_offsets,
+            token_offsets=token_offsets,
+            attn_block_offsets=attn_off[doc],
+            attn_block_bases=attn_bases,
+            attn_block_ends=attn_ends,
+        )
+
+    def _packed_block_keys(
+        self, raw_keys: Tensor, rotary_pos_emb: Tensor, cu: Tensor, blk_off: Tensor, nb_max: int
+    ) -> Tensor:
+        """Block keys of a packed pack in one fixed ``[nb_max]`` buffer (no host sync).
+
+        Document ``d`` (token range ``[cu[d], cu[d + 1])``) owns rows
+        ``[blk_off[d], blk_off[d + 1])``; each block is pooled from its ``r`` tokens and
+        rotated at its first token's document-local position. Rows past ``blk_off[-1]``
+        are pooled from the pack's first ``r`` tokens and are never visible to a query.
+        """
+        r = self.compress_ratio
+        b = raw_keys.shape[1]
+        device = raw_keys.device
+        n_docs = cu.numel() - 1
+        slot = torch.arange(nb_max, device=device, dtype=torch.int64)
+        bdoc = torch.searchsorted(blk_off[1:].contiguous(), slot, right=True).clamp(max=n_docs - 1)
+        j = slot - blk_off[bdoc]
+        start = torch.where(slot < blk_off[-1], cu[bdoc] + j * r, 0)
+        rows = (start.unsqueeze(1) + torch.arange(r, device=device)).reshape(-1)
+        pooled = raw_keys.index_select(0, rows).view(nb_max, r, b, self.head_dim)
+        pooled = pooled.float().mean(dim=1).to(raw_keys.dtype)  # [nb_max, b, d]
+        pooled = self.k_layernorm(pooled)
+        # Each block's RoPE position is its first token's document-local position.
+        block_freqs = rotary_pos_emb.index_select(0, j * r).contiguous()
+        return apply_rotary_pos_emb(
+            pooled.unsqueeze(2), block_freqs, config=self.config, cp_group=self.pg_collection.cp
+        ).squeeze(2)
+
+    def _rope_at_positions(self, t: Tensor, rotary_pos_emb: Tensor, positions: Tensor) -> Tensor:
+        """Apply RoPE at explicit per-row positions from a FULL frequency table.
+
+        Indexing the frequency table by position keeps the BSHD apply path (which
+        never slices by CP) exact for any sharding layout, sidestepping the
+        per-document assumption in the THD+CP rope helper. Note: under CP the
+        model passes a full table only for packed (THD) inputs — for BSHD,
+        RotaryEmbedding already emits the rank's zigzag slice."""
+        freqs = rotary_pos_emb.index_select(0, positions).contiguous()
+        return apply_rotary_pos_emb(t, freqs, config=self.config, cp_group=self.pg_collection.cp)
+
+    def _cp_global_freqs(self, rotary_pos_emb: Tensor, s_local: int, reorder: Tensor) -> Tensor:
+        """Rebuild the full BSHD frequency table from each rank's zigzag slice.
+
+        Under CP, ``RotaryEmbedding`` returns only this rank's zigzag rows for
+        BSHD inputs; the pooled block keys live in GLOBAL order, so the table is
+        all-gathered and restored with the same reorder index as the keys. The
+        result is cached per (length, dtype): frequencies are a deterministic
+        function of position, so one gather per length suffices."""
+        key = (s_local, rotary_pos_emb.dtype)
+        cached = self._cp_freqs_cache.get(key)
+        if cached is not None:
+            return cached
+        gathered = gather_from_sequence_parallel_region(
+            rotary_pos_emb[:s_local].contiguous(), group=self.pg_collection.cp
+        )
+        result = gathered.index_select(0, reorder)
+        self._cp_freqs_cache[key] = result
+        return result
+
+    def _cp_layout(self, s_local: int, cu_seqlens: Optional[Tensor], device):
+        """(q_positions, key_reorder_idx) for this rank's allgather-CP shard."""
+        cp_group = self.pg_collection.cp
+        cp_size, cp_rank = cp_group.size(), cp_group.rank()
+        if cu_seqlens is None:
+            q_pos = build_zigzag_cp_local_positions(s_local * cp_size, cp_size, cp_rank, device)
+            reorder = build_zigzag_allgather_cp_key_reorder(s_local, cp_size, device)
+            return q_pos, reorder
+        # Packed THD: device-only (graph-capturable) builder; equal to
+        # build_packed_allgather_cp_query_positions_and_key_reorder under the contract
+        # cu_seqlens[-1] == s_local * cp_size, without its boolean-mask / .item() syncs.
+        from megatron.core.transformer.experimental_attention_variant.ops.triton_qsa_select import (  # pylint: disable=line-too-long
+            qsa_cp_layout_static,
+        )
+
+        return qsa_cp_layout_static(
+            cu_seqlens.to(device=device),
+            s_local,
+            cp_size,
+            cp_rank,
+            self.config.qsa_cp_packing_layout,
+        )
+
+    def _select_cp(
+        self, hidden_states: Tensor, rotary_pos_emb: Tensor, cu_seqlens: Optional[Tensor] = None
+    ) -> QSASelection:
+        """Allgather-CP selection: local queries, globally ordered block keys.
+
+        Only the single shared raw index-key head is all-gathered across CP (its
+        backward is a reduce-scatter, so key projections receive gradient from the
+        queries on every rank); queries stay local at their zigzag positions.
+        Pooling happens strictly AFTER the gather+reorder — pooling rank-local
+        neighbours would combine tokens that are not adjacent in the sequence.
+        All returned block/token coordinates live in the GLOBAL token space, and
+        ``q_positions`` records each local row's global position.
+
+        Host-sync free in every mode (no ``.tolist()``/``.item()``, no per-document
+        loop): packed THD inputs use fixed ``[S // r]`` block-key and
+        ``[S // r + n_docs]`` attention-block buffers, exactly like
+        :meth:`_select_thd_static`, so the layer is CUDA-graph capturable under CP.
+        """
+        cp_group = self.pg_collection.cp
+        cp_size = cp_group.size()
+        q_all, raw_keys = self._project(hidden_states, rotary_pos_emb)
+        s_loc, b = q_all.shape[0], q_all.shape[1]
+        r = self.compress_ratio
+        device = q_all.device
+
+        q_pos, reorder = self._cp_layout(s_loc, cu_seqlens, device)
+        gathered = gather_from_sequence_parallel_region(raw_keys, group=cp_group)
+        global_keys = gathered.index_select(0, reorder)  # [S_g, b, d] global order
+
+        if cu_seqlens is None:
+            s_g = s_loc * cp_size
+            m_t = (q_pos + 1) // r
+            n_blocks = s_g // r
+            k = max(min(self.block_topk, n_blocks), 1)
+            # BSHD under CP: rotary_pos_emb is already this rank's zigzag slice, so
+            # it applies to the local queries directly; the block keys need the
+            # rebuilt GLOBAL table.
+            q = apply_rotary_pos_emb(
+                q_all, rotary_pos_emb[:s_loc], config=self.config, cp_group=self.pg_collection.cp
+            )
+            if n_blocks > 0:
+                global_freqs = self._cp_global_freqs(rotary_pos_emb, s_loc, reorder)
+                block_keys = self._block_keys(global_keys, global_freqs, n_blocks)
+                order, picked = self._streaming_topk(q, block_keys, m_t, n_blocks, k)
+            else:
+                block_keys = raw_keys.new_zeros(0, b, self.head_dim)
+                order = torch.zeros(b, s_loc, k, dtype=torch.long, device=device)
+                picked = torch.zeros(b, s_loc, k, dtype=torch.bool, device=device)
+            nb_attn = s_g // r + 1
+            attn_bases = torch.arange(nb_attn, device=device, dtype=torch.int32) * r
+            attn_ends = torch.clamp(attn_bases + r, max=s_g)
+            return QSASelection(
+                q=q,
+                block_keys=block_keys,
+                order=order,
+                picked=picked,
+                own_block=m_t,
+                attn_block_offsets=torch.zeros(s_loc, dtype=torch.long, device=device),
+                attn_block_bases=attn_bases,
+                attn_block_ends=attn_ends,
+                q_positions=q_pos,
+                cp_key_reorder=reorder,
+            )
+
+        assert b == 1, "packed THD inputs must be flattened to batch size 1"
+        # Host-sync free and fixed-shape (CUDA-graph capturable), the CP analogue of
+        # _select_thd_static: every quantity is a device op over shape-only sizes. The
+        # contract is cu_seqlens[-1] == s_loc * cp_size (the pack fills the buffer).
+        s_g = s_loc * cp_size
+        cu = cu_seqlens.to(device=device, dtype=torch.int64)
+        n_docs = cu.numel() - 1
+        lens = cu[1:] - cu[:-1]
+        # Positions restart per document; map each local row to its document.
+        doc_idx = torch.searchsorted(cu, q_pos, right=True) - 1
+        doc_start = cu[doc_idx]
+        pos_doc = q_pos - doc_start
+        m_t = (pos_doc + 1) // r
+        q_rot = self._rope_at_positions(q_all, rotary_pos_emb, pos_doc)
+
+        # Block keys of the GLOBAL pack in one fixed [s_g // r] buffer (same layout as
+        # the single-rank static path); one top-k scan with a per-row visible window
+        # [block_offset, block_offset + own_block) replaces the per-document loop.
+        blk_off = torch.nn.functional.pad((lens // r).cumsum(0), (1, 0))
+        block_offsets = blk_off[doc_idx]
+        nb_max = s_g // r
+        k = max(self.block_topk, 1)
+        if nb_max > 0:
+            block_keys = self._packed_block_keys(global_keys, rotary_pos_emb, cu, blk_off, nb_max)
+            order, picked = self._streaming_topk(
+                q_rot, block_keys, block_offsets + m_t, nb_max, k, m_lo=block_offsets
+            )
+            order = torch.where(picked, order - block_offsets.view(1, s_loc, 1), 0)
+        else:
+            block_keys = raw_keys.new_zeros(0, b, self.head_dim)
+            order = torch.zeros(b, s_loc, k, dtype=torch.long, device=device)
+            picked = torch.zeros(b, s_loc, k, dtype=torch.bool, device=device)
+
+        # Attention-kernel block space in GLOBAL token coordinates: a non-empty document
+        # owns lens // r + 1 blocks; unused tail entries of the fixed
+        # [s_g // r + n_docs] buffer are empty token ranges.
+        n_attn = torch.where(lens > 0, lens // r + 1, 0)
+        attn_off = torch.nn.functional.pad(n_attn.cumsum(0), (1, 0))
+        na_max = s_g // r + n_docs
+        aslot = torch.arange(na_max, device=device, dtype=torch.int64)
+        adoc = torch.searchsorted(attn_off[1:].contiguous(), aslot, right=True).clamp(
+            max=n_docs - 1
+        )
+        in_use = aslot < attn_off[-1]
+        bases = cu[adoc] + (aslot - attn_off[adoc]) * r
+        ends = torch.minimum(bases + r, cu[adoc + 1])
+        return QSASelection(
+            q=q_rot,
+            block_keys=block_keys,
+            order=order,
+            picked=picked,
+            own_block=m_t,
+            block_offsets=block_offsets,
+            token_offsets=doc_start,
+            attn_block_offsets=attn_off[doc_idx],
+            attn_block_bases=torch.where(in_use, bases, 0).to(torch.int32),
+            attn_block_ends=torch.where(in_use, ends, 0).to(torch.int32),
+            q_positions=q_pos,
+            cp_key_reorder=reorder,
+        )
+
     def forward(
         self, hidden_states: Tensor, rotary_pos_emb: Tensor, return_selection: bool = False
     ) -> Union[Tensor, Tuple[Tensor, Optional[QSASelection]]]:
@@ -384,8 +701,8 @@ class QSAIndexer(MegatronModule):
             complete attention mask for the layer.
         """
         assert self.pg_collection.cp is None or self.pg_collection.cp.size() == 1, (
-            "The dense-mask bridge is single-rank only; QSA does not support context "
-            "parallelism on this path."
+            "The dense-mask bridge is single-rank only; QSA under context parallelism "
+            "requires the sparse kernel path (qsa_use_sparse_attention=True)."
         )
         selection = self.select(hidden_states, rotary_pos_emb)
         order, picked = selection.order, selection.picked
@@ -501,6 +818,43 @@ class QSAIndexer(MegatronModule):
         return order, picked
 
 
+def _require_qsa_kernel_support(config: TransformerConfig, tp_size: int) -> None:
+    """The QSA sparse-attention kernels are CuTe DSL kernels for Blackwell (SM100-class) GPUs.
+
+    Checked once, when a QSA layer that uses them is built, so that an unsupported device or
+    shape fails with its cause instead of inside a kernel launch.
+    """
+    if not config.qsa_use_sparse_attention:
+        return
+    what = "qsa_use_sparse_attention"
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        raise RuntimeError(
+            f"{what} requires a Blackwell (SM100-class: B200, GB200, B300, GB300) GPU; the "
+            "QSA kernels are CuTe DSL tcgen05 kernels."
+        )
+    try:
+        import cutlass  # noqa: F401  # pylint: disable=unused-import
+    except ImportError as e:
+        raise RuntimeError(f"{what} requires nvidia-cutlass-dsl (CuTe DSL).") from e
+    if not (config.bf16 or config.fp16):
+        raise ValueError("qsa_use_sparse_attention requires bf16 or fp16 training.")
+    if config.kv_channels not in (128, 256):
+        raise ValueError(
+            f"qsa_use_sparse_attention supports head dims 128 and 256, got "
+            f"kv_channels={config.kv_channels}."
+        )
+    group = config.num_attention_heads // config.num_query_groups
+    if group > 128:
+        raise ValueError(
+            f"qsa_use_sparse_attention supports at most 128 query heads per KV head, got {group}."
+        )
+    if config.kv_channels == 256 and group == 1:
+        # The dq kernel's 128-query tile at G = 1 needs 1 KB more shared memory than SM100 has.
+        raise ValueError(
+            "qsa_use_sparse_attention with head dim 256 needs at least 2 query heads per KV head."
+        )
+
+
 @dataclass
 class QSASelfAttentionSubmodules(SelfAttentionSubmodules):
     """Self-attention submodules plus the QSA indexer."""
@@ -542,6 +896,17 @@ class QSASelfAttention(SelfAttention):
         if not self.config.qsa_indexer_loss_coeff:
             for param in self.indexer.parameters():
                 param.requires_grad_(False)
+        _require_qsa_kernel_support(self.config, self.pg_collection.tp.size())
+
+    def is_cuda_graph_capturable(self) -> bool:
+        """QSA layers are capturable, with or without (allgather) context parallelism.
+
+        With attention in the capture scope the indexer runs its static-shape path
+        (:meth:`QSAIndexer._select_thd_static`, or the always host-sync-free
+        :meth:`QSAIndexer._select_cp` under CP) and the sparse kernels build their
+        fixed-capacity metadata.
+        """
+        return True
 
     def forward(
         self,
@@ -564,31 +929,45 @@ class QSASelfAttention(SelfAttention):
         loss_coeff = self.config.qsa_indexer_loss_coeff or 0.0
         train_indexer = self.training and loss_coeff > 0 and torch.is_grad_enabled()
 
-        assert packed_seq_params is None, (
-            "QSA dense-mask bridge supports BSHD only; packed THD inputs need "
-            "the sparse kernel path."
-        )
-        if train_indexer:
-            selection_mask, selection = self.indexer(hidden_states, freqs, return_selection=True)
-        else:
-            selection_mask, selection = self.indexer(hidden_states, freqs), None
-        if attention_mask is not None:
-            if attention_mask.dtype != torch.bool:
+        if self.config.qsa_use_sparse_attention:
+            if attention_mask is not None and attention_mask.dtype != torch.bool:
                 raise ValueError(
                     "QSA expects a bool attention mask (True = masked out); additive "
                     f"float masks are not supported (got dtype {attention_mask.dtype})."
                 )
-            selection_mask = selection_mask | attention_mask
+            # A bool mask is assumed to be the standard causal/per-document mask, which
+            # the block selection already implies, and is therefore not consumed here.
+            # Padded batches are NOT supported on the sparse path: pad tokens would be
+            # attended and eligible for selection. Use unpadded BSHD or packed THD.
+            output, bias, selection = self._sparse_forward(hidden_states, freqs, packed_seq_params)
+        else:
+            assert packed_seq_params is None, (
+                "QSA dense-mask bridge supports BSHD only; use "
+                "qsa_use_sparse_attention=True for packed THD inputs."
+            )
+            if train_indexer:
+                selection_mask, selection = self.indexer(
+                    hidden_states, freqs, return_selection=True
+                )
+            else:
+                selection_mask, selection = self.indexer(hidden_states, freqs), None
+            if attention_mask is not None:
+                if attention_mask.dtype != torch.bool:
+                    raise ValueError(
+                        "QSA expects a bool attention mask (True = masked out); additive "
+                        f"float masks are not supported (got dtype {attention_mask.dtype})."
+                    )
+                selection_mask = selection_mask | attention_mask
 
-        output, bias = super().forward(
-            hidden_states,
-            selection_mask,
-            key_value_states=None,
-            inference_context=None,
-            rotary_pos_emb=rotary_pos_emb,
-            packed_seq_params=None,
-            **kwargs,
-        )
+            output, bias = super().forward(
+                hidden_states,
+                selection_mask,
+                key_value_states=None,
+                inference_context=None,
+                rotary_pos_emb=rotary_pos_emb,
+                packed_seq_params=None,
+                **kwargs,
+            )
 
         if train_indexer and selection is not None:
             loss_cu_seqlens = (
@@ -638,6 +1017,116 @@ class QSASelfAttention(SelfAttention):
             cp_group=self.pg_collection.cp,
         )
         return q2.unsqueeze(1), k2.unsqueeze(1)
+
+    def _rope_qk_cp(self, query, key, freqs, selection: QSASelection):
+        """CP shard q/k RoPE at the shard's true positions (layout-exact).
+
+        THD: ``freqs`` is a full table — index it at the per-document positions of
+        this rank's rows. BSHD: ``freqs`` is already the rank's zigzag slice and
+        applies to the local rows directly."""
+        if selection.token_offsets is not None:  # THD: positions restart per document
+            pos = selection.q_positions - selection.token_offsets
+            f = freqs.index_select(0, pos).contiguous()
+        else:
+            f = freqs[: query.shape[0]]
+        query = apply_rotary_pos_emb(query, f, config=self.config, cp_group=self.pg_collection.cp)
+        key = apply_rotary_pos_emb(key, f, config=self.config, cp_group=self.pg_collection.cp)
+        return query, key
+
+    def _cp_gather_kv(self, tensors, selection: QSASelection):
+        """All-gather CP-sharded [s, b, ...] tensors and restore global order."""
+        cp_group = self.pg_collection.cp
+        reorder = selection.cp_key_reorder
+        return [
+            gather_from_sequence_parallel_region(t, group=cp_group).index_select(0, reorder)
+            for t in tensors
+        ]
+
+    @nvtx_decorator(message="QSA::sparse_attn")
+    def _sparse_forward(self, hidden_states, freqs, packed_seq_params):
+        """Sparse kernel path: indexer selection -> query-tile shared-superset GQA.
+
+        Supports BSHD and packed THD (``packed_seq_params.qkv_format == 'thd'``).
+        The kernels take global block ids plus per-block token [base, end) ranges,
+        so packed varlen needs no cu_seqlens on the kernel side, and any GQA group
+        size works without head padding.
+        """
+        from megatron.core.transformer.experimental_attention_variant.ops.cute_qsa_attn import (
+            qsa_sparse_attention,
+        )
+
+        cu_seqlens = None
+        if packed_seq_params is not None:
+            assert packed_seq_params.qkv_format == 'thd', "QSA supports BSHD or packed THD"
+            cu_seqlens = packed_seq_params.cu_seqlens_q
+            # QSA is self-attention only, so q and kv boundaries must coincide. A full
+            # torch.equal would force a device sync per layer; check identity/shape and
+            # rely on PackedSeqParams construction for element equality.
+            cu_kv = packed_seq_params.cu_seqlens_kv
+            assert (
+                cu_kv is None or cu_kv is cu_seqlens or cu_kv.shape == cu_seqlens.shape
+            ), "QSA is self-attention only (cu_seqlens_q must equal cu_seqlens_kv)."
+
+        # THD inputs arrive as [t, 1, h]; SelfAttention would squeeze them later, we
+        # keep the [s, b, ...] convention throughout and reshape for the kernel.
+        selection = self.indexer.select(hidden_states, freqs, cu_seqlens=cu_seqlens)
+
+        qkv = self.get_query_key_value_tensors(
+            hidden_states,
+            None,
+            split_qkv=True,
+            output_gate=self.config.attention_output_gate,
+            head_wise_gate=False,
+        )
+        if self.config.attention_output_gate:
+            query, key, value, gate = qkv
+        else:
+            query, key, value = qkv
+            gate = None
+        cp_size = self.pg_collection.cp.size() if self.pg_collection.cp is not None else 1
+        if cp_size > 1:
+            # Allgather CP: RoPE locally at the shard's true positions, then gather
+            # K/V into global order. The gather is differentiable (backward =
+            # reduce-scatter), so dk/dv flow back to every rank's projections.
+            query, key = self._rope_qk_cp(query, key, freqs, selection)
+            key, value = self._cp_gather_kv([key, value], selection)
+        else:
+            query, key = self._rope_qk(query, key, freqs, cu_seqlens)
+
+        s, b, np_local, d = query.shape
+        q_bt = query.permute(1, 0, 2, 3)
+        k_bt = key.permute(1, 0, 2, 3)
+        v_bt = value.permute(1, 0, 2, 3)
+
+        # Selection: the query's own block leads; the deterministic top-k follows.
+        # In-kernel token [base, end) + causal masking makes the own-block entry
+        # reproduce the unconditional ragged tail exactly (and drop it when fully in
+        # the future). Ids are translated from document-local to the global
+        # attention-block space (ceil blocks per document).
+        order, picked = selection.order, selection.picked
+        own = selection.own_block.view(1, s, 1).expand(b, s, 1)
+        block_indices = torch.cat([own, order], dim=-1)  # [b, s, k + 1] doc-local
+        block_indices = block_indices + selection.attn_block_offsets.view(1, s, 1)
+        block_counts = 1 + picked.sum(dim=-1)  # [b, s]
+
+        core_out = qsa_sparse_attention(
+            q_bt,
+            k_bt,
+            v_bt,
+            block_indices=block_indices,
+            block_counts=block_counts,
+            block_bases=selection.attn_block_bases,
+            block_ends=selection.attn_block_ends,
+            scale=self.hidden_size_per_attention_head**-0.5,
+            q_positions=selection.q_positions,
+            static_shapes=self.indexer.static_shapes,
+        )  # [b, s, np, d_v]
+        core_out = core_out.reshape(b, s, np_local * core_out.shape[-1]).permute(1, 0, 2)
+
+        if gate is not None:
+            core_out = self._apply_output_gate(core_out, gate)
+        output, bias = self.linear_proj(core_out)
+        return output, bias, selection
 
     @nvtx_decorator(message="QSA::indexer_loss")
     def _compute_indexer_loss(
@@ -736,7 +1225,15 @@ class QSASelfAttention(SelfAttention):
             head_wise_gate=False,
         )
         query, key = qkv[0], qkv[1]  # [s, b, np, d], [s, b, ng, d]
-        query, key = self._rope_qk(query, key, freqs, cu_seqlens)
+        cp = self.pg_collection.cp
+        if cp is not None and cp.size() > 1 and selection.q_positions is not None:
+            # Teacher under allgather CP: local queries at their true positions,
+            # keys gathered to global order (the token gather below uses global
+            # ids). No grad here, so the gather carries no backward cost.
+            query, key = self._rope_qk_cp(query, key, freqs, selection)
+            (key,) = self._cp_gather_kv([key], selection)
+        else:
+            query, key = self._rope_qk(query, key, freqs, cu_seqlens)
         return query.permute(1, 0, 2, 3), key.permute(1, 0, 2, 3)
 
     @torch.no_grad()

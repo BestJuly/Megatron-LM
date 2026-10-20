@@ -149,6 +149,22 @@ class TestPerLayerCaptureEligibility:
         monkeypatch.setattr(attention, "is_cuda_graph_capturable", lambda: False, raising=False)
         assert not _layer_is_graphable(wrapper, config)
 
+    def test_qsa_is_capturable_with_and_without_context_parallelism(self):
+        from types import SimpleNamespace
+
+        from megatron.core.transformer.experimental_attention_variant.qsa import QSASelfAttention
+
+        def capturable(cp_size):
+            fake = SimpleNamespace(
+                pg_collection=SimpleNamespace(cp=SimpleNamespace(size=lambda: cp_size))
+            )
+            return QSASelfAttention.is_cuda_graph_capturable(fake)
+
+        assert capturable(1) is True
+        # The allgather-CP selection is host-sync free (test_qsa_select_cp.py replays a CP2
+        # capture bitwise against eager).
+        assert capturable(2) is True
+
     def test_gdn_is_not_capturable_under_chunkwise_context_parallelism(self):
         from types import SimpleNamespace
 

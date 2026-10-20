@@ -1,12 +1,74 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""QSA selection helpers: fast exact indexer top-k and sort-free sparse-attention metadata."""
+"""QSA selection helpers: host-sync-free CP layout and fast exact top-k.
+
+* :func:`qsa_cp_layout_static` -- the allgather-CP query positions and the gathered-key
+  reorder for packed THD inputs, computed with device ops at shape-only sizes (no
+  boolean-mask indexing, no ``.item()``), so :meth:`QSAIndexer._select_cp` can be
+  captured into a CUDA graph. Values equal
+  :func:`dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder` under the
+  contract ``cu_seqlens[-1] == s_local * cp_size`` (the pack fills the buffer).
+"""
 
 import functools
 
 import torch
-import triton
-import triton.language as tl
+
+from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
+    build_zigzag_cp_local_positions,
+)
+
+
+def _per_document_positions(cu: torch.Tensor, s_local: int, cp_size: int, cp_rank: int):
+    """Local-row -> global-token map for per-document zigzag sharding, sync-free.
+
+    Every document of length ``l`` contributes a front segment
+    ``[start + rank * h, + h)`` and a back segment ``[end - (rank + 1) * h, + h)`` with
+    ``h = (l // cp) // 2``; local rows are their concatenation in document order. Empty
+    segments are skipped by the ``searchsorted`` (no compaction needed).
+    """
+    device = cu.device
+    starts, ends = cu[:-1], cu[1:]
+    h = ((ends - starts) // cp_size) // 2
+    seg_starts = torch.stack((starts + cp_rank * h, ends - (cp_rank + 1) * h), dim=1).reshape(-1)
+    seg_lens = torch.stack((h, h), dim=1).reshape(-1)
+    cum = seg_lens.cumsum(0)
+    i = torch.arange(s_local, device=device, dtype=torch.int64)
+    seg = torch.searchsorted(cum, i, right=True).clamp(max=seg_lens.numel() - 1)
+    return seg_starts[seg] + i - (cum[seg] - seg_lens[seg])
+
+
+def qsa_cp_local_positions_static(
+    cu_seqlens: torch.Tensor, s_local: int, cp_size: int, cp_rank: int, layout: str
+) -> torch.Tensor:
+    """Global token position of each of this rank's ``s_local`` packed rows."""
+    cu = cu_seqlens.to(dtype=torch.int64)
+    if layout == "per_sequence":
+        return build_zigzag_cp_local_positions(s_local * cp_size, cp_size, cp_rank, cu.device)
+    if layout != "per_document":
+        raise ValueError(f"unknown cp packing layout {layout!r}")
+    return _per_document_positions(cu, s_local, cp_size, cp_rank)
+
+
+def qsa_cp_layout_static(
+    cu_seqlens: torch.Tensor, s_local: int, cp_size: int, cp_rank: int, layout: str
+):
+    """(q_positions [s_local], key_reorder [s_local * cp_size]) without host syncs."""
+    q_pos = qsa_cp_local_positions_static(cu_seqlens, s_local, cp_size, cp_rank, layout)
+    gathered = torch.cat(
+        [
+            (
+                q_pos
+                if r == cp_rank
+                else qsa_cp_local_positions_static(cu_seqlens, s_local, cp_size, r, layout)
+            )
+            for r in range(cp_size)
+        ]
+    )
+    # Positions are a permutation of [0, S) under the fill contract: unique keys, so the
+    # argsort is deterministic.
+    return q_pos, torch.argsort(gathered)
+
 
 # ---------------------------------------------------------------------------
 # Indexer top-k (K4): scores + exact (score desc, block id asc) top-k without the
@@ -25,6 +87,8 @@ import triton.language as tl
 #   smallest-id ties at the threshold (the unique-key tie-break), and sorts the k keys
 #   descending. The resulting keys are bit-identical to the opt2 path's ``run_keys``.
 
+import triton
+import triton.language as tl
 
 ID_BITS = 21
 _MAX_ID_CODE = (1 << ID_BITS) - 1

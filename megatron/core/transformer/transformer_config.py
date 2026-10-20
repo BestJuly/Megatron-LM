@@ -568,6 +568,22 @@ class TransformerConfig(ModelParallelConfig):
     ``layout``: eager, bit-identical teacher targets without materializing the gathered
     keys (one GEMM per query chunk over its causal key range, then a logit gather)."""
 
+    qsa_use_sparse_attention: bool = False
+    """Use the sparse GQA kernel path (gathered block-sparse attention over the selected
+    4-token blocks; supports BSHD and packed THD). The kernels are CuTe DSL kernels for
+    Blackwell (SM100-class) GPUs with bf16/fp16 inputs; building a QSA layer elsewhere
+    raises. When False, the dense-mask
+    bridge is used: the selection is materialized as a [b, s, s] bool mask fed to dense
+    core attention — functionally identical, no sparsity speedup, BSHD only."""
+
+    qsa_cp_packing_layout: Literal["per_document", "per_sequence"] = "per_document"
+    """How packed THD batches are zigzag-sharded across context-parallel ranks for QSA.
+    'per_document' splits every document independently into 2*cp chunks (each document
+    length must divide 2*cp); 'per_sequence' zigzags the flattened pack (what
+    per-sequence balancing / inter-document masking dataloaders produce). This is a
+    caller contract — both layouts are legal for the same cu_seqlens and cannot be
+    inferred. Ignored for cp=1 and for BSHD inputs."""
+
     ####################
     # linear attention
     ####################
@@ -2447,6 +2463,30 @@ class TransformerConfig(ModelParallelConfig):
             # Note: the indexer reuses the main attention's rotary frequencies. Their dim
             # (kv_channels * rotary_percent, a model-level arg) must fit the indexer head
             # dim; this is asserted at runtime in QSAIndexer.forward.
+            if self.qsa_cp_packing_layout not in ("per_document", "per_sequence"):
+                raise ValueError(
+                    "qsa_cp_packing_layout must be 'per_document' or 'per_sequence', got "
+                    f"{self.qsa_cp_packing_layout!r}."
+                )
+            if self.context_parallel_size > 1:
+                # QSA CP is allgather-only: the indexer all-gathers the shared raw index
+                # key head and the sparse path all-gathers K/V; queries stay local at
+                # their zigzag positions. Ring (p2p) attention is not implemented.
+                if not self.qsa_use_sparse_attention:
+                    raise ValueError(
+                        "QSA with context parallelism requires qsa_use_sparse_attention=True "
+                        "(the dense-mask bridge is single-rank only)."
+                    )
+                cp_comm_types = (
+                    self.cp_comm_type
+                    if isinstance(self.cp_comm_type, list)
+                    else [self.cp_comm_type]
+                )
+                if any(c not in (None, "all_gather", "allgather") for c in cp_comm_types):
+                    raise ValueError(
+                        "QSA context parallelism supports cp_comm_type='all_gather' only, "
+                        f"got {self.cp_comm_type!r}."
+                    )
 
         if self.gdn_pre_gated_delta_rule_fusion and self.experimental_attention_variant == "kda":
             raise NotImplementedError(
