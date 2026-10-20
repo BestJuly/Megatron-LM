@@ -565,6 +565,11 @@ class TransformerConfig(ModelParallelConfig):
     kda_lower_bound: Optional[float] = None
     """Optional lower bound for KDA's bounded gate values."""
 
+    gdn_kernel_backend: Literal["fla", "cudnn"] = "fla"
+    """Gated delta rule kernel backend. The cuDNN backend uses cuDNN Frontend's
+    FLA-compatible GDN adapter and retains its automatic FLA fallback for unsupported cases.
+    With context parallelism, the cuDNN backend currently supports only headwise CP."""
+
     gdn_pre_gated_delta_rule_fusion: bool = False
     """Whether to use the streamed Triton fusion for GatedDeltaNet pre-GDR preprocessing."""
 
@@ -2106,6 +2111,12 @@ class TransformerConfig(ModelParallelConfig):
                     f"gdn_conv_pad_alignment must be positive when set, "
                     f"got {self.gdn_conv_pad_alignment}."
                 )
+            if self.gdn_kernel_backend == "cudnn" and self.deterministic_mode:
+                raise ValueError(
+                    "gdn_kernel_backend='cudnn' is incompatible with deterministic_mode=True; "
+                    "leave gdn_kernel_backend='fla' so deterministic mode can select the "
+                    "PyTorch GDR implementation."
+                )
 
             if has_context_parallelism:
                 if self.experimental_attention_variant == "gdn2" and self.dynamic_context_parallel:
@@ -2113,6 +2124,11 @@ class TransformerConfig(ModelParallelConfig):
                         "experimental_attention_variant='gdn2' does not support "
                         "dynamic_context_parallel=True: GDN2 shards heads over the static CP "
                         "group and does not follow the per-microbatch CP group."
+                    )
+                if self.gdn_kernel_backend == "cudnn" and self.linear_cp_mode != "headwise":
+                    raise ValueError(
+                        "gdn_kernel_backend='cudnn' only supports "
+                        "linear_cp_mode='headwise' when context_parallel_size > 1."
                     )
                 if self.gdn_conv_pad_alignment is not None:
                     assert self.linear_cp_mode != "chunkwise", (
@@ -2336,6 +2352,21 @@ class TransformerConfig(ModelParallelConfig):
             # layer pattern contains 'G' (has_gated_delta_net_layers).
             raise ValueError(
                 "gdn_pre_gated_delta_rule_fusion requires a model with GatedDeltaNet layers "
+                "(experimental_attention_variant='gdn', or a hybrid layer pattern "
+                "containing 'G')."
+            )
+
+        if self.gdn_kernel_backend not in ("fla", "cudnn"):
+            raise ValueError("gdn_kernel_backend must be one of: fla, cudnn.")
+
+        if self.gdn_kernel_backend != "fla" and not (
+            self.experimental_attention_variant == "gdn" or self.has_gated_delta_net_layers
+        ):
+            # Same predicate as gdn_pre_gated_delta_rule_fusion above: the backend is read by
+            # the GatedDeltaNet module itself, so what matters is that GDN layers exist, not the
+            # global variant name (a GDN+QSA hybrid must set that to "qsa").
+            raise ValueError(
+                "gdn_kernel_backend requires a model with GatedDeltaNet layers "
                 "(experimental_attention_variant='gdn', or a hybrid layer pattern "
                 "containing 'G')."
             )
@@ -4671,6 +4702,26 @@ class TransformerConfig(ModelParallelConfig):
                     "Batch-invariant MoE supports dynamic dropless routing only. "
                     "Disable MoE capacity/expert padding."
                 )
+
+        # cudnn-frontend caches one execution graph (and its buffers) per input shape for
+        # the whole process, and that state does not reliably survive a released CUDA graph:
+        # after a captured GDN layer is freed, the next GDR call with the same shapes can
+        # fault with an illegal memory access. It reproduces deterministically when the
+        # first call for a shape happens inside graph construction (Transformer Engine's
+        # capture warmup or the capture itself), and intermittently even after an eager
+        # call. Training is safe as long as the cache entries are built in eager iterations
+        # before capture (cuda_graph_warmup_steps > 0) and the graphs live for the whole run;
+        # releasing and re-capturing graphs in one process is not supported with cuDNN GDR.
+        if (
+            self.gdn_kernel_backend == "cudnn"
+            and cuda_graph_captures_attention(self)
+            and self.cuda_graph_warmup_steps <= 0
+        ):
+            raise ValueError(
+                "gdn_kernel_backend='cudnn' with attention CUDA-graph capture requires "
+                "cuda_graph_warmup_steps > 0, so cuDNN's per-shape GDR graphs are built in "
+                "eager iterations rather than during capture."
+            )
 
         if self.cuda_graph_impl != "none" and (
             self.sequence_packing_scheduler is not None or self.dynamic_context_parallel
