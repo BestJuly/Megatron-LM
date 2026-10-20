@@ -2538,6 +2538,8 @@ def core_transformer_config_from_args(args, config_class=None):
                 kw_args['experimental_attention_variant'] = 'dsv4_hybrid'
             elif _has_dsa:
                 kw_args['experimental_attention_variant'] = 'dsa'
+            elif Symbols.QSA in _pat:
+                kw_args['experimental_attention_variant'] = 'qsa'
             elif _has_kda:
                 kw_args['experimental_attention_variant'] = 'kda'
         # Normalize compact and legacy-padded ratios through the shared migration helper.

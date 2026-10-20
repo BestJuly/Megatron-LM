@@ -37,6 +37,12 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     is_dsa_skip_topk_layer,
     source_dsa_compute_layer,
 )
+from megatron.core.transformer.experimental_attention_variant.qsa import (
+    QSAIndexer,
+    QSAIndexerSubmodules,
+    QSASelfAttention,
+    QSASelfAttentionSubmodules,
+)
 from megatron.core.transformer.gated_residual import GatedResidualModule
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.identity_op import IdentityOp
@@ -252,6 +258,51 @@ def get_dsv4_hybrid_module_spec_for_backend(
     return attention
 
 
+def get_qsa_module_spec_for_backend(
+    config: TransformerConfig, backend: BackendSpecProvider = None
+) -> ModuleSpec:
+    """Helper function to get module spec for QSA (Qwen Sparse Attention).
+
+    QSA is GQA-based: the main attention is a stock ``SelfAttention`` (output gate,
+    partial RoPE, qk layernorm come from existing config knobs); only the indexer that
+    produces the block-sparse selection mask is new. Dense-mask bridge path.
+    """
+    if backend is None:
+        backend = _get_backend_spec_provider(config=config)
+    assert not config.multi_latent_attention, "QSA is GQA-based, not MLA."
+
+    rms_norm = config.normalization == "RMSNorm"
+    qk_norm = (
+        backend.layer_norm(rms_norm=rms_norm, for_qk=True) if config.qk_layernorm else IdentityOp
+    )
+
+    indexer = ModuleSpec(
+        module=QSAIndexer,
+        submodules=QSAIndexerSubmodules(
+            index_qk_proj=backend.linear(),
+            q_layernorm=backend.layer_norm(rms_norm=rms_norm, for_qk=True),
+            k_layernorm=backend.layer_norm(rms_norm=rms_norm, for_qk=True),
+        ),
+    )
+
+    # The indexer consumes the same post-input-layernorm hidden states as the main
+    # q/k/v projections (HF semantics), so the input layernorm must stay unfused.
+    attention = ModuleSpec(
+        module=QSASelfAttention,
+        params={"attn_mask_type": AttnMaskType.arbitrary},
+        submodules=QSASelfAttentionSubmodules(
+            linear_qkv=backend.column_parallel_linear(),
+            core_attention=backend.core_attention(),
+            linear_proj=backend.row_parallel_linear(),
+            q_layernorm=qk_norm,
+            k_layernorm=qk_norm,
+            indexer=indexer,
+        ),
+        metainfo={"fuse_input_layernorm": False},
+    )
+    return attention
+
+
 def get_experimental_attention_variant_module_spec(
     config: TransformerConfig, backend: BackendSpecProvider = None
 ) -> ModuleSpec:
@@ -266,6 +317,8 @@ def get_experimental_attention_variant_module_spec(
         return get_dsa_module_spec_for_backend(config=config, backend=backend)
     elif config.experimental_attention_variant == "dsv4_hybrid":
         return get_dsv4_hybrid_module_spec_for_backend(config=config, backend=backend)
+    elif config.experimental_attention_variant == "qsa":
+        return get_qsa_module_spec_for_backend(config=config, backend=backend)
     else:
         raise ValueError(
             f"Invalid experimental attention variant: {config.experimental_attention_variant}"

@@ -992,6 +992,41 @@ def _dsa_indexer_flops(
     )
 
 
+def _qsa_indexer_flops(
+    *, hidden_size, n_heads, head_dim, compress_ratio, num_qsa_layers, indexer_loss_coeff
+):
+    """QSA indexer FLOPs coefficients, fwd/bwd expansion included.
+
+    The QSA counterpart of :func:`_dsa_indexer_flops`, with the same conventions:
+
+      * the projection ``index_qk_proj`` (``hidden -> (n_heads + 1) * head_dim``:
+        ``n_heads`` MQA query heads plus one shared index-key head) reads a
+        detached input, so with the indexer loss on it pays fwd + wgrad = 2x;
+      * the block scoring scores every query against every visible pooled key
+        block. Keys are mean-pooled over ``compress_ratio`` tokens, so the causal
+        scoring pass is ``n_heads * head_dim / (2 * compress_ratio)`` per
+        ``L^2`` and pays fwd + dq + dk = 3x with the loss on;
+      * with the loss off the indexer only runs forward (1x).
+
+    The indexer distillation loss itself and the top-k selection are NOT
+    counted (auxiliary-loss and sorting work), as for DSA.
+
+    Returns ``(token_linear, core)`` INCLUDING the fwd/bwd and FMA factors.
+    Multiply ``token_linear`` by the real token count and ``core`` by
+    ``sum_i(L_i ** 2)``.
+    """
+    if num_qsa_layers <= 0:
+        return 0, 0
+    token_linear = num_qsa_layers * hidden_size * (n_heads + 1) * head_dim
+    core = num_qsa_layers * n_heads * head_dim / (2 * compress_ratio)
+    fma_expansion_factor = 2
+    loss_enabled = (indexer_loss_coeff or 0.0) > 0
+    return (
+        (2 if loss_enabled else 1) * fma_expansion_factor * token_linear,
+        (3 if loss_enabled else 1) * fma_expansion_factor * core,
+    )
+
+
 def _standard_layer_numbers_for_execution(
     num_decoder_layers, *, mtp_num_layers=0, mtp_use_repeated_layer=False
 ):
@@ -1878,6 +1913,12 @@ def num_floating_point_operations(
         dsa_indexer_n_heads=None,
         dsa_indexer_head_dim=None,
         dsa_indexer_topk=None,
+        num_qsa_layers=0,
+        qsa_indexer_n_heads=4,
+        qsa_indexer_head_dim=128,
+        qsa_indexer_budget=2048,
+        qsa_indexer_compress_ratio=4,
+        qsa_indexer_loss_coeff=None,
     ):
         """Calculate total FLOPs for the hybrid model."""
         # Self-attention (already summed over all attention layers, fwd-equivalent
@@ -1933,6 +1974,39 @@ def num_floating_point_operations(
                     attention_output_gate,
                     gated_attention_proj_granularity,
                 )
+
+        # QSA ('Q') layers: a plain GQA attention block (QKV + output projections and
+        # the optional output gate) whose core attention only covers the indexer's
+        # selection, i.e. ``min(i, budget)`` keys per query -- the same causal
+        # effective-length scaling as DSA's top-k. The indexer is added below,
+        # outside the global fwd+bwd factor, like DSA's.
+        qsa_indexer_total = 0
+        if num_qsa_layers:
+            qsa_core_scale = _dsa_sparse_core_scale(
+                total_tokens, seqlen_squared_sum, qsa_indexer_budget
+            )
+            attn_flops_total += num_qsa_layers * attn_layer_flops(
+                total_tokens,
+                seqlen_squared_sum * qsa_core_scale,
+                hidden_size,
+                num_attn_heads,
+                gqa,
+                gqa_groups,
+                kv_channels,
+                attention_output_gate,
+                gated_attention_proj_granularity,
+            )
+            qsa_token_term, qsa_core_term = _qsa_indexer_flops(
+                hidden_size=hidden_size,
+                n_heads=qsa_indexer_n_heads,
+                head_dim=qsa_indexer_head_dim,
+                compress_ratio=qsa_indexer_compress_ratio,
+                num_qsa_layers=num_qsa_layers,
+                indexer_loss_coeff=qsa_indexer_loss_coeff,
+            )
+            qsa_indexer_total = (
+                qsa_token_term * total_tokens + qsa_core_term * seqlen_squared_sum
+            )
 
         kda_flops_total = 0
         if num_kda_layers:
@@ -2009,7 +2083,10 @@ def num_floating_point_operations(
         e2e_tv_target_projection_flops = (
             2 * total_tokens * hidden_size * vocab_size if mtp_loss_type == "e2e_tv" else 0
         )
-        return flops_fwd * 3 + logit_flops + e2e_tv_target_projection_flops
+        # The QSA indexer term already carries its own fwd/bwd factor.
+        return (
+            flops_fwd * 3 + logit_flops + e2e_tv_target_projection_flops + qsa_indexer_total
+        )
 
     def transformer_flops():
         """Calculate FLOPs for a standard Transformer model."""
@@ -2606,6 +2683,12 @@ def num_floating_point_operations(
             dsa_indexer_n_heads=getattr(args, "dsa_indexer_n_heads", None),
             dsa_indexer_head_dim=getattr(args, "dsa_indexer_head_dim", None),
             dsa_indexer_topk=getattr(args, "dsa_indexer_topk", None),
+            num_qsa_layers=layer_counts[Symbols.QSA],
+            qsa_indexer_n_heads=getattr(args, "qsa_indexer_n_heads", 4),
+            qsa_indexer_head_dim=getattr(args, "qsa_indexer_head_dim", 128),
+            qsa_indexer_budget=getattr(args, "qsa_indexer_budget", 2048),
+            qsa_indexer_compress_ratio=getattr(args, "qsa_indexer_compress_ratio", 4),
+            qsa_indexer_loss_coeff=getattr(args, "qsa_indexer_loss_coeff", None),
         )
     else:
         # Compute standard Transformer model FLOPs.
@@ -5291,11 +5374,9 @@ def training_log(
     should_track_dsa, dsa_metric_pg_collection = resolve_dsa_metric_pg_collection(
         pg_collection, schedule_pg_collection=schedule_pg_collection
     )
-    if (
-        args.dsa_indexer_loss_coeff is not None
-        and args.dsa_indexer_loss_coeff > 0
-        and should_track_dsa
-    ):
+    dsa_loss_on = args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0
+    qsa_loss_on = (getattr(args, "qsa_indexer_loss_coeff", None) or 0) > 0
+    if (dsa_loss_on or qsa_loss_on) and should_track_dsa:
         # Sequence packing may pass the physical packed microbatch count to training_log, but
         # Dynamic-CP metric reduction reconstructs equal weighting over the nominal global-batch
         # samples. Normalize by the calculator's nominal scheduled count deliberately.
@@ -5313,7 +5394,9 @@ def training_log(
                 # Legacy training entry points without a process-group collection.
                 dynamic_cp_parent_group = mpu.get_data_parallel_group(with_context_parallel=True)
         tracked_layers = args.num_layers + (args.mtp_num_layers or 0)
-        if args.csa_compress_ratios is not None:
+        if qsa_loss_on and args.hybrid_layer_pattern is not None:
+            num_indexer_layers = args.hybrid_layer_pattern.count("Q") or None
+        elif args.csa_compress_ratios is not None:
             compress_ratios = args.csa_compress_ratios
             if not is_hybrid_model(args):
                 compress_ratios = [

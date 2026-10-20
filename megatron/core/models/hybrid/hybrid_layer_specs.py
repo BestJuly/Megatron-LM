@@ -494,17 +494,49 @@ def hybrid_dsv4_stack_spec(config):
     return ModuleSpec(module=HybridStack, submodules=submodules)
 
 
+def hybrid_qsa_stack_spec(config):
+    """Config-aware hybrid stack spec wiring the ``Q`` (QSA) layer symbol to
+    ``QSASelfAttention`` (GQA + block-sparse indexer mask), reusing GPT's own
+    ``get_qsa_module_spec_for_backend`` so the hybrid and GPT paths build the same
+    attention module. Selected via
+    ``--spec megatron.core.models.hybrid.hybrid_layer_specs hybrid_qsa_stack_spec``;
+    ``hybrid_builder`` invokes this function with ``config`` when the spec is callable.
+    """
+    import dataclasses
+
+    from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+        _get_backend_spec_provider,
+        get_qsa_module_spec_for_backend,
+    )
+
+    backend = _get_backend_spec_provider(config)
+    qsa_attention = get_qsa_module_spec_for_backend(config, backend)
+
+    qsa_layer = ModuleSpec(
+        module=TransformerLayer,
+        submodules=TransformerLayerSubmodules(
+            input_layernorm=TENorm, self_attention=qsa_attention, self_attn_bda=get_bias_dropout_add
+        ),
+    )
+
+    submodules = dataclasses.replace(hybrid_stack_spec.submodules, qsa_layer=qsa_layer)
+    return ModuleSpec(module=HybridStack, submodules=submodules)
+
+
 def gated_residual_hybrid_stack_spec(config):
     """Config-aware hybrid stack spec for ``hyper_connection_variant='gated_residual'``.
 
     Gated-residual layers carry no pre-sublayer norms (the gated-residual group
-    norm owns that role), so every layer spec is rebuilt from the default
-    ``hybrid_stack_spec`` with the input layernorm removed: fused-LN projections
-    (GDN ``in_proj``, attention ``linear_qkv``, dense-MLP ``linear_fc1``) become
-    plain column-parallel linears, and explicit ``input_layernorm`` /
-    ``pre_mlp_layernorm`` entries become ``IdentityOp``. ``hybrid_builder``
-    invokes this function with ``config`` when the spec is callable, and picks it
-    automatically when the gated-residual variant is enabled.
+    norm owns that role), so every layer spec is rebuilt with the input layernorm
+    removed: fused-LN projections (GDN ``in_proj``, attention ``linear_qkv``,
+    dense-MLP ``linear_fc1``) become plain column-parallel linears, and explicit
+    ``input_layernorm`` / ``pre_mlp_layernorm`` entries become ``IdentityOp``.
+    ``hybrid_builder`` invokes this function with ``config`` when the spec is
+    callable, and picks it automatically when the gated-residual variant is enabled.
+
+    The base stack is the QSA-extended one when the pattern selected the ``qsa``
+    variant (Qwen3.8-Flash-Next is GDN + QSA + gated residual), otherwise the
+    default hybrid stack.
     """
     import copy as _copy
 
@@ -512,7 +544,13 @@ def gated_residual_hybrid_stack_spec(config):
         config.enable_hyper_connections and config.hyper_connection_variant == "gated_residual"
     ), "gated_residual_hybrid_stack_spec requires the gated_residual variant."
 
-    spec = _copy.deepcopy(hybrid_stack_spec)
+    if getattr(config, "experimental_attention_variant", None) == "qsa":
+        # hybrid_qsa_stack_spec already dataclasses.replace()s a fresh submodules
+        # container, but its untouched layer specs are still shared with the module-level
+        # hybrid_stack_spec, so deepcopy before mutating.
+        spec = _copy.deepcopy(hybrid_qsa_stack_spec(config))
+    else:
+        spec = _copy.deepcopy(hybrid_stack_spec)
     sub = spec.submodules
 
     sub.gdn_layer.submodules.self_attention.submodules.in_proj = TEColumnParallelLinear
@@ -522,7 +560,9 @@ def gated_residual_hybrid_stack_spec(config):
         MLP.as_mlp_submodule,
         submodules=MLPSubmodules(linear_fc1=TEColumnParallelLinear, linear_fc2=TERowParallelLinear),
     )
-    for layer_spec in (sub.kda_layer, sub.mla_layer, sub.dsa_layer):
+    # The QSA layer keeps its qkv projection unfused by design (the indexer consumes the
+    # same post-norm hidden states), so only its explicit input_layernorm has to go.
+    for layer_spec in (sub.kda_layer, sub.mla_layer, sub.dsa_layer, sub.qsa_layer):
         if layer_spec is not IdentityOp and hasattr(layer_spec, "submodules"):
             layer_spec.submodules.input_layernorm = IdentityOp
     # Lets a builder that was handed this spec explicitly (via --spec) tell it apart from an

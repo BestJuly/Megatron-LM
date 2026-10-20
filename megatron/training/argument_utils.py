@@ -480,11 +480,14 @@ def core_transformer_config_from_args(args, config_class=None):
         has_kda = Symbols.KDA in pattern
         has_dsv4_csa = any(s in pattern for s in (Symbols.WINDOW, Symbols.CSA, Symbols.HCA))
         has_dsa = Symbols.DS_ATTENTION in pattern
+        has_qsa = Symbols.QSA in pattern
         if getattr(args, 'experimental_attention_variant', None) is None:
             if has_dsv4_csa:
                 kw_args['experimental_attention_variant'] = 'dsv4_hybrid'
             elif has_dsa:
                 kw_args['experimental_attention_variant'] = 'dsa'
+            elif has_qsa:
+                kw_args['experimental_attention_variant'] = 'qsa'
             elif has_kda:
                 kw_args['experimental_attention_variant'] = 'kda'
 

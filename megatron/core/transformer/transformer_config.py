@@ -342,7 +342,7 @@ class TransformerConfig(ModelParallelConfig):
     # attention variant
     ####################
     experimental_attention_variant: Optional[
-        Literal['gdn', 'gdn2', 'kda', 'gated_delta_net', 'dsa', 'dsv4_hybrid']
+        Literal['gdn', 'gdn2', 'kda', 'gated_delta_net', 'dsa', 'dsv4_hybrid', 'qsa']
     ] = None
     """Type of experimental attention variant to use.
 
@@ -529,6 +529,44 @@ class TransformerConfig(ModelParallelConfig):
     apply_dsa_kernel_fusion: Optional[bool] = None
     """Deprecated DSv4 fused-kernel switch. Use ``dsa_kernel_backend`` instead. For
     ``dsv4_hybrid`` only, True maps to ``cudnn`` and False maps to ``none``."""
+
+    ####################
+    # QSA (Qwen Sparse Attention)
+    ####################
+    qsa_indexer_n_heads: int = 4
+    """Number of QSA indexer query heads (MQA over one shared index key head)."""
+
+    qsa_indexer_head_dim: int = 128
+    """Dimension per QSA indexer head (query heads and the shared key head)."""
+
+    qsa_indexer_budget: int = 2048
+    """QSA token budget: number of KV tokens each query attends to through block
+    selection. Selected block count is ``qsa_indexer_budget // qsa_indexer_compress_ratio``.
+    Sequences no longer than the budget degenerate to dense causal attention."""
+
+    qsa_indexer_compress_ratio: int = 4
+    """QSA block size in tokens: index keys are mean-pooled (parameter-free) over
+    fixed, causal-prefix-aligned groups of this many tokens; selection is block-granular."""
+
+    qsa_indexer_loss_coeff: Optional[float] = None
+    """Coefficient for the QSA indexer sparse-KL distillation loss (teacher = the main
+    attention distribution aggregated to blocks, normalized over the selected block set
+    only). None or 0 disables indexer training."""
+
+    qsa_indexer_loss_chunk: int = 256
+    """Query-chunk size for the QSA indexer distillation loss.
+
+    Pure memory staging: the loss's softmax is over the token axis and its accumulator is
+    per-chunk, so this cannot change any result - it trades peak memory for kernel launches.
+    On the Qwen3.8-Flash-Next proxy shape, 1024 costs 0.8 GiB and 4096 costs 13.1 GiB more
+    peak memory than 256."""
+
+    qsa_indexer_loss_impl: Literal["reference", "layout"] = "reference"
+    """Implementation of the QSA indexer distillation loss (same loss definition for all).
+
+    ``reference``: the original eager path (materializes the gathered selected keys).
+    ``layout``: eager, bit-identical teacher targets without materializing the gathered
+    keys (one GEMM per query chunk over its causal key range, then a logit gather)."""
 
     ####################
     # linear attention
@@ -2358,6 +2396,47 @@ class TransformerConfig(ModelParallelConfig):
                             f"{', '.join(missing_offsets)}. Install a compatible cuDNN Frontend "
                             "build or set dsa_kernel_backend='none'."
                         )
+
+        elif self.experimental_attention_variant == "qsa":
+            if self.multi_latent_attention:
+                raise ValueError(
+                    "QSA is GQA-based and is incompatible with multi_latent_attention."
+                )
+            if self.qsa_indexer_compress_ratio < 1:
+                raise ValueError(
+                    "qsa_indexer_compress_ratio must be positive, got "
+                    f"{self.qsa_indexer_compress_ratio}."
+                )
+            if (
+                self.qsa_indexer_budget < 1
+                or self.qsa_indexer_budget % self.qsa_indexer_compress_ratio != 0
+            ):
+                raise ValueError(
+                    f"qsa_indexer_budget ({self.qsa_indexer_budget}) must be a positive "
+                    f"multiple of qsa_indexer_compress_ratio ({self.qsa_indexer_compress_ratio})."
+                )
+            if self.qsa_indexer_n_heads < 1 or self.qsa_indexer_head_dim < 1:
+                raise ValueError(
+                    "qsa_indexer_n_heads and qsa_indexer_head_dim must be positive, got "
+                    f"{self.qsa_indexer_n_heads} and {self.qsa_indexer_head_dim}."
+                )
+            if self.qsa_indexer_loss_chunk < 1:
+                raise ValueError(
+                    f"qsa_indexer_loss_chunk must be positive, got {self.qsa_indexer_loss_chunk}."
+                )
+            if self.qsa_indexer_loss_impl not in ("reference", "layout"):
+                raise ValueError(
+                    "qsa_indexer_loss_impl must be one of 'reference', 'layout', "
+                    f"got {self.qsa_indexer_loss_impl!r}."
+                )
+            if self.qsa_indexer_loss_coeff is not None and self.qsa_indexer_loss_coeff < 0:
+                raise ValueError(
+                    f"qsa_indexer_loss_coeff must be non-negative, got "
+                    f"{self.qsa_indexer_loss_coeff}."
+                )
+            # Note: the indexer reuses the main attention's rotary frequencies. Their dim
+            # (kv_channels * rotary_percent, a model-level arg) must fit the indexer head
+            # dim; this is asserted at runtime in QSAIndexer.forward.
 
         if self.gdn_pre_gated_delta_rule_fusion and self.experimental_attention_variant == "kda":
             raise NotImplementedError(
