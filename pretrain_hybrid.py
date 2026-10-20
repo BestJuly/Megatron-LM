@@ -423,6 +423,7 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         fast_cache_load=args.dataloader_fast_cache_load,
         sequences_per_dataset=sequences_per_dataset,
         defer_npy_index_mmap=args.dataloader_defer_npy_index_mmap,
+        sft_mock_dataset_config_json=args.sft_mock_dataset_config_json,
         varlen_mock_dataset_config_json=args.varlen_mock_dataset_config_json,
         varlen_sbhd_validation=args.varlen_sbhd_validation,
         context_parallel_size=args.context_parallel_size,
