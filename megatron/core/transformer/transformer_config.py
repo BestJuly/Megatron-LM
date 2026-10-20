@@ -561,12 +561,14 @@ class TransformerConfig(ModelParallelConfig):
     On the Qwen3.8-Flash-Next proxy shape, 1024 costs 0.8 GiB and 4096 costs 13.1 GiB more
     peak memory than 256."""
 
-    qsa_indexer_loss_impl: Literal["reference", "layout"] = "reference"
+    qsa_indexer_loss_impl: Literal["reference", "layout", "fused"] = "fused"
     """Implementation of the QSA indexer distillation loss (same loss definition for all).
 
     ``reference``: the original eager path (materializes the gathered selected keys).
     ``layout``: eager, bit-identical teacher targets without materializing the gathered
-    keys (one GEMM per query chunk over its causal key range, then a logit gather)."""
+    keys (one GEMM per query chunk over its causal key range, then a logit gather).
+    ``fused``: CuTe DSL teacher kernel (Blackwell, bf16) on the main path's q/k plus the
+    CuTe DSL sparse student; CUDA-graph capturable, deterministic indexer gradients."""
 
     qsa_use_sparse_attention: bool = False
     """Use the sparse GQA kernel path (gathered block-sparse attention over the selected
@@ -2450,9 +2452,9 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     f"qsa_indexer_loss_chunk must be positive, got {self.qsa_indexer_loss_chunk}."
                 )
-            if self.qsa_indexer_loss_impl not in ("reference", "layout"):
+            if self.qsa_indexer_loss_impl not in ("reference", "layout", "fused"):
                 raise ValueError(
-                    "qsa_indexer_loss_impl must be one of 'reference', 'layout', "
+                    "qsa_indexer_loss_impl must be one of 'reference', 'layout', 'fused', "
                     f"got {self.qsa_indexer_loss_impl!r}."
                 )
             if self.qsa_indexer_loss_coeff is not None and self.qsa_indexer_loss_coeff < 0:

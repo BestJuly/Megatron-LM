@@ -1,15 +1,17 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""QSA indexer distillation loss: the ``layout`` implementation vs ``reference``.
+"""QSA indexer distillation loss: ``layout`` / ``fused`` implementations vs ``reference``.
 
-Both implementations compute the same loss from the same selection. Each case runs the
-implementations on one module (same weights, same inputs, same selection) in a
+All implementations compute the same loss from the same selection. Each case runs the
+three implementations on one module (same weights, same inputs, same selection) in a
 single forward/backward and compares the teacher targets, the loss, and the indexer
 parameter gradients:
 
 * ``layout`` (eager, no gathered-key materialization) must reproduce the reference
   targets within fp32 rounding and its gradients within the reference's own run-to-run
-  noise (the reference student's ``torch.gather`` backward is a bf16 atomic scatter-add).
+  noise (the reference student's ``torch.gather`` backward is a bf16 atomic scatter-add);
+* ``fused`` (CuTe DSL teacher and sparse student kernels) must match within the
+  documented tolerances and be bitwise repeatable.
 
 A last test captures a whole QSA layer (selection, sparse attention, indexer loss and its
 backward) with ``make_graphed_callables`` and checks replay against eager execution.
@@ -160,12 +162,44 @@ class TestQSAIndexerLossImpl:
             targets = attn._indexer_targets(q_bt, k_bt, sel, impl)
         return loss.detach().double().item(), targets, grads, sel
 
+    @staticmethod
+    def _gold_student_grads(sel, targets):
+        """fp64 gradients of the KL w.r.t. the student inputs (``selection.q`` and
+        ``selection.block_keys``) for fixed targets: the exact value both bf16 paths
+        approximate."""
+        q = sel.q.detach().double().requires_grad_(True)  # [s, b, nh, d]
+        bk = sel.block_keys.detach().double().requires_grad_(True)  # [nb, b, d]
+        order, picked = sel.order, sel.picked
+        b, s, k = order.shape
+        blk = order
+        if sel.block_offsets is not None:
+            blk = blk + sel.block_offsets.view(1, s, 1)
+        bk_bt = bk.permute(1, 0, 2)
+        d = bk_bt.shape[-1]
+        bk_sel = torch.gather(
+            bk_bt,
+            1,
+            blk.clamp_max(bk_bt.shape[1] - 1).reshape(b, s * k)[..., None].expand(-1, -1, d),
+        ).view(b, s, k, d)
+        st = torch.einsum("bshd,bskd->bshk", q.permute(1, 0, 2, 3), bk_sel)
+        st = torch.relu(st).sum(dim=2) / d**0.5
+        st = st.masked_fill(~picked, torch.finfo(torch.float64).min)
+        has = picked.any(-1, keepdim=True)
+        logp = torch.log_softmax(torch.where(has, st, torch.zeros_like(st)), dim=-1)
+        t = targets.double()
+        terms = torch.where(picked, t * (torch.log(t.clamp_min(1e-10)) - logp), 0.0)
+        loss = terms.sum() / picked.any(-1).sum().clamp_min(1) * COEFF
+        dq, dbk = torch.autograd.grad(loss, [q, bk])
+        return {"d_student_q": dq, "d_block_keys": dbk}
+
     @pytest.mark.parametrize("case", list(CASES))
     def test_impls_match_reference(self, case):
         attn, hidden, freqs, cu = self._build(CASES[case])
         ref = self._run(attn, "reference", hidden, freqs, cu)
         ref2 = self._run(attn, "reference", hidden, freqs, cu)
         lay = self._run(attn, "layout", hidden, freqs, cu)
+        fus = self._run(attn, "fused", hidden, freqs, cu)
+        fus2 = self._run(attn, "fused", hidden, freqs, cu)
         assert ref[3].picked.any(), "the case selects nothing"
 
         # Reference run-to-run noise: its student backward is a bf16 atomic scatter-add.
@@ -174,7 +208,7 @@ class TestQSAIndexerLossImpl:
         assert torch.equal(ref[1], ref2[1]) and ref[0] == ref2[0]
 
         # Targets and loss.
-        for name, got, t_tol, l_tol in (("layout", lay, 1e-6, 1e-6),):
+        for name, got, t_tol, l_tol in (("layout", lay, 1e-6, 1e-6), ("fused", fus, 1e-5, 1e-4)):
             t_err = (got[1] - ref[1]).abs().max().item()
             l_err = abs(got[0] - ref[0]) / max(abs(ref[0]), 1e-30)
             _report(case, f"{name}_targets_maxabs", t_err)
@@ -202,6 +236,24 @@ class TestQSAIndexerLossImpl:
             else:
                 assert e <= 2 * max(_rel_l2(ref_det2[2][n], ref_det[2][n]), 1e-5)
 
+        # 1b: accuracy against the fp64 gradient of the same loss (fixed targets). The
+        # reference's bf16 atomic accumulation into the block keys is the least accurate
+        # step; the fused sparse student accumulates in fp32.
+        gold = self._gold_student_grads(ref[3], ref[1])
+        for n in gold:
+            e_ref = _rel_l2(ref[2][n], gold[n])
+            e_fus = _rel_l2(fus[2][n], gold[n])
+            _report(case, f"ref_vs_fp64_relL2[{n}]", e_ref)
+            _report(case, f"fused_vs_fp64_relL2[{n}]", e_fus)
+            assert e_fus <= 1e-2, f"fused {n} rel-L2 vs fp64 {e_fus:.3e}"
+            assert e_fus <= e_ref * 1.05 + 1e-5, f"fused {n} less accurate than reference"
+
+        # The fused path is deterministic: no atomics anywhere in the loss.
+        assert fus[0] == fus2[0]
+        assert torch.equal(fus[1], fus2[1])
+        for n in fus[2]:
+            assert torch.equal(fus[2][n], fus2[2][n]), f"fused grad {n} not repeatable"
+
     @pytest.mark.parametrize("case", ["thd_multidoc", "bshd_batch2"])
     def test_layer_trunk_is_independent_of_impl(self, case):
         """The loss is attached through a forward-identity autoscaler and its inputs are
@@ -220,7 +272,7 @@ class TestQSAIndexerLossImpl:
         g = torch.Generator().manual_seed(4)
         grad_out = torch.randn(hidden.shape, generator=g).to(hidden.device, hidden.dtype)
         res = {}
-        for impl in ("reference", "layout", "reference"):
+        for impl in ("reference", "layout", "fused", "reference"):
             attn.config.qsa_indexer_loss_impl = impl
             attn.zero_grad(set_to_none=True)
             h = hidden.detach().clone().requires_grad_(True)
@@ -235,11 +287,31 @@ class TestQSAIndexerLossImpl:
             if impl in res:
                 assert torch.equal(res[impl][0], got[0])
             res[impl] = got
-        for impl in ("layout",):
+        for impl in ("layout", "fused"):
             assert torch.equal(res[impl][0], res["reference"][0]), f"{impl}: output differs"
             assert torch.equal(res[impl][1], res["reference"][1]), f"{impl}: input grad differs"
             for n, gr in res["reference"][2].items():
                 assert torch.equal(res[impl][2][n], gr), f"{impl}: trunk grad {n} differs"
+
+    def test_fused_teacher_unpooled_matches_pooled(self):
+        """``pool=False`` (the tensor-parallel path) returns the token mass whose block
+        max is exactly the pooled kernel output."""
+        from megatron.core.transformer.experimental_attention_variant.ops.cute_qsa_indexer_loss import (  # pylint: disable=line-too-long
+            qsa_indexer_teacher,
+        )
+
+        attn, hidden, freqs, cu = self._build(CASES["thd_multidoc"])
+        with torch.no_grad():
+            sel = attn.indexer.select(hidden, freqs, cu_seqlens=cu)
+            q_bt, k_bt = attn._indexer_teacher_qk(hidden, freqs, sel, cu)
+            kw = dict(
+                compress_ratio=4,
+                scale=attn.hidden_size_per_attention_head**-0.5,
+                token_offsets=sel.token_offsets,
+            )
+            pooled = qsa_indexer_teacher(q_bt, k_bt, sel.order, sel.picked, pool=True, **kw)
+            tok = qsa_indexer_teacher(q_bt, k_bt, sel.order, sel.picked, pool=False, **kw)
+        assert torch.equal(tok.amax(-1).masked_fill(~sel.picked, 0.0), pooled)
 
 
 T = 320
@@ -257,7 +329,7 @@ def _cu(lengths):
 
 @requires_qsa_kernels
 class TestQSAIndexerLossCapture:
-    """The ``layout`` loss path inside a captured QSA layer (as in an
+    """The ``layout`` / ``fused`` loss paths inside a captured QSA layer (as in an
     attention-scope CUDA graph) replay to the eager results on new packings."""
 
     def setup_method(self, method):
@@ -271,7 +343,7 @@ class TestQSAIndexerLossCapture:
         initialize_rng_tracker(force_reset=True)
         Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize("impl", ["layout"])
+    @pytest.mark.parametrize("impl", ["layout", "fused"])
     def test_capture_replays_eager(self, impl):
         from transformer_engine.pytorch import make_graphed_callables
 
@@ -344,6 +416,8 @@ class TestQSAIndexerLossCapture:
                 if torch.equal(r, ref_repeat[2][name]):
                     assert torch.equal(r, got[2][name]), f"{name} grad differs for {lengths}"
                 else:
-                    # The layout impl keeps the reference student (atomic gather backward).
+                    # Only the layout impl keeps the reference student (atomic gather
+                    # backward); the fused impl must be repeatable.
+                    assert impl == "layout", f"fused {name} grad not repeatable"
                     torch.testing.assert_close(got[2][name], r, msg=f"{name} for {lengths}")
             assert n_idx > 0
