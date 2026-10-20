@@ -40,6 +40,24 @@ SEQ = 300
 BATCH = 2
 BUDGET = 64  # block_topk 16 -> sparse for queries past ~67 tokens
 RATIO = 4
+# The sparse kernels (CuTe DSL, Blackwell) take bf16/fp16 inputs and head dims 128 / 256.
+SPARSE_HEAD_DIM = 128
+
+
+def qsa_kernels_available():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        return False
+    try:
+        import cutlass  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+requires_qsa_kernels = pytest.mark.skipif(
+    not qsa_kernels_available(),
+    reason="the QSA sparse kernels need an SM100-class GPU and nvidia-cutlass-dsl",
+)
 
 
 def max_rel_err(got, ref):
