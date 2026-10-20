@@ -226,6 +226,14 @@ class EngramConfig:
     """
     embedding_lr_multiplier: float = 5.0
     embedding_weight_decay: float = 0.0
+    dense_impl: str = "fused"
+    """Implementation of the dense half (gate, conv-norm, short convolution).
+
+    ``"fused"`` runs the Triton kernels in ``fused_dense.py`` where they apply (CUDA, bf16 or
+    fp16 activations, no context parallelism, no sequence-parallel halo) and falls back to
+    the reference otherwise; ``"reference"`` always runs the PyTorch op chain. The
+    ``MEGATRON_ENGRAM_DENSE_IMPL`` environment variable overrides this at module build time.
+    """
     variant_spec: EngramVariant = field(init=False, repr=False)
     tokenizer_remap: torch.Tensor | None = field(init=False, repr=False, default=None)
     hash_boundary_token_id: int = field(init=False)
