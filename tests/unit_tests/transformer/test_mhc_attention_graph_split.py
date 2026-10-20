@@ -434,6 +434,11 @@ class TestMHCAttentionGraphSplitTHD:
                 "cu_seqlens_kv_padded",
             ):
                 expected[name] = getattr(packed, name)
+            if not with_padded_seqlens:
+                # A pack without padding replays its unpadded boundaries as the *_padded ones:
+                # the captured graph takes all four (_thd_graph_cu_seqlens_kwargs).
+                expected["cu_seqlens_q_padded"] = packed.cu_seqlens_q
+                expected["cu_seqlens_kv_padded"] = packed.cu_seqlens_kv
             if isinstance(layer, HyperConnectionTransformerLayer):
                 kwargs["input_ids"] = torch.arange(8).reshape(1, 8)
                 expected["input_ids"] = kwargs["input_ids"]

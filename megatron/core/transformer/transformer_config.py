@@ -4323,9 +4323,13 @@ class TransformerConfig(ModelParallelConfig):
         ):
             warnings.warn(PACKED_DSA_CP_CUDA_GRAPH_WARNING, stacklevel=2)
 
+        # Only a real layout edge is unsupported. GDN-family models convert when the
+        # linear layers run chunkwise CP (they need the contiguous layout) or when the
+        # block-level layout is not the zigzag one the softmax-attention layers ask for.
+        # headwise linear CP on a zigzag block layout has no conversion edge at all.
         cp_layout_conversion_required = is_gated_delta_net_variant(
             self.experimental_attention_variant
-        )
+        ) and (self.cp_partition_mode != "zigzag" or self.linear_cp_mode == "chunkwise")
         # (dsa_cp_balance_indexer does NOT belong in this predicate: the balanced DSA
         # indexer operates natively on the contiguous layout and performs no
         # module-local THD CP layout conversion.)
@@ -4922,7 +4926,11 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.cuda_graph_impl != "none" and (
-            self.sequence_packing_scheduler is not None or self.dynamic_context_parallel
+            self.sequence_packing_scheduler is not None
+            or self.dynamic_context_parallel
+            # The SFT packed path has no scheduler and opts into static THD graph inputs
+            # with thd_max_packed_sequences (see cuda_graph_uses_static_thd_inputs).
+            or self.thd_max_packed_sequences is not None
         ):
             if self.thd_max_packed_sequences is None:
                 raise ValueError("THD CUDA Graph requires --thd-max-packed-sequences to be set.")
