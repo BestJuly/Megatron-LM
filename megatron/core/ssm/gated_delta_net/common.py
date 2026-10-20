@@ -424,6 +424,15 @@ class _GDNBase(MegatronModule):
 
         self.reset_parameters()
 
+    def is_cuda_graph_capturable(self) -> bool:
+        """Whether per-layer CUDA graph capture may take a layer hosting this module.
+
+        Chunkwise context parallelism swaps the packed THD layout with an all-to-all whose
+        route and split sizes are built on the host from cu_seqlens, so it cannot be captured;
+        the layer then runs eagerly while other layers in the capture scope are still graphed.
+        """
+        return not (self.cp_size > 1 and self.config.linear_cp_mode == "chunkwise")
+
     def _setup_variant_attrs(self):
         """Set variant projection sections, gate parameter sizes, and kernel callable.
 

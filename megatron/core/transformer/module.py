@@ -508,6 +508,18 @@ class GraphableMegatronModule(MegatronModule):
             # according to CUDA graph scope.
             self.cuda_graph_backward_dw_wrapper = None
 
+    def is_cuda_graph_capturable(self) -> bool:
+        """Whether per-layer CUDA graph capture may take this layer.
+
+        ``_layer_is_graphable`` consults this before applying the configured
+        ``cuda_graph_modules`` scope, so a layer that returns ``False`` stays eager under
+        every per-layer scope while the rest of the model is still captured. Layers
+        override it to aggregate what their submodules declare; the decision belongs to
+        the modules that know about their own host synchronizations and data-dependent
+        shapes, not to the graph-discovery code.
+        """
+        return True
+
     def _set_te_cuda_graph_route_replay_state(self, packed_seq_params):
         """Pin replay to the graph slot retained by a checkpointed packed invocation."""
         microbatch_idx = getattr(packed_seq_params, _TE_CUDA_GRAPH_ROUTE_MICROBATCH_ATTR, None)

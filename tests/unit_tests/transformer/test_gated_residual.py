@@ -458,11 +458,21 @@ class TestGatedResidualConfigValidation:
         with pytest.raises(ValueError, match="hc_lowrank"):
             make_config(hc_lowrank=0)
 
-    def test_cuda_graphs_rejected_outside_the_moe_scopes(self):
-        # The attn scope captures the attention-type layers, which is untested for this
-        # variant; only the MoE scopes are validated.
+    def test_cuda_graphs_rejected_outside_the_validated_scopes(self):
+        # Only attn and the MoE scopes are validated for this variant.
         with pytest.raises(ValueError, match="MoE scopes"):
-            make_config(cuda_graph_impl="transformer_engine", cuda_graph_modules=["attn"])
+            make_config(cuda_graph_impl="transformer_engine", cuda_graph_modules=["mlp"])
+
+    def test_attn_scoped_cuda_graphs_accepted(self):
+        # attn captures each attention-type hybrid layer as one whole-wrapper graph whose
+        # only output is the n-stream hidden state, so the None h_res slot is never a graph
+        # output there.
+        cfg = make_config(
+            num_moe_experts=4,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=["attn", "moe_router", "moe_preprocess"],
+        )
+        assert cfg.cuda_graph_impl == "transformer_engine"
 
     def test_cuda_graphs_rejected_for_whole_layer_capture(self):
         with pytest.raises(ValueError, match="partial"):
