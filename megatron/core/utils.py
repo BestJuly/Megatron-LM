@@ -2895,8 +2895,13 @@ def get_thd_batch_on_this_cp_rank(
             "Please update Transformer Engine to >= 1.10 to use "
             "Context Parallel with THD format data"
         )
+        # Unpadded packs carry cu_seqlens_padded=None; the partition is then the unpadded one,
+        # as in _get_batch_on_this_cp_rank_per_document_balancing.
         index = tex.thd_get_partitioned_indices(
-            cu_seqlens_padded, batch['tokens'].size(1), cp_size, cp_rank
+            cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens,
+            batch['tokens'].size(1),
+            cp_size,
+            cp_rank,
         )
         for key, data in batch.items():
             if key in {'attention_mask', 'cu_seqlens', 'cu_seqlens_padded', 'max_seqlen'}:
