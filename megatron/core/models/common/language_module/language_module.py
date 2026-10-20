@@ -31,6 +31,7 @@ from megatron.core.utils import (
     get_tensor_model_parallel_group_if_none,
     is_te_min_version,
     make_tp_sharded_tensor_for_checkpoint,
+    nvtx_decorator,
 )
 
 
@@ -158,6 +159,7 @@ class LanguageModule(MegatronModule):
                         f"NVTE_FLASH_ATTN_V{version}", 0, self.config.attention_backend
                     )
 
+    @nvtx_decorator(message="LM::loss")
     def compute_language_model_loss(self, labels: Tensor, logits: Tensor) -> Tensor:
         """Computes the language model loss (Cross entropy across vocabulary)
 

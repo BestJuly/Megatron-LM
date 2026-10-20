@@ -143,6 +143,8 @@ from megatron.core.utils import (
     get_model_config,
     get_pg_rank,
     get_pg_size,
+    nvtx_range_pop,
+    nvtx_range_push,
     unwrap_model,
 )
 from megatron.training.checkpointing import (
@@ -4981,7 +4983,9 @@ def train_step(
         if _otel_sg_enabled('optimizer') and _otel_step_tracer is not None else nullcontext()
     )
     with _opt_cm as _opt_span:
+        nvtx_range_push("train.optimizer_step")
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+        nvtx_range_pop("train.optimizer_step")
         if _opt_span is not None:
             _otel_set_attrs(_opt_span, {
                 "megatron.update_successful": bool(update_successful),
