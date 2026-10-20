@@ -194,6 +194,15 @@ class GatedResidualModule(MegatronModule):
         self.hidden_size = config.hidden_size
         self.lowrank = config.hc_lowrank
         self.use_combine = use_combine
+        # deterministic_mode keeps the torch (torch.compile) path; otherwise the fused
+        # Triton kernels in gated_residual_triton.py run, which are not held to bitwise
+        # equality with the torch path. The fused kernels unroll at most four residual
+        # streams (Qwen4-Exp uses four); wider configs use the torch path.
+        from megatron.core.transformer.gated_residual_triton import HAVE_TRITON, MAX_FUSED_STREAMS
+
+        self.use_fused_kernels = (
+            HAVE_TRITON and not config.deterministic_mode and self.n <= MAX_FUSED_STREAMS
+        )
         nC = self.n * self.hidden_size
 
         self.hc_norm = GroupedRMSNorm(
@@ -244,6 +253,23 @@ class GatedResidualModule(MegatronModule):
         # require matching dtypes. In the common case both dtypes agree and this
         # is a no-op.
         gemm_dtype = self.input_mix_weight_down.weight.dtype
+        # The fused gates target 16-bit gate weights. fp32-weight modules (reference / debug
+        # runs) keep the torch path so they stay numerically identical to it: with fp32
+        # operands both paths round to TF32 and a recomputed x̃ that differs in the last ulp
+        # can land on the other side of a TF32 rounding boundary.
+        if self.use_fused_kernels and gemm_dtype != torch.float32 and hidden_states.is_cuda:
+            from megatron.core.transformer.gated_residual_triton import fused_gated_residual_gates
+
+            return fused_gated_residual_gates(
+                hidden_states,
+                self.hc_norm.weight,
+                self.input_mix_weight_down.weight,
+                self.input_mix_weight_up.weight,
+                self.block_inject_weight.weight if self.use_combine else None,
+                self.hc_norm.eps,
+                self.n,
+                self.hc_norm.zero_centered_gamma,
+            )
         x_norm_f32 = grouped_rms_norm(
             hidden_states,
             self.hc_norm.weight,
@@ -339,6 +365,11 @@ class GatedResidualModule(MegatronModule):
         x, bias = layer_output_with_bias
 
         if dropout_prob == 0.0 or not training:
+            write_back = _native_gr_write_back
+            if self.use_fused_kernels and original_residual.is_cuda:
+                from megatron.core.transformer.gated_residual_triton import (
+                    fused_gated_residual_write_back as write_back,
+                )
             if manager is not None:
                 from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
 
@@ -346,13 +377,13 @@ class GatedResidualModule(MegatronModule):
                 # by varargs presence, never by passing None.
                 def _wrapper(residual, h_post, x, *optional_bias):
                     b_arg = optional_bias[0] if optional_bias else None
-                    return _native_gr_write_back(residual, h_post, x, b_arg)
+                    return write_back(residual, h_post, x, b_arg)
 
                 ckpt = CheckpointWithoutOutput(ckpt_manager=manager)
                 if bias is not None:
                     return ckpt.checkpoint(_wrapper, original_residual, h_post, x, bias)
                 return ckpt.checkpoint(_wrapper, original_residual, h_post, x)
-            return _native_gr_write_back(original_residual, h_post, x, bias)
+            return write_back(original_residual, h_post, x, bias)
 
         # Dropout path: dropout applies to the injected delta, the residual is
         # added unscaled — matching mHC's structure with the bmm-mixed residual
