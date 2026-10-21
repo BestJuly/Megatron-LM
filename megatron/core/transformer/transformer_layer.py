@@ -691,6 +691,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         inference_context: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
+        strict_runtime_validation: Optional[bool] = None,
         mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None,
         *,
         inference_params: Optional[Any] = None,
@@ -713,6 +714,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         if using_fused_tp_inference_kernel:
             self._set_proj_residual(residual)
 
+        runtime_validation_kwargs = {}
+        if strict_runtime_validation is not None and getattr(
+            self.self_attention, "supports_strict_runtime_validation", False
+        ):
+            runtime_validation_kwargs["strict_runtime_validation"] = strict_runtime_validation
+
         nvtx_range_push(suffix="self_attention")
         attention_output_with_bias = self.self_attention(
             input_layernorm_output,
@@ -725,6 +732,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            **runtime_validation_kwargs,
         )
         nvtx_range_pop(suffix="self_attention")
 
@@ -792,6 +800,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         padding_mask: Optional[Tensor] = None,
         input_ids: Optional[Tensor] = None,
         residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+        strict_runtime_validation: Optional[bool] = None,
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -845,6 +854,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         if using_fused_tp_inference_kernel:
             self._set_proj_residual(residual)
 
+        runtime_validation_kwargs = {}
+        if strict_runtime_validation is not None and getattr(
+            self.self_attention, "supports_strict_runtime_validation", False
+        ):
+            runtime_validation_kwargs["strict_runtime_validation"] = strict_runtime_validation
+
         nvtx_range_push(suffix="self_attention")
         with _otel_managed_span('layer', 'megatron.layer.self_attention'):
             attention_output_with_bias = self.self_attention(
@@ -858,6 +873,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                **runtime_validation_kwargs,
             )
         nvtx_range_pop(suffix="self_attention")
 
