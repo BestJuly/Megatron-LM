@@ -128,6 +128,9 @@ _CONTEXT_PARALLEL_GLOBAL_RANKS = None
 _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = None
 # Dynamic context parallel groups, indexed by the runtime CP group size.
 _DYNAMIC_DP_CP_GROUPS = {}
+# Dynamic context parallel groups spanning tensor parallelism: TP x (dynamic DP x CP
+# sub-group), indexed by the sub-group size.
+_DYNAMIC_TP_DP_CP_GROUPS = {}
 
 # Full data-parallel groups: span every distinct-data rank
 # (size = replicate_DP x gtp_remat). Used for data distribution (batch split, num-microbatches,
@@ -482,6 +485,49 @@ def create_dynamic_dp_cp_groups(
                 ), f"Rank {rank} appears in multiple Dynamic DP CP groups of size {group_size}"
                 dynamic_dp_cp_groups[group_size] = group
     return dynamic_dp_cp_groups
+
+
+def create_dynamic_tp_dp_cp_groups(
+    rank, dp_cp_ranks_lists, tp_ranks_by_rank, pg_options, min_cp_size=1
+):
+    """
+    Creates the TP x (dynamic DP x CP sub-group) groups required for dynamic CP with
+    tensor parallelism. For every dynamic DP x CP sub-group (each valid runtime-size
+    chunk of every 'dp-cp' rank list, as in ``create_dynamic_dp_cp_groups``) the group
+    spans the TP groups of all its members, i.e. the Cartesian product of the chunk with
+    the TP dimension. Chunks that differ only in their TP coordinate span the same ranks;
+    every distinct rank set is created exactly once, in the same deterministic order on
+    every rank. Returns a dictionary with this rank's group indexed by sub-group size.
+    """
+    dynamic_tp_dp_cp_groups = {}
+    created = set()
+    for dp_cp_ranks in dp_cp_ranks_lists:
+        group_sizes = [
+            group_size
+            for group_size in get_valid_dynamic_context_parallel_group_sizes(len(dp_cp_ranks))
+            if min_cp_size <= group_size < len(dp_cp_ranks)
+        ]
+        for group_size in group_sizes:
+            for i in range(0, len(dp_cp_ranks), group_size):
+                chunk = dp_cp_ranks[i : i + group_size]
+                ranks = tuple(
+                    sorted({tp_rank for member in chunk for tp_rank in tp_ranks_by_rank[member]})
+                )
+                if (group_size, ranks) in created:
+                    continue
+                created.add((group_size, ranks))
+                group = create_group(
+                    list(ranks),
+                    pg_options=pg_options,
+                    group_desc=f"DYNAMIC_TP_DP_CP_GROUP_{group_size}",
+                )
+                if rank in ranks:
+                    assert group_size not in dynamic_tp_dp_cp_groups, (
+                        f"Rank {rank} appears in multiple Dynamic TP DP CP groups of size "
+                        f"{group_size}"
+                    )
+                    dynamic_tp_dp_cp_groups[group_size] = group
+    return dynamic_tp_dp_cp_groups
 
 
 class RankGenerator(object):
@@ -1368,6 +1414,38 @@ def initialize_model_parallel(
         )
         if rank in ranks:
             _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP = group
+
+    if dynamic_context_parallel:
+        # Sequence-parallel THD layout conversion under dynamic CP exchanges shards over
+        # TP x (dynamic DP x CP sub-group); create those groups next to the dynamic
+        # DP x CP groups. With TP == 1 they coincide with the dynamic DP x CP groups.
+        global _DYNAMIC_TP_DP_CP_GROUPS
+        if tensor_model_parallel_size == 1:
+            _DYNAMIC_TP_DP_CP_GROUPS = dict(_DYNAMIC_DP_CP_GROUPS)
+        else:
+            tp_ranks_by_rank = {}
+            for tp_ranks in decoder_rank_generator.get_ranks('tp'):
+                for tp_member in tp_ranks:
+                    tp_ranks_by_rank[tp_member] = tuple(tp_ranks)
+            _DYNAMIC_TP_DP_CP_GROUPS = create_dynamic_tp_dp_cp_groups(
+                rank,
+                decoder_rank_generator.get_ranks('dp-cp'),
+                tp_ranks_by_rank,
+                get_nccl_options("tp_dp_cp", nccl_comm_cfgs),
+                min_cp_size=min_dynamic_context_parallel_size,
+            )
+            # Touch every local group in a deterministic order, like the dynamic DP x CP
+            # groups above; the full size maps to the tensor + data parallel group with CP.
+            data_parallel_size_with_cp = data_parallel_size * context_parallel_size
+            for group_size in get_valid_dynamic_context_parallel_group_sizes(
+                data_parallel_size_with_cp
+            ):
+                if group_size < min_dynamic_context_parallel_size:
+                    continue
+                group = get_dynamic_tensor_and_data_context_parallel_groups(group_size=group_size)
+                torch.distributed.barrier(group=group, device_ids=[torch.cuda.current_device()])
+                torch.cuda.synchronize()
+
     for ranks in decoder_rank_generator.get_ranks('tp-gtp_remat-dp'):
         group = create_group(
             ranks,
@@ -1963,6 +2041,32 @@ def get_hybrid_data_context_parallel_groups(
         stacklevel=2,
     )
     return get_dynamic_data_context_parallel_groups(check_initialized, group_size)
+
+
+def get_dynamic_tensor_and_data_context_parallel_groups(check_initialized=True, group_size=None):
+    """Get the TP x (dynamic DP x CP sub-group) group of the caller rank for ``group_size``.
+
+    ``group_size`` is the dynamic context parallel sub-group size; the full DP x CP size
+    maps to the tensor-, data- and context-parallel group. Mirrors
+    ``get_dynamic_data_context_parallel_groups``; with TP == 1 the groups coincide with
+    the dynamic DP x CP groups. With ``check_initialized=False`` a missing group returns
+    None instead of raising.
+    """
+    # Runtime DCP subdivides the replicate DPxCP domain, not the GTP-remat axis. With
+    # gtp_remat > 1 the tensor + data parallel group with CP also spans that axis, so it
+    # is not the exact TP x (DP x CP) product; the layout conversion then detects the
+    # size mismatch and composes the TP and CP collectives instead.
+    if get_data_parallel_world_size(with_context_parallel=True, with_gtp_remat=False) == group_size:
+        if check_initialized:
+            assert _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP is not None
+        return _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP
+    if check_initialized:
+        assert group_size in _DYNAMIC_TP_DP_CP_GROUPS, (
+            f"dynamic tensor and data context parallel group of size {group_size} is not "
+            "initialized"
+        )
+        return _DYNAMIC_TP_DP_CP_GROUPS[group_size]
+    return _DYNAMIC_TP_DP_CP_GROUPS.get(group_size)
 
 
 def get_embedding_group(check_initialized=True):
@@ -2659,6 +2763,9 @@ def destroy_model_parallel():
 
     global _DYNAMIC_DP_CP_GROUPS
     _DYNAMIC_DP_CP_GROUPS = {}
+
+    global _DYNAMIC_TP_DP_CP_GROUPS
+    _DYNAMIC_TP_DP_CP_GROUPS = {}
 
     global _EMBEDDING_GROUP
     _EMBEDDING_GROUP = None
