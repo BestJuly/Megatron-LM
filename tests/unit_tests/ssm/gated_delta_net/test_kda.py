@@ -13,6 +13,8 @@ from megatron.core.models.common.embeddings.rope_utils import (
     get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
 )
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.optimizer.emerging_optimizers import HAVE_EMERGING_OPTIMIZERS
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import HAVE_FLA_KDA, KimiDeltaAttention
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -166,6 +168,61 @@ def test_kda_rejects_invalid_packed_boundaries():
     with pytest.raises(ValueError, match="at least one sequence in both Q and KV"):
         empty = torch.tensor([0], dtype=torch.int32)
         KimiDeltaAttention._validate_packed_cu_seqlens(empty, empty.clone())
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not HAVE_FLA_KDA, reason="FLA with KDA support is not installed.")
+@pytest.mark.skipif(
+    not HAVE_EMERGING_OPTIMIZERS, reason="emerging_optimizers package is not installed."
+)
+@pytest.mark.parametrize(
+    ("f_lora_rank", "gate_lora_rank", "local_projection_count", "local_head_count"),
+    [(None, None, 5, 10), (16, 12, 3, 6)],
+    ids=["legacy-fused", "kimi-low-rank"],
+)
+def test_kda_per_head_muon_uses_rank_major_projection_layout(
+    f_lora_rank, gate_lora_rank, local_projection_count, local_head_count
+):
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=2, pipeline_model_parallel_size=1, context_parallel_size=1
+    )
+    try:
+        model_parallel_cuda_manual_seed(123)
+        config = _make_config(tp_size=2, f_lora_rank=f_lora_rank, gate_lora_rank=gate_lora_rank)
+        kda = _build_kda(config)
+        assert kda.beta_proj.weight.shape == (config.linear_num_key_heads, config.hidden_size)
+        assert not getattr(kda.beta_proj.weight, "tensor_model_parallel", False)
+        assert not getattr(kda.beta_proj.weight, "sequence_parallel", False)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        optimizer = get_megatron_optimizer(
+            config=OptimizerConfig(
+                optimizer="muon",
+                lr=0.01,
+                use_distributed_optimizer=False,
+                muon_split_qkv=True,
+                muon_split_qkv_per_head=True,
+                muon_tp_mode="blockwise",
+            ),
+            model_chunks=[kda],
+            use_gloo_process_groups=False,
+            pg_collection=pg_collection,
+        )
+
+        weight = kda.in_proj.weight
+        layout = weight.qkv_layout
+        assert optimizer is not None
+        assert layout.num_groups == 2
+        assert len(layout.projection_split_shapes) == local_projection_count
+        assert layout.projection_split_shapes == tuple(kda.in_proj_split_sections)
+        assert layout.per_head_split_shapes == (config.linear_key_head_dim,) * local_head_count
+        assert weight.is_qkv
+        assert weight.qkv_split_shapes == [config.linear_key_head_dim] * local_head_count
+        assert weight.qkv_split_shapes_global == [config.linear_key_head_dim] * (
+            local_head_count * layout.num_groups
+        )
+        assert weight.qkv_split_heads_are_complete
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.internal

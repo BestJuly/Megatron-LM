@@ -27,6 +27,7 @@ from megatron.core.ssm.gated_delta_net.common import (
     causal_conv1d,
     get_parameter_local_cp,
 )
+from megatron.core.transformer.attention import QKVLayout
 from megatron.core.transformer.attention_output_gate import apply_attention_output_gate
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import mark_keep_in_fp32
@@ -124,6 +125,8 @@ class KimiDeltaAttention(_GDNBase):
             pp_layer_offset=pp_layer_offset,
             is_mtp_layer=is_mtp_layer,
         )
+
+        self.in_proj.weight.qkv_layout = self._get_in_proj_qkv_layout()
 
         if not self.use_legacy_fused_projections:
             if self.config.kda_f_lora_rank is None:
@@ -288,6 +291,31 @@ class KimiDeltaAttention(_GDNBase):
         self.a_log_dim = self.num_k_heads_local_tp
         self.gate_params_dtype = torch.float32
         self.gated_delta_rule = chunk_kda
+
+    def _get_in_proj_qkv_layout(self) -> QKVLayout:
+        """Describe KDA's rank-major packed input projection for Muon splitting."""
+
+        per_head_split_shapes = (
+            (self.key_head_dim,) * self.num_k_heads_local_tp
+            + (self.key_head_dim,) * self.num_k_heads_local_tp
+            + (self.value_head_dim,) * self.num_v_heads_local_tp
+        )
+        if self.use_legacy_fused_projections:
+            # The legacy packed projection also contains per-key-head decay gates and
+            # per-value-head output gates; split those rows on the same physical heads.
+            per_head_split_shapes += (self.key_head_dim,) * self.num_k_heads_local_tp + (
+                self.value_head_dim,
+            ) * self.num_v_heads_local_tp
+
+        projection_split_shapes = tuple(self.in_proj_split_sections)
+        assert sum(per_head_split_shapes) == sum(projection_split_shapes)
+        return QKVLayout(
+            # GDN input-projection rows are physically packed rank-major: each TP rank owns
+            # one complete local Q/K/V[/g/gate] group.
+            num_groups=self.tp_size,
+            projection_split_shapes=projection_split_shapes,
+            per_head_split_shapes=per_head_split_shapes,
+        )
 
     def _get_in_proj_dim(self) -> int:
         """Return the legacy or low-rank-enabled fused projection width."""
