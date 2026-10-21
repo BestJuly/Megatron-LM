@@ -909,6 +909,8 @@ class MLASelfAttention(MultiLatentAttention):
         # =========================================
         # Prepare RoPE and seqlen related params
         # =========================================
+        if not self.use_rope and inference_context is not None:
+            raise NotImplementedError("MLA no_rope_freq currently supports training only.")
         rotary_seq_len = None
         if self.use_rope:
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
@@ -1149,25 +1151,14 @@ class MLASelfAttention(MultiLatentAttention):
 
             # todo add assert about fusions and caching
             if not self.use_rope:
-                # q_no_pe: [num_tokens, n, qk_head_dim]
-                # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
-                q_no_pe, q_pos_emb = torch.split(
-                    q, [self.config.qk_head_dim, self.config.qk_pos_emb_head_dim], dim=-1
-                )
-
-                # k_no_pe: [num_tokens, n, qk_head_dim]
-                # value: [num_tokens, n, v_head_dim]
+                # K3 keeps the positional projection channels (and the original
+                # attention scale), but does not rotate them. Dropping those
+                # channels would change the architecture and checkpoint shapes.
+                query = q
                 k_no_pe, value = torch.split(
                     kv, [self.config.qk_head_dim, self.config.v_head_dim], dim=-1
                 )
-
-                query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
-                if k_pos_emb.ndim == 4:
-                    k_pos_emb = k_pos_emb.expand(-1, -1, self.num_attention_heads_per_partition, -1)
-                else:
-                    assert k_pos_emb.ndim == 3
-                    k_pos_emb = k_pos_emb.expand(-1, self.num_attention_heads_per_partition, -1)
-                key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
+                key = torch.cat([k_no_pe, k_pos_emb.expand(*k_no_pe.shape[:-1], -1)], dim=-1)
             elif use_fused_rope:
                 cp_rank = self.pg_collection.cp.rank()
                 cp_size = self.pg_collection.cp.size()

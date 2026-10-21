@@ -10,7 +10,10 @@ import pytest
 import torch
 
 from megatron.core._rank_utils import safe_get_rank
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
+)
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import ChunkOffloadHandler
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -538,12 +541,23 @@ def _build_gpt_model(
     enable_hyper_connections: bool = False,
     num_residual_streams: int = 4,
     mhc_recompute_layer_num: Optional[int] = None,
+    enable_attention_residuals: bool = False,
+    attn_res_block_layers: int = 2,
+    attn_res_impl: str = "eager",
+    mtp_num_layers: Optional[int] = None,
+    use_transformer_engine_op_fuser: bool = False,
+    recompute_modules: Optional[List[str]] = None,
 ) -> GPTModel:
     """Build a GPTModel that uses TE-based transformer layer spec."""
     model_parallel_cuda_manual_seed(seed)
     torch.manual_seed(seed)
     ConfigClass = MLATransformerConfig if is_mla else TransformerConfig
-    recompute_modules = ["layernorm", "moe_act"] if num_experts is not None else ["layernorm"]
+    if recompute_modules is None:
+        recompute_modules = ["layernorm"]
+        if num_experts is not None and not use_transformer_engine_op_fuser:
+            recompute_modules.append("moe_act")
+    else:
+        recompute_modules = list(recompute_modules)
     if enable_hyper_connections and mhc_recompute_layer_num is not None:
         recompute_modules.append("mhc")
     transformer_config = ConfigClass(
@@ -556,27 +570,50 @@ def _build_gpt_model(
         params_dtype=torch.bfloat16,
         # Recompute
         recompute_modules=recompute_modules,
-        recompute_granularity="selective",
+        recompute_granularity="selective" if recompute_modules else None,
         # MoE
         num_moe_experts=num_experts,
         moe_grouped_gemm=(num_experts is not None),
+        gated_linear_unit=use_transformer_engine_op_fuser,
+        activation_func=(
+            torch.nn.functional.silu
+            if use_transformer_engine_op_fuser
+            else torch.nn.functional.gelu
+        ),
         # Fine-grained activation offloading
         fine_grained_activation_offloading=fine_grained_activation_offloading,
         offload_modules=offload_modules,
         min_offloaded_tensor_size=min_offloaded_tensor_size,
+        use_transformer_engine_op_fuser=use_transformer_engine_op_fuser,
         # Hyper Connection settings
         enable_hyper_connections=enable_hyper_connections,
         num_residual_streams=num_residual_streams,
         mhc_recompute_layer_num=mhc_recompute_layer_num,
+        # Attention Residual settings
+        enable_attention_residuals=enable_attention_residuals,
+        attn_res_block_layers=attn_res_block_layers if enable_attention_residuals else None,
+        attn_res_impl=attn_res_impl,
+        mtp_num_layers=mtp_num_layers,
+    )
+    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+        num_experts=num_experts,
+        moe_grouped_gemm=num_experts is not None,
+        multi_latent_attention=is_mla,
+        use_te_op_fuser=use_transformer_engine_op_fuser,
+        enable_hyper_connection=enable_hyper_connections,
+        enable_attention_residual=enable_attention_residuals,
+    )
+    mtp_block_spec = (
+        get_gpt_mtp_block_spec(
+            config=transformer_config, spec=transformer_layer_spec, use_transformer_engine=True
+        )
+        if mtp_num_layers is not None
+        else None
     )
     gpt_model = GPTModel(
         config=transformer_config,
-        transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(
-            num_experts=num_experts,
-            moe_grouped_gemm=num_experts is not None,
-            multi_latent_attention=is_mla,
-            enable_hyper_connection=enable_hyper_connections,
-        ),
+        transformer_layer_spec=transformer_layer_spec,
+        mtp_block_spec=mtp_block_spec,
         vocab_size=vocab_size,
         max_sequence_length=seq_length,
     ).bfloat16()
@@ -783,21 +820,125 @@ def test_one_layer_vpp_chunk_runs_full_iteration_with_activation_offload():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
 @pytest.mark.parametrize(
-    "is_moe, is_mla, offload_modules",
+    "is_moe, is_mla, offload_modules, enable_attention_residuals, attn_res_impl, "
+    "mtp_num_layers, recompute_modules",
     [
         # Dense GPT modules
-        (False, True, ["attn_norm"]),
-        (True, False, ["qkv_linear"]),
-        (True, False, ["core_attn"]),
+        (False, True, ["attn_norm"], False, "eager", None, None),
+        (True, False, ["qkv_linear"], False, "eager", None, None),
+        (True, False, ["core_attn"], False, "eager", None, None),
         # # attn_proj depends on core_attn (validated in TransformerConfig.__post_init__)
-        (True, True, ["core_attn", "attn_proj"]),
-        (True, False, ["mlp_norm"]),
-        (True, False, ["expert_fc1"]),
-        (True, False, ["moe_act"]),
+        (True, True, ["core_attn", "attn_proj"], False, "eager", None, None),
+        (True, False, ["mlp_norm"], False, "eager", None, None),
+        (True, False, ["expert_fc1"], False, "eager", None, None),
+        (True, False, ["moe_act"], False, "eager", None, None),
+        # Attention Residuals with every non-fused offload boundary enabled together.
+        pytest.param(
+            True,
+            True,
+            [
+                "attn_norm",
+                "qkv_linear",
+                "core_attn",
+                "attn_proj",
+                "mlp_norm",
+                "expert_fc1",
+                "moe_act",
+            ],
+            True,
+            "eager",
+            None,
+            [],
+            id="attnres-all-non-fused-eager",
+        ),
+        pytest.param(
+            True,
+            True,
+            [
+                "attn_norm",
+                "qkv_linear",
+                "core_attn",
+                "attn_proj",
+                "mlp_norm",
+                "expert_fc1",
+                "moe_act",
+            ],
+            True,
+            "compile",
+            None,
+            [],
+            id="attnres-all-non-fused-compile",
+        ),
+        pytest.param(
+            True,
+            True,
+            [
+                "attn_norm",
+                "qkv_linear",
+                "core_attn",
+                "attn_proj",
+                "mlp_norm",
+                "expert_fc1",
+                "moe_act",
+            ],
+            True,
+            "fla",
+            None,
+            [],
+            id="attnres-all-non-fused-fla",
+        ),
+        # The whole fused grouped MLP boundary is mutually exclusive with expert_fc1/moe_act.
+        pytest.param(
+            True, False, ["fused_group_mlp"], True, "fla", None, [], id="attnres-fused-group-mlp"
+        ),
+        # Two MTP depths exercise the longer-lived trunk source tuple with all non-fused groups.
+        pytest.param(
+            True,
+            True,
+            [
+                "attn_norm",
+                "qkv_linear",
+                "core_attn",
+                "attn_proj",
+                "mlp_norm",
+                "expert_fc1",
+                "moe_act",
+            ],
+            True,
+            "eager",
+            2,
+            ["layernorm", "moe_act"],
+            id="attnres-mtp2-all-non-fused",
+        ),
+        pytest.param(
+            True,
+            True,
+            [
+                "attn_norm",
+                "qkv_linear",
+                "core_attn",
+                "attn_proj",
+                "mlp_norm",
+                "expert_fc1",
+                "moe_act",
+            ],
+            True,
+            "fla",
+            None,
+            ["layernorm", "moe_act"],
+            id="attnres-all-non-fused-selective-recompute",
+        ),
     ],
 )
 def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
-    is_moe: bool, is_mla: bool, offload_modules: List[str]
+    is_moe: bool,
+    is_mla: bool,
+    offload_modules: List[str],
+    enable_attention_residuals: bool,
+    attn_res_impl: str,
+    mtp_num_layers: Optional[int],
+    recompute_modules: Optional[List[str]],
+    monkeypatch,
 ):
     """
     Initialize a GPTModel and verify:
@@ -805,6 +946,12 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
     - backward gradient correctness (subset)
     - peak GPU memory is reduced roughly as expected (based on recorded offload bytes)
     """
+    if attn_res_impl == "fla":
+        from megatron.core.transformer.attention_residual import _get_fla_fused_attnres
+
+        if _get_fla_fused_attnres() is None:
+            pytest.skip("FLA fused AttnRes is not installed")
+
     # setup distributed/model-parallel (same pattern as other UTs)
     os.environ.pop("NVTE_FUSED_ATTN", None)
     os.environ.pop("NVTE_FLASH_ATTN", None)
@@ -822,6 +969,15 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
     seq_length = 1024
     micro_batch_size = 2
     device = torch.device("cuda")
+    use_transformer_engine_op_fuser = "fused_group_mlp" in offload_modules
+    if use_transformer_engine_op_fuser:
+        if not is_te_min_version("2.14.0"):
+            pytest.skip("TE operation fuser requires transformer-engine>=2.14.0")
+        try:
+            from transformer_engine.pytorch.ops import GroupedLinear  # noqa: F401
+        except ImportError:
+            pytest.skip("Installed Transformer Engine does not provide the operation-fuser API")
+        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
 
     input_ids, position_ids, attention_mask = _make_gpt_inputs(
         seq_length=seq_length, micro_batch_size=micro_batch_size, device=device
@@ -846,6 +1002,11 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
             offload_modules=None,
             min_offloaded_tensor_size=1024 * 1024,
             is_mla=is_mla,
+            enable_attention_residuals=enable_attention_residuals,
+            attn_res_impl=attn_res_impl,
+            mtp_num_layers=mtp_num_layers,
+            use_transformer_engine_op_fuser=use_transformer_engine_op_fuser,
+            recompute_modules=recompute_modules,
         ).cuda()
         base_model.train()
         base_params = _capture_params(base_model)
@@ -883,6 +1044,11 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
             offload_modules=offload_modules,
             min_offloaded_tensor_size=1024,  # force offloading for UT determinism
             is_mla=is_mla,
+            enable_attention_residuals=enable_attention_residuals,
+            attn_res_impl=attn_res_impl,
+            mtp_num_layers=mtp_num_layers,
+            use_transformer_engine_op_fuser=use_transformer_engine_op_fuser,
+            recompute_modules=recompute_modules,
         ).cuda()
         _restore_params(off_model, base_params)
         off_model.train()
@@ -903,6 +1069,20 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
         )
 
         mgr = PipelineOffloadManager.get_instance()
+        for module in offload_modules:
+            if (
+                enable_attention_residuals
+                and module == "qkv_linear"
+                and "layernorm" in off_model.config.recompute_modules
+            ):
+                # AttnRes uses an explicit norm: checkpointing its output makes
+                # the QKV input recompute-owned rather than offload-owned.
+                assert mgr.offload_summary_bytes.get(module, 0) == 0
+                continue
+            assert mgr.offload_summary_bytes.get(module, 0) > 0, (
+                f"Expected {module} to offload at least one activation, got "
+                f"{mgr.offload_summary_bytes.get(module, 0)} bytes"
+            )
         expected_offload_bytes = int(
             sum(mgr.offload_summary_bytes.get(k, 0) for k in offload_modules)
         )
