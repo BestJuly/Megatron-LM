@@ -690,6 +690,8 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                     chunkwise_cp_context,
                 )
 
+            # Quantized recompute must restore TE's FP8/FP4 state, matching the
+            # selective MLP and MoE recompute paths.
             if self.config.fp8 or self.config.fp4:
                 # Import here to avoid a circular dependency.
                 from megatron.core.extensions.transformer_engine import te_checkpoint
@@ -698,7 +700,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                     _checkpointed_compute,
                     False,
                     tensor_parallel.random.get_cuda_rng_tracker,
-                    self.pg_collection.tp,
+                    active_pg_collection.tp,
                     hidden_states,
                 )
             else:
