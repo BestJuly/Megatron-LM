@@ -54,7 +54,7 @@ class MdpMicrobatchVisionRecord:
     global_item_id: int
     sample_id: int
     image_ordinal: int
-    grid_thw: tuple
+    shape_key: tuple
     output_rows: int
     decoder_positions: tuple
 
@@ -150,7 +150,6 @@ class MdpIterationWindow:
         descriptors = []
         sidecar = {}
         next_item_id = 0
-        merge = adapter.spatial_merge_size
         for microbatch_id in range(num_microbatches):
             owner_worker_id = microbatch_id % num_workers
             owns_pixels = owner_worker_id == my_worker_id
@@ -168,13 +167,12 @@ class MdpIterationWindow:
             _validate_captured(
                 captured,
                 microbatch_id,
-                merge,
+                adapter,
                 expect_pixels=owns_pixels,
             )
             vision_records = []
             for item in captured.vision_items:
-                t, h, w = item.grid_thw
-                output_rows = t * (h // merge) * (w // merge)
+                output_rows = item.output_rows
                 item_id = next_item_id
                 next_item_id += 1
                 vision_records.append(
@@ -182,7 +180,7 @@ class MdpIterationWindow:
                         global_item_id=item_id,
                         sample_id=item.sample_id,
                         image_ordinal=item.image_ordinal,
-                        grid_thw=item.grid_thw,
+                        shape_key=item.shape_key,
                         output_rows=output_rows,
                         decoder_positions=item.decoder_positions,
                     )
@@ -205,7 +203,7 @@ class MdpIterationWindow:
                             estimated_cost_units=adapter.estimate_cost(item),
                             payload_rows=item.payload_rows,
                             output_rows=output_rows,
-                            grid_thw=item.grid_thw,
+                            shape_key=item.shape_key,
                             owner_worker_id=owner_worker_id,
                         )
                     )
@@ -261,7 +259,7 @@ class MdpIterationWindow:
 def _validate_captured(
     captured: CapturedMicrobatch,
     microbatch_id: int,
-    merge: int,
+    adapter: MdpModelAdapter,
     expect_pixels: Optional[bool] = None,
 ) -> None:
     """Local consistency checks performed before any bridge collective.
@@ -269,6 +267,10 @@ def _validate_captured(
     An owned microbatch must carry pixels for its items and a non-owned one must
     not (its collate pixel branch is suppressed), so both wiring failures are
     diagnosed here.
+
+    Only model-independent invariants live here. Anything that relates
+    ``shape_key`` to the row counts is the adapter's business and is delegated to
+    :meth:`MdpModelAdapter.validate_item`.
     """
     params = captured.decoder_packed_seq_params
     if params is not None and getattr(params, "qkv_format", None) != "thd":
@@ -299,22 +301,23 @@ def _validate_captured(
                 f"(sample_id, image_ordinal) without duplicates (at {key})."
             )
         previous = key
-        t, h, w = item.grid_thw
-        if t < 1 or h < 1 or w < 1:
-            raise MdpConfigurationError(
-                f"MDP: item {key} in microbatch {microbatch_id} violates: grid_thw is "
-                f"positive (got {item.grid_thw})."
-            )
-        if h % merge != 0 or w % merge != 0:
-            raise MdpConfigurationError(
-                f"MDP: item {key} in microbatch {microbatch_id} violates: h and w are "
-                f"divisible by spatial_merge_size={merge} (got {item.grid_thw})."
-            )
-        if t * h * w != item.payload_rows:
+        if len(item.shape_key) != adapter.shape_key_width:
             raise MdpConfigurationError(
                 f"MDP: item {key} in microbatch {microbatch_id} violates: "
-                f"payload_rows == t*h*w ({item.payload_rows} != {t * h * w})."
+                f"len(shape_key) == adapter.shape_key_width "
+                f"({len(item.shape_key)} != {adapter.shape_key_width})."
             )
+        if any(int(value) < 0 for value in item.shape_key):
+            raise MdpConfigurationError(
+                f"MDP: item {key} in microbatch {microbatch_id} violates: shape_key holds "
+                f"non-negative integers (got {item.shape_key})."
+            )
+        if item.payload_rows < 1 or item.output_rows < 1:
+            raise MdpConfigurationError(
+                f"MDP: item {key} in microbatch {microbatch_id} violates: payload_rows and "
+                f"output_rows are positive (got {item.payload_rows}, {item.output_rows})."
+            )
+        adapter.validate_item(item)
         end = item.payload_row_start + item.payload_rows
         if item.payload_row_start < 0 or (
             has_pixels and end > captured.flat_pixel_payload.shape[0]

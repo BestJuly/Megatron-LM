@@ -275,18 +275,24 @@ _vision_stats_in_iteration: Optional[torch.Tensor] = None
 _vision_stats_active: bool = False
 
 
-def update_vision_stats(patch_rows, attn_squared_sum) -> None:
+def update_vision_stats(patch_rows, attn_squared_sum, output_rows) -> None:
     """Add one micro-batch's vision-encoder work to the per-iteration stats.
 
     Args:
-        patch_rows: ``sum_items(t * h * w)`` -- patch rows fed to the vision
-            encoder. Python number or 0-dim tensor.
-        attn_squared_sum: ``sum_items(t * (h * w) ** 2)`` -- the vision
-            attention ``L^2`` term. Each temporal frame of each item is a
-            separate attention chunk of length ``h * w``, matching the
-            ``cu_seqlens`` the encoder builds from ``grid_thw``.
+        patch_rows: ``sum_items`` of the patch rows fed to the vision encoder.
+            Python number or 0-dim tensor.
+        attn_squared_sum: the vision attention ``L^2`` term, ``sum_chunks(L^2)``
+            over the encoder's packed attention sub-sequences.
+        output_rows: ``sum_items`` of the rows the encoder emits after its
+            downsample/merge stage -- the rows the projector runs on and the
+            number of decoder slots filled.
 
-    Both arguments may be device tensors; the accumulation stays on device (no
+    All three are reported by the model through ``VisionCollateSpec.workload_of``
+    rather than derived here, because the segmentation and the merge policy are
+    encoder-specific (frame-wise vs whole-image attention, merge factor 2 vs 3,
+    floor vs ceiling division under padding).
+
+    Arguments may be device tensors; the accumulation stays on device (no
     ``.item()``), so callers on the hot path pay no host sync. Must be called
     once per micro-batch on every rank of the model-parallel group -- the same
     contract as ``update_seqlen_stats_from_cu_seqlens`` -- because the consume
@@ -299,22 +305,26 @@ def update_vision_stats(patch_rows, attn_squared_sum) -> None:
             if torch.cuda.is_available()
             else torch.device('cpu')
         )
-        _vision_stats_in_iteration = torch.zeros(2, dtype=torch.float64, device=device)
+        _vision_stats_in_iteration = torch.zeros(3, dtype=torch.float64, device=device)
     _vision_stats_in_iteration[0] += patch_rows
     _vision_stats_in_iteration[1] += attn_squared_sum
+    _vision_stats_in_iteration[2] += output_rows
     _vision_stats_active = True
 
 
-def consume_vision_stats_in_iteration() -> Tuple[Optional[float], Optional[float]]:
+def consume_vision_stats_in_iteration() -> (
+    Tuple[Optional[float], Optional[float], Optional[float]]
+):
     """Read, reset and globally reduce the per-iteration vision-encoder stats.
 
-    Returns ``(patch_rows, attn_squared_sum)`` for the whole global batch, or
-    ``(None, None)`` when nothing reported vision work this iteration (in which
-    case no collective is issued and the FLOPs metric stays language-only).
+    Returns ``(patch_rows, attn_squared_sum, output_rows)`` for the whole global
+    batch, or ``(None, None, None)`` when nothing reported vision work this
+    iteration (in which case no collective is issued and the FLOPs metric stays
+    language-only).
     """
     global _vision_stats_in_iteration, _vision_stats_active
     if not _vision_stats_active:
-        return None, None
+        return None, None, None
     t = _vision_stats_in_iteration
     if torch.distributed.is_initialized() and mpu.model_parallel_is_initialized():
         torch.distributed.all_reduce(t)
@@ -325,10 +335,10 @@ def consume_vision_stats_in_iteration() -> Tuple[Optional[float], Optional[float
         )
     else:
         dedup = 1
-    patch_rows, attn_squared_sum = t.tolist()
+    patch_rows, attn_squared_sum, output_rows = t.tolist()
     t.zero_()
     _vision_stats_active = False
-    return patch_rows / dedup, attn_squared_sum / dedup
+    return patch_rows / dedup, attn_squared_sum / dedup, output_rows / dedup
 
 
 def reset_vision_stats_in_iteration() -> None:
@@ -745,6 +755,7 @@ def num_floating_point_operations(
     total_real_tokens_in_batch=None,
     vision_patch_rows_in_batch=None,
     vision_attn_squared_sum_in_batch=None,
+    vision_output_rows_in_batch=None,
 ):
     """Compute the number of floating-point operations for one global batch.
 
@@ -761,17 +772,21 @@ def num_floating_point_operations(
             For THD it is the actual ragged sum and is strictly less than the
             BSHD value, reflecting per-chunk causal masking AND the fact that
             padding tokens do not contribute to attention scores.
-        vision_patch_rows_in_batch: ``sum_items(t * h * w)`` -- vision patch
-            rows processed by the vision encoder over the global batch. ``None``
-            (the default) means "no vision work reported", and the vision term
-            is omitted entirely, preserving the language-only behavior for every
-            text model. Only consumed when ``args.count_vision_model_flops`` is
-            set by the multimodal entry point.
-        vision_attn_squared_sum_in_batch: ``sum_items(t * (h * w) ** 2)`` -- the
-            vision core-attention ``L^2`` term. The vision encoder gives each
-            temporal frame of each item its own attention chunk of length
-            ``h * w`` (see its ``cu_seqlens``), so this is not
-            ``sum_items((t*h*w)**2)``.
+        vision_patch_rows_in_batch: vision patch rows processed by the vision
+            encoder over the global batch. ``None`` (the default) means "no
+            vision work reported", and the vision term is omitted entirely,
+            preserving the language-only behavior for every text model. Only
+            consumed when ``args.count_vision_model_flops`` is set by the
+            multimodal entry point.
+        vision_attn_squared_sum_in_batch: the vision core-attention ``L^2``
+            term, summed over the encoder's packed attention sub-sequences. How
+            an encoder segments its pack is encoder-specific (a patch-grid ViT
+            gives each temporal frame its own chunk of length ``h * w``), so this
+            is reported by the model, not derived here.
+        vision_output_rows_in_batch: rows the vision encoder emits after its
+            downsample/merge stage, i.e. the rows the projector runs on. Also
+            reported by the model, because merge policies differ (factor 2 vs 3,
+            floor vs ceiling division under padding, temporal pooling).
         total_real_tokens_in_batch: ``sum_i(L_i)``, the TOTAL REAL (unpadded)
             token count across the global batch. Drives all token-linear FLOPs
             (QKV+output projections, MLP, MoE, MTP norms/projs, logits). For
@@ -1594,26 +1609,35 @@ def num_floating_point_operations(
         point sets alongside the ``args.vision_*`` dimensions. Text models never
         set it, so this returns 0 and the metric is bit-for-bit unchanged.
 
-        Notation: ``R`` = vision patch rows (``sum_items t*h*w``), ``A`` = the
-        attention term (``sum_items t*(h*w)^2``), ``m`` = spatial merge size,
-        ``M = R / m^2`` = merged rows handed to the language model (exact: the
-        collate path rejects grids whose ``h``/``w`` are not divisible by ``m``).
+        Notation: ``R`` = vision patch rows, ``A`` = the packed-attention ``L^2``
+        term, ``M`` = rows the encoder emits after its downsample/merge stage.
+        All three are measured and reported by the model (see
+        ``VisionCollateSpec.workload_of``) rather than derived from a merge
+        factor here, so merge policies that are not exact -- ceiling division
+        under padding, temporal pooling -- stay exact.
 
         Terms, all already carrying the FMA factor of 2 and multiplied by 3 at
         the end for forward + backward:
 
-        * patch embed (Conv3d, kernel == stride, so one GEMM per patch row):
-          ``2 * R * (C * T_p * P * P) * h_v``
+        * patch embed (one GEMM per patch row, whether the model spells it as a
+          ``Conv3d`` with kernel == stride or a ``Linear`` on flattened patches):
+          ``2 * R * d_in * h_v`` with
+          ``d_in = C * T_p * P * P`` (``T_p = 1`` for a 2D patch embedding)
         * per layer, attention projections (MHA -- the ViT has no GQA):
           ``4 * R * h_v * p * 2 * h_v`` with ``p = kv_channels * heads / h_v``
         * per layer, core attention: ``4 * A * h_v * p``. Note the factor 4 and
           not the language model's 2: vision attention is BIDIRECTIONAL, so the
           causal-mask halving that cancels the FMA factor there does not apply.
-        * per layer, MLP (plain GELU, not gated): ``4 * R * h_v * ffn_v``
-        * patch merger: ``2 * M * (d_m^2 + d_m * h_out)`` with ``d_m = h_v * m^2``
+        * per layer, MLP: ``4 * R * h_v * ffn_v`` when plain, ``6 * R * h_v *
+          ffn_v`` when gated (SwiGLU has three matrices, not two), selected by
+          ``args.vision_gated_mlp``.
+        * projector / patch merger: ``2 * M * (d_m * d_p + d_p * h_out)`` with
+          ``d_m = args.vision_merge_dim`` (the concatenated merge width) and
+          ``d_p = args.vision_merger_hidden_size``. Defaulting ``d_p`` to
+          ``d_m`` reproduces the two-layer ``d_m -> d_m -> h_out`` merger.
 
         Not counted (deliberate, and identical for the MDP and native arms):
-        norms, GELU/softmax elementwise work, RoPE, and the position-embedding
+        norms, activation/softmax elementwise work, RoPE, and position-embedding
         interpolation -- all sub-1% and outside Megatron's FLOPs convention.
         Recompute is likewise not counted, matching the language-model term:
         this is a MODEL-FLOPs metric, not a hardware-FLOPs metric.
@@ -1626,7 +1650,6 @@ def num_floating_point_operations(
         attn_sq = vision_attn_squared_sum_in_batch or 0
         h_v = args.vision_hidden_size
         n_v = args.vision_num_attention_heads
-        merge = args.vision_spatial_merge_size
         # p mirrors attn_layer_flops: head_dim * heads may differ from hidden.
         p = (args.vision_kv_channels * n_v / h_v) if args.vision_kv_channels else 1
         patch_in_dim = (
@@ -1635,17 +1658,19 @@ def num_floating_point_operations(
             * args.vision_patch_size
             * args.vision_patch_size
         )
-        merged_rows = rows / (merge * merge)
-        merge_dim = h_v * merge * merge
+        merged_rows = vision_output_rows_in_batch or 0
+        merge_dim = args.vision_merge_dim
+        merger_hidden = getattr(args, "vision_merger_hidden_size", None) or merge_dim
+        mlp_matrices = 3 if getattr(args, "vision_gated_mlp", False) else 2
 
         patch_embed = 2 * rows * patch_in_dim * h_v
         per_layer = (
             4 * rows * h_v * p * (2 * h_v)  # QKV + output projections
             + 4 * attn_sq * h_v * p  # bidirectional core attention
-            + 4 * rows * h_v * args.vision_ffn_hidden_size  # MLP (non-gated)
+            + 2 * mlp_matrices * rows * h_v * args.vision_ffn_hidden_size  # MLP
         )
         merger = 2 * merged_rows * (
-            merge_dim * merge_dim + merge_dim * args.vision_out_hidden_size
+            merge_dim * merger_hidden + merger_hidden * args.vision_out_hidden_size
         )
         forward_backward_expansion_factor = 3
         return forward_backward_expansion_factor * (
@@ -3657,6 +3682,7 @@ def training_log(
     total_real_tokens_in_batch: float | None = None,
     vision_patch_rows_in_batch: float | None = None,
     vision_attn_squared_sum_in_batch: float | None = None,
+    vision_output_rows_in_batch: float | None = None,
     num_microbatches: int | None = None,
 ):
     """Log training information such as losses, timing, ...."""
@@ -3940,6 +3966,7 @@ def training_log(
             total_real_tokens_in_batch=total_real_tokens_in_batch,
             vision_patch_rows_in_batch=vision_patch_rows_in_batch,
             vision_attn_squared_sum_in_batch=vision_attn_squared_sum_in_batch,
+            vision_output_rows_in_batch=vision_output_rows_in_batch,
         ) / (elapsed_time_per_iteration * 10**12 * args.world_size)
 
         one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
@@ -5088,9 +5115,11 @@ def train(
         # Vision-encoder work for this global batch. ``(None, None)`` for text
         # models and for any multimodal iteration that reported no vision items,
         # in which case the FLOPs metric stays language-only.
-        vision_patch_rows_in_batch, vision_attn_squared_sum_in_batch = (
-            consume_vision_stats_in_iteration()
-        )
+        (
+            vision_patch_rows_in_batch,
+            vision_attn_squared_sum_in_batch,
+            vision_output_rows_in_batch,
+        ) = consume_vision_stats_in_iteration()
         num_floating_point_operations_in_batch = num_floating_point_operations(
             args,
             batch_size,
@@ -5098,6 +5127,7 @@ def train(
             total_real_tokens_in_batch=total_real_tokens_in_batch,
             vision_patch_rows_in_batch=vision_patch_rows_in_batch,
             vision_attn_squared_sum_in_batch=vision_attn_squared_sum_in_batch,
+            vision_output_rows_in_batch=vision_output_rows_in_batch,
         )
         num_floating_point_operations_so_far += num_floating_point_operations_in_batch
         num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
@@ -5133,6 +5163,7 @@ def train(
             total_real_tokens_in_batch=total_real_tokens_in_batch,
             vision_patch_rows_in_batch=vision_patch_rows_in_batch,
             vision_attn_squared_sum_in_batch=vision_attn_squared_sum_in_batch,
+            vision_output_rows_in_batch=vision_output_rows_in_batch,
             num_microbatches=num_microbatches,
         )
         is_first_iteration = False

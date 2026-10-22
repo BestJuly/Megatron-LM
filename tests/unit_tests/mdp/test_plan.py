@@ -16,8 +16,6 @@ from megatron.core.mdp.plan import (
     RouteSlice,
     RowCapacityPolicy,
     compute_plan_digest,
-    frame_cu_seqlens,
-    frame_lengths,
     split_encoder_layout,
 )
 
@@ -33,7 +31,7 @@ def _segment(item_id, grid, payload_start=0, output_start=0, mb=0, sample=0, ord
         payload_rows=t * h * w,
         output_row_start=output_start,
         output_rows=t * (h // 2) * (w // 2),
-        grid_thw=grid,
+        shape_key=grid,
     )
 
 
@@ -53,19 +51,10 @@ def test_capacity_policy_alignment():
         aligned.capacity_of(-1)
 
 
-# ------------------------- frame derivation -------------------------
-
-
-def test_frame_lengths_and_cu_seqlens_from_grid():
-    segments = (_segment(0, (2, 4, 6)), _segment(1, (1, 8, 8), payload_start=48))
-    # (2,4,6) -> two frames of 24; (1,8,8) -> one frame of 64.
-    assert frame_lengths(segments) == (24, 24, 64)
-    assert frame_cu_seqlens(segments) == (0, 24, 48, 112)
+# ------------------------- layout totals -------------------------
 
 
 def test_empty_producer_layout():
-    assert frame_lengths(()) == ()
-    assert frame_cu_seqlens(()) == (0,)
     layout = EncoderThdLayout(producer_worker_id=0, segments=())
     assert layout.total_payload_rows == 0
     assert layout.total_output_rows == 0
@@ -128,29 +117,60 @@ def _entry(item_id, worker=0, order=0, endpoint=0, grid=(1, 4, 4)):
 
 def test_digest_is_deterministic_and_16_bytes():
     policy = RowCapacityPolicy()
-    a = compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [_entry(0), _entry(1, worker=1)])
-    b = compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [_entry(0), _entry(1, worker=1)])
+    a = compute_plan_digest(
+        PLAN_SCHEMA_VERSION, policy, [_entry(0), _entry(1, worker=1)], shape_key_width=3
+    )
+    b = compute_plan_digest(
+        PLAN_SCHEMA_VERSION, policy, [_entry(0), _entry(1, worker=1)], shape_key_width=3
+    )
     assert a == b
     assert len(a) == 16
 
 
 def test_digest_covers_the_minimal_sufficient_set():
     policy = RowCapacityPolicy()
-    base = compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [_entry(0)])
-    # Same payload_rows, different grid -> different frame boundaries -> the
-    # digest must change (design doc 7.4).
-    same_rows_other_grid = (0, 0, 0, 0, 16, 4, 1, 2, 8)
+    base = compute_plan_digest(
+        PLAN_SCHEMA_VERSION, policy, [_entry(0)], shape_key_width=3
+    )
+    # Same row counts, different shape key -> the producer would build different
+    # encoder metadata -> the digest must change (design doc 7.4).
+    same_rows_other_shape = (0, 0, 0, 0, 16, 4, 1, 2, 8)
     assert compute_plan_digest(
-        PLAN_SCHEMA_VERSION, policy, [same_rows_other_grid]
+        PLAN_SCHEMA_VERSION, policy, [same_rows_other_shape], shape_key_width=3
     ) != base
     # Worker assignment changes the digest.
-    assert compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [_entry(0, worker=1)]) != base
+    assert compute_plan_digest(
+        PLAN_SCHEMA_VERSION, policy, [_entry(0, worker=1)], shape_key_width=3
+    ) != base
     # The capacity policy is part of the digest.
     assert (
-        compute_plan_digest(PLAN_SCHEMA_VERSION, RowCapacityPolicy(16), [_entry(0)]) != base
+        compute_plan_digest(
+        PLAN_SCHEMA_VERSION, RowCapacityPolicy(16), [_entry(0)], shape_key_width=3
+    ) != base
     )
     # Schema version is part of the digest.
-    assert compute_plan_digest(PLAN_SCHEMA_VERSION + 1, policy, [_entry(0)]) != base
+    assert compute_plan_digest(
+        PLAN_SCHEMA_VERSION + 1, policy, [_entry(0)], shape_key_width=3
+    ) != base
+
+
+def test_digest_is_shape_key_width_aware():
+    """A model with a different shape-key width gets a different digest space.
+
+    Without the width in the header, a 2-slot key ``(4, 4)`` and the first two
+    slots of a 3-slot key could pack to the same bytes; the check that turns a
+    plan mismatch into a clean error would then miss it.
+    """
+    policy = RowCapacityPolicy()
+    narrow = (0, 0, 0, 0, 16, 4, 4, 4)
+    wide = (0, 0, 0, 0, 16, 4, 4, 4, 0)
+    assert compute_plan_digest(
+        PLAN_SCHEMA_VERSION, policy, [narrow], shape_key_width=2
+    ) != compute_plan_digest(
+        PLAN_SCHEMA_VERSION, policy, [wide], shape_key_width=3
+    )
+    with pytest.raises(MdpPlanError, match="slots"):
+        compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [narrow], shape_key_width=3)
 
 
 # ------------------------- batch plan indexes -------------------------
@@ -199,7 +219,7 @@ def test_plan_indexes_are_dictionaries():
     empty = plan.encoder_layout_for_producer(5)
     assert empty.segments == () and empty.producer_worker_id == 5
     assert plan.layout_for_microbatch(1).text_only
-    assert plan.segment_for_item(0).grid_thw == (1, 8, 8)
+    assert plan.segment_for_item(0).shape_key == (1, 8, 8)
     with pytest.raises(MdpPlanError):
         plan.segment_for_item(42)
     with pytest.raises(MdpPlanError):

@@ -42,13 +42,15 @@ schedule model list.
 
 | File | Contents |
 |---|---|
-| `config.py` | `MdpConfig`, support-matrix validation, typed encoder recompute configuration |
+| `config.py` | `MdpConfig`, support-matrix validation, typed encoder recompute configuration, vision config override allowlist |
+| `protocols.py` | `MdpModelAdapter` and the carrier types; the only place model behavior enters core |
 | `rank_mapping.py` | Pure-compute outer-DP planning groups and logical workers from `RankGenerator` coordinates |
 | `groups.py` | Process-group installation, fixed-width descriptor broadcast |
 | `plan.py` / `planner.py` | Minimal-sufficient plan data model, blake2b digest, deterministic integer LPT, group consistency check |
+| `window.py` | Iteration capture with VPP replay cursors; delegates all model geometry to `adapter.validate_item` |
 | `allocator.py` / `storage.py` | Single allocation point for MDP buffers; endpoint leaf storage |
 | `bridge.py` | One ledger + transport for pixels/embeddings/gradients |
-| `window.py` / `activation.py` | Iteration window with VPP replay cursors; forward handle, chunking, encoder THD params |
+| `activation.py` | Forward handle (retained graph or whole-encoder replay recipe), chunk retention, multi-tensor backward |
 | `packing.py` | Greedy token-budget bin filling and the cross-iteration sample buffer |
 | `runtime.py` / `schedule.py` | Phase machine; schedule and finalizer wrappers |
 | `encoder.py` / `optimizer.py` | Encoder DDP over WORLD + ZeRO-1; composite optimizer with WORLD overflow union |
@@ -57,7 +59,25 @@ schedule model list.
 
 ## Support matrix (v1)
 
-Supported: Qwen3.5-VL (one vision encoder), `TP=1`, decoder `CP=1`,
+Core is model-agnostic: an item reaches it as `payload_rows`, `output_rows`, an
+integer LPT cost and an opaque fixed-width `shape_key` that only the adapter
+interprets (`adapter.shape_key_width` slots). Row arithmetic, attention
+segmentation and geometry validation belong to the adapter; core never assumes a
+`(t, h, w)` patch grid or a spatial merge factor.
+
+The decoder is equally opaque. Core touches it only through parameter
+disjointness against the encoder, `len(model)` (VPP chunks), the wrapped native
+schedule and the `finalize_model_grads` token capture. Which decoder runs is the
+model package's choice: `examples/multimodal_dev` builds it through the
+registry's `language_model_builder_fn`, by default `hybrid_config_from_args` +
+`HybridModelBuilder` -- the same path as `pretrain_hybrid.py`, so `--spec` and
+builder-side stack features apply.
+
+| `--model-arch` | Vision encoder | Decoder build path | Status |
+|---|---|---|---|
+| `qwen35_vl` | Qwen3.5 ViT (grid shape key `(t, h, w)`, merge 2) | default hook (`HybridModelBuilder`), RoPE fraction/base pinned | supported |
+
+Supported: one vision encoder per model, `TP=1`, decoder `CP=1`,
 `encoder_cp=1`, native PP/VPP/EP, fully replicated encoder with WORLD ZeRO-1,
 `calculate_per_token_loss=True`, bf16 main path (fp16 covered by
 overflow-union tests), THD packed sequences on both sides, native MCore vision

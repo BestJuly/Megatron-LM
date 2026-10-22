@@ -24,6 +24,7 @@ Usage::
 """
 
 import dataclasses
+import functools
 import importlib
 import os
 import sys
@@ -63,17 +64,10 @@ def model_provider(
     registry factory functions.
     """
     args = get_args()
-    model_arch = getattr(args, "model_arch", "qwen35_vl")
 
-    from examples.multimodal_dev.models import MODEL_REGISTRY
+    from examples.multimodal_dev.models import registry_for
 
-    if model_arch not in MODEL_REGISTRY:
-        raise ValueError(
-            f"Unknown model arch '{model_arch}'. "
-            f"Available: {list(MODEL_REGISTRY.keys())}"
-        )
-
-    registry = MODEL_REGISTRY[model_arch]
+    registry = registry_for(args)
 
     # --- language config (generic + model-specific post-processing) ---
     language_config = core_transformer_config_from_args(args)
@@ -122,6 +116,21 @@ def model_provider(
     if vision_flops_fn is not None:
         vision_flops_fn(args, language_config, vision_config)
 
+    # --- language decoder hook (registry, default: HybridModelBuilder) ---
+    # Bound here, invoked by the arch factory at the point in construction it
+    # chooses (e.g. after its vision encoder, preserving the init RNG order).
+    from examples.multimodal_dev.models.base import build_language_model
+
+    language_model_builder = functools.partial(
+        registry.get("language_model_builder_fn") or build_language_model,
+        args,
+        language_config,
+        pre_process=pre_process,
+        post_process=post_process,
+        vp_stage=kwargs.get("vp_stage"),
+        pg_collection=kwargs.get("pg_collection"),
+    )
+
     # --- build model (fully delegated to the arch factory) ---
     model = registry["model_factory_fn"](
         args=args,
@@ -129,6 +138,7 @@ def model_provider(
         vision_config=vision_config,
         pre_process=pre_process,
         post_process=post_process,
+        language_model_builder=language_model_builder,
         **kwargs,
     )
 
@@ -155,24 +165,17 @@ def datasets_provider(train_val_test_num_samples, vp_stage=None):
     """
     del vp_stage
     args = get_args()
-    model_arch = getattr(args, "model_arch", "qwen35_vl")
     provider = getattr(args, "dataset_provider", "mock")
 
-    from examples.multimodal_dev.models import MODEL_REGISTRY
+    from examples.multimodal_dev.models import registry_for
 
-    if model_arch not in MODEL_REGISTRY:
-        raise ValueError(
-            f"Unknown model arch '{model_arch}'. "
-            f"Available: {list(MODEL_REGISTRY.keys())}"
-        )
-
-    registry = MODEL_REGISTRY[model_arch]
+    registry = registry_for(args)
     available = registry.get("dataset_providers", {})
 
     if provider not in available:
         raise ValueError(
             f"Unknown dataset provider '{provider}' for arch "
-            f"'{model_arch}'. Available: {list(available.keys())}"
+            f"'{getattr(args, 'model_arch', None)}'. Available: {list(available.keys())}"
         )
 
     provider_fn = _resolve_provider_fn(available[provider])
@@ -180,15 +183,15 @@ def datasets_provider(train_val_test_num_samples, vp_stage=None):
 
 
 def _mdp_adapter_builder(args):
-    """Build the Qwen3.5-VL MDP adapter plus its vision TransformerConfig.
+    """Build the registered MDP adapter plus its vision TransformerConfig.
 
     Mirrors model_provider's vision-config assembly so the MDP encoder is
     built from exactly the same configuration as the native path.
     """
     from examples.multimodal_dev.mdp_adapter import build_mdp_adapter
-    from examples.multimodal_dev.models import MODEL_REGISTRY
+    from examples.multimodal_dev.models import registry_for
 
-    registry = MODEL_REGISTRY[getattr(args, "model_arch", "qwen35_vl")]
+    registry = registry_for(args)
     language_config = core_transformer_config_from_args(args)
     post_language_config_fn = registry.get("post_language_config_fn")
     if post_language_config_fn is not None:
@@ -204,7 +207,7 @@ def _mdp_adapter_builder(args):
     # The encoder DDP derives its gradient prescale from this flag; MDP
     # requires prescale 1 (WORLD sum, normalized once by 1/T_global).
     vision_config.calculate_per_token_loss = language_config.calculate_per_token_loss
-    return build_mdp_adapter(args, language_config), vision_config
+    return build_mdp_adapter(args, language_config, vision_config), vision_config
 
 
 def _setup_mdp(args):

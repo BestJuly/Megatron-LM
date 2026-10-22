@@ -17,9 +17,20 @@ from megatron.core.mdp.errors import MdpBridgeError, MdpConfigurationError
 from megatron.core.mdp.protocols import VisionDescriptor
 from megatron.core.mdp.rank_mapping import MdpRankMap
 
-# int64 slots per descriptor record (see API design 5.6; slot 11 carries
-# owner_worker_id for owner-sharded pixel reading).
-DESCRIPTOR_SLOTS = 12
+# int64 slots every descriptor record carries regardless of the model. The
+# model's ``shape_key`` is appended after them, so a record is
+# ``DESCRIPTOR_FIXED_SLOTS + adapter.shape_key_width`` slots wide and the fixed
+# fields keep stable indices for every model.
+DESCRIPTOR_FIXED_SLOTS = 9
+
+
+def descriptor_slots(shape_key_width: int) -> int:
+    """Wire width of one descriptor record for a given shape-key width."""
+    if shape_key_width < 0:
+        raise MdpConfigurationError(
+            f"MDP: shape_key_width={shape_key_width} violates: shape_key_width >= 0."
+        )
+    return DESCRIPTOR_FIXED_SLOTS + shape_key_width
 
 
 @dataclass(frozen=True)
@@ -111,10 +122,17 @@ def install_mdp_process_groups(
     )
 
 
-def descriptors_to_records(descriptors: Sequence[VisionDescriptor]) -> list:
-    """Fixed-width int64 record rows in the wire slot order."""
+def descriptors_to_records(
+    descriptors: Sequence[VisionDescriptor], *, shape_key_width: int
+) -> list:
+    """Int64 record rows in the wire slot order: fixed fields, then the shape key."""
     records = []
     for d in descriptors:
+        if len(d.shape_key) != shape_key_width:
+            raise MdpBridgeError(
+                f"MDP: descriptor {d.global_item_id} violates: len(shape_key) == "
+                f"shape_key_width ({len(d.shape_key)} != {shape_key_width})."
+            )
         records.append(
             [
                 d.global_item_id,
@@ -125,19 +143,22 @@ def descriptors_to_records(descriptors: Sequence[VisionDescriptor]) -> list:
                 d.estimated_cost_units,
                 d.payload_rows,
                 d.output_rows,
-                d.grid_thw[0],
-                d.grid_thw[1],
-                d.grid_thw[2],
                 d.owner_worker_id,
+                *(int(value) for value in d.shape_key),
             ]
         )
     return records
 
 
-def records_to_descriptors(records) -> tuple:
+def records_to_descriptors(records, *, shape_key_width: int) -> tuple:
     """Inverse of :func:`descriptors_to_records`."""
     descriptors = []
+    width = descriptor_slots(shape_key_width)
     for row in records:
+        if len(row) != width:
+            raise MdpBridgeError(
+                f"MDP: descriptor record violates: {width} int64 slots (got {len(row)})."
+            )
         (
             global_item_id,
             sample_id,
@@ -147,11 +168,8 @@ def records_to_descriptors(records) -> tuple:
             estimated_cost_units,
             payload_rows,
             output_rows,
-            grid_t,
-            grid_h,
-            grid_w,
             owner_worker_id,
-        ) = (int(v) for v in row)
+        ) = (int(v) for v in row[:DESCRIPTOR_FIXED_SLOTS])
         descriptors.append(
             VisionDescriptor(
                 global_item_id=global_item_id,
@@ -162,7 +180,7 @@ def records_to_descriptors(records) -> tuple:
                 estimated_cost_units=estimated_cost_units,
                 payload_rows=payload_rows,
                 output_rows=output_rows,
-                grid_thw=(grid_t, grid_h, grid_w),
+                shape_key=tuple(int(v) for v in row[DESCRIPTOR_FIXED_SLOTS:]),
                 owner_worker_id=owner_worker_id,
             )
         )
@@ -175,14 +193,17 @@ def broadcast_descriptors(
     planning_group: dist.ProcessGroup,
     endpoint_rank: int,
     num_microbatches: int,
+    shape_key_width: int,
     text_only_flags: Sequence[bool] = (),
     device=None,
 ) -> tuple:
     """Broadcast the endpoint's descriptors to its planning group.
 
     Two collectives: a small header (descriptor count and per-microbatch
-    ``text_only`` flags), then the fixed-width ``int64[count, 11]`` payload.
-    Pickle and object collectives are forbidden. The endpoint emits in
+    ``text_only`` flags), then the ``int64[count, descriptor_slots(shape_key_width)]``
+    payload. ``shape_key_width`` comes from the adapter and is identical on every
+    member by construction (one adapter per run), so it does not travel on the
+    wire. Pickle and object collectives are forbidden. The endpoint emits in
     ``(microbatch_id, sample_id, image_ordinal)`` order, so every member's input
     is byte-identical by construction.
 
@@ -222,10 +243,13 @@ def broadcast_descriptors(
         count = int(header[0].item())
         flags = tuple(bool(v) for v in header[1:].tolist())
 
-    payload = torch.zeros(count, DESCRIPTOR_SLOTS, dtype=torch.int64, device=device)
+    payload = torch.zeros(
+        count, descriptor_slots(shape_key_width), dtype=torch.int64, device=device
+    )
     if is_endpoint and count:
         records = torch.tensor(
-            descriptors_to_records(local_descriptors), dtype=torch.int64
+            descriptors_to_records(local_descriptors, shape_key_width=shape_key_width),
+            dtype=torch.int64,
         )
         # Pinned staging: a pageable H2D here blocks until the compute
         # stream drains; pinned + non_blocking stays stream-ordered ahead
@@ -236,4 +260,9 @@ def broadcast_descriptors(
     if is_endpoint:
         # Wire roundtrip is lossless (unit-tested); skip the D2H readback.
         return tuple(local_descriptors), flags
-    return records_to_descriptors(payload.tolist() if count else []), flags
+    return (
+        records_to_descriptors(
+            payload.tolist() if count else [], shape_key_width=shape_key_width
+        ),
+        flags,
+    )

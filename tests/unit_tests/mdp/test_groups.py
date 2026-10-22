@@ -37,7 +37,7 @@ def _descriptor(item_id, mb=0, sample=0, ordinal=0, lane=0, cost=7, grid=(1, 4, 
         estimated_cost_units=cost,
         payload_rows=t * h * w,
         output_rows=t * (h // 2) * (w // 2),
-        grid_thw=grid,
+        shape_key=grid,
         owner_worker_id=0,
     )
 
@@ -47,7 +47,12 @@ def test_record_round_trip_is_lossless():
         _descriptor(0, grid=(2, 6, 8)),
         _descriptor(1, mb=1, sample=3, ordinal=2, cost=123, grid=(1, 4, 4)),
     )
-    assert records_to_descriptors(descriptors_to_records(descriptors)) == descriptors
+    assert (
+        records_to_descriptors(
+            descriptors_to_records(descriptors, shape_key_width=3), shape_key_width=3
+        )
+        == descriptors
+    )
 
 
 _DISTRIBUTED = int(os.environ.get("WORLD_SIZE", "1")) > 1
@@ -114,6 +119,7 @@ def test_broadcast_descriptors_from_endpoint():
         planning_group=groups.planning_group,
         endpoint_rank=view.endpoint_rank,
         num_microbatches=2,
+        shape_key_width=3,
         text_only_flags=flags,
     )
     assert received == endpoint_descriptors
@@ -143,6 +149,7 @@ def test_broadcast_rejects_misordered_descriptors():
                 planning_group=groups.planning_group,
                 endpoint_rank=view.endpoint_rank,
                 num_microbatches=2,
+                shape_key_width=3,
                 text_only_flags=(False, False),
             )
     # Non-endpoint ranks skip; a real run would abort collectively before
