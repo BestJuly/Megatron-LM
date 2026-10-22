@@ -439,3 +439,95 @@ def hybrid_dsv4_stack_spec(config):
         window_layer=_wrap_dsv4_layer(compress_ratio=0),  # 'W': sliding-window-only
     )
     return ModuleSpec(module=HybridStack, submodules=submodules)
+
+
+def hybrid_qsa_stack_spec(config):
+    """Config-aware hybrid stack spec wiring the ``Q`` (QSA) layer symbol to
+    ``QSASelfAttention`` (GQA + block-sparse indexer mask), reusing GPT's own
+    ``get_qsa_module_spec_for_backend`` so the hybrid and GPT paths build the same
+    attention module. Selected via
+    ``--spec megatron.core.models.hybrid.hybrid_layer_specs hybrid_qsa_stack_spec``;
+    ``hybrid_builder`` invokes this function with ``config`` when the spec is callable.
+    """
+    import dataclasses
+
+    from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+        _get_backend_spec_provider,
+        get_qsa_module_spec_for_backend,
+    )
+
+    backend = _get_backend_spec_provider(config)
+    qsa_attention = get_qsa_module_spec_for_backend(config, backend)
+
+    qsa_layer = ModuleSpec(
+        module=TransformerLayer,
+        submodules=TransformerLayerSubmodules(
+            input_layernorm=TENorm,
+            self_attention=qsa_attention,
+            self_attn_bda=get_bias_dropout_add,
+        ),
+    )
+
+    submodules = dataclasses.replace(hybrid_stack_spec.submodules, qsa_layer=qsa_layer)
+    return ModuleSpec(module=HybridStack, submodules=submodules)
+
+
+def gated_residual_hybrid_stack_spec(config):
+    """Config-aware hybrid stack spec for ``hyper_connection_variant='gated_residual'``.
+
+    Gated-residual layers carry no pre-sublayer norms (the gated-residual group
+    norm owns that role), so every layer spec is rebuilt with the input layernorm
+    removed: fused-LN projections (GDN ``in_proj``, attention ``linear_qkv``,
+    dense-MLP ``linear_fc1``) become plain column-parallel linears, and explicit
+    ``input_layernorm`` / ``pre_mlp_layernorm`` entries become ``IdentityOp``.
+    ``hybrid_builder`` invokes this function with ``config`` when the spec is
+    callable, and picks it automatically when the gated-residual variant is enabled.
+
+    The base stack is the QSA-extended one when the pattern selected the ``qsa``
+    variant (Qwen3.8-Flash-Next is GDN + QSA + gated residual), otherwise the
+    default hybrid stack.
+    """
+    import copy as _copy
+
+    assert (
+        config.enable_hyper_connections
+        and config.hyper_connection_variant == "gated_residual"
+    ), "gated_residual_hybrid_stack_spec requires the gated_residual variant."
+
+    if getattr(config, "experimental_attention_variant", None) == "qsa":
+        # hybrid_qsa_stack_spec already dataclasses.replace()s a fresh submodules
+        # container, but its untouched layer specs are still shared with the module-level
+        # hybrid_stack_spec, so deepcopy before mutating.
+        spec = _copy.deepcopy(hybrid_qsa_stack_spec(config))
+    else:
+        spec = _copy.deepcopy(hybrid_stack_spec)
+    sub = spec.submodules
+
+    sub.gdn_layer.submodules.self_attention.submodules.in_proj = TEColumnParallelLinear
+    sub.attention_layer.submodules.self_attention.submodules.linear_qkv = TEColumnParallelLinear
+    sub.moe_layer.submodules.pre_mlp_layernorm = IdentityOp
+    sub.mlp_layer.submodules.mlp = partial(
+        MLP.as_mlp_submodule,
+        submodules=MLPSubmodules(
+            linear_fc1=TEColumnParallelLinear, linear_fc2=TERowParallelLinear
+        ),
+    )
+    # The QSA layer keeps its qkv projection unfused by design (the indexer consumes the
+    # same post-norm hidden states), so only its explicit input_layernorm has to go.
+    for layer_spec in (sub.kda_layer, sub.mla_layer, sub.dsa_layer, sub.qsa_layer):
+        if layer_spec is not IdentityOp and hasattr(layer_spec, "submodules"):
+            layer_spec.submodules.input_layernorm = IdentityOp
+    # Lets a builder that was handed this spec explicitly (via --spec) tell it apart from an
+    # arbitrary user spec, which must still be warned about as possibly double-normalizing.
+    spec.metainfo = {**(spec.metainfo or {}), "gated_residual_norm_free": True}
+    return spec
+
+
+def is_gated_residual_norm_free(spec) -> bool:
+    """True for stack specs built by :func:`gated_residual_hybrid_stack_spec`.
+
+    The hybrid builder warns about explicitly provided specs under the gated-residual
+    variant (fused input layernorms would normalize the residual streams twice); specs that
+    carry the ``gated_residual_norm_free`` metainfo are exempt.
+    """
+    return bool((getattr(spec, "metainfo", None) or {}).get("gated_residual_norm_free", False))

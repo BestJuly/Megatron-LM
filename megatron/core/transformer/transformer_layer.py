@@ -274,6 +274,8 @@ class TransformerLayerSubmodules:
             after the MLP.
         sharded_state_dict_keys_map (Dict[str, str]): Mapping for sharded tensor keys to be applied
             in the `sharded_state_dict` method.
+        engram (Union[ModuleSpec, type]): Optional residual injection before attention. Kept last
+            to preserve the established positional constructor order.
     """
 
     input_layernorm: LayerNormBuilder = IdentityOp
@@ -293,6 +295,10 @@ class TransformerLayerSubmodules:
 
     # Mapping for sharded tensor keys to be applied in `sharded_state_dict` method
     sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
+
+    # Keep extension points after the established positional fields for backward compatibility.
+    # Engram consumes the real multi-stream residual before native mHC applies H_pre.
+    engram: Union[ModuleSpec, type] = IdentityOp
 
 
 class BaseTransformerLayer(ABC):
@@ -361,6 +367,24 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
         self.is_mtp_layer = is_mtp_layer
+
+        self.engram = None
+        if submodules.engram is not IdentityOp and not is_mtp_layer:
+            # MTP layers use their own local layer numbering, which would collide with the
+            # decoder's global Engram layer IDs; Engram never attaches to MTP layers.
+            if not isinstance(submodules.engram, ModuleSpec):
+                raise TypeError("The Engram composition point must be a ModuleSpec or IdentityOp.")
+            engram_spec = submodules.engram
+            engram_config = engram_spec.params.get("engram_config")
+            if engram_config is None:
+                raise ValueError("The Engram ModuleSpec must provide engram_config.")
+            if self.layer_number in engram_config.layer_ids:
+                self.engram = build_module(
+                    engram_spec,
+                    config=self.config,
+                    layer_number=self.layer_number,
+                    pg_collection=pg_collection,
+                )
 
         # [Module 1: Input Layernorm] Optional Layernorm on the input data
         # TODO: add pytorch only layernorm
@@ -715,6 +739,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         input_ids: Optional[Tensor] = None,
         *,
         inference_params: Optional[Any] = None,
+        skip_engram: bool = False,
     ):
         """
         Perform a forward pass through the attention layer and the layernorms before and after
@@ -744,6 +769,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 otherwise None.
         """
         inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        if not skip_engram:
+            # skip_engram=True means an outer hyper-connection wrapper already added the memory
+            # residual to the n-stream tensor, before its read gate.
+            hidden_states = self._maybe_apply_engram(hidden_states, input_ids, packed_seq_params)
 
         # Optional Input Layer norm
         attn_norm_manager = self.off_interface(self.offload_attn_norm, hidden_states, "attn_norm")
@@ -859,6 +889,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
 
         return hidden_states, context
 
+    def _maybe_apply_engram(self, hidden_states, input_ids, packed_seq_params=None):
+        """Add the Engram residual for the layers that carry an Engram module.
+
+        Unsupported inputs are rejected by GPTModel.forward, which every pipeline stage
+        executes; raising here would only fire on the stages that own an Engram layer and
+        would hang the remaining stages in their pipeline collectives.
+        """
+        if self.engram is None:
+            return hidden_states
+        return hidden_states + self.engram(hidden_states, input_ids, packed_seq_params)
+
     @copy_signature(_forward_attention)
     def forward(self, *args, **kwargs):
         """
@@ -878,7 +919,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 "wrapped TransformerLayer through this path automatically for hybrid "
                 "stacks."
             )
-        hidden_states, context = self._forward_attention(*args, **kwargs)
+        # The hybrid hyper-connection wrapper owns the n-gram memory injection (it must happen
+        # on the n-stream tensor, before the read gate), so do not repeat it here.
+        hidden_states, context = self._forward_attention(
+            *args, **kwargs, skip_engram=called_from_hybrid_mhc_wrapper
+        )
         output = self._forward_mlp(
             hidden_states,
             kwargs.get("inference_context", None),
@@ -2348,6 +2393,8 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         """Forward attention with hyper connection pre/post processing on self-attention."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        hidden_states = self._maybe_apply_engram(hidden_states, input_ids, packed_seq_params)
+
         nvtx_range_push(suffix="self_attention_hyper_connection")
         hidden_states, self_attn_h_res, self_attn_hc_h_post, residual = (
             self.self_attention_hyper_connection(
@@ -2541,7 +2588,14 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 for tensor in mlp_output_with_bias:
                     self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(tensor)
             # Append HC state (mlp_hc_h_post, mlp_h_res, residual) for replay.
-            return list(mlp_output_with_bias) + [mlp_hc_h_post, mlp_h_res, residual]
+            # Variants whose residual is the identity (gated_residual) leave the h_res slot
+            # None, and None cannot be a CUDA graph output, so the slot is omitted for them
+            # and the replay side reconstructs it. Keyed on the module, not on the variant
+            # name, so a future identity-residual variant needs no change here.
+            hc_state = [mlp_hc_h_post]
+            if self.mlp_hyper_connection.produces_h_res:
+                hc_state.append(mlp_h_res)
+            return list(mlp_output_with_bias) + hc_state + [residual]
 
         return self._forward_post_mlp_with_fused_hyper_connection(
             mlp_output_with_bias, mlp_h_res, residual, mlp_hc_h_post, mhc_mlp_bda_manager
@@ -2875,9 +2929,12 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             assert not self.config.overlap_moe_expert_parallel_comm, "EP overlap must be \
                 disabled when CUDA graph captures the whole MLP/MoE part."
         elif self.is_moe_layer and CudaGraphModule.moe_router in self.config.cuda_graph_modules:
-            # Pop HC state (appended during capture in _forward_mlp).
+            # Pop HC state (appended during capture in _forward_mlp). The h_res slot is only
+            # packed by variants that produce one; see the capture side.
             residual = cuda_graph_output.pop()
-            mlp_h_res = cuda_graph_output.pop()
+            mlp_h_res = (
+                cuda_graph_output.pop() if self.mlp_hyper_connection.produces_h_res else None
+            )
             mlp_hc_h_post = cuda_graph_output.pop()
 
             shared_expert_output, routing_map = None, None

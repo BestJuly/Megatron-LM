@@ -233,6 +233,11 @@ class TransformerConfig(ModelParallelConfig):
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
     for no MoE."""
 
+    engram_enabled: bool = False
+    """Whether Engram n-gram memory modules are attached to selected transformer layers.
+    Engram shards its lookup tables over the expert-parallel dimension, so enabling it
+    also permits expert parallelism without MoE experts."""
+
     rotary_interleaved: bool = False
     """True is rotate pairs of even and odd dimensions (RoFormer style), False is rotate pairs of
     first half and second half (LLaMa style). Default to False."""
@@ -319,7 +324,7 @@ class TransformerConfig(ModelParallelConfig):
     # attention variant
     ####################
     experimental_attention_variant: Optional[
-        Literal['gdn', 'kda', 'gated_delta_net', 'dsa', 'dsv4_hybrid']
+        Literal['gdn', 'kda', 'gated_delta_net', 'dsa', 'dsv4_hybrid', 'qsa']
     ] = None
     """Type of experimental attention variant to use.
 
@@ -470,6 +475,43 @@ class TransformerConfig(ModelParallelConfig):
     ``dsv4_hybrid`` only, True maps to ``cudnn`` and False maps to ``none``."""
 
     ####################
+    # QSA (Qwen Sparse Attention)
+    ####################
+    qsa_indexer_n_heads: int = 4
+    """Number of QSA indexer query heads (MQA over one shared index key head)."""
+
+    qsa_indexer_head_dim: int = 128
+    """Dimension per QSA indexer head (query heads and the shared key head)."""
+
+    qsa_indexer_budget: int = 2048
+    """QSA token budget: number of KV tokens each query attends to through block
+    selection. Selected block count is ``qsa_indexer_budget // qsa_indexer_compress_ratio``.
+    Sequences no longer than the budget degenerate to dense causal attention."""
+
+    qsa_indexer_compress_ratio: int = 4
+    """QSA block size in tokens: index keys are mean-pooled (parameter-free) over
+    fixed, causal-prefix-aligned groups of this many tokens; selection is block-granular."""
+
+    qsa_indexer_loss_coeff: Optional[float] = None
+    """Coefficient for the QSA indexer sparse-KL distillation loss (teacher = the main
+    attention distribution aggregated to blocks, normalized over the selected block set
+    only). None or 0 disables indexer training."""
+
+    qsa_use_sparse_attention: bool = False
+    """Use the sparse GQA Triton kernel path (gathered block-sparse attention over the
+    selected 4-token blocks; supports BSHD and packed THD). When False, the dense-mask
+    bridge is used: the selection is materialized as a [b, s, s] bool mask fed to dense
+    core attention — functionally identical, no sparsity speedup, BSHD only."""
+
+    qsa_cp_packing_layout: Literal["per_document", "per_sequence"] = "per_document"
+    """How packed THD batches are zigzag-sharded across context-parallel ranks for QSA.
+    'per_document' splits every document independently into 2*cp chunks (each document
+    length must divide 2*cp); 'per_sequence' zigzags the flattened pack (what
+    per-sequence balancing / inter-document masking dataloaders produce). This is a
+    caller contract — both layouts are legal for the same cu_seqlens and cannot be
+    inferred. Ignored for cp=1 and for BSHD inputs."""
+
+    ####################
     # linear attention
     ####################
     linear_attention_type: Optional[str] = None
@@ -484,6 +526,12 @@ class TransformerConfig(ModelParallelConfig):
 
     linear_conv_kernel_dim: Optional[int] = 4
     """Conv kernel dimension for the gated delta net."""
+
+    gdn_output_gate_activation: Optional[Literal['silu', 'sigmoid']] = None
+    """Activation of the GDN output gate. ``None`` keeps the historical behaviour of reusing
+    the model-wide ``activation_func`` (silu for Qwen3-Next). Qwen3.8-Flash-Next specifies
+    ``sigmoid`` for the output gate only; this knob must not change the causal-conv
+    activation or the MLP activation."""
 
     linear_key_head_dim: Optional[int] = 128
     """Query and key head dimension for the gated delta net."""
@@ -505,6 +553,13 @@ class TransformerConfig(ModelParallelConfig):
 
     gdn_pre_gated_delta_rule_fusion: bool = False
     """Whether to use the streamed Triton fusion for GatedDeltaNet pre-GDR preprocessing."""
+
+    has_gated_delta_net_layers: bool = False
+    """Whether the model actually builds GatedDeltaNet layers. Set for hybrid models whose
+    layer pattern contains 'G'; a pure-GDN model instead signals this through
+    experimental_attention_variant='gdn'. A hybrid stack cannot use the variant name for this:
+    it is a single global value and a GDN+attention hybrid (Qwen3.8-Flash-Next is GDN+QSA)
+    must set it to the attention family so the right layer spec is composed."""
 
     gdn_conv_pad_alignment: Optional[int] = None
     """When set, pad packed GDN causal-conv inputs to this token alignment.
@@ -1349,6 +1404,23 @@ class TransformerConfig(ModelParallelConfig):
     num_residual_streams: int = 4
     """Number of residual streams (n in paper)."""
 
+    hyper_connection_variant: str = "mhc"
+    """Which hyper-connection mathematics to use when enable_hyper_connections=True.
+
+    "mhc": Manifold-Constrained Hyper-Connections (Sinkhorn doubly-stochastic
+    cross-stream mixing + per-stream scalar read gate). The default; existing
+    behaviour is unchanged.
+    "gated_residual": the Qwen4-Exp variant — low-rank per-channel read gate
+    over group-RMS-normalized streams, per-stream scalar write gate, identity
+    residual (no cross-stream mixing). Removes the per-sublayer pre-norms
+    (the gated-residual group norm takes over that role).
+    """
+
+    hc_lowrank: int = 320
+    """Bottleneck width of the gated-residual read gate's two projections
+    ((n*C) -> hc_lowrank -> (n*C)). Only used with
+    hyper_connection_variant="gated_residual"."""
+
     mhc_sinkhorn_iterations: int = 20
     """Number of Sinkhorn-Knopp iterations for doubly stochastic projection."""
 
@@ -2146,15 +2218,78 @@ class TransformerConfig(ModelParallelConfig):
                             "build or set dsa_kernel_backend='none'."
                         )
 
+        elif self.experimental_attention_variant == "qsa":
+            if self.multi_latent_attention:
+                raise ValueError(
+                    "QSA is GQA-based and is incompatible with multi_latent_attention."
+                )
+            if self.qsa_indexer_compress_ratio < 1:
+                raise ValueError(
+                    "qsa_indexer_compress_ratio must be positive, got "
+                    f"{self.qsa_indexer_compress_ratio}."
+                )
+            if (
+                self.qsa_indexer_budget < 1
+                or self.qsa_indexer_budget % self.qsa_indexer_compress_ratio != 0
+            ):
+                raise ValueError(
+                    f"qsa_indexer_budget ({self.qsa_indexer_budget}) must be a positive "
+                    f"multiple of qsa_indexer_compress_ratio ({self.qsa_indexer_compress_ratio})."
+                )
+            if self.qsa_indexer_n_heads < 1 or self.qsa_indexer_head_dim < 1:
+                raise ValueError(
+                    "qsa_indexer_n_heads and qsa_indexer_head_dim must be positive, got "
+                    f"{self.qsa_indexer_n_heads} and {self.qsa_indexer_head_dim}."
+                )
+            if self.qsa_indexer_loss_coeff is not None and self.qsa_indexer_loss_coeff < 0:
+                raise ValueError(
+                    f"qsa_indexer_loss_coeff must be non-negative, got "
+                    f"{self.qsa_indexer_loss_coeff}."
+                )
+            # Note: the indexer reuses the main attention's rotary frequencies. Their dim
+            # (kv_channels * rotary_percent, a model-level arg) must fit the indexer head
+            # dim; this is asserted at runtime in QSAIndexer.forward.
+            if self.qsa_cp_packing_layout not in ("per_document", "per_sequence"):
+                raise ValueError(
+                    "qsa_cp_packing_layout must be 'per_document' or 'per_sequence', got "
+                    f"{self.qsa_cp_packing_layout!r}."
+                )
+            if self.context_parallel_size > 1:
+                # QSA CP is allgather-only: the indexer all-gathers the shared raw index
+                # key head and the sparse path all-gathers K/V; queries stay local at
+                # their zigzag positions. Ring (p2p) attention is not implemented.
+                if not self.qsa_use_sparse_attention:
+                    raise ValueError(
+                        "QSA with context parallelism requires qsa_use_sparse_attention=True "
+                        "(the dense-mask bridge is single-rank only)."
+                    )
+                cp_comm_types = (
+                    self.cp_comm_type if isinstance(self.cp_comm_type, list)
+                    else [self.cp_comm_type]
+                )
+                if any(c not in (None, "all_gather", "allgather") for c in cp_comm_types):
+                    raise ValueError(
+                        "QSA context parallelism supports cp_comm_type='all_gather' only, "
+                        f"got {self.cp_comm_type!r}."
+                    )
+
         if self.gdn_pre_gated_delta_rule_fusion and self.experimental_attention_variant == "kda":
             raise NotImplementedError(
                 "gdn_pre_gated_delta_rule_fusion is not implemented for KDA yet."
             )
 
-        if self.gdn_pre_gated_delta_rule_fusion and self.experimental_attention_variant != "gdn":
+        if self.gdn_pre_gated_delta_rule_fusion and not (
+            self.experimental_attention_variant == "gdn" or self.has_gated_delta_net_layers
+        ):
+            # The fusion is a property of the GatedDeltaNet module, which reads
+            # gdn_pre_gated_delta_rule_fusion directly and never looks at
+            # experimental_attention_variant. What it needs is that GDN layers exist at all,
+            # so gate on that: either a pure-GDN model (variant 'gdn') or a hybrid stack whose
+            # layer pattern contains 'G' (has_gated_delta_net_layers).
             raise ValueError(
-                "gdn_pre_gated_delta_rule_fusion is only supported with "
-                "experimental_attention_variant='gdn'."
+                "gdn_pre_gated_delta_rule_fusion requires a model with GatedDeltaNet layers "
+                "(experimental_attention_variant='gdn', or a hybrid layer pattern "
+                "containing 'G')."
             )
 
         if self.fp8:
@@ -2225,8 +2360,14 @@ class TransformerConfig(ModelParallelConfig):
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
 
-        if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:
-            raise ValueError("num_moe_experts must be non None to use expert-parallel.")
+        if (
+            self.expert_model_parallel_size > 1
+            and self.num_moe_experts is None
+            and not self.engram_enabled
+        ):
+            raise ValueError(
+                "num_moe_experts must be non None to use expert-parallel unless Engram is enabled."
+            )
 
         if self.transformer_impl == "inference_optimized" and self.num_moe_experts is not None:
             if self.expert_tensor_parallel_size > 1:
@@ -2851,6 +2992,94 @@ class TransformerConfig(ModelParallelConfig):
         if self.use_fused_mhc:
             if not self.enable_hyper_connections:
                 raise ValueError("use_fused_mhc requires enable_hyper_connections=True.")
+
+        # Validation for hyper_connection_variant
+        if self.hyper_connection_variant not in ("mhc", "gated_residual"):
+            raise ValueError(
+                f"hyper_connection_variant must be 'mhc' or 'gated_residual', got "
+                f"{self.hyper_connection_variant!r}."
+            )
+        if self.hyper_connection_variant != "mhc" and not self.enable_hyper_connections:
+            warnings.warn(
+                f"hyper_connection_variant={self.hyper_connection_variant!r} has no "
+                "effect without enable_hyper_connections=True.",
+                UserWarning,
+                stacklevel=2,
+            )
+        if self.enable_hyper_connections and self.hyper_connection_variant == "gated_residual":
+            if not isinstance(self.hc_lowrank, int) or isinstance(self.hc_lowrank, bool) or (
+                self.hc_lowrank < 1
+            ):
+                raise ValueError("hc_lowrank must be a positive integer for gated_residual.")
+            if self.transformer_impl != "transformer_engine":
+                raise ValueError(
+                    "hyper_connection_variant='gated_residual' requires "
+                    "transformer_impl='transformer_engine': the norm-free layer specs are "
+                    "only built for the TE backend."
+                )
+            if self.use_fused_mhc:
+                raise ValueError(
+                    "use_fused_mhc applies only to hyper_connection_variant='mhc'; the "
+                    "gated-residual variant uses its own native kernels."
+                )
+            if self.mhc_recompute_attn_cuda_graph_split:
+                raise ValueError(
+                    "mhc_recompute_attn_cuda_graph_split is mHC-only; the gated-residual "
+                    "variant does not implement the attention-only split."
+                )
+            # The partial-MoE capture path used to pack the 4-tuple's h_res slot as a graph
+            # output unconditionally, which a None cannot be, so CUDA graphs were rejected
+            # outright for this variant. The capture/replay pair now keys on
+            # HyperConnectionModule.produces_h_res and omits the slot for identity-residual
+            # variants, so the gated residual no longer blocks capture. Only the
+            # TE-backed partial capture is exercised: the `local` implementation captures
+            # the whole layer, which has not been validated against the 4-tuple contract.
+            if (
+                self.cuda_graph_impl not in ("none", "transformer_engine")
+                or self.enable_cuda_graph
+                or self.external_cuda_graph
+            ):
+                raise ValueError(
+                    "CUDA graphs with hyper_connection_variant='gated_residual' are "
+                    "supported only as cuda_graph_impl='transformer_engine' partial "
+                    f"capture, got cuda_graph_impl={self.cuda_graph_impl!r}"
+                    f"{', enable_cuda_graph' if self.enable_cuda_graph else ''}"
+                    f"{', external_cuda_graph' if self.external_cuda_graph else ''}. "
+                    "Whole-layer and full-iteration capture have not been validated "
+                    "against the 4-tuple contract."
+                )
+            if self.cuda_graph_impl == "transformer_engine":
+                _gr_graphable_scopes = {
+                    CudaGraphModule.moe,
+                    CudaGraphModule.moe_router,
+                    CudaGraphModule.moe_preprocess,
+                }
+                # cuda_graph_modules entries may still be plain strings here: this guard runs
+                # before the generic CUDA-graph normalization, and only arguments.py converts
+                # the CLI values to enum members. Compare on names so both forms work.
+                _gr_graphable_names = {m.name for m in _gr_graphable_scopes}
+                _gr_scopes = {
+                    getattr(m, "name", m) for m in (self.cuda_graph_modules or [])
+                }
+                if not _gr_scopes or not _gr_scopes <= _gr_graphable_names:
+                    raise ValueError(
+                        "CUDA graphs with hyper_connection_variant='gated_residual' are "
+                        "validated only for cuda_graph_modules restricted to the MoE "
+                        "scopes (moe / moe_router / moe_preprocess), where the capture "
+                        "covers the aggregate plus the router and dispatch preprocessing; "
+                        f"got {sorted(_gr_scopes) or 'all layers'}. Wider "
+                        "scopes capture the attention-type layers too, which is untested "
+                        "for this variant."
+                    )
+            if self.tensor_model_parallel_size > 1 and not self.sequence_parallel:
+                warnings.warn(
+                    "hyper_connection_variant='gated_residual' with tensor parallelism "
+                    "but without sequence_parallel duplicates the gated-residual "
+                    "computation (~10% of forward FLOPs) on every TP rank. Enable "
+                    "sequence_parallel so each rank processes s/TP of the sequence.",
+                    UserWarning,
+                    stacklevel=2,
+                )
 
         if self.fine_grained_activation_offloading:
             assert (

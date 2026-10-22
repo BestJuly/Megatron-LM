@@ -41,6 +41,29 @@ def validate_encoder_recompute_args(args) -> None:
         )
 
 
+def validate_engram_args(args) -> None:
+    """Reject Engram configurations the multimodal entry cannot run correctly.
+
+    Engram's own packed-sequence guards key off ``--sft`` / ``--use-varlen-dataset``,
+    which this entry never sets, so they do not see ``--use-packed-sequence`` batches.
+    """
+    if not getattr(args, "engram_enabled", False):
+        return
+    if getattr(args, "engram_token_prefetch", False):
+        raise RuntimeError(
+            "multimodal_dev collates a full batch on every pipeline stage; the Engram "
+            "pipeline token prefetch must stay disabled (engram_token_prefetch=False)"
+        )
+    if getattr(args, "use_packed_sequence", False) and args.context_parallel_size > 1:
+        raise RuntimeError(
+            "Engram does not support context parallelism with packed (THD) multimodal "
+            "batches: its n-gram windows and causal convolution are restored across CP "
+            "ranks from the packed boundaries, a layout path that is unvalidated for "
+            "multimodal_dev's per-sample padding. Use --context-parallel-size 1 or the "
+            "padded (BSHD) layout."
+        )
+
+
 def encoder_recompute_overrides_from_args(args) -> dict:
     """Return native TransformerConfig overrides for encoder recompute."""
     validate_encoder_recompute_args(args)
@@ -311,5 +334,10 @@ def add_multimodal_args(parser):
             "Use vanilla collate function to collate the data."
         ),
     )
+
+    # Every pipeline stage collates its own batch (token IDs included), so Engram
+    # layers read input_ids directly. The decoder-only pre-schedule token broadcast
+    # expects batch["tokens"] and would consume the MDP capture/replay iterator.
+    parser.set_defaults(engram_token_prefetch=False)
 
     return parser

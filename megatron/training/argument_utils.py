@@ -16,6 +16,7 @@ from typing import Any, Callable, Optional
 import torch
 import torch.nn.functional as F
 
+from megatron.core.models.engram import EngramConfig
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import ModuleSpec, import_module
 from megatron.training.config import (
@@ -469,14 +470,21 @@ def core_transformer_config_from_args(args, config_class=None):
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
         pattern = args.hybrid_layer_pattern
+        # Whether GatedDeltaNet layers are actually built. transformer_config cannot derive
+        # this itself (it does not hold the layer pattern) and cannot read it off
+        # experimental_attention_variant, which is one global name for the whole stack.
+        kw_args['has_gated_delta_net_layers'] = Symbols.GDN in pattern
         has_kda = Symbols.KDA in pattern
         has_dsv4_csa = any(s in pattern for s in (Symbols.WINDOW, Symbols.CSA, Symbols.HCA))
         has_dsa = Symbols.DS_ATTENTION in pattern
+        has_qsa = Symbols.QSA in pattern
         if getattr(args, 'experimental_attention_variant', None) is None:
             if has_dsv4_csa:
                 kw_args['experimental_attention_variant'] = 'dsv4_hybrid'
             elif has_dsa:
                 kw_args['experimental_attention_variant'] = 'dsa'
+            elif has_qsa:
+                kw_args['experimental_attention_variant'] = 'qsa'
             elif has_kda:
                 kw_args['experimental_attention_variant'] = 'kda'
 
@@ -590,6 +598,9 @@ def gpt_config_from_args(
     else:
         transformer_cfg = config
     kwargs["transformer"] = transformer_cfg
+    # Built here so the CLI/YAML validation runs once; the padded vocabulary is checked later
+    # by the model builder, which is the first place that knows it.
+    kwargs["engram_config"] = EngramConfig.from_args(args, transformer_cfg)
 
     if args.spec is not None:
         kwargs["transformer_layer_spec"] = import_module(args.spec)
@@ -653,6 +664,10 @@ def hybrid_config_from_args(
         if callable(hybrid_stack_spec) and not isinstance(hybrid_stack_spec, ModuleSpec):
             hybrid_stack_spec = hybrid_stack_spec(transformer_cfg)
         kwargs["hybrid_stack_spec"] = hybrid_stack_spec
+
+    # Built here so the CLI/YAML validation runs once; the padded vocabulary is checked later
+    # by the model builder, which is the first place that knows it.
+    kwargs["engram_config"] = EngramConfig.from_args(args, transformer_cfg)
 
     kwargs["fp16_lm_cross_entropy"] = args.fp16_lm_cross_entropy
     kwargs["hybrid_layer_pattern"] = args.hybrid_layer_pattern

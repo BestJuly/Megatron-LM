@@ -129,6 +129,37 @@ def build_language_model(
     )
 
 
+def engram_padding_token_id(language_model: torch.nn.Module) -> Optional[int]:
+    """Token id the decoder's Engram layers hash collate padding as; None without Engram.
+
+    HF ``qwen4_exp`` hashes the n-gram ids with attention-padding positions replaced by
+    EOS, the qwen variant's window-boundary token (the deepseek variant's boundary is its
+    pad token: same rule). Image/video placeholder ids are hashed as-is. Collate padding
+    here is id 0, so the wrapper rewrites it before the decoder sees ``input_ids``.
+    """
+    from megatron.core.models.engram.engram import Engram
+
+    ids = {
+        module.engram_config.hash_boundary_token_id
+        for module in language_model.modules()
+        if isinstance(module, Engram)
+    }
+    if not ids:
+        return None
+    if len(ids) != 1:
+        raise ValueError(f"Engram layers disagree on the boundary token id: {sorted(ids)}")
+    return ids.pop()
+
+
+def mask_padding_for_decoder(
+    input_ids: Tensor, padding_mask: Optional[Tensor], pad_token_id: Optional[int]
+) -> Tensor:
+    """Return ``input_ids`` with collate-padded positions set to ``pad_token_id``."""
+    if pad_token_id is None or padding_mask is None or input_ids is None:
+        return input_ids
+    return input_ids.masked_fill(padding_mask.to(torch.bool), pad_token_id)
+
+
 class MultimodalModel(MegatronModule):
     """Base class for multimodal vision-language models.
 
@@ -181,10 +212,19 @@ class MultimodalModel(MegatronModule):
         self.share_embeddings_and_output_weights = bool(
             getattr(language_model, "share_embeddings_and_output_weights", False)
         )
+        # The training loop reads the model's process groups off the outermost module
+        # (``get_attr_wrapped_model(model, "pg_collection")``), and Float16Module copies this
+        # attribute at wrap time. The decoder owns them; without this, multimodal models
+        # report ``None`` and features that need the groups (Engram's
+        # ``--engram-verify-training``, the topology report) fail.
+        self.pg_collection = getattr(language_model, "pg_collection", None)
 
         # Vision encoder lives only on the first PP stage.
         self.vision_model = vision_encoder if pre_process else None
         self.language_model = language_model
+        # Set only when this stage's decoder has Engram layers; see
+        # engram_padding_token_id. Text embeddings still use the raw ids.
+        self.decoder_padding_token_id = engram_padding_token_id(language_model)
 
     def shared_embedding_or_output_weight(self):
         """Surface the wrapped language model's shared embedding / output
@@ -277,6 +317,9 @@ class MultimodalModel(MegatronModule):
             position_ids=position_ids,
             packed_seq_params=packed_seq_params,
             padding_mask=padding_mask,
+        )
+        input_ids = mask_padding_for_decoder(
+            input_ids, padding_mask, self.decoder_padding_token_id
         )
 
         return dict(

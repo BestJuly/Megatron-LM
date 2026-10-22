@@ -3,7 +3,7 @@
 """Layout helpers for DeepSeek sparse attention."""
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Literal, Optional, Tuple
 
 import torch
 
@@ -11,6 +11,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.utils import get_pg_size, move_host_tensor_to_device
 
 __all__ = [
+    "CPPackingLayout",
     "PackedCPIndexerLayout",
     "build_packed_cp_indexer_layout",
     "build_packed_allgather_cp_local_positions",
@@ -25,6 +26,25 @@ __all__ = [
     "build_packed_allgather_cp_local_positions_from_host",
     "build_packed_allgather_cp_query_positions_and_key_reorder_from_host",
 ]
+
+
+CPPackingLayout = Literal["per_document", "per_sequence"]
+"""How the training stack shards one packed THD batch across context-parallel ranks.
+
+``per_document``: every document is independently split into ``2 * cp_size`` chunks and
+rank ``r`` keeps chunk ``r`` followed by chunk ``2 * cp_size - 1 - r``. Every document
+length must therefore be divisible by ``2 * cp_size``.
+
+``per_sequence`` (what per-sequence balancing / ``--dataloader-inter-document-masking``
+produces): the *flattened* pack is split into ``2 * cp_size`` chunks and rank ``r``
+keeps chunk ``r`` followed by chunk ``2 * cp_size - 1 - r``. Document boundaries are
+ignored, so a document may straddle a chunk boundary or live entirely on one rank.
+
+This is a caller-supplied contract, never something to infer. Both layouts are legal
+for the very same ``cu_seqlens``: a caller may pick per-sequence balancing even when
+every document length happens to be divisible by ``2 * cp_size``, so divisibility is
+not evidence of a layout.
+"""
 
 
 @dataclass(frozen=True)
@@ -223,6 +243,37 @@ def get_cp_positions_from_layout(
     return query_pos, key_pos
 
 
+def _build_per_sequence_cp_local_positions(
+    cu_seqlens_i64: torch.Tensor,
+    cp_size: int,
+    cp_rank: int,
+    device: torch.device,
+    output_size: Optional[int],
+    cu_seqlens_cover_output: bool = False,
+) -> torch.Tensor:
+    """Local-row to global-token map for flattened (per-sequence) zigzag THD sharding.
+
+    The flattened pack -- not each document -- is cut into ``2 * cp_size`` equal
+    chunks, so ``cu_seqlens`` only supplies the global token count and is otherwise
+    unused. A document that never reaches this rank contributes no local rows.
+    """
+    if output_size is None:
+        global_tokens = int(cu_seqlens_i64[-1].item())
+    else:
+        global_tokens = int(output_size) * cp_size
+        if cu_seqlens_cover_output:
+            # Both arguments then claim to describe the same global pack. Accepting a
+            # mismatch would silently drop or invent rows, so require agreement.
+            covered = int(cu_seqlens_i64[-1].item())
+            if covered != global_tokens:
+                raise ValueError(
+                    "cu_seqlens_cover_output=True requires cu_seqlens[-1] == "
+                    f"output_size * cp_size, got cu_seqlens[-1]={covered} but "
+                    f"output_size={int(output_size)} * cp_size={cp_size} = {global_tokens}."
+                )
+    return build_zigzag_cp_local_positions(global_tokens, cp_size, cp_rank, device)
+
+
 def build_packed_allgather_cp_local_positions(
     cu_seqlens: torch.Tensor,
     cp_size: int,
@@ -231,18 +282,32 @@ def build_packed_allgather_cp_local_positions(
     output_size: Optional[int] = None,
     *,
     cu_seqlens_cover_output: bool = False,
+    cp_packing_layout: CPPackingLayout = "per_document",
 ) -> torch.Tensor:
     """Build local packed-token positions for one CP rank under zigzag THD sharding.
 
-    This mirrors the packed THD CP layout used by the surrounding training stack:
-    each packed sequence is padded to a multiple of ``2 * cp_size`` and each rank
-    receives the rank-local front chunk followed by the mirrored back chunk.
+    ``cp_packing_layout`` is an explicit contract naming the zigzag the caller
+    actually applied; see :data:`CPPackingLayout`. The default ``per_document``
+    keeps the historical DSA behaviour: each packed sequence is padded to a
+    multiple of ``2 * cp_size`` and each rank receives that document's front chunk
+    followed by the mirrored back chunk. ``per_sequence`` instead zigzags the
+    flattened pack.
     """
+    if cp_packing_layout not in ("per_document", "per_sequence"):
+        raise ValueError(
+            "cp_packing_layout must be 'per_document' or 'per_sequence', got "
+            f"{cp_packing_layout!r}"
+        )
     cu_seqlens_i64 = cu_seqlens.to(device=device, dtype=torch.int64)
     if cp_size <= 1:
         if output_size is None:
             output_size = int(cu_seqlens_i64[-1].item())
         return torch.arange(output_size, dtype=torch.int64, device=device)
+
+    if cp_packing_layout == "per_sequence":
+        return _build_per_sequence_cp_local_positions(
+            cu_seqlens_i64, cp_size, cp_rank, device, output_size, cu_seqlens_cover_output
+        )
 
     seq_starts = cu_seqlens_i64[:-1]
     seq_ends = cu_seqlens_i64[1:]
@@ -415,6 +480,7 @@ def build_packed_allgather_cp_query_positions_and_key_reorder(
     *,
     query_cu_seqlens_cover_output: bool = False,
     key_cu_seqlens_cover_output: bool = False,
+    cp_packing_layout: CPPackingLayout = "per_document",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Build packed-query positions and gathered-KV reorder index for allgather CP.
 
@@ -423,6 +489,9 @@ def build_packed_allgather_cp_query_positions_and_key_reorder(
     rank0-local-packed, rank1-local-packed, ..., rank{cp_size-1}-local-packed.
     This helper returns the permutation that restores those gathered KV tensors
     to global packed order, matching the Slime GLM5 implementation semantics.
+
+    ``cp_packing_layout`` names the zigzag the caller applied and is forwarded
+    unchanged to :func:`build_packed_allgather_cp_local_positions`.
     """
     query_positions = build_packed_allgather_cp_local_positions(
         cu_seqlens_q,
@@ -431,18 +500,36 @@ def build_packed_allgather_cp_query_positions_and_key_reorder(
         device,
         output_size=local_output_size,
         cu_seqlens_cover_output=query_cu_seqlens_cover_output,
+        cp_packing_layout=cp_packing_layout,
     )
     if key_local_output_size is None:
         key_local_output_size = local_output_size
-    # All ranks in one batched build. Row-major flattening reproduces exactly the
-    # rank0-local, rank1-local, ... concatenation the gathered KV tensor is in.
-    gathered_key_positions = build_packed_allgather_cp_all_rank_positions(
-        cu_seqlens_kv,
-        cp_size,
-        device,
-        output_size=key_local_output_size,
-        cu_seqlens_cover_output=key_cu_seqlens_cover_output,
-    ).reshape(-1)
+    if cp_packing_layout == "per_document":
+        # All ranks in one batched build. Row-major flattening reproduces exactly the
+        # rank0-local, rank1-local, ... concatenation the gathered KV tensor is in.
+        gathered_key_positions = build_packed_allgather_cp_all_rank_positions(
+            cu_seqlens_kv,
+            cp_size,
+            device,
+            output_size=key_local_output_size,
+            cu_seqlens_cover_output=key_cu_seqlens_cover_output,
+        ).reshape(-1)
+    else:
+        gathered_key_positions = torch.cat(
+            [
+                build_packed_allgather_cp_local_positions(
+                    cu_seqlens_kv,
+                    cp_size,
+                    rank,
+                    device,
+                    output_size=key_local_output_size,
+                    cu_seqlens_cover_output=key_cu_seqlens_cover_output,
+                    cp_packing_layout=cp_packing_layout,
+                )
+                for rank in range(cp_size)
+            ],
+            dim=0,
+        )
     key_reorder_idx = torch.argsort(gathered_key_positions)
     if global_output_size is not None and key_reorder_idx.numel() != global_output_size:
         raise RuntimeError(

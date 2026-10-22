@@ -17,16 +17,28 @@ multimodal_dev/
 │   ├── __init__.py          # MODEL_REGISTRY — central model registry
 │   ├── base.py              # MultimodalModel (vision encoder + built decoder), default decoder hook
 │   ├── vision_base.py       # VisionCollateSpec, BaseGridVisionAdapter (shared MDP plumbing)
-│   └── qwen35_vl/           # Qwen3.5-VL architecture
+│   ├── qwen35_vl/           # Qwen3.5-VL architecture
 │       ├── factory.py       # Factory functions for pretrain entry point
 │       ├── mdp_adapter.py   # Qwen3.5-VL MDP adapter + collate spec
 │       ├── model.py         # Qwen35VLModel (MRoPE, vision encoder wiring)
 │       ├── configuration.py # TransformerConfig builders and constants
 │       ├── specs.py         # Vision layer spec builders
 │       ├── mrope.py         # 3D MRoPE position ID computation
-│       └── vision_encoder.py# ViT encoder (patch embed, merger, RoPE)
+│   │   └── vision_encoder.py# ViT encoder (patch embed, merger, RoPE)
+│   └── qwen38_vl/           # Qwen3.8-Flash-Next VL: Qwen3.5 ViT + Qwen3.8 decoder
+│       ├── configuration.py # Token ids, RoPE constants, ViT depth per variant
+│       ├── factory.py       # Decoder-argument checks; builds Qwen38VLModel via the hook
+│       └── model.py         # Qwen38VLModel (Qwen35VLModel with Qwen3.8 defaults)
 └── scripts/                 # Launch scripts (torchrun, Slurm)
 ```
+
+Qwen3.8-Flash-Next VL (`--model-arch qwen38_vl`) reuses the Qwen3.5-VL ViT, collate spec,
+MDP adapter and data providers (HF `qwen4_exp` code is identical) and takes the Qwen3.8
+decoder from CLI arguments through the default decoder hook: gated residual
+(`--enable-hyper-connections --hyper-connection-variant gated_residual`, `--spec ...
+gated_residual_hybrid_stack_spec`), QSA (`Q` in the pattern; `--qsa-use-sparse-attention` for
+THD/MDP), Engram/PLE (`--engram-variant qwen --engram-eos-token-id 248044`), mRoPE `11 11 10`.
+`scripts/run_qwen38_vl.sh` runs the single-node proxy (MDP or native, THD or BSHD).
 
 ## Quick Start
 
@@ -81,6 +93,20 @@ The supplied `scripts/run_qwen35_vl.sh` derives this pattern from
 a multiple of 4 leaves trailing GatedDeltaNet blocks (and a `/G-` or `/GE` MTP
 depth), which is what `--linear-attention-freq 4` produced on the GPT path, so
 shallow proxy runs keep working.
+
+### Token-indexed decoder features (Engram / PLE)
+
+The decoder is called with `input_ids` on every pipeline stage, because every
+stage collates its own batch. So Engram layers read token IDs directly, and the
+decoder-only pre-schedule token broadcast is switched off for this entry
+(`--no-engram-token-prefetch` is the parser default here). That broadcast expects
+`batch["tokens"]` and would consume the MDP capture/replay iterator. Engram
+hashes follow HF `qwen4_exp`: image/video placeholder IDs are hashed as-is, and
+collate padding (`padding_mask`) is rewritten to the Engram boundary token
+(EOS for the qwen variant) before the decoder sees `input_ids`. Packed documents
+reset their n-gram windows at `cu_seqlens_q_padded`, where the rows actually
+sit. Engram with `--use-packed-sequence` and `--context-parallel-size > 1` is
+rejected at startup.
 
 ### Existing checkpoints
 

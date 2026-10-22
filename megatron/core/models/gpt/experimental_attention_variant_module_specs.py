@@ -36,6 +36,15 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     is_dsa_skip_topk_layer,
     source_dsa_compute_layer,
 )
+from megatron.core.transformer.experimental_attention_variant.qsa import (
+    QSAIndexer,
+    QSAIndexerSubmodules,
+    QSASelfAttention,
+    QSASelfAttentionSubmodules,
+)
+
+
+from megatron.core.transformer.gated_residual import GatedResidualModule
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -97,12 +106,27 @@ def get_gated_delta_net_module_spec(
         backend = _get_backend_spec_provider(config=config)
 
     rms_norm = config.normalization == "RMSNorm"
+    gated_residual = (
+        config.enable_hyper_connections and config.hyper_connection_variant == "gated_residual"
+    )
     if config.experimental_attention_variant == "kda":
         attention = ModuleSpec(
             module=KimiDeltaAttention,
             submodules=KimiDeltaAttentionSubmodules(
                 in_proj=backend.column_parallel_linear(),
                 beta_proj=backend.column_parallel_linear(),
+                out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
+                out_proj=backend.row_parallel_linear(),
+            ),
+            metainfo={"fuse_input_layernorm": False},
+        )
+    elif gated_residual:
+        # The gated-residual variant has no pre-sublayer norm (its group norm
+        # owns that role), so in_proj must not carry a fused input layernorm.
+        attention = ModuleSpec(
+            module=GatedDeltaNet,
+            submodules=GatedDeltaNetSubmodules(
+                in_proj=backend.column_parallel_linear(),
                 out_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
                 out_proj=backend.row_parallel_linear(),
             ),
@@ -230,6 +254,51 @@ def get_dsv4_hybrid_module_spec_for_backend(
     return attention
 
 
+def get_qsa_module_spec_for_backend(
+    config: TransformerConfig, backend: BackendSpecProvider = None
+) -> ModuleSpec:
+    """Helper function to get module spec for QSA (Qwen Sparse Attention).
+
+    QSA is GQA-based: the main attention is a stock ``SelfAttention`` (output gate,
+    partial RoPE, qk layernorm come from existing config knobs); only the indexer that
+    produces the block-sparse selection mask is new. Dense-mask bridge path.
+    """
+    if backend is None:
+        backend = _get_backend_spec_provider(config=config)
+    assert not config.multi_latent_attention, "QSA is GQA-based, not MLA."
+
+    rms_norm = config.normalization == "RMSNorm"
+    qk_norm = (
+        backend.layer_norm(rms_norm=rms_norm, for_qk=True) if config.qk_layernorm else IdentityOp
+    )
+
+    indexer = ModuleSpec(
+        module=QSAIndexer,
+        submodules=QSAIndexerSubmodules(
+            index_qk_proj=backend.linear(),
+            q_layernorm=backend.layer_norm(rms_norm=rms_norm, for_qk=True),
+            k_layernorm=backend.layer_norm(rms_norm=rms_norm, for_qk=True),
+        ),
+    )
+
+    # The indexer consumes the same post-input-layernorm hidden states as the main
+    # q/k/v projections (HF semantics), so the input layernorm must stay unfused.
+    attention = ModuleSpec(
+        module=QSASelfAttention,
+        params={"attn_mask_type": AttnMaskType.arbitrary},
+        submodules=QSASelfAttentionSubmodules(
+            linear_qkv=backend.column_parallel_linear(),
+            core_attention=backend.core_attention(),
+            linear_proj=backend.row_parallel_linear(),
+            q_layernorm=qk_norm,
+            k_layernorm=qk_norm,
+            indexer=indexer,
+        ),
+        metainfo={"fuse_input_layernorm": False},
+    )
+    return attention
+
+
 def get_experimental_attention_variant_module_spec(
     config: TransformerConfig, backend: BackendSpecProvider = None
 ) -> ModuleSpec:
@@ -244,6 +313,8 @@ def get_experimental_attention_variant_module_spec(
         return get_dsa_module_spec_for_backend(config=config, backend=backend)
     elif config.experimental_attention_variant == "dsv4_hybrid":
         return get_dsv4_hybrid_module_spec_for_backend(config=config, backend=backend)
+    elif config.experimental_attention_variant == "qsa":
+        return get_qsa_module_spec_for_backend(config=config, backend=backend)
     else:
         raise ValueError(
             f"Invalid experimental attention variant: {config.experimental_attention_variant}"
@@ -332,7 +403,26 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
     # Get GPT decoder block layer specs
     rms_norm = config.normalization == "RMSNorm"
     enable_hc = config.enable_hyper_connections
-    hc_module = HyperConnectionModule if enable_hc else IdentityOp
+    gated_residual = enable_hc and config.hyper_connection_variant == "gated_residual"
+    if gated_residual:
+        hc_module = GatedResidualModule
+        # The gated-residual variant carries no pre-sublayer norms (its group
+        # norm owns that role): un-fuse the standard attention QKV projection
+        # and reject the fused dense-MLP layernorm, which has no unfused knob.
+        if standard_attention_spec is not None and standard_attention_spec.metainfo.get(
+            "fuse_input_layernorm"
+        ):
+            standard_attention_spec.submodules.linear_qkv = backend.column_parallel_linear()
+            standard_attention_spec.metainfo["fuse_input_layernorm"] = False
+        if dense_mlp_layer_spec is not None and fuse_layernorm_pre_dense:
+            from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec_for_backend
+
+            dense_mlp_layer_spec = get_mlp_module_spec_for_backend(
+                backend=backend, num_experts=None, fuse_layernorm=False
+            )
+            fuse_layernorm_pre_dense = False
+    else:
+        hc_module = HyperConnectionModule if enable_hc else IdentityOp
     layer_module = HyperConnectionTransformerLayer if enable_hc else TransformerLayer
 
     layer_specs = []
@@ -350,12 +440,12 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
         )
         input_layernorm = (
             IdentityOp
-            if attention.metainfo["fuse_input_layernorm"]
+            if gated_residual or attention.metainfo["fuse_input_layernorm"]
             else backend.layer_norm(rms_norm=rms_norm, for_qk=False)
         )
         pre_mlp_layernorm = (
             IdentityOp
-            if fuse_pre_mlp_layernorm
+            if gated_residual or fuse_pre_mlp_layernorm
             else backend.layer_norm(rms_norm=rms_norm, for_qk=False)
         )
 
