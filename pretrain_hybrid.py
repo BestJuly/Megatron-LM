@@ -113,7 +113,13 @@ def _engram_tokens(data_iterator, tokens):
     """
     args = get_args()
     prefetched_tokens = get_pipeline_prefetched_tokens(data_iterator)
-    if args.engram_verify_training and tokens is not None:
+    # The cross-check synchronizes with the host, which a CUDA graph capture cannot do. Under
+    # full-iteration capture it runs on the eager warmup steps; replays never re-run Python.
+    if (
+        args.engram_verify_training
+        and tokens is not None
+        and not torch.cuda.is_current_stream_capturing()
+    ):
         # This rank consumed its own iterator for labels; its tokens must match the batch
         # broadcast from the first stage or the sampler states diverged. Packed rows are
         # compared on the common prefix, since the local row is still unpadded here.

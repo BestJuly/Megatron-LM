@@ -3605,6 +3605,15 @@ def _add_engram_args(parser):
         help='HF config.vocab_size bounding the qwen-variant hash multipliers; the padded '
         'vocabulary must not exceed it.',
     )
+    group.add_argument(
+        '--engram-ep-capacity-factor',
+        type=float,
+        default=2.0,
+        help='Under --cuda-graph-impl full_iteration, the EP lookup sends each (owner rank, '
+        'table) bucket ceil(factor * tokens / ep_size) fixed slots. A bucket that overflows '
+        'fails the run (a device-side assert once the step is captured); a factor >= the EP '
+        'size can never overflow.',
+    )
     group.add_argument('--engram-embedding-lr-multiplier', type=float, default=5.0)
     group.add_argument('--engram-embedding-weight-decay', type=float, default=0.0)
     group.add_argument(

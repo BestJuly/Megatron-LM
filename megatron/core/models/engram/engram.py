@@ -339,6 +339,11 @@ class Engram(MegatronModule):
             ep_group=pg_collection.ep,
             tp_group=pg_collection.tp,
             expt_dp_group=pg_collection.expt_dp,
+            capacity_factor=(
+                engram_config.ep_capacity_factor
+                if getattr(config, "cuda_graph_impl", "none") == "full_iteration"
+                else None
+            ),
         )
         if engram_config.freeze_embedding:
             for table in self.embedding.tables:
