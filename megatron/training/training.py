@@ -5371,7 +5371,12 @@ def training_log(
             # by the scheduled microbatch count for this step.
             mtp_loss_scale = 1 / (num_microbatches or get_num_microbatches())
         MTPLossLoggingHelper.track_mtp_metrics(
-            mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
+            mtp_loss_scale,
+            iteration,
+            writer,
+            wandb_writer,
+            total_loss_dict,
+            preserve_groups=args.cuda_graph_impl != "none",
         )
 
     # Track sparse attention indexer loss.

@@ -1945,6 +1945,36 @@ class TestMTPLossLoggingHelper:
         assert all_reduce_calls[1][1] is fake_group
         assert all_reduce_calls[1][2] == torch.distributed.ReduceOp.SUM
 
+    def test_loss_reduction_groups_survive_graph_replay_cleanup(self, monkeypatch):
+        """A replayed graph never re-records the loss groups; cleanup must keep them."""
+        reduce_group, avg_group = object(), object()
+        all_reduce_calls = []
+
+        def record_all_reduce(tensor, group=None, op=None):
+            all_reduce_calls.append(group)
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", record_all_reduce)
+        MTPLossLoggingHelper.save_loss_to_tracker(
+            loss_sum=torch.tensor(2.0, device="cuda"),
+            num_tokens=torch.tensor(1.0, device="cuda"),
+            layer_number=0,
+            num_layers=1,
+            reduce_group=reduce_group,
+            avg_group=avg_group,
+        )
+        MTPLossLoggingHelper.track_mtp_metrics(1.0, 1, None, preserve_groups=True)
+        assert all_reduce_calls == [reduce_group, avg_group]
+
+        # Graph replay: only the captured tensor changes, the Python save never runs.
+        MTPLossLoggingHelper.tracker["loss_sums"][0] += 3.0
+        MTPLossLoggingHelper.track_mtp_metrics(1.0, 2, None, preserve_groups=True)
+        assert all_reduce_calls[2:] == [reduce_group, avg_group]
+
+        # Eager default keeps the historical reset.
+        MTPLossLoggingHelper.track_mtp_metrics(1.0, 3, None)
+        assert MTPLossLoggingHelper.tracker["reduce_group"] is None
+        assert MTPLossLoggingHelper.tracker["avg_group"] is None
+
     def test_acceptance_reports_each_step_and_cumulates_all_steps(self):
         """The legacy names keep per-step and all-steps, all-microbatch semantics."""
 
