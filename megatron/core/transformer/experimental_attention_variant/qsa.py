@@ -358,6 +358,9 @@ class QSAIndexer(MegatronModule):
                 tail_pos = (
                     torch.arange(blocks_so_far, nb_max, device=device) - last_doc_blocks
                 ) * r
+                # The rotary table only spans the longest document, which these positions
+                # can pass; the rows are never visible, so any in-table position works.
+                tail_pos = tail_pos.clamp_(max=rotary_pos_emb.shape[0] - 1)
                 freq_parts.append(rotary_pos_emb.index_select(0, tail_pos))
             pooled = self.k_layernorm(torch.cat(pooled_parts, dim=0))
             block_keys = apply_rotary_pos_emb(
