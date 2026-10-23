@@ -383,14 +383,16 @@ class EPShardedMultiTableEmbedding(MegatronModule):
         """Slots per (owner, table) bucket for a lookup over ``num_tokens`` tokens."""
         return max(1, math.ceil(self.capacity_factor * num_tokens / self.ep_size))
 
-    def _forward_fixed_capacity(self, hash_ids: Tensor) -> Tensor:
+    def _forward_fixed_capacity(self, hash_ids: Tensor, valid: Tensor | None = None) -> Tensor:
         """EP lookup through fixed-size buckets; every shape follows from ``hash_ids.shape``.
 
         Each (owner, table) bucket holds ``bucket_capacity`` requests. Requests travel in a
         ``[ep, num_tables, capacity]`` layout, so the table of a slot is implicit in its position
         and the owner gathers each table's slots with one embedding call. Unused slots look up
         row 0 and are never read back, so they contribute no gradient. A bucket that overflows
-        is an error (see ``_check_bucket_capacity``): the capacity factor is too small.
+        is an error (see ``_check_bucket_capacity``): the capacity factor is too small. Requests
+        of tokens where ``valid`` is False take no slot; their returned rows are arbitrary and
+        must be discarded by the caller.
         """
         original_shape = hash_ids.shape
         num_tables = len(self.tables)
@@ -405,10 +407,15 @@ class EPShardedMultiTableEmbedding(MegatronModule):
         try:
             table_ids = self._table_ids(original_shape, device)
             owners, local_rows = self._owner_map(rows, table_ids)
+            num_buckets = self.ep_size * num_tables
             buckets = owners * num_tables + table_ids
+            if valid is not None:
+                # Invalid requests go to one extra bucket that is never sent.
+                valid = valid.unsqueeze(-1).expand(original_shape).reshape(-1)
+                buckets = torch.where(valid, buckets, num_buckets)
             # Rank of each request within its bucket, from a stable sort and per-bucket starts.
             order = torch.argsort(buckets, stable=True)
-            counts = torch.zeros(self.ep_size * num_tables, dtype=torch.int64, device=device)
+            counts = torch.zeros(num_buckets + 1, dtype=torch.int64, device=device)
             counts.scatter_add_(0, buckets, torch.ones_like(buckets))
             starts = torch.cumsum(counts, 0) - counts
             sorted_positions = torch.arange(
@@ -416,10 +423,15 @@ class EPShardedMultiTableEmbedding(MegatronModule):
             ) - starts.index_select(0, buckets.index_select(0, order))
             positions = torch.empty_like(sorted_positions).scatter_(0, order, sorted_positions)
             fits = positions < capacity
-            _check_bucket_capacity(counts.max(), capacity, num_requests // num_tables, self.ep_size)
+            if valid is not None:
+                fits = fits & valid
+                buckets = torch.where(valid, buckets, 0)
+            _check_bucket_capacity(
+                counts[:num_buckets].max(), capacity, num_requests // num_tables, self.ep_size
+            )
             slots = buckets * capacity + positions.clamp_max(capacity - 1)
-            # Excess requests (before the capacity check fails) write to one spare slot past the
-            # end that is never sent.
+            # Invalid (and, before the capacity check fails, excess) requests write to one
+            # spare slot past the end that is never sent.
             send = torch.zeros(num_slots + 1, dtype=torch.int64, device=device)
             send.scatter_(0, torch.where(fits, slots, num_slots), local_rows)
             send = send[:num_slots]
@@ -452,11 +464,14 @@ class EPShardedMultiTableEmbedding(MegatronModule):
         responses = _DifferentiableEngramAllToAll.apply(self.ep_group, owner_embeddings, None, None)
         return responses.index_select(0, slots).view(*original_shape, self.embedding_dim)
 
-    def forward(self, hash_ids: Tensor) -> Tensor:
+    def forward(self, hash_ids: Tensor, valid: Tensor | None = None) -> Tensor:
         """Route global table rows to owners and restore token/head ordering.
 
         Args:
             hash_ids: Per-table row IDs with shape ``[..., num_tables]``.
+            valid: Optional bool mask of shape ``hash_ids.shape[:-1]``. The fixed-capacity
+                exchange gives tokens where it is False no bucket slot; their returned rows
+                are arbitrary and must be discarded by the caller.
 
         Returns:
             Retrieved embeddings with shape ``[..., num_tables, embedding_dim]``.
@@ -476,7 +491,7 @@ class EPShardedMultiTableEmbedding(MegatronModule):
             return torch.stack(values, dim=-2).view(*original_shape, self.embedding_dim)
 
         if self.capacity_factor is not None:
-            return self._forward_fixed_capacity(hash_ids)
+            return self._forward_fixed_capacity(hash_ids, valid)
 
         rows = hash_ids.reshape(-1).to(torch.int64)
         table_ids = self._table_ids(original_shape, hash_ids.device)

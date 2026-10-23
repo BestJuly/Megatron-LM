@@ -178,3 +178,40 @@ def test_captured_lookup_replays_with_new_tokens(ep_size):
             torch.testing.assert_close(graph_grad, expected_grad)
     del graph
 
+
+@pytest.mark.parametrize("ep_size", [2, 4])
+def test_invalid_requests_take_no_bucket_slot(ep_size):
+    """THD padding slots hash to the same n-gram; masked out, they cannot overflow a bucket."""
+    state = _setup(ep_size, capacity_factor=1.0)
+    if state is None:
+        return
+    rank, embedding = state
+    hash_ids = _hash_ids(seed=41 + rank)
+    # The padded half of the row repeats one row per table: far beyond one bucket's
+    # 1.0 * TOKENS / ep_size slots, exactly what a padding tail looks like.
+    hash_ids[:, TOKENS // 2 :] = hash_ids[:, :1]
+    valid = torch.arange(TOKENS, device="cuda").view(1, TOKENS) < TOKENS // 2
+    grad_output = torch.randn(
+        (*hash_ids.shape, EMBEDDING_DIM),
+        device="cuda",
+        dtype=torch.float64,
+        generator=torch.Generator(device="cuda").manual_seed(3 + rank),
+    )
+    masked = valid[..., None, None].to(torch.float64)
+
+    for table in embedding.tables:
+        table.weight.grad = None
+    output = embedding(hash_ids, valid=valid) * masked
+    output.backward(grad_output)
+    grads = [table.weight.grad.clone() for table in embedding.tables]
+
+    # Unmasked, the same padding overflows the fixed-capacity bucket.
+    with torch.no_grad(), pytest.raises(ValueError, match="engram-ep-capacity-factor"):
+        embedding(hash_ids)
+
+    expected_output, expected_grads = _lookup_and_grads(
+        embedding, hash_ids, grad_output * masked, dynamic=True
+    )
+    torch.testing.assert_close(output.detach(), expected_output * masked, rtol=0, atol=0)
+    for grad, expected_grad in zip(grads, expected_grads):
+        torch.testing.assert_close(grad, expected_grad)
