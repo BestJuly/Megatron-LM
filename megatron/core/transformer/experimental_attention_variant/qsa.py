@@ -1061,6 +1061,14 @@ class QSASelfAttention(SelfAttention):
             loss_cu_seqlens = (
                 packed_seq_params.cu_seqlens_q if packed_seq_params is not None else None
             )
+            padding_mask = getattr(packed_seq_params, "padding_mask", None)
+            if padding_mask is not None:
+                # Slots added by THD padding are not data: keep their rows out of the KL sum
+                # and of the row count that normalizes it.
+                picked = selection.picked
+                selection = selection._replace(
+                    picked=picked & ~padding_mask.reshape(picked.shape[0], -1, 1)
+                )
             indexer_loss = self._compute_indexer_loss(
                 hidden_states, freqs, selection, loss_coeff, cu_seqlens=loss_cu_seqlens
             )

@@ -38,6 +38,10 @@ class PackedSeqParams:
     tokens_per_sample: int = None
     cp_partition_route: Optional["ThdCpRoute"] = None
     cp_scatter_cache: object = None
+    # Bool [b, local tokens], True at slots added by THD padding (pad_sequence_for_thd). Token
+    # aggregates that have no other mask for those slots (the QSA indexer loss, the Engram
+    # fixed-capacity lookup) exclude them.
+    padding_mask: Optional[Tensor] = None
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.
@@ -751,5 +755,6 @@ def pad_sequence_for_thd(
         padding_mask = tail_padding_mask
     else:
         padding_mask = _pad_padding_mask(padding_mask, local_target_len) | tail_padding_mask
+    padded_params.padding_mask = padding_mask
 
     return tokens, labels, loss_mask, position_ids, padded_params, padding_mask
