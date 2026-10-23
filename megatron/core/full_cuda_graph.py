@@ -192,17 +192,39 @@ def clone_tensors_in_struct(tgt, src):
         raise Exception(f"Expect top-level as container type but got: {type(src)}")
 
 
+# Optional callable applied to every drained microbatch before it reaches the schedule (see
+# set_pre_graph_batch_transform).
+_pre_graph_batch_transform = None
+
+
+def set_pre_graph_batch_transform(transform):
+    """Register a transform applied to every microbatch drained for a full-iteration step.
+
+    ``FullCudaGraphWrapper`` drains the schedule's microbatches before running it; the transform
+    runs there, eagerly and outside any capture, so it may synchronize with the host and
+    allocate data-dependent shapes. It must return a batch whose tensor shapes do not depend on
+    the data (they become static graph inputs). Pass None to clear it.
+    """
+    global _pre_graph_batch_transform
+    _pre_graph_batch_transform = transform
+
+
 def drain_microbatches(data_iterator, num_microbatches):
     """Read the schedule's microbatches from ``data_iterator``.
 
     An iterator that carries per-schedule state for ``forward_step`` (it defines
     ``take_batches`` / ``with_batches``, e.g. the Engram token-prefetch wrapper) drains itself,
-    and may own no batches on ranks that read no data.
+    and may own no batches on ranks that read no data. A registered pre-graph batch transform
+    is applied to every batch.
     """
     take_batches = getattr(data_iterator, 'take_batches', None)
     if take_batches is not None:
-        return take_batches(num_microbatches)
-    return [next(data_iterator) for _ in range(num_microbatches)]
+        batches = take_batches(num_microbatches)
+    else:
+        batches = [next(data_iterator) for _ in range(num_microbatches)]
+    if _pre_graph_batch_transform is not None:
+        batches = [_pre_graph_batch_transform(batch) for batch in batches]
+    return batches
 
 
 def replay_iterator(data_iterator, batches, static_stage=None):
