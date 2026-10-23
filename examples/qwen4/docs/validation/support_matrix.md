@@ -29,8 +29,25 @@ the *combination* works.
 | **Activation recompute, selective** | ✅ | `--recompute-granularity selective --recompute-modules core_attn mhc` | 62.5 GiB (−13 %) |
 | **MXFP8** | ✅ | `--fp8-format e4m3 --fp8-recipe mxfp8` | 72.4 GiB |
 | **CUDA graphs, MoE scopes** | ✅ | `--cuda-graph-impl transformer_engine --cuda-graph-modules moe_router moe_preprocess --cuda-graph-warmup-steps 2` | 30 iterations, peak allocated unchanged (42.57 vs 42.59 GiB), loss identical to the eager run at iteration 1 (lm loss 1.073585E+01, grad norm 6.642). `_layer_is_graphable` leaves a hybrid layer eager unless its inner layer is MoE, so this captures the gated-residual aggregate plus the router and dispatch preprocessing and never touches GDN, QSA or the memory. `[moe_router]` alone measures the same — `moe_preprocess` adds nothing. Needed two fixes: the gated residual used to pack its always-`None` `h_res` slot as a graph output, and Engram rejected every `cuda_graph_impl` |
-| **CUDA graphs, wider scopes** | ⛔ | `--cuda-graph-impl local`, or `transformer_engine` with `attn` in the scope list | rejected at config validation, by the gated-residual guard and again by Engram. QSA's sparse path builds its selection superset with host synchronization and a data-dependent union size; the memory's hashed lookup and its all-to-all have data-dependent shapes. **This is the largest remaining opening** |
+| **CUDA graphs, `attn` scope** | ✅ | `--cuda-graph-impl transformer_engine --cuda-graph-modules attn moe_router --cuda-graph-warmup-steps 2 --cuda-graph-capture-engram-host` | run on packed THD (`--sft`) at 32K per rank, CP1, EP4, with MoK, on GB300 (arguments: [`../../README.md`](../../README.md#kernel-backends)). Engram-hosting layers stay eager unless `--cuda-graph-capture-engram-host` runs the Engram lookup eagerly in front of the layer's graph and captures the rest of the layer. Under THD `attn` capture GDN `internal` resolves to `fla` (use `--gdn-kernel-backend cudnn`) and QSA `cudnn` needs `--qsa-cudnn-bwd-impl qsa_api` |
+| **CUDA graphs, other modes** | ⛔ | `--cuda-graph-impl local`, `full_iteration`, or `transformer_engine` without `--cuda-graph-modules` | rejected by Engram at config validation: these modes capture the Engram-hosting layer, whose hashed lookup and all-to-all have data-dependent shapes |
 | **FSDP** | ⛔ | `--use-megatron-fsdp --ckpt-format fsdp_dtensor` | rejected: "Engram does not yet support FSDP" |
+
+## Kernel backends (GB300)
+
+Proxy, 4 × GB300, mock data (cuDNN 9.27.0, cudnn-frontend `lit/qsa`, MoK `lit/qwen4`). Flags and constraints:
+[`../../README.md`](../../README.md#kernel-backends).
+
+| Feature | Whole model | How it was run | Notes |
+|---|:---:|---|---|
+| **GDN `internal` (CuTe DSL), the default** | ✅ | no flag | CuTe DSL forward + fla backward at 48 value heads (logged). Under THD with `attn` captured it resolves to `fla` (one warning) |
+| **GDN `fla`** | ✅ | `--gdn-kernel-backend fla` | the previous default |
+| **GDN `cudnn`** | ✅ | `--gdn-kernel-backend cudnn` | THD + `attn moe_router` capture + MoK, 32K per rank |
+| **QSA `cute`** | ✅ | `--qsa-attn-backend cute` (= `--qsa-use-sparse-attention`) | |
+| **QSA `cudnn` + `sparse_gqa` bwd** | ✅ | `--qsa-attn-backend cudnn` | rejected under THD CUDA-graph capture and for 12Q/1KV (TP2) |
+| **QSA `cudnn` + `qsa_api` bwd** | ✅ | `--qsa-attn-backend cudnn --qsa-cudnn-bwd-impl qsa_api` | the one for 12Q/1KV and THD capture |
+| **QSA `cudnn` + CP** | ⛔ | — | rejected at config time (no CP path in the cuDNN API) |
+| **MoK** | ✅ | `--moe-megakernel-backend mok` | needs MoK `lit/qwen4` ≥ `2649f3b` (128-aligned *intermediate*, the 640 expert FFN) |
 
 ## Optimizer
 

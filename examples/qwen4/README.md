@@ -125,6 +125,64 @@ what makes it useful for recipe work. It is **not** a memory proxy for EP64 — 
 with a large margin. Details and the dimension-by-dimension rationale:
 [`training/proxy_single_node.md`](docs/training/proxy_single_node.md).
 
+### Kernel backends
+
+Three switches pick the GDN and QSA kernels; none of them changes the model.
+
+| Flag | Default | Choices |
+|---|---|---|
+| `--gdn-kernel-backend` | `internal` | `internal` (in-tree CuTe DSL GDR, SM10x), `fla`, `cudnn` |
+| `--qsa-attn-backend` | follows `--qsa-use-sparse-attention` (`dense` / `cute`) | `dense` (mask bridge), `cute` (in-tree CuTe DSL sparse kernels), `cudnn` (cuDNN Frontend QSA kernels) |
+| `--qsa-cudnn-bwd-impl` | `sparse_gqa` | `sparse_gqa` (index-list backward), `qsa_api` (`cudnn.ops.qsa_backward`) |
+
+* GDN `internal` is NVIDIA/Megatron-LM PR #6511
+  ([`internal_gdn_backend/`](../../megatron/core/ssm/gated_delta_net/internal_gdn_backend/)).
+  It runs the CuTe DSL forward and, at this model's 48 value heads, the fla backward (the fused
+  CuTe backward serves 64 heads). The log says which path ran:
+  `Internal GDN backend forward: CuTe DSL` / `backward: fla fallback (...)`.
+  `MCORE_GDN_INTERNAL_BACKEND=cute` turns a fallback into an error, `=fla` bypasses CuTe.
+  Under THD with `attn` in `--cuda-graph-modules` it resolves to `fla` (one warning), because
+  it builds its chunk metadata on the host; pass `--gdn-kernel-backend cudnn` there.
+* QSA backends are described in [`docs/models/qsa.md`](../../docs/models/qsa.md) (execution
+  paths 2 and 3). `cudnn` needs a cuDNN Frontend with the QSA training kernels
+  (BestJuly/cudnn-frontend `lit/qsa`), bf16, head dim 256, 24/2 or 12/1 heads per rank and no
+  CP. `sparse_gqa` additionally needs 512 selected blocks, an even KV head count per rank (so
+  not TP2) and no THD CUDA-graph capture; use `--qsa-cudnn-bwd-impl qsa_api` there.
+
+Arguments for the configurations run on this branch, appended to `train_proxy_1node.sh`:
+
+| Configuration | Arguments |
+|---|---|
+| defaults (GDN `internal`, QSA `cute`) | `--qsa-attn-backend cute` |
+| previous kernels (GDN `fla`, QSA `cute`) | `--gdn-kernel-backend fla --qsa-attn-backend cute` |
+| cuDNN QSA | `--qsa-attn-backend cudnn` (add `--qsa-cudnn-bwd-impl qsa_api` for 12Q/1KV or THD capture) |
+| MoK expert FFN | `--moe-megakernel-backend mok` (MoK `lit/qwen4` ≥ `2649f3b` for the 640-wide expert FFN) |
+
+Packed THD at 32K per rank with partial CUDA graphs (`attn moe_router`) and MoK, CP1, EP4: the
+arguments that run adds to `train_proxy_1node.sh` (its run length and LR schedule left out):
+
+```bash
+--seq-length 32768 --micro-batch-size 1 --global-batch-size 16 --eval-iters 1 \
+--vocab-size 40832 --make-vocab-size-divisible-by 128 \
+--engram-unigram-vocab-size 40832 --engram-eos-token-id 40831 \
+--sft --pad-packed-seq-alignment max --max-seqlen-per-dp-cp-rank 32768 \
+--thd-max-packed-sequences 1 \
+--sft-mock-dataset-config-json '{"mode":"distribution","type":"lognormal","format":"thd","min_seq_len":32768,"max_seq_len":32768,"mean_seq_len":32768,"lognormal_sigma":1.1}' \
+--cuda-graph-impl transformer_engine --cuda-graph-modules attn moe_router \
+--cuda-graph-warmup-steps 2 --cuda-graph-capture-engram-host --te-rng-tracker \
+--moe-megakernel-backend mok \
+--moe-megakernel-backend-config '{"fwd_num_comm_sms":48,"bwd_num_comm_sms":56,"minibatch_size":8192,"macrobatch_size":65536,"schedule_capacity_multiplier":0.0625,"all_gather_top_experts_chunk_bytes":2048}' \
+--moe-router-fusion \
+--gdn-kernel-backend cudnn --gdn-pre-gated-delta-rule-fusion \
+--qsa-use-sparse-attention --qsa-indexer-loss-impl fused --qsa-indexer-loss-chunk 1024 \
+--use-precision-aware-optimizer --main-grads-dtype fp32 --main-params-dtype fp32 \
+--exp-avg-dtype bf16 --exp-avg-sq-dtype bf16 \
+--manual-gc --manual-gc-interval 100 --rerun-mode disabled --no-check-for-nan-in-loss-and-grad
+```
+
+`--gdn-pre-gated-delta-rule-fusion` needs `causal-conv1d` in the image. For cuDNN QSA in this
+configuration add `--qsa-attn-backend cudnn --qsa-cudnn-bwd-impl qsa_api`.
+
 ## 3. Convert the released checkpoint
 
 Needed only for continued pretraining from the published weights. The released checkpoint is
@@ -169,8 +227,9 @@ Each of these cost at least one job to find.
 * Packed sequences go through `--sft`; the packing schedulers selected by `--use-varlen-dataset`
   are rejected by the n-gram memory.
 * VPP works, but not together with `--overlap-param-gather`.
-* CUDA graphs: MoE-scoped capture works; wider scopes are refused by the sparse-attention and
-  memory modules.
+* CUDA graphs: per-layer Transformer Engine capture with explicit `--cuda-graph-modules` works
+  (the MoE scopes, and `attn` with `--cuda-graph-capture-engram-host`); local, full-iteration
+  and whole-layer capture are refused by the memory module.
 
 The full list of what runs and what is refused, with the exact flags:
 [`validation/support_matrix.md`](docs/validation/support_matrix.md).
