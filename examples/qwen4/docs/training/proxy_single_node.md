@@ -94,6 +94,12 @@ GDN requires for THD attention capture, `NVTE_FUSED_ATTN=1`, `NCCL_NVLS_ENABLE=0
 
 The `--sft` path builds a validation loader, so `thd32k` needs `--eval-iters` ≥ 1.
 
+`CUDA_GRAPH` picks the capture mode of `thd32k`: `te` (the default, the per-layer graphs in the
+block above), `full_iteration` (one graph for the whole forward-backward step; it drops
+`--cuda-graph-modules` and `--cuda-graph-capture-engram-host`, and needs
+`--gdn-kernel-backend fla` and a larger MoK `schedule_capacity_multiplier`, see
+[`full_iteration_cuda_graph.md`](full_iteration_cuda_graph.md)) or `none` (eager).
+
 Later flags win in Megatron's argparse, so append overrides after the block rather than editing
 it. `--eval-interval` must stay set: iteration-based data sizing divides by it. `--mock-data` needs
 `--moe-router-force-load-balancing` for meaningful timing (random tokens give a skewed router);

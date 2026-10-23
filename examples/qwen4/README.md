@@ -233,8 +233,10 @@ Each of these cost at least one job to find.
   are rejected by the n-gram memory.
 * VPP works, but not together with `--overlap-param-gather`.
 * CUDA graphs: per-layer Transformer Engine capture with explicit `--cuda-graph-modules` works
-  (the MoE scopes, and `attn` with `--cuda-graph-capture-engram-host`); local, full-iteration
-  and whole-layer capture are refused by the memory module.
+  (the MoE scopes, and `attn` with `--cuda-graph-capture-engram-host`), and so does
+  full-iteration capture with MoK (`CUDA_GRAPH=full_iteration`, `--gdn-kernel-backend fla`; see
+  [`docs/training/full_iteration_cuda_graph.md`](docs/training/full_iteration_cuda_graph.md)).
+  Local and whole-layer capture are refused by the memory module.
 
 The full list of what runs and what is refused, with the exact flags:
 [`validation/support_matrix.md`](docs/validation/support_matrix.md).

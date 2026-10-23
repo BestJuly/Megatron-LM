@@ -30,7 +30,8 @@ the *combination* works.
 | **MXFP8** | ✅ | `--fp8-format e4m3 --fp8-recipe mxfp8` | 72.4 GiB |
 | **CUDA graphs, MoE scopes** | ✅ | `--cuda-graph-impl transformer_engine --cuda-graph-modules moe_router moe_preprocess --cuda-graph-warmup-steps 2` | 30 iterations, peak allocated unchanged (42.57 vs 42.59 GiB), loss identical to the eager run at iteration 1 (lm loss 1.073585E+01, grad norm 6.642). `_layer_is_graphable` leaves a hybrid layer eager unless its inner layer is MoE, so this captures the gated-residual aggregate plus the router and dispatch preprocessing and never touches GDN, QSA or the memory. `[moe_router]` alone measures the same — `moe_preprocess` adds nothing. Needed two fixes: the gated residual used to pack its always-`None` `h_res` slot as a graph output, and Engram rejected every `cuda_graph_impl` |
 | **CUDA graphs, `attn` scope** | ✅ | `--cuda-graph-impl transformer_engine --cuda-graph-modules attn moe_router --cuda-graph-warmup-steps 2 --cuda-graph-capture-engram-host` | the proxy's default `LAYOUT=thd32k`: packed THD (`--sft`) at 32K per rank, CP1, EP4, with MoK, on GB300 ([`../training/proxy_single_node.md`](../training/proxy_single_node.md)). Engram-hosting layers stay eager unless `--cuda-graph-capture-engram-host` runs the Engram lookup eagerly in front of the layer's graph and captures the rest of the layer. Under THD `attn` capture GDN `internal` resolves to `fla` (use `--gdn-kernel-backend cudnn`) and QSA `cudnn` needs `--qsa-cudnn-bwd-impl qsa_api` |
-| **CUDA graphs, other modes** | ⛔ | `--cuda-graph-impl local`, `full_iteration`, or `transformer_engine` without `--cuda-graph-modules` | rejected by Engram at config validation: these modes capture the Engram-hosting layer, whose hashed lookup and all-to-all have data-dependent shapes |
+| **CUDA graphs, full iteration** | ✅ **with MoK; packed rows at CP = 1** | `CUDA_GRAPH=full_iteration` (`--cuda-graph-impl full_iteration`) `--gdn-kernel-backend fla`, MoK `schedule_capacity_multiplier` 4.0 — [`../training/full_iteration_cuda_graph.md`](../training/full_iteration_cuda_graph.md) | the proxy's default `LAYOUT=thd32k`, Muon, 4 × GB300: **2844 ms vs 2880 ms eager and 2886 ms with `attn moe_router` capture (−1.3 %)**, 361.6 vs 357.0 TFLOP/s/GPU, peak allocated unchanged (128.0 GiB). Losses identical to eager through iteration 10. The memory's EP lookup runs on fixed-capacity buckets (`--engram-ep-capacity-factor`; an overflow is an error). The dropless alltoall MoE fails at capture; dynamic THD, CP > 1, PP > 1 and the packing schedulers are rejected |
+| **CUDA graphs, other modes** | ⛔ | `--cuda-graph-impl local`, or `transformer_engine` without `--cuda-graph-modules` | rejected by Engram at config validation: these modes capture the Engram-hosting layer through per-layer graphs, whose dynamic hashed lookup and all-to-all have data-dependent shapes |
 | **FSDP** | ⛔ | `--use-megatron-fsdp --ckpt-format fsdp_dtensor` | rejected: "Engram does not yet support FSDP" |
 
 ## Kernel backends (GB300)
@@ -69,11 +70,12 @@ Proxy, 4 × GB300, mock data, the image of [`../../Dockerfile.gb300`](../../Dock
 
 ## TODO — what this matrix says is missing
 
-1. **CUDA graphs beyond the MoE scopes** — the gated-residual blocker is fixed and the MoE-scoped
-   capture now runs (see above). Two of the three original blockers remain and both are the same
-   shape: QSA's host-synchronizing superset build and the memory's data-dependent lookup /
-   all-to-all shapes both need a fixed upper bound with the dynamic size consumed inside the
-   kernel. Still the single largest step-time opening.
+1. **CUDA graphs** — per-layer `attn moe_router` capture and full-iteration capture (with MoK,
+   packed rows at CP = 1) both run; at `thd32k`'s 32K tokens per rank neither gains much, since
+   the step is not launch-bound (full_iteration gave −26 % / −35 % on the earlier 4K
+   configuration). Left: full_iteration with GDN `cudnn` (not run) and `internal` (not
+   capturable), packed rows with CP > 1, and real-data sizing of `--engram-ep-capacity-factor`
+   at EP64.
 2. **Packed rows + CP** — blocked upstream (`cu_seqlens_padded=None`), not by this model. The
    last piece of long-context packed training.
 3. **FSDP** — rejected by the memory; the only route to a non-EP memory layout.

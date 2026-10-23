@@ -21,6 +21,7 @@ the whole model.
 |---|---|
 | [`architecture/config_mapping.md`](architecture/config_mapping.md) | HF `config.json` → Megatron arguments, field by field; the hybrid layer pattern; the settings that are easy to get wrong (router path, PLE width, GDN gate, MTP norms) |
 | [`training/proxy_single_node.md`](training/proxy_single_node.md) | An 8-layer / 32-expert proxy with every per-layer dimension real; one `torchrun` on a single node, packed THD at 32K per rank by default or the BSHD baseline; what to expect |
+| [`training/full_iteration_cuda_graph.md`](training/full_iteration_cuda_graph.md) | Full-iteration CUDA graphs on packed rows (THD) with the MoK MoE: the command, the settings that must be right (GDN backend, MoK scheduler capacity, static THD contract, n-gram memory bucket capacity), measured step time |
 | [`training/full_model_64gpu.md`](training/full_model_64gpu.md) | The 48-layer model on 64 GPUs (EP64, BF16): the full argument list, measured memory, from-scratch schedule |
 | [`checkpoint/hf_weights_and_resume.md`](checkpoint/hf_weights_and_resume.md) | Weight-mapping rules from the released checkpoint, the native `torch_dist` checkpoint, and the resume flags; what was measured |
 | [`validation/support_matrix.md`](validation/support_matrix.md) | **What the composed model actually supports** — EP/TP/PP/VPP/CP/THD/recompute/MXFP8/CUDA-graph/FSDP, each measured on the proxy, with the TODO list the gaps produce |
@@ -38,7 +39,7 @@ MTP are stock Megatron Core.
 | Numerical parity vs HF | whole-model proxy: logits `max_abs 2.7e-7`, 161/161 parameter gradients, 20-step trajectory; real weights (4-layer truncation): every point before the first MoE router at fp32 noise, routing ties after it (`validation/`) |
 | Released weights | convert strictly (all 131 shards consumed), load exactly as a native `torch_dist` checkpoint at EP64, 50-step resume on 64 GB300s (`checkpoint/`) |
 | Memory / layout | BF16, expert parallelism only: EP64 peaks at 204 GiB per GPU with 29 GiB headroom; EP32 does not fit without recompute (`training/full_model_64gpu.md`) |
-| Parallelism / features | EP, TP+SP, PP, VPP, CP (unpacked), packed rows (`--sft`), recompute, MXFP8 and per-layer CUDA graphs (`attn`, `moe_router` scopes) all **measured working** on the composed stack; local and full-iteration CUDA graphs, FSDP and packed-rows+CP are rejected at startup ([`validation/support_matrix.md`](validation/support_matrix.md)) |
+| Parallelism / features | EP, TP+SP, PP, VPP, CP (unpacked), packed rows (`--sft`), recompute, MXFP8, per-layer CUDA graphs (`attn`, `moe_router` scopes) and full-iteration CUDA graphs with MoK ([`training/full_iteration_cuda_graph.md`](training/full_iteration_cuda_graph.md)) all **measured working** on the composed stack; local and full-iteration CUDA graphs, FSDP and packed-rows+CP are rejected at startup ([`validation/support_matrix.md`](validation/support_matrix.md)) |
 | Not yet done | loss quality on real text (all runs used mock data); performance tuning (hybridep, CUDA graphs, fused GR kernels, QSA sparse kernel by default); CP on packed rows; the multimodal variant |
 
 ## Entry point and specs

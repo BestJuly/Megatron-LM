@@ -49,6 +49,26 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 LAYOUT="${LAYOUT:-thd32k}"
+# CUDA graphs of the thd32k layout (CUDA_GRAPH=...):
+#   te (default)     TE per-layer graphs over attention and the MoE router; the Engram lookup
+#                    runs eagerly in front of its layer's graph
+#   full_iteration   one graph for the whole forward-backward step (data read, all layers,
+#                    DDP grad reduce); see docs/training/full_iteration_cuda_graph.md
+#   none             eager
+CUDA_GRAPH="${CUDA_GRAPH:-te}"
+case "$CUDA_GRAPH" in
+  te)
+    CUDA_GRAPH_ARGS=(--cuda-graph-impl transformer_engine --cuda-graph-modules attn moe_router
+      --cuda-graph-warmup-steps 2 --cuda-graph-capture-engram-host --te-rng-tracker) ;;
+  full_iteration)
+    CUDA_GRAPH_ARGS=(--cuda-graph-impl full_iteration --cuda-graph-warmup-steps 2 --te-rng-tracker) ;;
+  none)
+    CUDA_GRAPH_ARGS=() ;;
+  *)
+    echo "CUDA_GRAPH must be te, full_iteration or none, got '$CUDA_GRAPH'" >&2
+    exit 2
+    ;;
+esac
 case "$LAYOUT" in
   thd32k)
     # FLA_DISABLE_TENSOR_CACHE: fla's tensor cache would freeze chunk metadata across
@@ -69,8 +89,7 @@ case "$LAYOUT" in
       --sft --pad-packed-seq-alignment max --max-seqlen-per-dp-cp-rank 32768
       --thd-max-packed-sequences 1
       --sft-mock-dataset-config-json '{"mode":"distribution","type":"lognormal","format":"thd","min_seq_len":32768,"max_seq_len":32768,"mean_seq_len":32768,"lognormal_sigma":1.1}'
-      --cuda-graph-impl transformer_engine --cuda-graph-modules attn moe_router
-      --cuda-graph-warmup-steps 2 --cuda-graph-capture-engram-host --te-rng-tracker
+      "${CUDA_GRAPH_ARGS[@]}"
       --moe-megakernel-backend mok
       --moe-megakernel-backend-config '{"fwd_num_comm_sms":48,"bwd_num_comm_sms":56,"minibatch_size":8192,"macrobatch_size":65536,"schedule_capacity_multiplier":0.0625,"all_gather_top_experts_chunk_bytes":2048}'
       --moe-router-fusion
