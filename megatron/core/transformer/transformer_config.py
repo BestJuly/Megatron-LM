@@ -626,10 +626,23 @@ class TransformerConfig(ModelParallelConfig):
     kda_lower_bound: Optional[float] = None
     """Optional lower bound for KDA's bounded gate values."""
 
-    gdn_kernel_backend: Literal["fla", "cudnn"] = "fla"
-    """Gated delta rule kernel backend. The cuDNN backend uses cuDNN Frontend's
-    FLA-compatible GDN adapter and retains its automatic FLA fallback for unsupported cases.
-    With context parallelism, the cuDNN backend currently supports only headwise CP."""
+    gdn_kernel_backend: Literal["internal", "fla", "cudnn"] = "internal"
+    """Gated delta rule kernel backend.
+
+    ``internal`` (default) is the in-tree SM10x (Blackwell) CuTe DSL GDR backend in
+    ``ssm/gated_delta_net/internal_gdn_backend``: fused CuTe DSL forward and backward plus
+    CuTe DSL context-parallel boundary preprocessing. The ``MCORE_GDN_INTERNAL_BACKEND``
+    environment variable sets its runtime dispatch: ``auto`` (default) runs CuTe DSL where
+    the inputs are supported and fla otherwise (per call, and for the backward separately:
+    the fused CuTe backward serves bf16 H=64, D=128); ``cute`` raises instead of falling
+    back; ``fla`` bypasses CuTe DSL. Layers whose attention is captured into a CUDA graph
+    with packed (THD) inputs use fla.
+
+    ``fla`` calls flash-linear-attention directly. ``cudnn`` uses cuDNN Frontend's
+    FLA-compatible GDN adapter, which keeps its own automatic fla fallback; with context
+    parallelism it supports only headwise CP.
+
+    ``deterministic_mode`` always runs the PyTorch GDR implementation."""
 
     gdn_pre_gated_delta_rule_fusion: bool = False
     """Whether to use the streamed Triton fusion for GatedDeltaNet pre-GDR preprocessing."""
@@ -645,6 +658,12 @@ class TransformerConfig(ModelParallelConfig):
     """When set, pad packed GDN causal-conv inputs to this token alignment.
     This is only valid without chunkwise CP: padding a chunk-local causal-conv input changes
     the sequence seen by later chunks and therefore changes the GDN recurrence numerics."""
+
+    gdn_gdr_recompute_h: bool = False
+    """Whether the internal GDR backward recomputes recurrent states instead of saving them.
+
+    Requires ``gdn_kernel_backend='internal'``.
+    """
 
     ####################
     # initialization
@@ -2509,19 +2528,26 @@ class TransformerConfig(ModelParallelConfig):
                 "containing 'G')."
             )
 
-        if self.gdn_kernel_backend not in ("fla", "cudnn"):
-            raise ValueError("gdn_kernel_backend must be one of: fla, cudnn.")
+        if self.gdn_kernel_backend not in ("internal", "fla", "cudnn"):
+            raise ValueError("gdn_kernel_backend must be one of: internal, fla, cudnn.")
 
-        if self.gdn_kernel_backend != "fla" and not (
+        if self.gdn_kernel_backend == "cudnn" and not (
             self.experimental_attention_variant == "gdn" or self.has_gated_delta_net_layers
         ):
             # Same predicate as gdn_pre_gated_delta_rule_fusion above: the backend is read by
             # the GatedDeltaNet module itself, so what matters is that GDN layers exist, not the
-            # global variant name (a GDN+QSA hybrid must set that to "qsa").
+            # global variant name (a GDN+QSA hybrid must set that to "qsa"). The default
+            # (internal) and fla are accepted on any model, since they are inert without GDN.
             raise ValueError(
-                "gdn_kernel_backend requires a model with GatedDeltaNet layers "
+                "gdn_kernel_backend='cudnn' requires a model with GatedDeltaNet layers "
                 "(experimental_attention_variant='gdn', or a hybrid layer pattern "
                 "containing 'G')."
+            )
+
+        if self.gdn_gdr_recompute_h and self.gdn_kernel_backend != "internal":
+            raise ValueError(
+                "gdn_gdr_recompute_h only applies to gdn_kernel_backend='internal', "
+                f"got gdn_kernel_backend={self.gdn_kernel_backend!r}."
             )
 
         if self.fp8:

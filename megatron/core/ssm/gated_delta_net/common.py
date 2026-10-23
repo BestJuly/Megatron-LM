@@ -104,10 +104,50 @@ def _get_cudnn_gated_delta_rule():
     return fla_gated_delta_rule.chunk_gated_delta_rule
 
 
+def resolve_gdn_kernel_backend(config) -> str:
+    """Return the GDR kernel backend a GDN/KDA layer actually runs for ``config``.
+
+    This is ``config.gdn_kernel_backend`` except where the configured backend cannot serve the
+    layer and a supported one exists. The internal CuTe DSL backend (the default) builds its
+    packed chunk metadata on the host from the *values* of ``cu_seqlens`` and caches it by
+    tensor version, so it can be neither captured into nor replayed from a CUDA graph with
+    static packed (THD) inputs. Those layers fall back to fla, the same per-shape fallback
+    ``MCORE_GDN_INTERNAL_BACKEND=auto`` applies inside the backend, and say so once.
+    """
+    backend = config.gdn_kernel_backend
+    if backend != "internal":
+        return backend
+    is_thd = (
+        config.sequence_packing_scheduler is not None
+        or config.dynamic_context_parallel
+        or getattr(config, "thd_max_packed_sequences", None) is not None
+    )
+    captures_attention = config.cuda_graph_impl == "full_iteration" or (
+        config.cuda_graph_impl in ("local", "transformer_engine")
+        and (not config.cuda_graph_modules or CudaGraphModule.attn in config.cuda_graph_modules)
+    )
+    if is_thd and captures_attention:
+        _warn_internal_gdr_thd_cuda_graph_fallback()
+        return "fla"
+    return backend
+
+
+@lru_cache(maxsize=1)
+def _warn_internal_gdr_thd_cuda_graph_fallback() -> None:
+    warnings.warn(
+        "gdn_kernel_backend='internal' cannot be captured into a CUDA graph with packed (THD) "
+        "inputs; GatedDeltaNet layers in captured attention use the fla backend instead. Pass "
+        "--gdn-kernel-backend fla to make this explicit, or drop attn from "
+        "--cuda-graph-modules to keep the internal backend.",
+        stacklevel=3,
+    )
+
+
 __all__ = [
     "HAVE_FLA",
     "GatedDeltaNetSubmodules",
     "_get_cudnn_gated_delta_rule",
+    "resolve_gdn_kernel_backend",
     "_GDNBase",
     "_build_head_perm_for_split_sections",
     "_build_thd_cp_a2a_perm",

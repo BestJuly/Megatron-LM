@@ -848,7 +848,11 @@ def get_batch_on_this_rank_for_sequence_packing(
         local_cp_size=local_cp_size,
         cp_group=cp_group,
         cp_partition_mode=cp_partition_mode,
-        pad_between_seqs=True,
+        # Megatron represents end padding as trailing tokens of each packed sequence, so
+        # attention receives the padded boundaries as its effective sequence boundaries
+        # (see the THD handling in megatron/core/extensions/transformer_engine.py). The
+        # GDN/KDA kernels always consume the padded boundaries and do not read this flag.
+        pad_between_seqs=False,
     )
 
     # Dummy metadata is appended after CP slicing as an ordinary sequence.
