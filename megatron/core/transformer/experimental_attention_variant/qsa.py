@@ -874,6 +874,9 @@ def _require_qsa_kernel_support(config: TransformerConfig, tp_size: int) -> None
             )
     if not sparse:
         return
+    if config.qsa_attn_backend == "cudnn":
+        _require_qsa_cudnn_support(config, tp_size)
+        return
     if not (config.bf16 or config.fp16):
         raise ValueError("qsa_use_sparse_attention requires bf16 or fp16 training.")
     if config.kv_channels not in (128, 256):
@@ -891,6 +894,47 @@ def _require_qsa_kernel_support(config: TransformerConfig, tp_size: int) -> None
         raise ValueError(
             "qsa_use_sparse_attention with head dim 256 needs at least 2 query heads per KV head."
         )
+
+
+def _require_qsa_cudnn_support(config: TransformerConfig, tp_size: int) -> None:
+    """``qsa_attn_backend='cudnn'``: cuDNN Frontend's QSA kernels serve one fixed geometry.
+
+    Checked when the layer is built, so an unsupported shape fails with its cause instead of
+    inside cuDNN. The device itself was checked by :func:`_require_qsa_kernel_support`.
+    """
+    from megatron.core.transformer.experimental_attention_variant.ops.cudnn_qsa_attn import (
+        cudnn_qsa_support_error,
+    )
+
+    try:
+        import cudnn.ops as cudnn_ops
+
+        cudnn_ops.qsa_forward, cudnn_ops.qsa_backward  # pylint: disable=pointless-statement
+        if config.qsa_cudnn_bwd_impl == "sparse_gqa":
+            from cudnn.sdpa.bwd import sparse_gqa_bwd_wrapper_sm100  # noqa: F401
+    except (ImportError, AttributeError) as e:
+        raise RuntimeError(
+            "qsa_attn_backend='cudnn' requires a cuDNN Frontend build with the QSA training "
+            "kernels (cudnn.ops.qsa_forward / qsa_backward, NVIDIA/cudnn-frontend PR #1765) "
+            "and, for qsa_cudnn_bwd_impl='sparse_gqa', cudnn.sdpa.bwd.sparse_gqa_bwd_wrapper_sm100."
+        ) from e
+    num_q_heads = config.num_attention_heads // tp_size
+    num_kv_heads = max(1, config.num_query_groups // tp_size)
+    dtype = torch.bfloat16 if config.bf16 else (torch.float16 if config.fp16 else torch.float32)
+    reason = cudnn_qsa_support_error(
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=config.kv_channels,
+        dtype=dtype,
+        block_size=config.qsa_indexer_compress_ratio,
+        num_selected_blocks=config.qsa_indexer_budget // config.qsa_indexer_compress_ratio,
+        bwd_impl=config.qsa_cudnn_bwd_impl,
+        device_capability=(
+            tuple(torch.cuda.get_device_capability()) if torch.cuda.is_available() else None
+        ),
+    )
+    if reason is not None:
+        raise ValueError(f"qsa_attn_backend='cudnn': {reason}.")
 
 
 @dataclass
@@ -1082,13 +1126,19 @@ class QSASelfAttention(SelfAttention):
 
     @nvtx_decorator(message="QSA::sparse_attn")
     def _sparse_forward(self, hidden_states, freqs, packed_seq_params):
-        """Sparse kernel path: indexer selection -> query-tile shared-superset GQA.
+        """Sparse kernel path: indexer selection -> sparse GQA over the selected blocks.
+
+        The attention op is the in-tree CuTe DSL query-tile shared-superset kernel set, or
+        cuDNN Frontend's QSA kernels with ``qsa_attn_backend='cudnn'``.
 
         Supports BSHD and packed THD (``packed_seq_params.qkv_format == 'thd'``).
         The kernels take global block ids plus per-block token [base, end) ranges,
         so packed varlen needs no cu_seqlens on the kernel side, and any GQA group
         size works without head padding.
         """
+        from megatron.core.transformer.experimental_attention_variant.ops.cudnn_qsa_attn import (
+            cudnn_qsa_sparse_attention,
+        )
         from megatron.core.transformer.experimental_attention_variant.ops.cute_qsa_attn import (
             qsa_sparse_attention,
         )
@@ -1150,18 +1200,34 @@ class QSASelfAttention(SelfAttention):
         block_indices = block_indices + selection.attn_block_offsets.view(1, s, 1)
         block_counts = 1 + picked.sum(dim=-1)  # [b, s]
 
-        core_out = qsa_sparse_attention(
-            q_bt,
-            k_bt,
-            v_bt,
-            block_indices=block_indices,
-            block_counts=block_counts,
-            block_bases=selection.attn_block_bases,
-            block_ends=selection.attn_block_ends,
-            scale=self.hidden_size_per_attention_head**-0.5,
-            q_positions=selection.q_positions,
-            static_shapes=self.indexer.static_shapes,
-        )  # [b, s, np, d_v]
+        if self.config.qsa_attn_backend == "cudnn":
+            core_out = cudnn_qsa_sparse_attention(
+                q_bt,
+                k_bt,
+                v_bt,
+                block_indices=block_indices,
+                block_counts=block_counts,
+                block_bases=selection.attn_block_bases,
+                block_ends=selection.attn_block_ends,
+                block_offsets=selection.attn_block_offsets,
+                token_offsets=selection.token_offsets,
+                cu_seqlens=cu_seqlens,
+                scale=self.hidden_size_per_attention_head**-0.5,
+                bwd_impl=self.config.qsa_cudnn_bwd_impl,
+            )  # [b, s, np, d_v]
+        else:
+            core_out = qsa_sparse_attention(
+                q_bt,
+                k_bt,
+                v_bt,
+                block_indices=block_indices,
+                block_counts=block_counts,
+                block_bases=selection.attn_block_bases,
+                block_ends=selection.attn_block_ends,
+                scale=self.hidden_size_per_attention_head**-0.5,
+                q_positions=selection.q_positions,
+                static_shapes=self.indexer.static_shapes,
+            )  # [b, s, np, d_v]
         core_out = core_out.reshape(b, s, np_local * core_out.shape[-1]).permute(1, 0, 2)
 
         if gate is not None:

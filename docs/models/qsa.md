@@ -38,7 +38,9 @@ symbol `Q`) implementing the block-sparse GQA attention of Qwen3.8-Flash-Next
 | `qsa_indexer_budget` | 2048 | token budget; selected blocks = budget / compress_ratio |
 | `qsa_indexer_compress_ratio` | 4 | block size in tokens |
 | `qsa_indexer_loss_coeff` | None | sparse-KL indexer distillation loss coefficient |
-| `qsa_use_sparse_attention` | False | sparse Triton kernel path vs the dense-mask bridge |
+| `qsa_attn_backend` | None | attention implementation: `dense` (dense-mask bridge), `cute` (in-tree CuTe DSL sparse kernels), `cudnn` (cuDNN Frontend QSA kernels). None follows `qsa_use_sparse_attention` |
+| `qsa_cudnn_bwd_impl` | `sparse_gqa` | backward of the `cudnn` backend: `sparse_gqa` (index-list backward; faster than `qsa_api`) or `qsa_api` (`cudnn.ops.qsa_backward`; also serves 12Q/1KV) |
+| `qsa_use_sparse_attention` | False | backward-compatible alias: True = sparse path (`cute` unless `qsa_attn_backend='cudnn'`), False = dense-mask bridge. Set from `qsa_attn_backend` when that is given |
 | `qsa_cp_packing_layout` | per_document | how packed THD batches are zigzag-sharded across CP ranks (`per_document` / `per_sequence`); a caller contract that cannot be inferred from cu_seqlens |
 
 Sequences no longer than the budget degenerate to dense causal attention — tests that
@@ -50,9 +52,9 @@ seq > 2.5k).
 1. **Dense-mask bridge** (default): the selection is materialized as a `[b, s, s]` bool
    mask and fed to dense core attention with `AttnMaskType.arbitrary`. Functional
    reference; no sparsity speedup; BSHD only.
-2. **Sparse kernel path** (`qsa_use_sparse_attention=True`): self-contained Triton
-   kernels (`experimental_attention_variant/ops/triton_qsa.py`, SGLang-prefill-style
-   design): a fused index-score kernel (scoring + visibility + int64 sort-key
+2. **Sparse kernel path** (`qsa_attn_backend='cute'`, or `qsa_use_sparse_attention=True`):
+   in-tree kernels — CuTe DSL attention (`ops/cute_qsa_attn.py`) over Triton-built metadata
+   (`ops/triton_qsa.py`, SGLang-prefill-style design): a fused index-score kernel (scoring + visibility + int64 sort-key
    encoding, no `[s, chunk, heads]` intermediate), the deterministic int64-key
    `torch.topk` streaming merge, and **query-tile shared-superset gather** sparse GQA
    forward/backward — each program serves `BQ` consecutive queries against the UNION
@@ -67,6 +69,32 @@ seq > 2.5k).
    indexer) the module is slower than dense, so the path stays **off by default**. The
    backward remains gather-bound; per-block query-run reuse in dkv is the identified
    follow-up.
+
+3. **cuDNN Frontend kernels** (`qsa_attn_backend='cudnn'`,
+   `experimental_attention_variant/ops/cudnn_qsa_attn.py`): the same sparse path (selection,
+   RoPE, gate, packed THD) with the attention op swapped for cuDNN Frontend's QSA training
+   kernels (NVIDIA/cudnn-frontend PR #1765). The forward is `cudnn.ops.qsa_forward`, whose
+   "Miles" contract is a `[T, NB]` uint8 block bitmap plus per-query token bounds
+   (`lo = document start`, `hi = position`), per-query document block/token bases and per-block
+   inclusive token spans. The indexer's document-local 4-token blocks are exactly that block
+   numbering, so the bitmap is a device-side scatter of the selected ids (no host sync); a slot
+   whose block starts after its query (the own block of a query that ends a block, or the empty
+   block past a document) is dropped since it has no visible token. Batch rows are packed as
+   separate sequences (`T = B * S`). Two backward implementations (`qsa_cudnn_bwd_impl`):
+   * `qsa_api`: `cudnn.ops.qsa_backward` on the same bitmap and the forward's fp32 output.
+   * `sparse_gqa`: `cudnn.sdpa.bwd.sparse_gqa_bwd_wrapper_sm100`, the index-list backward
+     (`topk_idxs [T, 2051]`: the 4 tokens of each of the 512 selected blocks, then the ragged
+     causal tail, then -1). Its kernels derive the block count and tail length from the query's
+     absolute position, so it runs once per sequence (batch row or packed document) on that
+     sequence's slices, and it needs exactly `budget / compress_ratio = 512` selected blocks, a
+     GQA ratio of 12 or 16 and an even KV head count per rank. The packed-THD document loop
+     reads `cu_seqlens` on the host, so it is rejected under THD CUDA-graph capture.
+
+   Constraints, checked when the layer is built (`_require_qsa_cudnn_support`): bf16, head dim
+   256, 24 query / 2 KV or 12 / 1 heads per rank, 4-token blocks, SM100 / SM103 / SM107, and no
+   context parallelism (the cuDNN API takes queries and keys in one token space). The bitmap and
+   cuDNN's int32 compact-index scratch are `O(T * NB)`: at `T = 131072` the scratch alone is
+   16 GiB.
 
 ## Indexer training (sparse KL)
 
@@ -141,6 +169,7 @@ supported and CP2-tested against the oracle.
   ignores the knob; an explicit p2p/a2a value is rejected at config validation, as
   is CP with the dense-mask bridge). TPxCP composition is untested.
 - The dense-mask bridge is BSHD-only; packed THD requires the sparse kernel path.
+- The cuDNN backend has no CP path and is `O(T * NB)` in memory (see execution path 3).
 - Padded batches are not supported: bool attention masks are OR-merged into the bridge
   mask but assumed causal/per-document; the sparse path derives causality from the
   selection and ignores bool masks entirely (pad tokens would be attended and

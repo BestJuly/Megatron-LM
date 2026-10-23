@@ -17,6 +17,7 @@ from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
     PACKED_DSA_CP_CUDA_GRAPH_WARNING,
     cuda_graph_captures_attention,
+    cuda_graph_uses_static_thd_inputs,
     get_deprecated_cuda_graph_modules_migration,
     is_packed_dsa_cp_cuda_graph_experimental,
     is_whole_moe_cuda_graph_scope,
@@ -577,6 +578,25 @@ class TransformerConfig(ModelParallelConfig):
     raises. When False, the dense-mask
     bridge is used: the selection is materialized as a [b, s, s] bool mask fed to dense
     core attention — functionally identical, no sparsity speedup, BSHD only."""
+
+    qsa_attn_backend: Optional[Literal["dense", "cute", "cudnn"]] = None
+    """QSA attention implementation.
+
+    ``dense``: the dense-mask bridge (see ``qsa_use_sparse_attention=False``). ``cute``: the
+    in-tree CuTe DSL sparse kernels (``qsa_use_sparse_attention=True``). ``cudnn``: the same
+    sparse path with cuDNN Frontend's QSA kernels (``cudnn.ops.qsa_forward``; backward chosen by
+    ``qsa_cudnn_bwd_impl``); bf16, head dim 256, 24 query / 2 KV or 12 / 1 heads per rank,
+    4-token blocks, SM100/SM103, no context parallelism. None (default) follows
+    ``qsa_use_sparse_attention``; any other value sets it (``dense`` -> False, else True)."""
+
+    qsa_cudnn_bwd_impl: Literal["qsa_api", "sparse_gqa"] = "sparse_gqa"
+    """Backward of ``qsa_attn_backend='cudnn'``. ``sparse_gqa`` (default): the index-list QSA
+    backward (``cudnn.sdpa.bwd.sparse_gqa_bwd_wrapper_sm100``), one launch per sequence; it needs
+    exactly 512 selected blocks, a GQA ratio of 12 or 16 with an even KV head count per rank, and
+    no CUDA-graph capture of packed (THD) inputs. ``qsa_api``: ``cudnn.ops.qsa_backward`` on the
+    forward's block bitmap; serves the rest (e.g. 12 query / 1 KV heads at TP2). ``sparse_gqa`` is
+    the default because its backward is faster than ``qsa_api`` at lower peak memory, single
+    sequence and packed THD alike."""
 
     qsa_cp_packing_layout: Literal["per_document", "per_sequence"] = "per_document"
     """How packed THD batches are zigzag-sharded across context-parallel ranks for QSA.
@@ -2262,6 +2282,22 @@ class TransformerConfig(ModelParallelConfig):
                 f"{linear_head_parallel_size=} for {self.linear_cp_mode=} "
                 f"and {self.experimental_attention_variant=}."
             )
+        # qsa_attn_backend is the QSA attention switch; qsa_use_sparse_attention stays its
+        # backward-compatible alias ("sparse path"), derived from it whenever it is set. None
+        # keeps the alias in charge (dense when False, cute when True).
+        if self.qsa_attn_backend is not None:
+            if self.qsa_attn_backend not in ("dense", "cute", "cudnn"):
+                raise ValueError(
+                    "qsa_attn_backend must be one of 'dense', 'cute', 'cudnn', got "
+                    f"{self.qsa_attn_backend!r}."
+                )
+            if self.qsa_attn_backend == "dense" and self.qsa_use_sparse_attention:
+                raise ValueError(
+                    "qsa_attn_backend='dense' contradicts qsa_use_sparse_attention=True; set "
+                    "only qsa_attn_backend."
+                )
+            self.qsa_use_sparse_attention = self.qsa_attn_backend != "dense"
+
         if self.experimental_attention_variant == "dsa":
             _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
             if self.add_bias_linear:
@@ -2484,6 +2520,19 @@ class TransformerConfig(ModelParallelConfig):
             # Note: the indexer reuses the main attention's rotary frequencies. Their dim
             # (kv_channels * rotary_percent, a model-level arg) must fit the indexer head
             # dim; this is asserted at runtime in QSAIndexer.forward.
+            if self.qsa_cudnn_bwd_impl not in ("qsa_api", "sparse_gqa"):
+                raise ValueError(
+                    "qsa_cudnn_bwd_impl must be 'qsa_api' or 'sparse_gqa', got "
+                    f"{self.qsa_cudnn_bwd_impl!r}."
+                )
+            if self.qsa_attn_backend == "cudnn":
+                if self.context_parallel_size > 1:
+                    raise ValueError(
+                        "qsa_attn_backend='cudnn' does not support context parallelism: "
+                        "cudnn.ops.qsa_forward takes queries and keys in one token space, while "
+                        "QSA CP runs local queries against all-gathered keys. Use "
+                        "qsa_attn_backend='cute'."
+                    )
             if self.qsa_cp_packing_layout not in ("per_document", "per_sequence"):
                 raise ValueError(
                     "qsa_cp_packing_layout must be 'per_document' or 'per_sequence', got "
@@ -5041,6 +5090,20 @@ class TransformerConfig(ModelParallelConfig):
         # call. Training is safe as long as the cache entries are built in eager iterations
         # before capture (cuda_graph_warmup_steps > 0) and the graphs live for the whole run;
         # releasing and re-capturing graphs in one process is not supported with cuDNN GDR.
+        # Needs the normalized cuda_graph_modules, so it lives here rather than with the other
+        # QSA checks.
+        if (
+            self.qsa_attn_backend == "cudnn"
+            and self.qsa_cudnn_bwd_impl == "sparse_gqa"
+            and cuda_graph_uses_static_thd_inputs(self)
+            and cuda_graph_captures_attention(self)
+        ):
+            raise ValueError(
+                "qsa_cudnn_bwd_impl='sparse_gqa' runs one backward per packed document from "
+                "host-side boundaries and cannot be captured into a CUDA graph with packed (THD) "
+                "inputs. Use qsa_cudnn_bwd_impl='qsa_api', or drop attn from --cuda-graph-modules."
+            )
+
         if (
             self.gdn_kernel_backend == "cudnn"
             and cuda_graph_captures_attention(self)
