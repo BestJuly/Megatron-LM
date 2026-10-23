@@ -360,10 +360,12 @@ def get_dsa_metric_tracker_size(model) -> int:
             if not getattr(module, "logs_dsa_indexer_loss", False):
                 continue
             config = getattr(module, "config", None)
+            # Writers name the config field that enables their loss (QSA has its own).
+            coeff_attr = getattr(module, "indexer_loss_coeff_attr", "dsa_indexer_loss_coeff")
             if (
                 config is not None
-                and hasattr(config, "dsa_indexer_loss_coeff")
-                and (config.dsa_indexer_loss_coeff or 0.0) <= 0
+                and hasattr(config, coeff_attr)
+                and (getattr(config, coeff_attr) or 0.0) <= 0
             ):
                 continue
             layer_number = getattr(module, "layer_number", None)

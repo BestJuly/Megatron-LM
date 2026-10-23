@@ -952,6 +952,12 @@ class QSASelfAttention(SelfAttention):
     RoPE, per-head qk layernorm, GQA) is the stock :class:`SelfAttention` machinery.
     """
 
+    # QSA writes its indexer loss into the shared DSA metric tracker, enabled by its own
+    # coefficient, so the tracker's fixed capacity (and the pre-capture check of
+    # full-iteration CUDA graphs) must account for it.
+    logs_dsa_indexer_loss = True
+    indexer_loss_coeff_attr = "qsa_indexer_loss_coeff"
+
     def __init__(
         self,
         config: TransformerConfig,

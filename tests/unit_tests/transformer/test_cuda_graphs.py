@@ -285,6 +285,30 @@ class TestCudaGraphConfigAndArguments:
 
         assert get_dsa_metric_tracker_size(DisabledMetricModule()) == 0
 
+    @pytest.mark.parametrize(("qsa_coeff", "expected"), [(0.01, 18), (0.0, 0), (None, 0)])
+    def test_dsa_tracker_size_counts_qsa_writers_by_their_own_coefficient(
+        self, qsa_coeff, expected
+    ):
+        """QSA writes the shared tracker under qsa_indexer_loss_coeff, not the DSA one."""
+        from megatron.core.transformer.experimental_attention_variant.qsa import QSASelfAttention
+
+        class QSAMetricModule(torch.nn.Module):
+            logs_dsa_indexer_loss = QSASelfAttention.logs_dsa_indexer_loss
+            indexer_loss_coeff_attr = QSASelfAttention.indexer_loss_coeff_attr
+
+            def __init__(self):
+                super().__init__()
+                # A hybrid MTP layer number can exceed num_layers + mtp_num_layers.
+                self.layer_number = 18
+                self.config = SimpleNamespace(
+                    dsa_indexer_loss_coeff=None,
+                    qsa_indexer_loss_coeff=qsa_coeff,
+                    num_layers=16,
+                    mtp_num_layers=1,
+                )
+
+        assert get_dsa_metric_tracker_size(QSAMetricModule()) == expected
+
     @pytest.mark.parametrize(
         ("cuda_graph_modules", "expected"),
         [([], True), ([CudaGraphModule.attn], True), ([CudaGraphModule.mlp], False)],

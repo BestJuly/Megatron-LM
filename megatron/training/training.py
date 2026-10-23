@@ -4345,7 +4345,9 @@ def setup_model_and_optimizer(
 
     # Match training_log's activation gate so every enabled writer is reduced and cleared once
     # per step. Establish its PP-agreed capacity before the first forward/capture.
-    if (getattr(args, "dsa_indexer_loss_coeff", None) or 0.0) > 0:
+    if (getattr(args, "dsa_indexer_loss_coeff", None) or 0.0) > 0 or (
+        getattr(args, "qsa_indexer_loss_coeff", None) or 0.0
+    ) > 0:
         initialize_dsa_metric_tracker(unwrapped_model, pg_collection)
 
     return model, optimizer, opt_param_scheduler
