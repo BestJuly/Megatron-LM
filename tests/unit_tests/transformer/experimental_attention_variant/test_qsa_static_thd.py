@@ -130,6 +130,18 @@ class TestQSAStaticTHD:
         self._run(padded, params, static_shapes=True)
         assert not torch.allclose(self.losses[-1], dyn_loss, rtol=1e-5, atol=0)
 
+    def test_dynamic_select_with_more_blocks_than_the_longest_document(self):
+        """Block rows lost to per-document remainders leave unused tail rows whose rotary
+        positions pass the table of the longest document (it used to index out of range)."""
+        doc_lens = [7] * 40 + [5]
+        hidden = self._hidden(doc_lens, seed=3)
+        n = hidden.shape[0]
+        cu = torch.tensor([0, *itertools.accumulate(doc_lens)], dtype=torch.int32, device="cuda")
+        dyn_out, _, _ = self._run(hidden, _psp(cu, max(doc_lens)), static_shapes=False)
+        padded, params, _ = _static_pack(hidden, doc_lens)
+        static_out, _, _ = self._run(padded, params, static_shapes=True)
+        assert torch.equal(static_out[:n], dyn_out)
+
     def test_indexer_gradient_ignores_padding(self):
         """Real-token loss only: the indexer gradient matches the unpadded pack."""
         doc_lens = [150, 150]
