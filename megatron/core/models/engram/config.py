@@ -226,6 +226,13 @@ class EngramConfig:
     """
     embedding_lr_multiplier: float = 5.0
     embedding_weight_decay: float = 0.0
+    ep_capacity_factor: float = 2.0
+    """Bucket size of the fixed-capacity EP lookup used under full-iteration CUDA graphs.
+
+    Each (owner rank, table) bucket holds ``ceil(factor * tokens / ep_size)`` requests. A bucket
+    that overflows is an error (raised eagerly, a device-side assert under capture); no overflow
+    is possible at a factor >= ep_size.
+    """
     dense_impl: str = "fused"
     """Implementation of the dense half (gate, conv-norm, short convolution).
 
@@ -288,6 +295,7 @@ class EngramConfig:
             unigram_vocab_size=getattr(args, "engram_unigram_vocab_size", None),
             embedding_lr_multiplier=args.engram_embedding_lr_multiplier,
             embedding_weight_decay=args.engram_embedding_weight_decay,
+            ep_capacity_factor=getattr(args, "engram_ep_capacity_factor", 2.0),
         )
         packed_sequences = _validate_packed_sequence_args(args)
         config.validate_startup(
@@ -370,6 +378,8 @@ class EngramConfig:
             raise ValueError("engram_embedding_lr_multiplier must be positive.")
         if self.embedding_weight_decay < 0:
             raise ValueError("engram_embedding_weight_decay must be nonnegative.")
+        if self.ep_capacity_factor <= 0:
+            raise ValueError("engram_ep_capacity_factor must be positive.")
         if self.variant_spec.uses_tokenizer_artifact:
             if not self.tokenizer_map_path:
                 raise ValueError(
@@ -604,9 +614,9 @@ class EngramConfig:
         # Activation recomputation is supported: checkpointed_forward already forwards
         # input_ids to the layers it replays, and the Engram collectives stay rank-symmetric
         # under replay because every rank in the EP/TP group recomputes the same layer block.
-        # CUDA graphs: Engram modules hang off attention-type layers, and their hashed lookup
-        # plus its all-to-all have data-dependent shapes, so no captured graph may contain an
-        # Engram-hosting layer. Per-layer Transformer Engine capture guarantees that for any
+        # CUDA graphs: Engram modules hang off attention-type layers, and their dynamic hashed
+        # lookup plus its all-to-all have data-dependent shapes, so no per-layer captured graph
+        # may contain an Engram-hosting layer. Per-layer Transformer Engine capture guarantees that for any
         # explicit scope: a layer that hosts Engram declares itself uncapturable
         # (TransformerLayer.is_cuda_graph_capturable) and _layer_is_graphable leaves it eager,
         # while the other layers -- including the other attention-type layers under the
@@ -620,14 +630,26 @@ class EngramConfig:
         # hyper-connection wrapper runs the Engram lookup eagerly in front of the host
         # layer's graph and captures only the rest of that layer, so the lookup itself is
         # still never inside a graph and the rules above are unchanged.
-        if transformer_config.cuda_graph_impl not in ("none", "transformer_engine"):
+        # Full-iteration capture is supported through the fixed-capacity EP lookup, which the
+        # modules select under cuda_graph_impl='full_iteration'. At EP > 1 a bucket overflow
+        # fails the run (engram_ep_capacity_factor too small); at EP 1 the lookup is local and
+        # cannot overflow. Deterministic mode keeps the sorted, segmented table backward,
+        # whose sizes are data-dependent.
+        if transformer_config.cuda_graph_impl == "full_iteration":
+            if getattr(transformer_config, "deterministic_mode", False):
+                raise ValueError(
+                    "Engram does not support cuda_graph_impl='full_iteration' with "
+                    "deterministic_mode: the deterministic table backward has data-dependent "
+                    "sizes."
+                )
+        elif transformer_config.cuda_graph_impl not in ("none", "transformer_engine"):
             raise ValueError(
                 "Engram does not yet support cuda_graph_impl="
-                f"{transformer_config.cuda_graph_impl!r}: full-iteration and local per-layer "
-                "capture would take the Engram-hosting layer with them, and its hashed gather "
-                "and all-to-all have data-dependent shapes. Use "
-                "cuda_graph_impl='transformer_engine' with explicit cuda_graph_modules; the "
-                "Engram-hosting layer then stays eager."
+                f"{transformer_config.cuda_graph_impl!r}: local per-layer capture would take the "
+                "Engram-hosting layer with it, and its dynamic hashed gather and all-to-all have "
+                "data-dependent shapes. Use cuda_graph_impl='transformer_engine' with explicit "
+                "cuda_graph_modules (the Engram-hosting layer then stays eager), or "
+                "cuda_graph_impl='full_iteration'."
             )
         if (
             transformer_config.cuda_graph_impl == "transformer_engine"

@@ -339,6 +339,11 @@ class Engram(MegatronModule):
             ep_group=pg_collection.ep,
             tp_group=pg_collection.tp,
             expt_dp_group=pg_collection.expt_dp,
+            capacity_factor=(
+                engram_config.ep_capacity_factor
+                if getattr(config, "cuda_graph_impl", "none") == "full_iteration"
+                else None
+            ),
         )
         factory_kwargs = {"device": device, "dtype": config.params_dtype}
         # Official Qwen PLE layout: one fused key projection over all residual streams, one
