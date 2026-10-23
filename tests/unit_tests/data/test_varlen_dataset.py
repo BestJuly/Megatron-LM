@@ -1092,6 +1092,47 @@ def test_mock_config_vocab_size_takes_precedence(
     assert tokens[:9].tolist() == [1, 2, 3, 4, 5, 6, 7, 1, 2]
 
 
+@pytest.mark.parametrize("pack_documents", [False, True])
+def test_mock_sft_thd_rows_pack_documents(monkeypatch, pack_documents):
+    """pack_documents fills a THD row with consecutive mock documents, each shifted on its own."""
+    monkeypatch.setattr(MockSFTLowLevelDataset, "size", 64)
+    tokenizer = _FakeTokenizer(eod=127, pad=0, vocab_size=128)
+    config = _make_config(tokenizer, seq_length=64)
+    config.sft_mock_dataset_config_json = json.dumps(
+        {
+            "mode": "distribution",
+            "type": "lognormal",
+            "min_seq_len": 4,
+            "max_seq_len": 24,
+            "mean_seq_len": 10,
+            "lognormal_sigma": 1.1,
+            "pack_documents": pack_documents,
+        }
+    )
+    ds = MockSFTDataset.__new__(MockSFTDataset)
+    ds.config = config
+    ds.dataset = MockSFTDataset.build_low_level_dataset("", config)
+    ds.indices = np.arange(64)
+    lengths = ds.dataset.sequence_lengths
+    for idx in range(8):
+        sample = ds[idx]
+        cu = sample["cu_seqlens"].tolist()
+        doc_lens = [b - a for a, b in zip(cu[:-1], cu[1:])]
+        assert sample["tokens"].numel() == cu[-1] <= 64
+        assert int(sample["max_seqlen"]) == max(doc_lens)
+        if not pack_documents:
+            assert doc_lens == [int(lengths[idx])]
+            continue
+        # Greedy: consecutive documents while they fit, then stop.
+        assert doc_lens == [int(n) for n in lengths[idx : idx + len(doc_lens)]]
+        assert cu[-1] + int(lengths[idx + len(doc_lens)]) > 64
+        for start, n in zip(cu[:-1], doc_lens):
+            # Positions restart and the last label of a document (its EOD) is masked.
+            assert sample["position_ids"][start : start + n].tolist() == list(range(n))
+            assert int(sample["tokens"][start + n - 1]) == tokenizer.eod
+            assert float(sample["loss_mask"][start + n - 1]) == 0.0
+
+
 def test_generated_mock_data_requires_available_vocab_size():
     """Missing tokenizer and JSON vocabulary values produce an actionable error."""
     tokenizer = _FakeTokenizer(eod=0, pad=None, vocab_size=None)

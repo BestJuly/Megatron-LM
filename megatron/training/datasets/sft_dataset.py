@@ -239,6 +239,8 @@ class MockSFTLowLevelDataset:
                 mean_seq_len=2048, lognormal_sigma=1.1).
         format (str): Output format for MockSFTDataset. Either 'thd' (default, sequence
             packing with cu_seqlens) or 'sbhd' (padded to seq_length, no cu_seqlens).
+        pack_documents (bool): With the 'thd' format, pack consecutive documents into one row
+            while they fit in seq_length, instead of one document per row. Default False.
     """
 
     seed: int = 0
@@ -250,6 +252,7 @@ class MockSFTLowLevelDataset:
     def __init__(self, mode: str, vocab_size: Optional[int] = None, **kwargs) -> None:
         np.random.seed(self.seed)
         self.format = kwargs.get("format", "thd")
+        self.pack_documents = bool(kwargs.get("pack_documents", False))
         self.vocab_size = vocab_size
 
         if mode in ("file", "distribution") and (vocab_size is None or vocab_size < 2):
@@ -412,37 +415,58 @@ class MockSFTDataset(SFTDataset):
             tokens.extend([pad] * pad_len)
             positions.extend(range(positions[-1] + 1, positions[-1] + 1 + pad_len))
 
-        pack_tokens = list(tokens_list) + [pad]
-        pack_positions = list(range(len(pack_tokens)))
-
-        # Truncate if sequence exceeds pack_length + 1 (need +1 for shift).
-        if len(pack_tokens) > pack_length + 1:
-            pack_tokens = pack_tokens[: pack_length - 1] + [eod, pad]
-            pack_positions = pack_positions[: pack_length + 1]
-
-        # Pad to pad_granularity alignment (tp * cp * 2).
-        # We need final length (after shift) to be divisible by pad_granularity.
         pad_granularity = self._calculate_padding_divisor()
-        final_len = len(pack_tokens) - 1
-        mod_token_count = final_len % pad_granularity
-        if mod_token_count != 0:
-            pad_len = pad_granularity - mod_token_count
-            extend_with_padding(pack_tokens, pack_positions, pad_len)
 
-        # Apply shift for next-token prediction.
-        input_ids = torch.tensor(pack_tokens[:-1], dtype=torch.int64)
-        labels = torch.tensor(pack_tokens[1:], dtype=torch.int64)
-        position_ids = torch.tensor(pack_positions[:-1], dtype=torch.int64)
+        def build_document(document_tokens):
+            """Return one document's shifted inputs, labels and position ids."""
+            pack_tokens = list(document_tokens) + [pad]
+            pack_positions = list(range(len(pack_tokens)))
 
+            # Truncate if sequence exceeds pack_length + 1 (need +1 for shift).
+            if len(pack_tokens) > pack_length + 1:
+                pack_tokens = pack_tokens[: pack_length - 1] + [eod, pad]
+                pack_positions = pack_positions[: pack_length + 1]
+
+            # Pad to pad_granularity alignment (tp * cp * 2).
+            # We need final length (after shift) to be divisible by pad_granularity.
+            final_len = len(pack_tokens) - 1
+            mod_token_count = final_len % pad_granularity
+            if mod_token_count != 0:
+                pad_len = pad_granularity - mod_token_count
+                extend_with_padding(pack_tokens, pack_positions, pad_len)
+
+            # Apply shift for next-token prediction.
+            return pack_tokens[:-1], pack_tokens[1:], pack_positions[:-1]
+
+        input_list, label_list, position_list = build_document(tokens_list)
+        cu_seqlens = [0, len(input_list)]
+        if self.dataset.pack_documents:
+            # Append the following documents of the low-level dataset while they fit, as
+            # SFTDataset packs conversations, so a row holds several documents. The row is
+            # not padded to pack_length: the remainder is left to the THD padding contract.
+            next_index = int(self.indices[idx % len(self.indices)]) + 1
+            while True:
+                document = self.dataset[next_index].tolist() + [eod]
+                document_inputs, document_labels, document_positions = build_document(document)
+                if len(input_list) + len(document_inputs) > pack_length:
+                    break
+                input_list += document_inputs
+                label_list += document_labels
+                position_list += document_positions
+                cu_seqlens.append(len(input_list))
+                next_index += 1
+
+        input_ids = torch.tensor(input_list, dtype=torch.int64)
+        labels = torch.tensor(label_list, dtype=torch.int64)
+        position_ids = torch.tensor(position_list, dtype=torch.int64)
         seq_len = len(input_ids)
-        cu_seqlens = [0, seq_len]
 
         # Loss mask: mask padding tokens
         loss_mask = torch.ones(seq_len, dtype=torch.float32)
         loss_mask[labels == pad] = 0.0
 
         cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32)
-        max_seqlen = torch.tensor(seq_len, dtype=torch.int32)
+        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
 
         return {
             'tokens': input_ids,
