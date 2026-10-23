@@ -6,7 +6,9 @@
 #
 # The argument block below is the configuration that was run end to end for a 50-step
 # weights-only resume: 204.4 GiB peak allocated per rank, 248.6 GiB device memory used,
-# 29 GiB headroom. See examples/qwen4/docs/training/full_model_64gpu.md.
+# 29 GiB headroom. That run used Adam; the block now selects Muon (--optimizer muon), which
+# has not been run at this scale yet -- pass --optimizer adam to reproduce it.
+# See examples/qwen4/docs/training/full_model_64gpu.md.
 #
 # **This wrapper script itself has not been executed.** It is a faithful transcription of that
 # argument list, not a separately validated artifact -- treat the first run as a validation run.
@@ -82,7 +84,7 @@ python -m torch.distributed.run \
     --mock-data --seq-length 4096 --moe-router-force-load-balancing \
     --tensor-model-parallel-size 1 --pipeline-model-parallel-size 1 \
     --expert-model-parallel-size 64 --context-parallel-size 1 --expert-tensor-parallel-size 1 \
-    --use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather \
+    --optimizer muon --use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather \
     --micro-batch-size 1 --global-batch-size 512 \
     --bf16 --transformer-impl transformer_engine --enable-experimental \
     --cross-entropy-loss-fusion --cross-entropy-fusion-impl native \
@@ -100,6 +102,6 @@ python -m torch.distributed.run \
 #   --dist-ckpt-optim-fully-reshardable --exit-duration-in-mins 230
 #
 # Sizing, for changing the layout: activations are ~130 GiB at any EP; parameters + optimizer
-# are 5.05 B replicated + 172 B / EP sharded, at 16 bytes per sharded parameter because
-# expert-DP is 1 at this layout. EP32 measured 251 GiB and does not fit once the ~42 GiB of
+# are 5.05 B replicated + 172 B / EP sharded, at 16 bytes per sharded parameter with Adam
+# because expert-DP is 1 at this layout. EP32 measured 251 GiB and does not fit once the ~42 GiB of
 # NCCL/all-to-all/context memory outside the allocator is counted.

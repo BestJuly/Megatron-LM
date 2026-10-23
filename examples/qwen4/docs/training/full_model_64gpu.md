@@ -17,7 +17,7 @@ mbs 1, no recompute), confirmed by the real 64-rank run:
 
 Activations are ≈ 130 GiB at any EP (≈ 15 GiB of them vocab-sized cross-entropy intermediates);
 parameters + optimizer are 5 B replicated + 172 B / EP sharded (experts 120.6 B + PLE 51.2 B),
-16 bytes per sharded parameter because expert-DP is 1. The PLE table is 1.49 GiB per rank at
+16 bytes per sharded parameter with Adam because expert-DP is 1. The PLE table is 1.49 GiB per rank at
 EP64 (fp32 master 2.98 GiB, Adam 5.96 GiB). Recompute for the n-gram memory is available
 (`engram.md`), so EP32 can now be re-measured.
 
@@ -66,7 +66,7 @@ pretrain_hybrid.py \
     --mock-data --seq-length 4096 --moe-router-force-load-balancing \
     --tensor-model-parallel-size 1 --pipeline-model-parallel-size 1 --expert-model-parallel-size 64 \
     --context-parallel-size 1 --expert-tensor-parallel-size 1 \
-    --use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather \
+    --optimizer adam --use-distributed-optimizer --overlap-grad-reduce --overlap-param-gather \
     --micro-batch-size 1 --global-batch-size 512 \
     --moe-token-dispatcher-type alltoall --moe-grouped-gemm --moe-permute-fusion \
     --bf16 --transformer-impl transformer_engine --enable-experimental \
@@ -77,7 +77,8 @@ pretrain_hybrid.py \
 ```
 
 `--no-load-optim --no-load-rng --finetune` because the converted checkpoint holds weights only
-(iteration counter restarts at 0). Environment used: `CUDA_DEVICE_MAX_CONNECTIONS=1`,
+(iteration counter restarts at 0). The run used Adam; `train_full_model_64gpu.sh` selects
+`--optimizer muon` instead, which has not been run at this scale yet. Environment used: `CUDA_DEVICE_MAX_CONNECTIONS=1`,
 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
 
 ## From scratch

@@ -2,8 +2,8 @@
 
 What the composed Qwen3.8-Flash-Next stack (GDN + QSA + MoE + gated residual + PLE + MTP) actually
 does on this branch. Every row was produced by running the single-node proxy
-([`../training/proxy_single_node.md`](../training/proxy_single_node.md)) with flag overrides,
-4 × GB300, 8 iterations, mock data, seq 4096 — **not** inferred from per-component status.
+([`../training/proxy_single_node.md`](../training/proxy_single_node.md)) in its `LAYOUT=bshd4k`
+mode with flag overrides, 4 × GB300, 8 iterations, mock data, seq 4096 — **not** inferred from per-component status.
 
 Re-run after any rebuild: the cases are cheap (one node) and they are the only thing that proves
 the *combination* works.
@@ -29,20 +29,21 @@ the *combination* works.
 | **Activation recompute, selective** | ✅ | `--recompute-granularity selective --recompute-modules core_attn mhc` | 62.5 GiB (−13 %) |
 | **MXFP8** | ✅ | `--fp8-format e4m3 --fp8-recipe mxfp8` | 72.4 GiB |
 | **CUDA graphs, MoE scopes** | ✅ | `--cuda-graph-impl transformer_engine --cuda-graph-modules moe_router moe_preprocess --cuda-graph-warmup-steps 2` | 30 iterations, peak allocated unchanged (42.57 vs 42.59 GiB), loss identical to the eager run at iteration 1 (lm loss 1.073585E+01, grad norm 6.642). `_layer_is_graphable` leaves a hybrid layer eager unless its inner layer is MoE, so this captures the gated-residual aggregate plus the router and dispatch preprocessing and never touches GDN, QSA or the memory. `[moe_router]` alone measures the same — `moe_preprocess` adds nothing. Needed two fixes: the gated residual used to pack its always-`None` `h_res` slot as a graph output, and Engram rejected every `cuda_graph_impl` |
-| **CUDA graphs, `attn` scope** | ✅ | `--cuda-graph-impl transformer_engine --cuda-graph-modules attn moe_router --cuda-graph-warmup-steps 2 --cuda-graph-capture-engram-host` | run on packed THD (`--sft`) at 32K per rank, CP1, EP4, with MoK, on GB300 (arguments: [`../../README.md`](../../README.md#kernel-backends)). Engram-hosting layers stay eager unless `--cuda-graph-capture-engram-host` runs the Engram lookup eagerly in front of the layer's graph and captures the rest of the layer. Under THD `attn` capture GDN `internal` resolves to `fla` (use `--gdn-kernel-backend cudnn`) and QSA `cudnn` needs `--qsa-cudnn-bwd-impl qsa_api` |
+| **CUDA graphs, `attn` scope** | ✅ | `--cuda-graph-impl transformer_engine --cuda-graph-modules attn moe_router --cuda-graph-warmup-steps 2 --cuda-graph-capture-engram-host` | the proxy's default `LAYOUT=thd32k`: packed THD (`--sft`) at 32K per rank, CP1, EP4, with MoK, on GB300 ([`../training/proxy_single_node.md`](../training/proxy_single_node.md)). Engram-hosting layers stay eager unless `--cuda-graph-capture-engram-host` runs the Engram lookup eagerly in front of the layer's graph and captures the rest of the layer. Under THD `attn` capture GDN `internal` resolves to `fla` (use `--gdn-kernel-backend cudnn`) and QSA `cudnn` needs `--qsa-cudnn-bwd-impl qsa_api` |
 | **CUDA graphs, other modes** | ⛔ | `--cuda-graph-impl local`, `full_iteration`, or `transformer_engine` without `--cuda-graph-modules` | rejected by Engram at config validation: these modes capture the Engram-hosting layer, whose hashed lookup and all-to-all have data-dependent shapes |
 | **FSDP** | ⛔ | `--use-megatron-fsdp --ckpt-format fsdp_dtensor` | rejected: "Engram does not yet support FSDP" |
 
 ## Kernel backends (GB300)
 
-Proxy, 4 × GB300, mock data (cuDNN 9.27.0, cudnn-frontend `lit/qsa`, MoK `lit/qwen4`). Flags and constraints:
+Proxy, 4 × GB300, mock data, the image of [`../../Dockerfile.gb300`](../../Dockerfile.gb300)
+(cuDNN 9.27.0, cudnn-frontend `lit/qsa`, MoK `lit/qwen4`). Flags and constraints:
 [`../../README.md`](../../README.md#kernel-backends).
 
 | Feature | Whole model | How it was run | Notes |
 |---|:---:|---|---|
 | **GDN `internal` (CuTe DSL), the default** | ✅ | no flag | CuTe DSL forward + fla backward at 48 value heads (logged). Under THD with `attn` captured it resolves to `fla` (one warning) |
 | **GDN `fla`** | ✅ | `--gdn-kernel-backend fla` | the previous default |
-| **GDN `cudnn`** | ✅ | `--gdn-kernel-backend cudnn` | THD + `attn moe_router` capture + MoK, 32K per rank |
+| **GDN `cudnn`** | ✅ | `--gdn-kernel-backend cudnn` | the proxy's `thd32k` default: THD + `attn moe_router` capture + MoK, 32K per rank |
 | **QSA `cute`** | ✅ | `--qsa-attn-backend cute` (= `--qsa-use-sparse-attention`) | |
 | **QSA `cudnn` + `sparse_gqa` bwd** | ✅ | `--qsa-attn-backend cudnn` | rejected under THD CUDA-graph capture and for 12Q/1KV (TP2) |
 | **QSA `cudnn` + `qsa_api` bwd** | ✅ | `--qsa-attn-backend cudnn --qsa-cudnn-bwd-impl qsa_api` | the one for 12Q/1KV and THD capture |
@@ -53,8 +54,8 @@ Proxy, 4 × GB300, mock data (cuDNN 9.27.0, cudnn-frontend `lit/qsa`, MoK `lit/q
 
 | Feature | Whole model | How it was run | Notes |
 |---|:---:|---|---|
-| **Adam + distributed optimizer** | ✅ | the default of every recipe here | expert-parallel parameters — the routed experts and the memory's hashed tables — shard their optimizer state over the **expert** data-parallel group, dense parameters over the ordinary one |
-| **Muon + distributed optimizer** | ✅ | `--optimizer muon --use-distributed-optimizer` (drop `--use-precision-aware-optimizer` and its four dtype flags; Muon rejects them) | Muon owns the 2-D matrices through the layer-wise optimizer; everything else goes to Adam siblings. **The memory's tables are expert-parallel *and* Adam-managed at once**, which used to be rejected at startup and forced the distributed optimizer off entirely, un-sharding every optimizer state. Measured on the proxy: peak allocated **−15.84 GiB (−23.7 %)** at expert-DP 2, −6.05 GiB at expert-DP 1 (dense side only), iteration-1 losses identical to the un-sharded arm, `torch_dist` round trip clean. Check the startup `[optimizer routing]` line: the tables must land in the scalar/embedding group, never in the matrix group |
+| **Adam + distributed optimizer** | ✅ | `--optimizer adam` (the recorded 64-GPU run used it) | expert-parallel parameters — the routed experts and the memory's hashed tables — shard their optimizer state over the **expert** data-parallel group, dense parameters over the ordinary one |
+| **Muon + distributed optimizer** | ✅ | the default of both recipes: `--optimizer muon --use-distributed-optimizer` (drop `--use-precision-aware-optimizer` and its four dtype flags; Muon rejects them) | Muon owns the 2-D matrices through the layer-wise optimizer; everything else goes to Adam siblings. **The memory's tables are expert-parallel *and* Adam-managed at once**, which used to be rejected at startup and forced the distributed optimizer off entirely, un-sharding every optimizer state. Measured on the proxy: peak allocated **−15.84 GiB (−23.7 %)** at expert-DP 2, −6.05 GiB at expert-DP 1 (dense side only), iteration-1 losses identical to the un-sharded arm, `torch_dist` round trip clean. Check the startup `[optimizer routing]` line: the tables must land in the scalar/embedding group, never in the matrix group |
 | **Muon + expert tensor parallelism** | ❓ | — | untested: every run above used `--expert-tensor-parallel-size 1`. ETP does not change the sharding logic, it only shrinks the expert data-parallel group (`expert_data_parallel_size = world_size // (ETP × EP × PP)`), and the expert sibling is built with the same process groups the standard path uses — but this is reasoned from the code, not measured |
 | **Muon + precision-aware optimizer** | ⛔ | `--optimizer muon --use-precision-aware-optimizer` | rejected: "only supported with adam" |
 

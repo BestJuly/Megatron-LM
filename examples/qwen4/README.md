@@ -22,6 +22,17 @@ A container with Megatron's usual dependencies plus, for this model:
 
 * **`fla`** — the gated-delta-rule kernels. Megatron's GDN imports it.
 * **Triton** and a recent **TransformerEngine**.
+* **`emerging-optimizers`** — Muon, the optimizer of the proxy recipe (`--optimizer muon`).
+* For the optional kernel backends: the cuDNN Frontend QSA kernels (`--qsa-attn-backend cudnn`),
+  the MoK megakernel (`--moe-megakernel-backend mok`) and `causal-conv1d`
+  (`--gdn-pre-gated-delta-rule-fusion`).
+
+[`Dockerfile.gb300`](Dockerfile.gb300) builds the GB300 image these recipes were run in, with
+every package above pinned to the commit that was run:
+
+```bash
+docker build -f examples/qwen4/Dockerfile.gb300 -t qwen4-gb300 examples/qwen4
+```
 * For step 1 only, a **`transformers` build that provides `qwen4_exp`**. At the time of writing
   that is not in a released wheel; install it into a side prefix and point `QWEN4_TRANSFORMERS`
   at it, so the container's own `transformers` is left alone:
@@ -117,12 +128,24 @@ Eight layers, 32 experts, every per-layer and per-expert dimension identical to 
 mock data with `NullTokenizer` — nothing to download:
 
 ```bash
-./examples/qwen4/train_proxy_1node.sh
+./examples/qwen4/train_proxy_1node.sh                  # LAYOUT=thd32k, the default
+LAYOUT=bshd4k ./examples/qwen4/train_proxy_1node.sh    # the BSHD baseline
 ```
 
-4 GPUs, EP4, BF16. Per-rank shapes match the 64-GPU model (8 local experts either way), which is
-what makes it useful for recipe work. It is **not** a memory proxy for EP64 — it fits one node
-with a large margin. Details and the dimension-by-dimension rationale:
+4 GPUs, EP4, BF16, Muon. Per-rank shapes match the 64-GPU model (8 local experts either way), which
+is what makes it useful for recipe work. It is **not** a memory proxy for EP64. Two layouts:
+
+* **`thd32k` (default)** — the training layout: packed THD with one 32K-token document per rank,
+  TE CUDA graphs over attention and the MoE router (the Engram lookup runs eagerly in front of its
+  layer's graph), the MoK expert megakernel, cuDNN GDN with the pre-gated-delta-rule fusion, the
+  CuTe DSL sparse QSA path and the fused indexer loss. The vocabulary is 40832, about 1/6 of the
+  real 248320, scaled down with the layers (8 of 48) so the vocabulary-sized part of the step keeps
+  the 48-layer model's share. Needs the [`Dockerfile.gb300`](Dockerfile.gb300) image.
+* **`bshd4k`** — unpacked BSHD at seq 4096, the real vocabulary and stock kernels; the baseline the
+  [support matrix](docs/validation/support_matrix.md) was measured on. Runs in any container with
+  TE, fla, Triton and `emerging-optimizers`.
+
+Details and the dimension-by-dimension rationale:
 [`training/proxy_single_node.md`](docs/training/proxy_single_node.md).
 
 ### Kernel backends
@@ -149,39 +172,20 @@ Three switches pick the GDN and QSA kernels; none of them changes the model.
   CP. `sparse_gqa` additionally needs 512 selected blocks, an even KV head count per rank (so
   not TP2) and no THD CUDA-graph capture; use `--qsa-cudnn-bwd-impl qsa_api` there.
 
-Arguments for the configurations run on this branch, appended to `train_proxy_1node.sh`:
+Overrides for the configurations run on this branch, appended to `train_proxy_1node.sh`:
 
-| Configuration | Arguments |
-|---|---|
-| defaults (GDN `internal`, QSA `cute`) | `--qsa-attn-backend cute` |
-| previous kernels (GDN `fla`, QSA `cute`) | `--gdn-kernel-backend fla --qsa-attn-backend cute` |
-| cuDNN QSA | `--qsa-attn-backend cudnn` (add `--qsa-cudnn-bwd-impl qsa_api` for 12Q/1KV or THD capture) |
-| MoK expert FFN | `--moe-megakernel-backend mok` (MoK `lit/qwen4` ≥ `2649f3b` for the 640-wide expert FFN) |
+| Layout | Configuration | Arguments |
+|---|---|---|
+| `thd32k` | the default (GDN `cudnn`, QSA `cute`, MoK, Muon) | none |
+| `thd32k` | GDN default backend | `--gdn-kernel-backend internal` (resolves to `fla` under the attention capture, see above) |
+| `thd32k` | cuDNN QSA | `--qsa-attn-backend cudnn --qsa-cudnn-bwd-impl qsa_api` |
+| `thd32k` | Adam | `--optimizer adam`; the recorded Adam run also used `--use-precision-aware-optimizer --main-grads-dtype fp32 --main-params-dtype fp32 --exp-avg-dtype bf16 --exp-avg-sq-dtype bf16`, which Muon rejects |
+| `bshd4k` | sparse QSA kernels | `--qsa-attn-backend cute` |
+| `bshd4k` | previous kernels (GDN `fla`, QSA `cute`) | `--gdn-kernel-backend fla --qsa-attn-backend cute` |
+| `bshd4k` | cuDNN QSA | `--qsa-attn-backend cudnn` (add `--qsa-cudnn-bwd-impl qsa_api` for 12Q/1KV) |
+| `bshd4k` | MoK expert FFN | `--moe-megakernel-backend mok` (MoK `lit/qwen4` ≥ `2649f3b` for the 640-wide expert FFN) |
 
-Packed THD at 32K per rank with partial CUDA graphs (`attn moe_router`) and MoK, CP1, EP4: the
-arguments that run adds to `train_proxy_1node.sh` (its run length and LR schedule left out):
-
-```bash
---seq-length 32768 --micro-batch-size 1 --global-batch-size 16 --eval-iters 1 \
---vocab-size 40832 --make-vocab-size-divisible-by 128 \
---engram-unigram-vocab-size 40832 --engram-eos-token-id 40831 \
---sft --pad-packed-seq-alignment max --max-seqlen-per-dp-cp-rank 32768 \
---thd-max-packed-sequences 1 \
---sft-mock-dataset-config-json '{"mode":"distribution","type":"lognormal","format":"thd","min_seq_len":32768,"max_seq_len":32768,"mean_seq_len":32768,"lognormal_sigma":1.1}' \
---cuda-graph-impl transformer_engine --cuda-graph-modules attn moe_router \
---cuda-graph-warmup-steps 2 --cuda-graph-capture-engram-host --te-rng-tracker \
---moe-megakernel-backend mok \
---moe-megakernel-backend-config '{"fwd_num_comm_sms":48,"bwd_num_comm_sms":56,"minibatch_size":8192,"macrobatch_size":65536,"schedule_capacity_multiplier":0.0625,"all_gather_top_experts_chunk_bytes":2048}' \
---moe-router-fusion \
---gdn-kernel-backend cudnn --gdn-pre-gated-delta-rule-fusion \
---qsa-use-sparse-attention --qsa-indexer-loss-impl fused --qsa-indexer-loss-chunk 1024 \
---use-precision-aware-optimizer --main-grads-dtype fp32 --main-params-dtype fp32 \
---exp-avg-dtype bf16 --exp-avg-sq-dtype bf16 \
---manual-gc --manual-gc-interval 100 --rerun-mode disabled --no-check-for-nan-in-loss-and-grad
-```
-
-`--gdn-pre-gated-delta-rule-fusion` needs `causal-conv1d` in the image. For cuDNN QSA in this
-configuration add `--qsa-attn-backend cudnn --qsa-cudnn-bwd-impl qsa_api`.
+`--gdn-pre-gated-delta-rule-fusion` (in `thd32k`) needs `causal-conv1d` in the image.
 
 ## 3. Convert the released checkpoint
 
@@ -209,9 +213,10 @@ MASTER_ADDR=<rank0-host> LOAD=<converted_ckpt_dir> \
 One instance per node, 16 nodes × 4 GPUs, EP64, BF16. Omit `LOAD` to train from scratch. Resolve
 `MASTER_ADDR` outside the container — `scontrol` usually is not installed inside it.
 
-**The argument list is the one that was run** (50 steps, 204.4 GiB peak per rank,
+**The argument list is the one that was run** (50 steps with Adam, 204.4 GiB peak per rank,
 29 GiB headroom); **the wrapper script itself has not been executed**, so treat its first run as a
-validation run. Why EP64 and not EP32, and the numbers behind that:
+validation run. The script selects Muon (`--optimizer muon`), which has not been run at this
+scale yet; `--optimizer adam` reproduces the recorded run. Why EP64 and not EP32, and the numbers behind that:
 [`training/full_model_64gpu.md`](docs/training/full_model_64gpu.md).
 
 ## Known traps

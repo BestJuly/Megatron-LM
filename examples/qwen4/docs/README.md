@@ -20,7 +20,7 @@ the whole model.
 | Document | Contents |
 |---|---|
 | [`architecture/config_mapping.md`](architecture/config_mapping.md) | HF `config.json` → Megatron arguments, field by field; the hybrid layer pattern; the settings that are easy to get wrong (router path, PLE width, GDN gate, MTP norms) |
-| [`training/proxy_single_node.md`](training/proxy_single_node.md) | An 8-layer / 32-expert proxy with every per-layer dimension real; one `torchrun` on a single node; what to expect |
+| [`training/proxy_single_node.md`](training/proxy_single_node.md) | An 8-layer / 32-expert proxy with every per-layer dimension real; one `torchrun` on a single node, packed THD at 32K per rank by default or the BSHD baseline; what to expect |
 | [`training/full_model_64gpu.md`](training/full_model_64gpu.md) | The 48-layer model on 64 GPUs (EP64, BF16): the full argument list, measured memory, from-scratch schedule |
 | [`checkpoint/hf_weights_and_resume.md`](checkpoint/hf_weights_and_resume.md) | Weight-mapping rules from the released checkpoint, the native `torch_dist` checkpoint, and the resume flags; what was measured |
 | [`validation/support_matrix.md`](validation/support_matrix.md) | **What the composed model actually supports** — EP/TP/PP/VPP/CP/THD/recompute/MXFP8/CUDA-graph/FSDP, each measured on the proxy, with the TODO list the gaps produce |
