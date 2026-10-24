@@ -239,7 +239,8 @@ def add_multimodal_args(parser):
             "pixel traffic."
         ),
     )
-    group.add_argument(
+    packing_group = group.add_mutually_exclusive_group()
+    packing_group.add_argument(
         "--mdp-greedy-packing",
         action="store_true",
         default=False,
@@ -261,12 +262,30 @@ def add_multimodal_args(parser):
             "which all assume a fixed samples-per-iteration rate."
         ),
     )
-    group.add_argument(
-        "--mdp-greedy-packing-approximate-resume",
+    packing_group.add_argument(
+        "--mdp-ffd-packing",
         action="store_true",
         default=False,
         help=(
-            "Allow --mdp-greedy-packing together with --save / --load. The greedy "
+            "Fill decoder microbatches using buffered first-fit decreasing packing. "
+            "Sort complete samples by descending aligned length, with source-order ties. "
+            "Uses the same token budget, sequence cap, bin-count MBS/GBS semantics and "
+            "checkpoint/sample-schedule restrictions as --mdp-greedy-packing."
+        ),
+    )
+    group.add_argument(
+        "--mdp-ffd-packing-buffer-size",
+        type=int,
+        default=128,
+        help="Samples per FFD sorting window (positive; default 128). Larger windows use more host memory.",
+    )
+    group.add_argument(
+        "--mdp-greedy-packing-approximate-resume",
+        "--mdp-packing-approximate-resume",
+        action="store_true",
+        default=False,
+        help=(
+            "Allow greedy or FFD packing together with --save / --load. The packing "
             "sample buffer carries across iterations and is NOT checkpointed, and "
             "the sampler is repositioned from one global consumed_train_samples "
             "that cannot express per-DP-rank drain counts, so a resumed run may "

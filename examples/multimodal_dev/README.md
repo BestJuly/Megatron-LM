@@ -27,6 +27,9 @@ multimodal_dev/
 
 ## Quick Start
 
+For complete Nemotron Image v3 records with MDP greedy packing and static THD,
+see the [Nemotron dataset contract](data/nemotron.md).
+
 ```bash
 torchrun --nproc_per_node=8 multimodal_dev/pretrain_multimodal.py \
     --model-arch qwen35_vl \

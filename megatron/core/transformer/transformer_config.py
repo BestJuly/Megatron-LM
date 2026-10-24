@@ -4357,6 +4357,17 @@ class TransformerConfig(ModelParallelConfig):
                 f"({self.max_seqlen_per_dp_cp_rank}), got {self.pad_packed_seq_alignment}."
             )
 
+        if self.thd_dummy_seq_length is not None and self.num_moe_experts is not None:
+            if (
+                self.moe_expert_capacity_factor is not None
+                or self.moe_expert_rank_capacity_factor is not None
+                or self.moe_router_load_balancing_type == "sinkhorn"
+            ):
+                raise ValueError(
+                    "thd_dummy_seq_length requires dropless, non-Sinkhorn MoE routing: "
+                    "changed dummy activations must not affect real-token expert selection."
+                )
+
         if self.thd_static_packing and self.thd_max_packed_sequences is None:
             raise ValueError(
                 "thd_static_packing requires --thd-max-packed-sequences: it fixes the "

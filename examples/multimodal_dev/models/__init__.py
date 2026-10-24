@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Model registry for multimodal_dev training.
 
@@ -49,18 +49,14 @@ MODEL_REGISTRY = {
         "post_language_config_fn": _qwen35_vl_post_language_config,
         "vision_flops_fn": _qwen35_vl_vision_flops,
         "dataset_providers": {
-            "mock": (
-                "examples.multimodal_dev.data.mock"
-                ".train_valid_test_datasets_provider"
-            ),
+            "nemotron": "examples.multimodal_dev.data.nemotron.train_valid_test_datasets_provider",
+            "mock": ("examples.multimodal_dev.data.mock" ".train_valid_test_datasets_provider"),
             "cord_v2": (
-                "examples.multimodal_dev.data.cord_v2"
-                ".train_valid_test_datasets_provider"
+                "examples.multimodal_dev.data.cord_v2" ".train_valid_test_datasets_provider"
             ),
             "mdp_mock": (
-                "examples.multimodal_dev.data.mdp_mock"
-                ".train_valid_test_datasets_provider"
+                "examples.multimodal_dev.data.mdp_mock" ".train_valid_test_datasets_provider"
             ),
         },
-    },
+    }
 }

@@ -411,7 +411,9 @@ def _mdp_greedy_consumed_samples(args):
     D2H per iteration on the logging path, next to the existing host-side
     ``consumed_train_samples`` arithmetic.
     """
-    if not getattr(args, "mdp_enable", False) or not getattr(args, "mdp_greedy_packing", False):
+    if not getattr(args, "mdp_enable", False) or not (
+        getattr(args, "mdp_greedy_packing", False) or getattr(args, "mdp_ffd_packing", False)
+    ):
         return None
     from megatron.core.mdp import integration as mdp_integration
 

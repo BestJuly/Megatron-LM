@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Greedy token-budget packing. Pure compute: no distributed state, no CUDA."""
 
@@ -7,7 +7,7 @@ import torch
 
 from megatron.core.mdp.config import MdpConfig
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
-from megatron.core.mdp.packing import GreedySampleStream, decoder_sample_length
+from megatron.core.mdp.packing import FfdSampleStream, GreedySampleStream, decoder_sample_length
 from megatron.core.mdp.runtime import MdpRuntime
 
 
@@ -85,10 +85,7 @@ def test_leftovers_carry_across_iterations():
 def test_alignment_is_charged_against_the_budget():
     # Aligned to 8, a 5-token sample occupies 8 rows: 3 fit in 24, not 4.
     stream = GreedySampleStream(
-        _microbatches([5] * 8, mbs=8),
-        token_budget=24,
-        align=8,
-        length_of=decoder_sample_length,
+        _microbatches([5] * 8, mbs=8), token_budget=24, align=8, length_of=decoder_sample_length
     )
     assert _bin_lengths([next(stream)]) == [[5, 5, 5]]
 
@@ -124,10 +121,7 @@ def test_oversized_sample_names_the_flag():
 def test_budget_must_be_divisible_by_the_row_alignment():
     with pytest.raises(MdpConfigurationError, match="row alignment"):
         GreedySampleStream(
-            _microbatches([10], mbs=1),
-            token_budget=100,
-            align=8,
-            length_of=decoder_sample_length,
+            _microbatches([10], mbs=1), token_budget=100, align=8, length_of=decoder_sample_length
         )
 
 
@@ -201,3 +195,130 @@ def test_consumed_samples_is_none_without_greedy_packing():
     runtime = _StubRuntime(token_budget=1000)
     runtime.config = MdpConfig(enable=True, greedy_packing=False)
     assert runtime.consumed_samples() is None
+
+
+@pytest.mark.parametrize('mbs', [1, 3, 8])
+def test_ffd_fills_earlier_bins_and_preserves_complete_samples(mbs):
+    samples = [_sample(length, tag=i) for i, length in enumerate([8, 7, 6, 4, 3, 2])]
+    for sample in samples:
+        sample['pixel_values'] = object()
+    stream = FfdSampleStream(
+        iter([samples[i : i + mbs] for i in range(0, len(samples), mbs)]),
+        token_budget=10,
+        buffer_size=6,
+        length_of=decoder_sample_length,
+    )
+    bins = list(stream)
+    assert _bin_lengths(bins) == [[8, 2], [7, 3], [6, 4]]
+    assert [[s['tag'] for s in b] for b in bins] == [[0, 5], [1, 4], [2, 3]]
+    assert all(sample is samples[sample['tag']] for pack in bins for sample in pack)
+    assert stream.exhausted
+    assert stream.drained_samples == 6
+    assert stream.consumed_samples == 0
+
+
+def test_ffd_ties_follow_source_order_and_window_boundaries():
+    stream = FfdSampleStream(
+        _microbatches([4, 4, 4, 4, 2, 2], 4),
+        token_budget=8,
+        buffer_size=3,
+        length_of=decoder_sample_length,
+    )
+    assert [[s['tag'] for s in pack] for pack in stream] == [[0, 1], [2], [3, 4, 5]]
+
+
+@pytest.mark.parametrize('buffer_size', [1, 2, 7, 128])
+@pytest.mark.parametrize('align,cap', [(1, None), (8, 3), (4, 1)])
+def test_ffd_conserves_samples_and_respects_both_capacities(buffer_size, align, cap):
+    lengths = [((i * 137) % 1016) + 1 for i in range(211)]
+    stream = FfdSampleStream(
+        _microbatches(lengths, 11),
+        token_budget=1024,
+        align=align,
+        max_num_seqs=cap,
+        buffer_size=buffer_size,
+        length_of=decoder_sample_length,
+    )
+    seen = []
+    for pack in stream:
+        assert pack
+        assert sum(((decoder_sample_length(s) + align - 1) // align) * align for s in pack) <= 1024
+        assert cap is None or len(pack) <= cap
+        seen.extend(s['tag'] for s in pack)
+    assert sorted(seen) == list(range(len(lengths)))
+
+
+def test_ffd_readahead_does_not_count_pending_bins_and_eof_drains_them():
+    stream = FfdSampleStream(
+        _microbatches([8, 7, 6, 4, 3, 2], 4),
+        token_budget=10,
+        buffer_size=128,
+        length_of=decoder_sample_length,
+    )
+    assert len(next(stream)) == 2
+    assert not stream.exhausted  # EOF observed, but two bins still queued.
+    assert stream.drained_samples == 2
+    with pytest.raises(MdpStateError, match='committed samples'):
+        stream.commit(3)
+    stream.commit(2)
+    assert stream.consumed_samples == 2
+    assert len(next(stream)) == 2
+    assert stream.consumed_samples == 2  # Dropped prefetch is not trained data.
+    assert len(next(stream)) == 2
+    assert stream.exhausted
+    with pytest.raises(StopIteration):
+        next(stream)
+
+
+@pytest.mark.parametrize('length', [0, -1, 17])
+def test_ffd_rejects_invalid_lengths(length):
+    stream = FfdSampleStream(iter([[length]]), token_budget=16, length_of=int)
+    with pytest.raises(MdpStateError):
+        next(stream)
+
+
+@pytest.mark.parametrize('kwargs', [{'buffer_size': 0}, {'buffer_size': -1}, {'max_num_seqs': 0}])
+def test_ffd_rejects_invalid_limits(kwargs):
+    with pytest.raises(MdpConfigurationError):
+        FfdSampleStream(iter([]), token_budget=16, length_of=int, **kwargs)
+
+
+@pytest.mark.parametrize('forward_only', [False, True])
+def test_ffd_runtime_commit_and_eval_accounting(forward_only):
+    runtime = _StubRuntime(token_budget=10, forward_only=forward_only)
+    runtime.config = MdpConfig(enable=True, ffd_packing=True, ffd_packing_buffer_size=6)
+    iterator = _microbatches([8, 7, 6, 4, 3, 2], 2)
+    packs, (stream, count) = runtime._capture_window(iterator, 2)
+    assert _bin_lengths(packs) == [[8, 2], [7, 3]]
+    assert count == 4
+    assert runtime.consumed_samples() == 0
+    stream.commit(count)
+    assert runtime.consumed_samples() == (0 if forward_only else 4)
+    runtime._capture_window(iterator, 1)
+    assert runtime.consumed_samples() == (0 if forward_only else 4)
+
+
+def test_ffd_refills_released_slots_without_counting_them_as_consumed():
+    reads = []
+
+    def source():
+        for tag in range(20):
+            reads.append(tag)
+            yield [_sample(5, tag)]
+
+    stream = FfdSampleStream(
+        source(), token_budget=10, buffer_size=6, length_of=decoder_sample_length
+    )
+    assert [s['tag'] for s in next(stream)] == [0, 1]
+    assert len(reads) == 6
+    assert [s['tag'] for s in next(stream)] == [2, 3]
+    assert len(reads) == 8  # Only the previous pack's two freed slots.
+    assert stream.drained_samples == 4
+    assert stream.consumed_samples == 0
+    assert [s['tag'] for s in next(stream)] == [4, 5]
+    assert len(reads) == 10
+    assert [s['tag'] for s in next(stream)] == [6, 7]
+    assert len(reads) == 12
+    stream.commit(8)
+    assert stream.consumed_samples == 8
+    assert [s['tag'] for pack in stream for s in pack] == list(range(8, 20))

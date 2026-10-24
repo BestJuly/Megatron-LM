@@ -197,7 +197,9 @@ def _greedy_sample_scale(args, scenarios):
 
     Returns 1.0 when greedy packing is off, so the default path is unchanged.
     """
-    if not getattr(args, "mdp_greedy_packing", False):
+    if not (
+        getattr(args, "mdp_greedy_packing", False) or getattr(args, "mdp_ffd_packing", False)
+    ):
         return 1.0
     budget = int(args.max_seqlen_per_dp_cp_rank) * int(args.context_parallel_size)
     cap = getattr(args, "thd_max_packed_sequences", None)
