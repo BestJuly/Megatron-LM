@@ -12,8 +12,9 @@ checkout 出来，再 cherry-pick [`lit/mdp_fast_pass`](https://github.com/BestJ
 | 场景 | 实测结果 | 说明与复现 |
 |---|---|---|
 | 35B-A3B，16K 变长 THD，8× GB300，BF16 | **约 474 TFLOP/s/GPU** | [35B rebench 更新](benchmarks/qwen35vl_35b_a3b_16k.md#2026-09-13-rebench-更新) |
-| 397B-A17B，单条 4096，128× GB300，decoder MXFP8 + encoder BF16 | **625.35 TFLOP/s/GPU**；保留约 **96.2%** 的 Decoder-only 吞吐 | [单条 4096 对照](benchmarks/qwen35vl_397b_a17b_4k.md#单条-4096加上-vl-的整体开销) |
-| 397B-A17B，4K 变长 THD，128× GB300 | Native **310.55** → MDP **501.05 TFLOP/s/GPU**，约 **+61.3%** | [变长 4K 对照](benchmarks/qwen35vl_397b_a17b_4k.md#变长-4kmdp-与-native-vl) |
+| 397B-A17B，单条 4096，128× GB300，decoder MXFP8 + encoder BF16 | **625.35 TFLOP/s/GPU**；保留约 **96.2%** 的 Decoder-only 吞吐 | [单条 4096 对照](benchmarks/qwen35vl_397b_a17b_4k_16k.md#单条-4096加上-vl-的整体开销) |
+| 397B-A17B，4K 变长 THD，128× GB300 | Native **310.55** → MDP **501.05 TFLOP/s/GPU**，约 **+61.3%** | [变长 4K 对照](benchmarks/qwen35vl_397b_a17b_4k_16k.md#变长-4kmdp-与-native-vl) |
+| 397B-A17B，单条 16384，128× GB300，decoder MXFP8 + encoder BF16 | **841.60 TFLOP/s/GPU**；保留约 **99.5%** 的 Decoder-only 吞吐 | [16K 更新](benchmarks/qwen35vl_397b_a17b_4k_16k.md#2026-10-26-更新16k-配置与结果) |
 
 单条 4096 对照的 step time 增加约 **4.5%**，说明在该视觉负载下使用 MDP
 加入 encoder 的整体开销有限，**不是完全零开销，也不是 MDP 调度本身的独立开销**。
@@ -34,13 +35,13 @@ doc/mdp/
 ├── commit.md                             fast-pass 历史 + 本分支集成说明
 ├── benchmarks/
 │   ├── qwen35vl_35b_a3b_16k.md           历史 35B 结果 + 474 milestone
-│   ├── qwen35vl_397b_a17b_4k.md          单条 4096 与变长 4K，分开比较
+│   ├── qwen35vl_397b_a17b_4k_16k.md     历史 4K + 16K 配置与结果
 │   ├── rebench_environment.md            统一环境、运行与测量约定
 │   └── mdp_feature_ablations.md          历史 fast-pass 消融
 └── recipes/
     ├── data/                             定长 / 变长 mock 配置
     ├── qwen35_vl_35b_a3b/                历史 recipe + rebench YAML / SH
-    ├── qwen35_vl_397b_a17b/               4 个完整 rebench cell
+    ├── qwen35_vl_397b_a17b/               4K/16K 完整 recipe 与数值适配入口
     └── proxy/                            历史 fast-pass proxy recipe
 ```
 
@@ -191,3 +192,11 @@ export NCCL_GRAPH_REGISTER=0        # 与 expandable_segments 共存时 Megatron
 [增量更新](benchmarks/qwen35vl_35b_a3b_16k.md#2026-09-10-更新)；原有拓扑测试与测量记录保留不变。
 
 </details>
+
+## 2026-10-26 更新
+
+397B-A17B 单条 16K 的 Decoder-only / VL + MDP 为
+**845.75 / 841.60 TFLOP/s/GPU**，中位数 step time 仅增加约 **0.61%**。
+双方关闭 VPP、开启 decoder selective recompute，encoder 保持 BF16 whole recompute。
+[统一测试页](benchmarks/qwen35vl_397b_a17b_4k_16k.md#2026-10-26-更新16k-配置与结果)
+追加了完整配置、输入数值规则、loss、显存和复现 recipe；原有 4K milestone 保持不变。

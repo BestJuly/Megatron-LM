@@ -104,3 +104,23 @@ bash /path/to/the/selected_recipe.sh /path/to/bindpcie python
   强制 MoE 负载均衡保持开启，loss 仅作有限步数的运行诊断。
 - Native VL 使用 vision 层级 recompute；MDP 使用 whole-encoder replay。
   Native 与 MDP 的收益是完整 recipe 的 E2E 对比，不是单个开关的独立因果测量。
+
+## 2026-10-26 更新：397B 16K
+
+[16K 增量测试](qwen35vl_397b_a17b_4k_16k.md#2026-10-26-更新16k-配置与结果)
+使用相同镜像、cuDNN 库路径和 CPU/NUMA 绑定方式，模型代码基线为
+`3a20252464deab35e47e5a3c6305f35fedb626ae`。资源为 32 节点×4 GB300，
+每个 GPU rank 预留 36 个 CPU；使用集群等效的 `segment=16` 放置。
+
+与上方历史 4K 不同：16K 关闭 VPP，并开启 decoder selective recompute
+`moe_act gdn`。Encoder 仍为 BF16、whole recompute，chunk 上限 65,536 patch rows；
+保留相同的实验性 window-overlap + partial-CUDA-graph 配置和原有检查。
+
+16K 的 SH/YAML 均使用随 recipe 提供的 `aligned_entry.py` 与
+`dataset_alignment.py`，统一 mock 文本数值规则，再调用原有训练入口。
+YAML 的 `ALIGNED_NUMERICAL_MODE` 选择 `decoder` 或 `mdp`；直接运行 SH 时已自动设置。
+这不是模型修复，也不是加载两份完全相同的多模态 tensor。
+使用包含全部复现文件的 checkout，勿只复制旧训练参数或单个脚本。
+
+20 步、第 9–20 步统计、FLOPs 和显存口径沿用上文；同时保留中位数和均值，
+不把微小差值当成 encoder 的独立耗时。当前文档整理未新增 GPU 实验。
