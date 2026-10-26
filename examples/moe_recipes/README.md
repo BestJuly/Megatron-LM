@@ -2,9 +2,13 @@
 
 This directory contains self-contained MoE training recipes. Each YAML file includes:
 
-- `DEPENDENCIES`: PyTorch base image and Dockerfile content used for the recipe.
+- `DEPENDENCIES`: PyTorch base image and either Dockerfile content (`dockerfile`)
+  or a Dockerfile path relative to the repository root (`dockerfile_path`).
 - `ENV_VARS`: Environment variables expected by the runtime.
 - `ARGS`: Megatron-LM training arguments.
+
+Qwen3.5-397B-A17B and Qwen3.8-2.4T-A95B container build and launch instructions
+are in the [Qwen3.5-family guide](qwen3_5_397b/README.md).
 
 ## Recipe Index
 
@@ -21,6 +25,56 @@ This directory contains self-contained MoE training recipes. Each YAML file incl
     </tr>
   </thead>
   <tbody>
+    <tr>
+      <td rowspan="3">Qwen3.5-397B-A17B</td>
+      <td><a href="qwen3_5_397b/gb300/mxfp8_THD4K_128GPU_TP1PP2EP64_mok.yaml">GB300 MXFP8 THD 4K</a></td>
+      <td>128</td>
+      <td>1/2/64/1/1</td>
+      <td>1/2048/4096</td>
+      <td>MoK; VPP2; attention CG; HybridEP; fixed-shape PP P2P</td>
+      <td>768.1</td>
+    </tr>
+    <tr>
+      <td><a href="qwen3_5_397b/gb300/mxfp8_THD64K_128GPU_TP1PP2EP64CP8_mok.yaml">GB300 MXFP8 THD 64K</a></td>
+      <td>128</td>
+      <td>1/2/64/8/1</td>
+      <td>1/256/65536</td>
+      <td>MoK; headwise GDN CP; attention CG; HybridEP; fixed-shape PP P2P; Long Context</td>
+      <td>837.9</td>
+    </tr>
+    <tr>
+      <td><a href="qwen3_5_397b/gb300/mxfp8_THD1M_128GPU_TP1PP2EP64CP64_mok.yaml">GB300 MXFP8 THD 1M</a></td>
+      <td>128</td>
+      <td>1/2/64/64/1</td>
+      <td>1/16/1048576</td>
+      <td>MoK; VPP2; chunkwise GDN CP; internal GDR; block recompute; HybridEP; Long Context</td>
+      <td>779.5</td>
+    </tr>
+    <tr>
+      <td rowspan="3">Qwen3.8-2.4T-A95B</td>
+      <td><a href="qwen3_8_2_4t_a95b/gb300/mxfp8_THD4K_256GPU_TP1PP4EP64_mok.yaml">GB300 MXFP8 THD 4K</a></td>
+      <td>256</td>
+      <td>1/4/64/1/1</td>
+      <td>1/4096/4096</td>
+      <td>MoK; selective recompute; optimizer offload; HybridEP</td>
+      <td>1064.9</td>
+    </tr>
+    <tr>
+      <td><a href="qwen3_8_2_4t_a95b/gb300/mxfp8_THD64K_256GPU_TP1PP4EP64CP16_mok.yaml">GB300 MXFP8 THD 64K</a></td>
+      <td>256</td>
+      <td>1/4/64/16/1</td>
+      <td>1/256/65536</td>
+      <td>MoK; headwise GDN CP; attention CG; selective recompute; optimizer offload; HybridEP; Long Context</td>
+      <td>902.4</td>
+    </tr>
+    <tr>
+      <td><a href="qwen3_8_2_4t_a95b/gb300/mxfp8_THD1M_256GPU_TP1PP4EP64CP64_mok.yaml">GB300 MXFP8 THD 1M</a></td>
+      <td>256</td>
+      <td>1/4/64/64/1</td>
+      <td>1/16/1048576</td>
+      <td>MoK; chunkwise GDN CP; internal GDR; full recompute; optimizer offload; HybridEP; Long Context</td>
+      <td>667.6</td>
+    </tr>
     <tr>
       <td>DeepSeek-V4-Pro</td>
       <td><a href="deepseek_v4_pro/gb300/mxfp8_SL4K_256GPU_TP1PP4EP64.yaml">GB300 MXFP8</a></td>
@@ -189,4 +243,4 @@ This directory contains self-contained MoE training recipes. Each YAML file incl
   </tbody>
 </table>
 
-Legend: TP = tensor parallel, PP = pipeline parallel, EP = expert parallel, CP = context parallel, ETP = expert tensor parallel, MBS = micro-batch size, GBS = global batch size, SL = sequence length, CG = CUDA graph, BSHD = fixed-length batch layout, THD = packed variable-length batch layout. The tuple orders are `TP/PP/EP/CP/ETP` and `MBS/GBS/SL`.
+Legend: TP = tensor parallel, PP = pipeline parallel, EP = expert parallel, CP = context parallel, ETP = expert tensor parallel, MBS = micro-batch size, GBS = global batch size, SL = sequence length, CG = CUDA graph, BSHD = fixed-length batch layout, THD = packed variable-length batch layout, MoK = Mixture-of-Kittens MoE megakernel, GDN = Gated DeltaNet, GDR = gated delta rule. The tuple orders are `TP/PP/EP/CP/ETP` and `MBS/GBS/SL`.
