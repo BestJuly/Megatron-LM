@@ -226,6 +226,10 @@ class EngramConfig:
     """
     embedding_lr_multiplier: float = 5.0
     embedding_weight_decay: float = 0.0
+    freeze_embedding: bool = False
+    """Keep the hash-embedding tables fixed: they still serve lookups, but take no gradient,
+    so they get no gradient buffer or optimizer state and the lookup's backward exchange is
+    skipped. The dense half (projections, norms, short convolution) still trains."""
     ep_capacity_factor: float = 2.0
     """Bucket size of the fixed-capacity EP lookup used under full-iteration CUDA graphs.
 
@@ -295,6 +299,7 @@ class EngramConfig:
             unigram_vocab_size=getattr(args, "engram_unigram_vocab_size", None),
             embedding_lr_multiplier=args.engram_embedding_lr_multiplier,
             embedding_weight_decay=args.engram_embedding_weight_decay,
+            freeze_embedding=getattr(args, "engram_freeze_embedding", False),
             ep_capacity_factor=getattr(args, "engram_ep_capacity_factor", 2.0),
         )
         packed_sequences = _validate_packed_sequence_args(args)
