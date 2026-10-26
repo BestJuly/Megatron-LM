@@ -67,6 +67,13 @@ _TMEM_COLS = 512
 _REGS_LOW, _REGS_HIGH = 96, 232  # tile kernel: warp-specialized register split
 _SUB = 32  # TMEM load sub-tile width (columns) of the tile kernel epilogue
 
+# cp.async (16 B, global -> shared) is the NVVM op behind cute.arch's auto-converting nvvm
+# proxy. nvidia-cutlass-dsl <= 4.7 re-exported the op as cute.arch.cp_async_shared_global;
+# 4.8 dropped that re-export, so fall back to the proxy, which takes the same arguments.
+_cp_async_shared_global = getattr(cute.arch, "cp_async_shared_global", None)
+if _cp_async_shared_global is None:
+    _cp_async_shared_global = cute.arch.nvvm_wrappers.nvvm.cp_async_shared_global
+
 
 def _pad16(n: int) -> int:
     return (n + 15) // 16 * 16
@@ -1230,7 +1237,7 @@ class _StudentRowSm100:
         g_base = mBK[bi, blk, None].iterator
         s_base = sbk[c % 2, tidx, None].iterator
         for i in cutlass.range_constexpr(self.d // 8):
-            cute.arch.cp_async_shared_global(
+            _cp_async_shared_global(
                 s_base + i * 8, g_base + i * 8, 16, "cg", cp_size=nbytes
             )
         cute.arch.cp_async_commit_group()
