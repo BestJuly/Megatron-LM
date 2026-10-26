@@ -1,0 +1,9 @@
+{
+  "mode": "distribution",
+  "type": "lognormal",
+  "format": "thd",
+  "min_seq_len": 4096,
+  "max_seq_len": 4096,
+  "mean_seq_len": 4096,
+  "lognormal_sigma": 1.1
+}
