@@ -1,0 +1,238 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Kimi-K3 full text backbone: 93 decoder blocks, 256 GB300 GPUs, packed THD
+# sequences of 262144 tokens (TP4 + sequence parallel, PP4, EP64, CP8).
+# MLA latent CP: pure a2a over eight ranks with FlashAttention-4 4.0.0b11. MoK
+# MoE megakernel, fused FLA attention residuals with output-RMSNorm fusion, no
+# layernorm recompute. Mock-data recipe measured on 2026-10-28; see the shared guide.
+# The 64K configuration of the same family is this recipe with seq_length 65536 (and
+# 65536-token mock documents), context_parallel_size 2, hierarchical_context_parallel_sizes
+# [2, 1] and global_batch_size 256; it is documented in the guide instead of a third file.
+# Entry point: pretrain_hybrid.py. Build and launch guide: ../README.md
+# Build from the repository root on an ARM64 builder:
+#   docker build --platform=linux/arm64 -f examples/moe_recipes/kimi_k3/Dockerfile \
+#       -t megatron-kimi-k3:blackwell .
+DEPENDENCIES:
+  pytorch_base_image: nvcr.io/nvidia/pytorch:26.04-py3
+  dockerfile_path: examples/moe_recipes/kimi_k3/Dockerfile
+ENV_VARS:
+  TORCH_NCCL_AVOID_RECORD_STREAMS: '0'
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  NCCL_NVLS_ENABLE: '0'
+  NCCL_GRAPH_REGISTER: '0'
+  NCCL_DEBUG: VERSION
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: '1'
+  NVTE_NORM_FWD_USE_CUDNN: '1'
+  NVTE_NORM_BWD_USE_CUDNN: '1'
+  PYTHONWARNINGS: ignore
+  # AttnRes compilation specializes on the number of depth sources.
+  DYNAMO_CACHE_SIZE_LIMIT: '64'
+  # HybridEP chunk kernels need the static per-CP-rank token count (32768)
+  # to be divisible by the chunk size.
+  NUM_OF_TOKENS_PER_CHUNK_DISPATCH_API: '128'
+  NUM_OF_TOKENS_PER_CHUNK_COMBINE_API: '128'
+  NUM_OF_TOKENS_PER_CHUNK_PREPROCESSING_API: '128'
+  # Select the activation-only TE CPU offload path and reduce NCCL buffers.
+  NVTE_CPU_OFFLOAD_V1: '1'
+  # 1 MiB LL128 buffers: the 614400-byte value breaks the RoCE transport's connection setup
+  # on GB300 NVL72 systems. The 256-GPU pipeline recipe keeps 2 MiB SIMPLE buffers; 1 MiB halves
+  # the inter-rack pipeline p2p bandwidth.
+  NCCL_LL128_BUFFSIZE: '1048576'
+  NCCL_PROTO: ^LL128
+  NCCL_BUFFSIZE: '2097152'
+ARGS:
+  tokenizer_type: HuggingFaceTokenizer
+  tokenizer_model: moonshotai/Kimi-K3
+  trust_remote_code: true
+  vocab_size: 163840
+  make_vocab_size_divisible_by: 1280
+  spec:
+  - megatron.core.models.hybrid.hybrid_layer_specs
+  - hybrid_stack_spec
+  enable_experimental: true
+  hidden_size: 7168
+  ffn_hidden_size: 33792
+  num_attention_heads: 96
+  kv_channels: 64
+  max_position_embeddings: 1048576
+  init_method_std: 0.02
+  # K=KDA, +=MLA, -=dense MLP, E=LatentMoE; /+E adds one MTP depth.
+  hybrid_layer_pattern: K-KEKE+EKEKEKE+EKEKEKE+EKEKEKE+EKEKEKE+EKEKEKE+E|KEKEKE+EKEKEKE+EKEKEKE+EKEKEKE+EKEKEKE+EKEKEKE+E|KEKEKE+EKEKEKE+EKEKEKE+EKEKEKE+EKEKEKE+EKEKEKE+E|KEKEKE+EKEKEKE+EKEKEKE+EKEKEKE+EKEKEKE+E+E/+E
+  experimental_attention_variant: kda
+  linear_conv_kernel_dim: 4
+  linear_key_head_dim: 128
+  linear_value_head_dim: 128
+  linear_num_key_heads: 96
+  linear_num_value_heads: 96
+  kda_f_lora_rank: 128
+  kda_safe_gate: true
+  kda_lower_bound: -5.0
+  multi_latent_attention: true
+  q_lora_rank: 1536
+  kv_lora_rank: 512
+  qk_head_dim: 128
+  qk_pos_emb_head_dim: 64
+  v_head_dim: 128
+  qk_layernorm: true
+  attention_latent_norm_epsilon: 1.0e-06
+  attention_output_gate: true
+  gated_attention_proj_granularity: elementwise
+  mla_down_proj_fusion: false
+  no_rope_freq: 1
+  position_embedding_type: none
+  enable_attention_residuals: true
+  # Counts HybridModel entries (one attention or MLP sublayer per entry).
+  attn_res_block_layers: 24
+  normalization: RMSNorm
+  norm_epsilon: 1.0e-05
+  situ_glu: true
+  situ_glu_beta1: 4.0
+  situ_glu_beta2: 25.0
+  disable_bias_linear: true
+  untie_embeddings_and_output_weights: true
+  num_experts: 896
+  moe_ffn_hidden_size: 3072
+  moe_latent_size: 3584
+  moe_latent_up_projection_rmsnorm: true
+  moe_shared_expert_intermediate_size: 6144
+  moe_router_topk: 16
+  moe_router_score_function: sigmoid
+  moe_router_dtype: fp32
+  moe_router_pre_softmax: false
+  moe_router_topk_scaling_factor: 1.0
+  moe_router_load_balancing_type: quantile_balancing
+  moe_aux_loss_coeff: 0.0
+  moe_router_quantile_balancing_estimation_scope: global_batch
+  moe_router_qb_num_bins: 1000
+  moe_router_enable_expert_bias: false
+  moe_enable_routing_replay: false
+  mtp_num_layers: 1
+  attention_dropout: 0.0
+  hidden_dropout: 0.0
+  mock_data: true
+  seq_length: 262144
+  moe_router_force_load_balancing: true
+  # Packed THD input: every mock document is exactly 262144 tokens, so each
+  # packed buffer holds one full-length sequence (worst-case attention cost).
+  use_varlen_dataset: true
+  varlen_mock_dataset_config_json: '{\"mode\":\"distribution\",\"type\":\"lognormal\",\"format\":\"thd\",\"min_seq_len\":262144,\"max_seq_len\":262144,\"mean_seq_len\":262144,\"lognormal_sigma\":1.1}'
+  sequence_packing_scheduler: dp_balanced
+  # Per-CP-rank token budget: 8 x 32768 = 262144 tokens per packed buffer,
+  # padded to the maximum so every micro-batch has the same static shape.
+  max_seqlen_per_dp_cp_rank: 32768
+  pad_packed_seq_alignment: max
+  calculate_per_token_loss: true
+  moe_hybridep_pad_variable_tokens: false
+  transformer_impl: transformer_engine
+  attention_backend: flash
+  distributed_timeout_minutes: 60
+  tensor_model_parallel_size: 4
+  sequence_parallel: true
+  pipeline_model_parallel_size: 4
+  expert_model_parallel_size: 64
+  expert_tensor_parallel_size: 1
+  # Contiguous CP partition for KDA; MLA handles its CP layout internally.
+  context_parallel_size: 8
+  cp_partition_mode: contiguous
+  linear_cp_mode: chunkwise
+  # Exchange latent KV instead of expanded K/V. With TP4 and 96 heads,
+  # a2a8 gives 3 heads per rank and no latent ring ([8, 1]).
+  mla_latent_cp: true
+  cp_comm_type: a2a
+  hierarchical_context_parallel_sizes: [8, 1]
+  distributed_backend: nccl
+  mtp_loss_scaling_factor: 0.1
+  attn_res_impl: fla
+  attn_res_norm_fusion: true
+  gdn_pre_gated_delta_rule_fusion: true
+  gdn_gated_output_norm_fusion: true
+  # Run the hybrid layers' strict runtime input checks on the first instance of each layer type
+  # per microbatch instead of in every layer (the default 'always'): the per-layer checks cost
+  # about 3.8 ms of host work and four stream syncs per KDA forward (-0.5% step time at 512K).
+  strict_runtime_validation_frequency: once_per_microbatch
+  moe_token_dispatcher_type: flex
+  moe_flex_dispatcher_backend: hybridep
+  moe_hybridep_num_sms: 32
+  moe_grouped_gemm: true
+  moe_permute_fusion: true
+  # Mixture-of-Kittens MoE megakernel: routed experts in the megakernel, shared experts on the native path.
+  moe_megakernel_backend: mok
+  moe_megakernel_backend_config:
+    shared_expert_mode: native
+  bf16: true
+  fp8_format: e4m3
+  fp8_recipe: mxfp8
+  fp8_param_gather: true
+  reuse_grad_buf_for_mxfp8_param_ag: true
+  moe_router_padding_for_quantization: true
+  micro_batch_size: 1
+  # Dense DP=2 (TP4 x CP8 x DP2 = 64 GPUs per pipeline stage): 32 microbatches per
+  # DP rank, 16.8M tokens per step.
+  global_batch_size: 64
+  train_iters: 50
+  exit_duration_in_mins: 230
+  seed: 20260901
+  recompute_granularity: selective
+  # Recompute layer norms, KDA and MoE/MLP activations.
+  recompute_modules:
+  - gdn
+  - moe
+  - mlp
+  fine_grained_activation_offloading: true
+  offload_modules: [core_attn, attn_proj]
+  # Run from the repository root so this shared config resolves consistently.
+  nccl_communicator_config_path: examples/moe_recipes/kimi_k3/nccl/tp_dp_cp_max_ctas16.yaml
+  cross_entropy_loss_fusion: true
+  cross_entropy_fusion_impl: native
+  optimizer: muon
+  use_distributed_optimizer: true
+  use_precision_aware_optimizer: false
+  muon_momentum: 0.95
+  muon_scale_mode: spectral
+  muon_extra_scale_factor: 1.0
+  muon_num_ns_steps: 5
+  muon_coefficient_type: quintic
+  muon_split_qkv_per_head: true
+  muon_tp_mode: duplicated
+  muon_fp32_matmul_prec: medium
+  muon_nesterov: false
+  optimizer_cpu_offload: false
+  optimizer_offload_fraction: 0.0
+  overlap_cpu_optimizer_d2h_h2d: false
+  # Run optimizer computation on GPU; offload states in bounded chunks.
+  chunked_optimizer_state_offload: true
+  optimizer_state_offload_chunk_size_mb: 256
+  optimizer_state_offload_fraction: 1.0
+  overlap_grad_reduce: true
+  overlap_param_gather: true
+  no_create_attention_mask_in_dataloader: true
+  # Short benchmark schedule inherited from the reference recipe.
+  lr: 1.0e-05
+  min_lr: 1.0e-06
+  lr_warmup_init: 1.0e-06
+  lr_decay_style: cosine
+  lr_decay_iters: 50
+  lr_warmup_iters: 0
+  weight_decay: 0.1
+  clip_grad: 1.0
+  no_check_for_nan_in_loss_and_grad: true
+  manual_gc: true
+  manual_gc_interval: 10
+  eval_iters: 0
+  eval_interval: 200
+  no_save_optim: true
+  no_load_optim: true
+  no_load_rng: true
+  auto_detect_ckpt_format: true
+  save_interval: 500
+  ckpt_format: torch_dist
+  dist_ckpt_strictness: log_all
+  log_throughput: true
+  log_interval: 1
+  logging_level: 20
+  log_timers_to_tensorboard: true
+  log_memory_to_tensorboard: true
+  log_validation_ppl_to_tensorboard: true
+  log_memory_interval: 1
+  log_device_memory_used: true
+  tensorboard_dir: ${OUTPUT_PATH}/tensorboard
+  wandb_exp_name: Kimi-K3-Full-GB300-MXFP8-THD256K-TP4SP-PP4EP64CP8-LatentCP-a2a8-FusedAttnRes-MoK-mock-GBS64

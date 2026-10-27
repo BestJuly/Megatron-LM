@@ -1,0 +1,9 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# NCCL communicator options per Megatron process group (--nccl-communicator-config-path).
+# tp_dp_cp is the 64-rank TP x CP group that the fused THD layout conversion (#7545) uses for its
+# all-to-all. On the GB300 NVL72 MNNVL clique NCCL opens 32 P2P channels per peer for it and gives
+# every connection a ~10 MiB buffer (about 20 GB per rank outside the PyTorch allocator). Capping the
+# communicator at 16 CTAs halves the channel count and the buffers; the a2a keeps 16 CTAs of
+# bandwidth. Everything else keeps NCCL defaults.
+tp_dp_cp:
+  max_ctas: 16
