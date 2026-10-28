@@ -25,7 +25,10 @@ class TestMoELayerInit:
         not is_te_min_version("1.7.0.dev0"),
         reason="Expert with TE Linear is only supported in TE 1.7.0 and later.",
     )
-    def test_megakernel_skips_native_token_dispatcher_construction(self, monkeypatch):
+    @pytest.mark.parametrize("latent,shared_size", [(None, 128), (64, 256), (None, None)])
+    def test_megakernel_skips_native_token_dispatcher_construction(
+        self, monkeypatch, latent, shared_size
+    ):
         Utils.initialize_model_parallel(1, 1)
         try:
             config = TransformerConfig(
@@ -34,7 +37,8 @@ class TestMoELayerInit:
                 num_attention_heads=4,
                 num_moe_experts=1,
                 moe_ffn_hidden_size=128,
-                moe_shared_expert_intermediate_size=128,
+                moe_shared_expert_intermediate_size=shared_size,
+                moe_latent_size=latent,
                 moe_router_topk=1,
                 moe_router_pre_softmax=True,
                 moe_grouped_gemm=True,
@@ -60,9 +64,14 @@ class TestMoELayerInit:
             monkeypatch.setattr(
                 moe_layer_module, "MoEAllGatherTokenDispatcher", fail_if_constructed
             )
-            monkeypatch.setattr(
-                moe_layer_module, "build_megakernel_backend", lambda **kwargs: backend
-            )
+
+            def build_backend(**kwargs):
+                assert (kwargs["shared_experts"] is not None) == (
+                    latent is None and shared_size == 128
+                )
+                return backend
+
+            monkeypatch.setattr(moe_layer_module, "build_megakernel_backend", build_backend)
 
             layer = MoELayer(config, submodules)
 
@@ -104,6 +113,7 @@ class TestMoELayerInit:
         )
         assert isinstance(submodules, MoESubmodules)
         moe_layer = MoELayer(self.transformer_config, submodules)
+        assert moe_layer.megakernel_fuses_shared_expert is False
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize("moe_token_dispatcher_type", ["allgather", "alltoall"])

@@ -19,6 +19,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection, resolve_
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.megakernel import (
     build_megakernel_backend,
+    megakernel_fuses_shared_expert,
     megakernel_shared_expert_init_context,
     prepare_megakernel_shared_expert_config,
 )
@@ -423,11 +424,15 @@ class MoELayer(BaseMoELayer):
         )
 
         # Initialize shared experts
+        self.megakernel_fuses_shared_expert = (
+            self.config.moe_megakernel_backend is not None
+            and megakernel_fuses_shared_expert(self.config)
+        )
         if self.use_shared_expert:
             assert (
                 self.submodules.shared_experts is not None
             ), "Shared experts builder is not provided in the module spec."
-            if self.config.moe_megakernel_backend is None:
+            if not self.megakernel_fuses_shared_expert:
                 self.shared_experts = self.submodules.shared_experts(
                     config=self.config,
                     pg_collection=pg_collection,
@@ -455,7 +460,7 @@ class MoELayer(BaseMoELayer):
                 config=self.config,
                 ep_group=self.ep_group,
                 routed_experts=self.experts,
-                shared_experts=self.shared_experts,
+                shared_experts=self.shared_experts if self.megakernel_fuses_shared_expert else None,
                 num_local_experts=self.num_local_experts,
             )
 
@@ -649,16 +654,20 @@ class MoELayer(BaseMoELayer):
         # Project the hidden_states from hidden dimension down to latent dimension.
         if self.config.moe_latent_size:
             hidden_states, _ = self.fc1_latent_proj(hidden_states)
-        if isinstance(self.token_dispatcher, MoEFlexTokenDispatcher):
-            # Only the flex dispatcher takes the mask (dropless HybridEP excludes padded rows).
-            padding_mask = self._align_batch_first_to_sequence_parallel(padding_mask, hidden_states)
-            hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
-                hidden_states, routing_map, probs, padding_mask=padding_mask
-            )
-        else:
-            hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
-                hidden_states, routing_map, probs
-            )
+        # A megakernel backend owns dispatch; there is no native token dispatcher to prepare.
+        if self.config.moe_megakernel_backend is None:
+            if isinstance(self.token_dispatcher, MoEFlexTokenDispatcher):
+                # Only the flex dispatcher takes the mask (dropless HybridEP excludes padded rows).
+                padding_mask = self._align_batch_first_to_sequence_parallel(
+                    padding_mask, hidden_states
+                )
+                hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
+                    hidden_states, routing_map, probs, padding_mask=padding_mask
+                )
+            else:
+                hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
+                    hidden_states, routing_map, probs
+                )
         return hidden_states, probs
 
     @staticmethod
@@ -813,7 +822,8 @@ class MoELayer(BaseMoELayer):
         shared-expert overlap). It is populated in preprocess and joined here, after
         fc2_latent_proj, so the dimensions match the full hidden dim."""
 
-        output = self.token_dispatcher.combine_postprocess(output)
+        if self.config.moe_megakernel_backend is None:
+            output = self.token_dispatcher.combine_postprocess(output)
         if self.config.moe_latent_size:
             if self.config.moe_use_norm_before_up_proj:
                 output = apply_module(self.fc2_norm)(output)
@@ -880,10 +890,17 @@ class MoELayer(BaseMoELayer):
                 )
 
             def megakernel_forward(hidden_states, padding_mask):
+                shared_output = None
+                if not self.megakernel_fuses_shared_expert:
+                    shared_output = self.shared_experts_compute(hidden_states)
                 probs, routing_map = self.route(
                     hidden_states, padding_mask, input_ids, packed_seq_params
                 )
-                return apply_module(self.megakernel_experts)(hidden_states, probs, routing_map)
+                if self.megakernel_fuses_shared_expert:
+                    return apply_module(self.megakernel_experts)(hidden_states, probs, routing_map)
+                hidden_states, probs = self.preprocess(hidden_states, probs, routing_map)
+                output = apply_module(self.megakernel_experts)(hidden_states, probs, routing_map)
+                return self.postprocess(output, shared_output)
 
             if self.moe_layer_recompute and self.training:
                 if self.config.fp8 or self.config.fp4:
