@@ -74,3 +74,53 @@ def apply_attention_output_gate(
     if granularity == 'headwise':
         return output.reshape(output_shape)
     return output
+
+
+class _ElementwiseGateBeforeCast(torch.autograd.Function):
+    """``core_attn_out * sigmoid(gate.float()).to(core_attn_out.dtype)`` saving only its inputs.
+
+    Run eagerly, that composition keeps the FP32 sigmoid output (SigmoidBackward) and the
+    cast scale plus ``core_attn_out`` (MulBackward) alive until backward: three gate-sized
+    tensors per layer, pinned on the device by the autograd graph of every in-flight
+    pipeline microbatch. This function saves the two BF16 inputs and recomputes the scale
+    in backward, which halves that footprint. It runs the same ATen ops in the same order
+    and dtypes as autograd does for the eager composition, so outputs and gradients are
+    bit-identical.
+    """
+
+    @staticmethod
+    def forward(ctx, core_attn_out: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
+        """Multiply by the sigmoid gate cast to the output dtype."""
+        ctx.save_for_backward(core_attn_out, gate)
+        scale = torch.sigmoid(gate.float()).to(core_attn_out.dtype)
+        return core_attn_out * scale
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        """Replay MulBackward, the cast's backward, and SigmoidBackward."""
+        core_attn_out, gate = ctx.saved_tensors
+        sigmoid_out = torch.sigmoid(gate.float())
+        grad_core_attn_out = None
+        grad_gate = None
+        if ctx.needs_input_grad[0]:
+            grad_core_attn_out = grad_output * sigmoid_out.to(core_attn_out.dtype)
+        if ctx.needs_input_grad[1]:
+            grad_scale = (grad_output * core_attn_out).to(sigmoid_out.dtype)
+            grad_gate = torch.ops.aten.sigmoid_backward(grad_scale, sigmoid_out).to(gate.dtype)
+        return grad_core_attn_out, grad_gate
+
+
+def apply_elementwise_attention_output_gate_before_cast(
+    core_attn_out: torch.Tensor, gate: torch.Tensor
+) -> torch.Tensor:
+    """Elementwise ``apply_attention_output_gate(..., cast_mode='before')`` for training.
+
+    Same forward and backward values as the eager helper, but the autograd graph keeps only
+    ``core_attn_out`` and ``gate`` (see ``_ElementwiseGateBeforeCast``). Use it on paths that
+    must keep the eager rounding and VJP and whose activations stay live across pipeline
+    microbatches, such as the MLA output gate.
+    """
+    validate_attention_output_gate_shapes(core_attn_out, gate, 'elementwise')
+    if not torch.is_grad_enabled() or not (core_attn_out.requires_grad or gate.requires_grad):
+        return apply_attention_output_gate(core_attn_out, gate, 'elementwise', cast_mode='before')
+    return _ElementwiseGateBeforeCast.apply(core_attn_out, gate)

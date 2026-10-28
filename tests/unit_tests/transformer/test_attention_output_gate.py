@@ -28,6 +28,7 @@ from megatron.core.ssm.gated_delta_net.kda import KimiDeltaAttention
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.attention_output_gate import (
     apply_attention_output_gate,
+    apply_elementwise_attention_output_gate_before_cast,
     validate_attention_output_gate_shapes,
 )
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
@@ -370,6 +371,39 @@ def test_mla_elementwise_gate_matches_native(dtype, cuda_device):
         values,
         logits,
     )
+
+
+@pytest.mark.parametrize("dtype", DTYPES, ids=["fp32", "bf16"])
+@pytest.mark.parametrize("gate_dtype", DTYPES, ids=["gate-fp32", "gate-bf16"])
+def test_elementwise_gate_before_cast_saves_only_inputs(dtype, gate_dtype, cuda_device):
+    # The MLA elementwise gate keeps the eager rounding and VJP but must not keep the
+    # FP32 sigmoid output and the cast scale alive until backward: with pipeline
+    # parallelism that is 384 MiB per MLA layer for every in-flight microbatch.
+    values, logits = _inputs(dtype, cuda_device, "elementwise")
+    logits = logits.to(gate_dtype)
+    _assert_output_and_vjp(
+        apply_elementwise_attention_output_gate_before_cast,
+        lambda x, g: apply_attention_output_gate(x, g, "elementwise", cast_mode="before"),
+        values,
+        logits,
+    )
+    gated_values = values.detach().clone().requires_grad_(True)
+    gated_logits = logits.detach().clone().requires_grad_(True)
+    output = apply_elementwise_attention_output_gate_before_cast(gated_values, gated_logits)
+    saved = output.grad_fn.saved_tensors
+    assert len(saved) == 2
+    assert saved[0].data_ptr() == gated_values.data_ptr()
+    assert saved[1].data_ptr() == gated_logits.data_ptr()
+    # Without grad the helper is the eager composition itself.
+    with torch.no_grad():
+        eager = apply_attention_output_gate(values, logits, "elementwise", cast_mode="before")
+        assert torch.equal(apply_elementwise_attention_output_gate_before_cast(values, logits), eager)
+
+
+def test_elementwise_gate_before_cast_rejects_invalid_shapes():
+    values = torch.zeros(2, 1, 64)
+    with pytest.raises(ValueError):
+        apply_elementwise_attention_output_gate_before_cast(values, torch.zeros(2, 1, 16))
 
 
 @pytest.mark.parametrize("dtype", DTYPES, ids=["fp32", "bf16"])
