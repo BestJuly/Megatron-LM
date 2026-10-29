@@ -186,6 +186,9 @@ Model-specific facts worth knowing:
   (`tests/test_kimi_k3_vl_vision_parity.py`).
 * On H100 the Blackwell-only Kimi-K3 features (MoK, MXFP8, FA4, MLA latent CP)
   must stay off; MDP additionally requires `TP=1`.
+* `--optimizer muon` trains the decoder with the layer-wise distributed
+  optimizer under MDP; the MoonViT encoder trains with Adam ZeRO-1 (decoder lr,
+  schedule, weight decay and betas).
 
 ```bash
 torchrun --nproc_per_node 8 examples/multimodal_dev/pretrain_multimodal.py \

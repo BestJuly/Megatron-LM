@@ -30,7 +30,7 @@ position after sorting the keys, which no longer reproduces the member order.
 
 import logging
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import MISSING, fields, replace
 from typing import List, Optional
 
 import torch
@@ -47,17 +47,36 @@ ENCODER_MEMBER_KEY = "mdp_encoder_optimizer"
 
 
 def build_encoder_optimizer_config(decoder_config):
-    """Project decoder MXFP8 buffer reuse out of the synchronous BF16 encoder."""
-    if not getattr(decoder_config, "reuse_grad_buf_for_mxfp8_param_ag", False):
-        return decoder_config
-    if decoder_config.fp8_recipe != "mxfp8":
-        raise MdpConfigurationError("MDP: gradient-buffer reuse requires decoder MXFP8.")
-    return replace(
-        decoder_config,
-        fp8_recipe=None,
-        reuse_grad_buf_for_mxfp8_param_ag=False,
-        overlap_param_gather=False,
-    )
+    """The encoder's optimizer config, projected from the decoder's.
+
+    The encoder is a synchronous BF16 Adam ZeRO-1 domain over WORLD:
+
+    * decoder MXFP8 buffer reuse is projected out;
+    * an emerging decoder optimizer (Muon, with its layer-wise sharding) becomes Adam
+      with the distributed optimizer -- the encoder neither shares the decoder's
+      layer-wise buffers nor needs matrix orthogonalization, and its checkpoint member
+      stays the fixed DistributedOptimizer contract. Learning rate, schedule, weight
+      decay and the Adam betas stay the decoder's.
+    """
+    overrides = {}
+    if getattr(decoder_config, "reuse_grad_buf_for_mxfp8_param_ag", False):
+        if decoder_config.fp8_recipe != "mxfp8":
+            raise MdpConfigurationError("MDP: gradient-buffer reuse requires decoder MXFP8.")
+        overrides.update(
+            fp8_recipe=None, reuse_grad_buf_for_mxfp8_param_ag=False, overlap_param_gather=False
+        )
+    if getattr(decoder_config, "optimizer", "adam") not in ("adam", "sgd"):
+        overrides.update(
+            optimizer="adam",
+            use_distributed_optimizer=True,
+            use_layer_wise_distributed_optimizer=False,
+        )
+        # Muon-only options (e.g. muon_tp_mode='layer_sharded') are invalid for Adam: back to
+        # their defaults.
+        for field in fields(decoder_config):
+            if field.name.startswith("muon_") and field.default is not MISSING:
+                overrides[field.name] = field.default
+    return replace(decoder_config, **overrides) if overrides else decoder_config
 
 
 class MdpChainedOptimizer(ChainedOptimizer):
@@ -152,7 +171,8 @@ class MdpChainedOptimizer(ChainedOptimizer):
         if getattr(optimizer, "config", None) != expected:
             raise MdpConfigurationError(
                 "MDP optimizer members must share hyperparameters; only the encoder's "
-                "MXFP8 recipe, gradient-buffer reuse and parameter-gather overlap may differ."
+                "MXFP8 recipe, gradient-buffer reuse, parameter-gather overlap and (under an "
+                "emerging decoder optimizer) its Adam projection may differ."
             )
 
     @torch.no_grad()
@@ -333,7 +353,11 @@ def build_mdp_composite_optimizer(
 
 
 def _flatten(optimizer: MegatronOptimizer):
-    if isinstance(optimizer, ChainedOptimizer):
+    # Only plain chains are flattened. Subclasses carry their own step, grad-norm and
+    # checkpoint semantics (LayerWiseDistributedOptimizer all-gathers its layer-sharded
+    # parameters after the step and reduces its norm over its own groups) and stay one
+    # member, exactly as the native decoder chain holds them.
+    if type(optimizer) is ChainedOptimizer:
         for member in optimizer.chained_optimizers:
             yield from _flatten(member)
     else:
