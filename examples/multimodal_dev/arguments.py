@@ -327,6 +327,18 @@ def add_multimodal_args(parser):
         help="Additionally compare canonical plan payloads (debug only).",
     )
     group.add_argument(
+        "--no-vision-muon",
+        dest="vision_muon",
+        action="store_false",
+        default=True,
+        help=(
+            "With --optimizer muon, train the vision encoder with Muon's scalar optimizer "
+            "(--muon-scalar-optimizer) instead of Muon. MDP always does this (its encoder is "
+            "an Adam ZeRO-1 domain), so a native run with this flag uses the same optimizer "
+            "math as an MDP run."
+        ),
+    )
+    group.add_argument(
         "--use-vanilla-collate-fn",
         action="store_true",
         default=False,

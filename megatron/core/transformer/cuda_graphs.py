@@ -2373,6 +2373,7 @@ class TECudaGraphHelper:
         self.callables_per_chunk_is_mtp = []
         self.flattened_callables = []
         self.flattened_callables_is_mtp = []
+        chunks_missing_decoder = 0
         for chunk_number, model_chunk in enumerate(self.model):
             try:
                 chunk_with_decoder = get_attr_wrapped_model(
@@ -2380,6 +2381,7 @@ class TECudaGraphHelper:
                 )
             except RuntimeError:
                 num_graphable_layers = 0
+                chunks_missing_decoder += 1
                 log_on_each_pipeline_stage(
                     logger=logger,
                     tp_group=self.tp_group,
@@ -2439,6 +2441,21 @@ class TECudaGraphHelper:
             msg=f'Rank {torch.distributed.get_rank()}: '
             f'{len(self.flattened_callables)} graphable layers.',
         )
+
+        # The per-chunk lookup failure above is only a DEBUG log, so a model whose decoder
+        # get_attr_wrapped_model(chunk, 'decoder') cannot reach would capture zero layers and
+        # look like a successful run. When every chunk fails that lookup it is a wiring bug
+        # (get_attr_wrapped_model unwraps only through '.module'), not a property of the
+        # model; a model whose layers are all non-graphable still passes silently.
+        if self.model and chunks_missing_decoder == len(self.model):
+            raise RuntimeError(
+                f"CUDA graphs are enabled (cuda_graph_impl={self.config.cuda_graph_impl!r}) but "
+                f"none of the {len(self.model)} model chunks exposes a 'decoder' attribute "
+                "reachable through get_attr_wrapped_model, so capture would be a silent no-op. "
+                "If the decoder lives under another attribute, add a forwarding property for "
+                "'decoder' (and 'mtp', 'rotary_pos_emb', 'position_embedding_type') on the "
+                "wrapper."
+            )
 
     def capture_finished(self):
         """

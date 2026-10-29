@@ -148,6 +148,12 @@ def model_provider(
         **kwargs,
     )
 
+    vision_model = getattr(model, "vision_model", None)
+    if not getattr(args, "vision_muon", True) and vision_model is not None:
+        # Muon routes parameters marked use_muon=False to its scalar optimizer.
+        for param in vision_model.parameters():
+            param.use_muon = False
+
     return model
 
 

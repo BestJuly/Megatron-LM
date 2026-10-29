@@ -119,10 +119,29 @@ disabled at both save and load; the default `dp_reshardable` format supports
 remainder storage. The optimizer checks the actual checkpoint format and
 encoder remainder mode before saving or loading optimizer state.
 
-Rejected at startup: FSDP/HSDP, encoder FP8, full-iteration CUDA graphs, CPU
-activation offload, delayed gradient reduction,
+Decoder optimizer: Adam (DistributedOptimizer) or an emerging optimizer such as
+`--optimizer muon`, whose layer-wise distributed optimizer stays one member of the
+composite (its layer-sharded parameter all-gather, grad norm and checkpoint state are
+its own). The encoder is always an Adam ZeRO-1 domain over WORLD: under an emerging
+decoder optimizer its optimizer config is projected to Adam with the decoder's learning
+rate, schedule, weight decay and betas (`build_encoder_optimizer_config`).
+
+Per-layer CUDA graphs on the decoder (`--cuda-graph-impl transformer_engine` or `local`)
+are supported with static THD batches (`--thd-static-packing --pad-packed-seq-alignment
+max --max-seqlen-per-dp-cp-rank N --thd-max-packed-sequences K`); the encoder, the
+schedule and every MDP collective stay eager, and the graphs never see the bridge.
+`MultimodalModel` forwards `decoder` / `mtp` / `rotary_pos_emb` /
+`position_embedding_type` so `TECudaGraphHelper` finds the decoder layers. mRoPE (and
+every rotary embedding but `rope`) is captured as a per-layer graph input, which needs
+at least one eager step before capture (`--cuda-graph-warmup-steps >= 1`). Not
+combinable with `--mdp-overlap-window-capture`.
+
+Rejected at startup: FSDP/HSDP, encoder FP8, full-iteration CUDA graphs (a
+full-iteration graph would capture P4 together with the host-planned phases around
+it), CPU activation offload, delayed gradient reduction,
 `overlap_param_gather_with_optimizer_step`,
-multiple distributed-optimizer instances, `calculate_per_token_loss=False`,
+multiple distributed-optimizer instances, replicated (non-distributed) decoder
+optimizer state, `calculate_per_token_loss=False`,
 non-`torch_dist` checkpoint formats, fully-parallel / asynchronous / non-persistent / constant-structure
 checkpoint modes, invalid rank mappings.
 
