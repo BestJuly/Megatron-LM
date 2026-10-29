@@ -40,6 +40,20 @@ gated_residual_hybrid_stack_spec`), QSA (`Q` in the pattern; `--qsa-use-sparse-a
 THD/MDP), Engram/PLE (`--engram-variant qwen --engram-eos-token-id 248044`), mRoPE `11 11 10`.
 `scripts/run_qwen38_vl.sh` runs the single-node proxy (MDP or native, THD or BSHD).
 
+The Qwen3.8 decoder kernels and training features of the main-based Qwen4 branch apply
+unchanged, passed through `EXTRA`:
+
+| Feature | Flags | Notes |
+|---|---|---|
+| MoK megakernel MoE | `--moe-megakernel-backend mok --moe-megakernel-backend-config '{...}'` | TP=1, ETP=1 |
+| cuDNN GDN | `--gdn-kernel-backend cudnn --gdn-pre-gated-delta-rule-fusion` | |
+| CuTe sparse QSA | `--qsa-use-sparse-attention --qsa-indexer-loss-impl fused` | bf16; per-token mRoPE rows (QSA + mRoPE + CP is rejected) |
+| Muon | `--optimizer muon --muon-tp-mode layer_sharded --muon-ns-batch-size 32 --muon-no-split-qkv` | under MDP the encoder trains with Adam ZeRO-1 |
+| Per-layer CUDA graphs | `--cuda-graph-impl transformer_engine --cuda-graph-modules attn moe_router --cuda-graph-capture-engram-host --cuda-graph-warmup-steps 2` | static THD batches: `--thd-static-packing --pad-packed-seq-alignment max --max-seqlen-per-dp-cp-rank N --thd-max-packed-sequences K` |
+
+Limits: `--cuda-graph-impl full_iteration` is not supported under MDP. QSA's dense-mask
+bridge is BSHD only, so packed THD (and MDP) needs the sparse path.
+
 ## Quick Start
 
 ```bash

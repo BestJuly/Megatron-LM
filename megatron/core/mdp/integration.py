@@ -138,6 +138,9 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
         ),
         calculate_per_token_loss=getattr(args, "calculate_per_token_loss", False),
         use_distributed_optimizer=getattr(args, "use_distributed_optimizer", False),
+        use_layer_wise_distributed_optimizer=getattr(
+            args, "use_layer_wise_distributed_optimizer", False
+        ),
         distributed_optimizer_instances=getattr(
             args, "num_distributed_optimizer_instances", 1
         ),

@@ -73,6 +73,9 @@ class MdpCompatibilityOptions:
     save_requested: bool
     load_requested: bool
     overlap_moe_expert_parallel_comm: bool = False
+    # Emerging optimizers (Muon) shard the decoder layer-wise; the encoder keeps its own
+    # Adam ZeRO-1 domain over WORLD either way.
+    use_layer_wise_distributed_optimizer: bool = False
     # Decoder-only MXFP8 staging; the encoder keeps independent BF16 buffers.
     reuse_grad_buf_for_mxfp8_param_ag: bool = False
     decoder_fp8_enabled: bool = False
@@ -301,12 +304,15 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "1/num_microbatches and the derivation collapses.",
             "True",
         )
-    if not options.use_distributed_optimizer:
+    if not (options.use_distributed_optimizer or options.use_layer_wise_distributed_optimizer):
         _reject(
             "use_distributed_optimizer",
             options.use_distributed_optimizer,
-            "use_distributed_optimizer == True",
-            "The encoder domain uses ZeRO-1 (DistributedOptimizer) over WORLD.",
+            "use_distributed_optimizer == True (or the layer-wise distributed optimizer of "
+            "--optimizer muon)",
+            "The decoder optimizer must be sharded like the encoder domain's ZeRO-1 "
+            "(DistributedOptimizer over WORLD); MDP is not validated with replicated "
+            "optimizer state.",
             "True",
         )
     if options.distributed_optimizer_instances != 1:

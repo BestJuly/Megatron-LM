@@ -46,10 +46,13 @@ def build_encoder_ddp_config(
 
     Decoder gradient-reduce and parameter-gather overlap is owned by the native
     decoder schedule. The encoder has a separate backward/finalization lifecycle in
-    P5/P6, so it must not inherit those schedule-driven hooks.
+    P5/P6, so it must not inherit those schedule-driven hooks. The encoder is always
+    a ZeRO-1 DistributedOptimizer domain over WORLD, including when the decoder runs
+    an emerging optimizer (Muon) whose layer-wise sharding the encoder does not use.
     """
     return replace(
         decoder_ddp_config,
+        use_distributed_optimizer=True,
         overlap_grad_reduce=False,
         overlap_param_gather=False,
         align_param_gather=False,
