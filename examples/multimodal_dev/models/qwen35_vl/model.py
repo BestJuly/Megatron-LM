@@ -52,6 +52,11 @@ class Qwen35VLModel(MultimodalModel):
             compute loss here.
         vp_stage: Virtual pipeline stage index, or ``None`` when VPP is
             disabled (selects the non-VPP ``is_pipeline_*_stage`` path).
+        build_vision_encoder: Build the in-model vision encoder. MDP sets
+            this to ``False``: its replicated encoder domain owns the
+            encoder, and an unused in-model copy would still drift under
+            weight decay and collide with the ``vision_model.*``
+            checkpoint keys.
     """
 
     def __init__(
@@ -73,6 +78,7 @@ class Qwen35VLModel(MultimodalModel):
         pre_process: bool = True,
         post_process: bool = True,
         vp_stage: Optional[int] = None,
+        build_vision_encoder: bool = True,
     ):
         if position_embedding_type != "mrope":
             raise ValueError(
@@ -89,8 +95,11 @@ class Qwen35VLModel(MultimodalModel):
         self.vision_start_token_id = vision_start_token_id
         self.spatial_merge_size = spatial_merge_size
 
-        # Vision encoder lives on the first PP stage only.
-        if pre_process:
+        # Vision encoder lives on the first PP stage only. Under MDP the
+        # replicated encoder domain replaces it (build_vision_encoder=False):
+        # an unused in-model copy would still drift under weight decay and
+        # collide with the vision_model.* checkpoint keys.
+        if pre_process and build_vision_encoder:
             vkw = dict(VISION_KWARGS)
             vkw["spatial_merge_size"] = spatial_merge_size
             vkw["out_hidden_size"] = language_config.hidden_size

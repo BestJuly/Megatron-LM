@@ -45,7 +45,7 @@ def test_model_provider_propagates_rope_fusion_to_vision(monkeypatch):
     from examples.multimodal_dev.models import MODEL_REGISTRY
 
     args = SimpleNamespace(
-        model_arch="qwen35_vl", model_variant="0.8b", vision_num_layers=None, recompute_vision=False
+        model_arch="qwen35_vl", model_variant="0.8b", vision_num_layers=None
     )
     language_config = SimpleNamespace(apply_rope_fusion=True, bf16=True, fp16=False)
     vision_config = SimpleNamespace(apply_rope_fusion=False, bf16=False, fp16=False)
@@ -68,6 +68,51 @@ def test_model_provider_propagates_rope_fusion_to_vision(monkeypatch):
     assert captured["language_config"] is language_config
     assert captured["vision_config"] is vision_config
     assert vision_config.apply_rope_fusion is True
+
+
+def test_model_provider_applies_native_encoder_recompute(monkeypatch):
+    import examples.multimodal_dev.pretrain_multimodal as training_entrypoint
+    from examples.multimodal_dev.models import MODEL_REGISTRY
+
+    args = SimpleNamespace(
+        model_arch="qwen35_vl",
+        model_variant="0.8b",
+        vision_num_layers=None,
+        mdp_enable=False,
+        encoder_recompute_granularity="full",
+        encoder_recompute_method="uniform",
+        encoder_recompute_num_layers=1,
+        encoder_recompute_modules=None,
+    )
+    language_config = SimpleNamespace(
+        apply_rope_fusion=False,
+        bf16=True,
+        fp16=False,
+    )
+    captured = {}
+
+    def build_model(*, vision_config, **kwargs):
+        captured["vision_config"] = vision_config
+        return object()
+
+    registry = {
+        "vision_config_fn": get_qwen35_vl_vision_config,
+        "model_factory_fn": build_model,
+    }
+    monkeypatch.setattr(training_entrypoint, "get_args", lambda: args)
+    monkeypatch.setattr(
+        training_entrypoint,
+        "core_transformer_config_from_args",
+        lambda args: language_config,
+    )
+    monkeypatch.setitem(MODEL_REGISTRY, "qwen35_vl", registry)
+
+    training_entrypoint.model_provider()
+
+    vision_config = captured["vision_config"]
+    assert vision_config.recompute_granularity == "full"
+    assert vision_config.recompute_method == "uniform"
+    assert vision_config.recompute_num_layers == 1
 
 
 def test_vision_raw_mrope_freqs_match_legacy_materialized_rope():

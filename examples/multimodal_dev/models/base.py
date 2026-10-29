@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Base multimodal model for FSDP + EP and PP training.
 
@@ -17,6 +17,7 @@ from typing import Optional
 import torch
 from torch import Tensor
 
+from examples.multimodal_dev.observability import nvtx_phase
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.transformer.module import MegatronModule
@@ -174,6 +175,125 @@ class MultimodalModel(MegatronModule):
         assert len(input_tensor) == 1
         self.language_model.set_input_tensor(input_tensor[0])
 
+    def _prepare_decoder_inputs(
+        self,
+        *,
+        input_ids: Tensor,
+        position_ids: Tensor = None,
+        attention_mask: Tensor = None,
+        labels: Tensor = None,
+        loss_mask: Tensor = None,
+        padding_mask: Tensor = None,
+        pixel_values: Tensor = None,
+        image_grid_thw: Tensor = None,
+        decoder_input: Tensor = None,
+        packed_seq_params=None,
+        vision_embeddings: Tensor = None,
+    ):
+        """Prepare the rank-local inputs shared by eager and scheduled decoder execution.
+
+        The native path runs the vision encoder here, while MDP supplies its
+        detached endpoint leaf through ``vision_embeddings`` after P2/P3.
+        Vision work and embedding scatter intentionally stay outside the
+        decoder's fine-grained schedule.
+        """
+        if position_ids is None:
+            with nvtx_phase("compute_position_ids"):
+                position_ids = self.compute_position_ids(
+                    input_ids=input_ids,
+                    image_grid_thw=image_grid_thw,
+                    packed_seq_params=packed_seq_params,
+                )
+
+        if self.pre_process:
+            # An MDP endpoint supplies the pre-encoded leaf. The native path
+            # encodes pixels here; both feed the same scatter below.
+            if vision_embeddings is None:
+                if self.vision_model is not None and pixel_values is not None:
+                    with nvtx_phase("native_vision_encoder_forward"):
+                        vision_embeddings = self.vision_model(pixel_values, image_grid_thw)
+
+            if decoder_input is None:
+                with nvtx_phase("text_embedding"):
+                    text_embeddings = self.language_model.embedding(
+                        input_ids=input_ids, position_ids=None
+                    )
+
+                if vision_embeddings is not None:
+                    with nvtx_phase("scatter_vision_embeddings"):
+                        decoder_input = self._scatter_vision_embeddings(
+                            input_ids, text_embeddings, vision_embeddings
+                        )
+                else:
+                    if bool((input_ids == self.image_token_id).any()):
+                        raise RuntimeError(
+                            "input_ids contain image-token slots but no vision "
+                            "source was provided (neither pixel_values nor "
+                            "vision_embeddings); the text path would silently "
+                            "train on placeholder embeddings"
+                        )
+                    decoder_input = text_embeddings
+        else:
+            # Intermediate PP/VPP chunks receive their activation through
+            # GPTModel.set_input_tensor during scheduled or eager execution.
+            decoder_input = None
+
+        (
+            decoder_input, input_ids, labels, loss_mask,
+            attention_mask, position_ids, padding_mask,
+        ) = self._cp_split_for_forward(
+            decoder_input=decoder_input,
+            input_ids=input_ids,
+            labels=labels,
+            loss_mask=loss_mask,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
+        )
+
+        return dict(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            decoder_input=decoder_input,
+            labels=labels,
+            loss_mask=loss_mask,
+            padding_mask=padding_mask,
+            packed_seq_params=packed_seq_params,
+        )
+
+    def build_schedule_plan(
+        self,
+        input_ids: Tensor,
+        position_ids: Tensor = None,
+        attention_mask: Tensor = None,
+        labels: Tensor = None,
+        loss_mask: Tensor = None,
+        padding_mask: Tensor = None,
+        pixel_values: Tensor = None,
+        image_grid_thw: Tensor = None,
+        decoder_input: Tensor = None,
+        packed_seq_params=None,
+        vision_embeddings: Tensor = None,
+        **kwargs,
+    ):
+        """Build the native fine-grained schedule for the decoder only."""
+        decoder_inputs = self._prepare_decoder_inputs(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            loss_mask=loss_mask,
+            padding_mask=padding_mask,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            decoder_input=decoder_input,
+            packed_seq_params=packed_seq_params,
+            vision_embeddings=vision_embeddings,
+        )
+        return self.language_model.build_schedule_plan(**decoder_inputs)
+
     def _scatter_vision_embeddings(
         self, input_ids: Tensor, text_embeddings: Tensor, vision_embeddings: Tensor
     ) -> Tensor:
@@ -201,8 +321,17 @@ class MultimodalModel(MegatronModule):
 
         combined = text_embeddings.transpose(0, 1).contiguous()
         image_mask = input_ids == self.image_token_id
+        num_slots = int(image_mask.sum())
+        if num_slots != vision_embeddings.shape[0]:
+            raise RuntimeError(
+                f"image-token slot count {num_slots} != vision embedding rows "
+                f"{vision_embeddings.shape[0]}; masked_scatter would silently "
+                "mis-fill the sequence"
+            )
         mask_expanded = image_mask.unsqueeze(-1).expand_as(combined)
-        combined = combined.masked_scatter(mask_expanded, vision_embeddings)
+        combined = combined.masked_scatter(
+            mask_expanded, vision_embeddings.to(combined.dtype)
+        )
         combined = combined.transpose(0, 1).contiguous()
 
         if sp:
@@ -345,6 +474,7 @@ class MultimodalModel(MegatronModule):
         image_grid_thw: Tensor = None,
         decoder_input: Tensor = None,
         packed_seq_params=None,
+        vision_embeddings: Tensor = None,
         **kwargs,
     ):
         """Forward pass.
@@ -371,43 +501,7 @@ class MultimodalModel(MegatronModule):
         Returns:
             Loss tensor (post_process=True) or hidden states.
         """
-        # MRoPE freqs are computed per PP stage from position_ids inside
-        # HybridModel, so position_ids must be available on every stage.
-        if position_ids is None:
-            position_ids = self.compute_position_ids(
-                input_ids=input_ids,
-                image_grid_thw=image_grid_thw,
-                packed_seq_params=packed_seq_params,
-            )
-
-        if self.pre_process:
-            vision_embeddings = None
-            if self.vision_model is not None and pixel_values is not None:
-                vision_embeddings = self.vision_model(pixel_values, image_grid_thw)
-
-            if decoder_input is None and self.language_model is not None:
-                text_embeddings = self.language_model.embedding(
-                    input_ids=input_ids, position_ids=None
-                )
-
-                if vision_embeddings is not None:
-                    decoder_input = self._scatter_vision_embeddings(
-                        input_ids, text_embeddings, vision_embeddings
-                    )
-                else:
-                    decoder_input = text_embeddings
-        else:
-            # Non-first PP stage: no vision encoder, no embedding; the
-            # activation arrives via HybridModel.set_input_tensor.
-            assert decoder_input is None, (
-                "decoder_input is only honored on the first pipeline stage; "
-                "later stages take their activation from set_input_tensor."
-            )
-
-        (
-            decoder_input, input_ids, labels, loss_mask,
-            attention_mask, position_ids, padding_mask,
-        ) = self._cp_split_for_forward(
+        decoder_inputs = self._prepare_decoder_inputs(
             decoder_input=decoder_input,
             input_ids=input_ids,
             labels=labels,
@@ -416,16 +510,12 @@ class MultimodalModel(MegatronModule):
             position_ids=position_ids,
             packed_seq_params=packed_seq_params,
             padding_mask=padding_mask,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            vision_embeddings=vision_embeddings,
         )
 
-        with self._thd_mrope_no_cp_override(packed_seq_params):
-            return self.language_model(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                decoder_input=decoder_input,
-                labels=labels,
-                loss_mask=loss_mask,
-                padding_mask=padding_mask,
-                packed_seq_params=packed_seq_params,
-            )
+        with self._thd_mrope_no_cp_override(packed_seq_params), nvtx_phase(
+            "decoder_forward"
+        ):
+            return self.language_model(**decoder_inputs)

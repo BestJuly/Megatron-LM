@@ -57,6 +57,10 @@ MODEL_REGISTRY = {
                 "examples.multimodal_dev.data.cord_v2"
                 ".train_valid_test_datasets_provider"
             ),
+            "mdp_mock": (
+                "examples.multimodal_dev.data.mdp_mock"
+                ".train_valid_test_datasets_provider"
+            ),
         },
     },
 }
