@@ -293,6 +293,15 @@ The current checkpoint support is intentionally narrow:
 Decoder and WORLD encoder optimizers do not share a DP sharding group; never
 key or reshard them as if they did.
 
+Emerging decoder optimizers (`--optimizer muon`): the decoder optimizer is
+`ChainedOptimizer([LayerWiseDistributedOptimizer, DistOpt(dense Adam), DistOpt(expert
+Adam)])`. `build_mdp_composite_optimizer` flattens only plain `ChainedOptimizer`s, so the
+`LayerWiseDistributedOptimizer` (a `ChainedOptimizer` subclass) stays one member: its step
+all-gathers the layer-sharded parameters, and its grad norm and checkpoint state are its
+own. The encoder member is projected to Adam with the distributed optimizer
+(`build_encoder_optimizer_config`), and its DDP config is always the distributed one
+(`build_encoder_ddp_config`).
+
 ## FP8 and quantized-GEMM alignment
 
 Decoder and encoder FP8 are configured separately. `args.fp8` reaches only the
@@ -550,13 +559,15 @@ Current major constraints:
 - TP=1;
 - decoder CP=1;
 - encoder CP=1;
-- distributed optimizer enabled;
+- distributed optimizer enabled (the byte-level DistributedOptimizer, or the
+  layer-wise one of an emerging optimizer such as Muon);
 - per-token loss enabled;
 - bf16/fp16 mixed precision;
 - synchronous global `torch_dist` checkpointing (exact resume, same world size);
 - decoder FP8 supported, encoder FP8 rejected;
 - no FSDP/HSDP, full-iteration CUDA graph, CPU activation offload, or encoder
-  communication overlap;
+  communication overlap; per-layer decoder CUDA graphs (`transformer_engine`,
+  `local`) need `--thd-static-packing` and exclude `--mdp-overlap-window-capture`;
 - native decoder `overlap_grad_reduce` and `overlap_param_gather` are supported,
   while delayed gradient reduction, parameter-gather overlap with the optimizer
   step are rejected by `validate_mdp_config`;
