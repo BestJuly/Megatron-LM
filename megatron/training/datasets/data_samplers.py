@@ -100,11 +100,13 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     # one variable-length dict per sample, not stack-able by the default
     # collate. --varlen-sbhd-validation is excluded: it bypasses packing and
     # emits fixed-length [seq_length] samples that the default collate stacks
-    # normally.
+    # normally. Entry points whose datasets emit per-sample dicts for their own
+    # collate (examples/multimodal_dev) opt in with --use-vanilla-collate-fn.
     if (
         (args.use_varlen_dataset and not args.varlen_sbhd_validation)
         or args.dynamic_context_parallel
         or args.sequence_packing_scheduler is not None
+        or getattr(args, "use_vanilla_collate_fn", False)
     ):
         extra_kwargs = {"collate_fn": lambda x: x}
     else:
