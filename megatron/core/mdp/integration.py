@@ -108,7 +108,9 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
         or getattr(args, "use_custom_fsdp", False)
         or getattr(args, "use_megatron_fsdp", False)
     )
-    cuda_graph = getattr(args, "cuda_graph_impl", "none") not in (None, "none")
+    # The implementation itself, not just "any graph": it decides whether the graph owns
+    # the whole iteration (rejected) or individual decoder layers (supported).
+    cuda_graph_impl = getattr(args, "cuda_graph_impl", "none") or "none"
     offload = bool(
         getattr(args, "cpu_offloading", False)
         or getattr(args, "fine_grained_activation_offloading", False)
@@ -142,7 +144,7 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
         fp16=bool(args.fp16),
         bf16=bool(args.bf16),
         fsdp_enabled=fsdp,
-        cuda_graph_enabled=cuda_graph,
+        cuda_graph_impl=cuda_graph_impl,
         activation_offload_enabled=offload,
         overlap_grad_reduce=getattr(args, "overlap_grad_reduce", False),
         overlap_param_gather=getattr(args, "overlap_param_gather", False),

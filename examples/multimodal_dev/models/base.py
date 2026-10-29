@@ -226,6 +226,40 @@ class MultimodalModel(MegatronModule):
         # engram_padding_token_id. Text embeddings still use the raw ids.
         self.decoder_padding_token_id = engram_padding_token_id(language_model)
 
+    # ------------------------------------------------------------------
+    # Attributes surfaced for per-layer CUDA graph capture.
+    #
+    # TECudaGraphHelper finds the graphable layers with
+    # ``get_attr_wrapped_model(chunk, 'decoder')``, which only unwraps through
+    # ``.module`` (DDP -> Float16Module -> this class), and then reads ``decoder``,
+    # ``mtp``, ``rotary_pos_emb`` and ``position_embedding_type`` off the object it
+    # stopped at. The decoder lives at ``self.language_model``, so forward them.
+    # ------------------------------------------------------------------
+
+    @property
+    def decoder(self):
+        """The language model's decoder block."""
+        return self.language_model.decoder
+
+    @property
+    def mtp(self):
+        """The language model's MTP block.
+
+        Raises ``AttributeError`` when MTP is off, so ``hasattr(chunk, 'mtp')`` reports
+        False exactly as it does for a bare language model.
+        """
+        return self.language_model.mtp
+
+    @property
+    def rotary_pos_emb(self):
+        """The language model's rotary embedding module."""
+        return self.language_model.rotary_pos_emb
+
+    @property
+    def position_embedding_type(self):
+        """The language model's position embedding type."""
+        return self.language_model.position_embedding_type
+
     def shared_embedding_or_output_weight(self):
         """Surface the wrapped language model's shared embedding / output
         weight to the PP grad-finalize step (mirrors the LLaVA wrapper).

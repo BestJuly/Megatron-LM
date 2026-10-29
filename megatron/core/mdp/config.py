@@ -63,7 +63,7 @@ class MdpCompatibilityOptions:
     fp16: bool
     bf16: bool
     fsdp_enabled: bool
-    cuda_graph_enabled: bool
+    cuda_graph_impl: str
     activation_offload_enabled: bool
     overlap_grad_reduce: bool
     overlap_param_gather: bool
@@ -336,14 +336,7 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "MDP requires the standard DistributedDataParallel gradient-buffer path.",
             "False",
         )
-    if options.cuda_graph_enabled:
-        _reject(
-            "cuda_graph_enabled",
-            options.cuda_graph_enabled,
-            "full-iteration CUDA graphs disabled",
-            "MDP buffers are not captured graph-safe in this version.",
-            "False",
-        )
+    _validate_cuda_graph_options(config, options)
     if options.activation_offload_enabled:
         _reject(
             "activation_offload_enabled",
@@ -407,6 +400,67 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "supported; fully-parallel, local, asynchronous, non-persistent, and "
             "constant-structure caching modes are rejected.",
             SUPPORTED_CHECKPOINT_MODE,
+        )
+
+
+# CUDA graph implementations MDP accepts. "local" and "transformer_engine" are the per-layer
+# implementations: they graph individual decoder submodules and leave the schedule, the
+# encoder and every MDP collective eager. MDP's P4 runs the unmodified decoder schedule, so
+# the decoder layers a per-layer graph owns are never touched by the bridge.
+SUPPORTED_CUDA_GRAPH_IMPLS: frozenset = frozenset({"none", "local", "transformer_engine"})
+
+
+def _validate_cuda_graph_options(config: MdpConfig, options: MdpCompatibilityOptions) -> None:
+    """Accept per-layer CUDA graphs on the decoder; reject full-iteration graphs.
+
+    The bridge only touches the decoder's embedding leaves (P3) and their gradients (P5),
+    never the transformer layers, so a per-layer graph and the phase machine do not
+    interact. A full-iteration graph would instead capture P4 itself, together with the
+    Python-level control flow of P1-P3/P5 around it.
+    """
+    impl = options.cuda_graph_impl or "none"
+    if impl == "full_iteration":
+        _reject(
+            "cuda_graph_impl",
+            impl,
+            "cuda_graph_impl != 'full_iteration'",
+            "A full-iteration graph captures the decoder schedule itself, so the phase "
+            "machine around it (pixel/embedding/gradient exchange, per-iteration plan, "
+            "variable vision item counts) cannot run. Per-layer graphs are supported.",
+            "transformer_engine",
+        )
+    if impl not in SUPPORTED_CUDA_GRAPH_IMPLS:
+        _reject(
+            "cuda_graph_impl",
+            impl,
+            f"cuda_graph_impl in {sorted(SUPPORTED_CUDA_GRAPH_IMPLS)}",
+            "MDP validates against the known CUDA graph implementations only.",
+            "none",
+        )
+    if impl == "none":
+        return
+    if config.overlap_window_capture:
+        _reject(
+            "overlap_window_capture",
+            config.overlap_window_capture,
+            "overlap_window_capture == False when per-layer CUDA graphs are enabled",
+            "Window prefetch runs H2D copies and allocations from a background thread on a "
+            "side stream while graph capture is in flight, which global-mode stream "
+            "capture treats as an unsafe concurrent action; whether it collides depends "
+            "on timing.",
+            "False",
+        )
+    if not options.thd_static_packing:
+        _reject(
+            "thd_static_packing",
+            options.thd_static_packing,
+            "thd_static_packing == True when per-layer CUDA graphs are enabled",
+            "The MDP decoder is THD-packed, and a CUDA graph replays into fixed-size static "
+            "inputs ([max_seqlen_per_dp_cp_rank, 1, H] hidden states and "
+            "thd_max_packed_sequences + 1 cu_seqlens entries). Only --thd-static-packing "
+            "makes the MDP collator emit that shape.",
+            "--thd-static-packing --pad-packed-seq-alignment max "
+            "--max-seqlen-per-dp-cp-rank <N> --thd-max-packed-sequences <K>",
         )
 
 

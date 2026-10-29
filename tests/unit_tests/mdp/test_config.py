@@ -35,7 +35,7 @@ def _options(**overrides):
         fp16=False,
         bf16=True,
         fsdp_enabled=False,
-        cuda_graph_enabled=False,
+        cuda_graph_impl="none",
         activation_offload_enabled=False,
         overlap_grad_reduce=False,
         overlap_param_gather=False,
@@ -149,7 +149,8 @@ def test_invalid_mdp_config_fields_rejected(config_kwargs, match):
         (dict(distributed_optimizer_instances=2), "distributed_optimizer_instances"),
         (dict(bf16=False), "fp16/bf16"),
         (dict(fsdp_enabled=True), "fsdp"),
-        (dict(cuda_graph_enabled=True), "cuda_graph"),
+        (dict(cuda_graph_impl="full_iteration"), "cuda_graph_impl"),
+        (dict(cuda_graph_impl="bogus"), "cuda_graph_impl"),
         (dict(activation_offload_enabled=True), "activation_offload"),
         (dict(overlap_param_gather=True), "overlap_param_gather"),
         (
@@ -702,3 +703,40 @@ def test_encoder_recompute_options_are_snapshotted_from_args(arg_overrides, expe
         config.encoder_recompute_modules,
     )
     assert actual == expected
+
+
+def _static_packing_options(**overrides):
+    kwargs = dict(
+        cuda_graph_impl="transformer_engine",
+        thd_static_packing=True,
+        max_seqlen_per_dp_cp_rank=8192,
+        thd_max_packed_sequences=8,
+    )
+    kwargs.update(overrides)
+    return _options(**kwargs)
+
+
+@pytest.mark.parametrize("impl", ["transformer_engine", "local"])
+def test_per_layer_cuda_graphs_pass_under_static_packing(impl):
+    validate_mdp_config(MdpConfig(enable=True), _static_packing_options(cuda_graph_impl=impl))
+
+
+def test_per_layer_cuda_graphs_need_static_packing():
+    with pytest.raises(MdpConfigurationError, match="thd_static_packing"):
+        validate_mdp_config(
+            MdpConfig(enable=True), _static_packing_options(thd_static_packing=False)
+        )
+
+
+def test_per_layer_cuda_graphs_reject_overlapped_window_capture():
+    with pytest.raises(MdpConfigurationError, match="overlap_window_capture"):
+        validate_mdp_config(
+            MdpConfig(enable=True, overlap_window_capture=True), _static_packing_options()
+        )
+
+
+def test_full_iteration_graph_stays_rejected_under_static_packing():
+    with pytest.raises(MdpConfigurationError, match="full_iteration"):
+        validate_mdp_config(
+            MdpConfig(enable=True), _static_packing_options(cuda_graph_impl="full_iteration")
+        )
