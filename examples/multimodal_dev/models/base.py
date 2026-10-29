@@ -17,6 +17,7 @@ position encoding (e.g. MRoPE for Qwen3.5-VL).
 """
 
 import contextlib
+import copy
 from typing import Optional
 
 import torch
@@ -355,6 +356,19 @@ class MultimodalModel(MegatronModule):
         input_ids = mask_padding_for_decoder(
             input_ids, padding_mask, self.decoder_padding_token_id
         )
+        if (
+            packed_seq_params is not None
+            and packed_seq_params.qkv_format == "thd"
+            and padding_mask is not None
+            and packed_seq_params.padding_mask is None
+            and not self.config.sequence_parallel
+        ):
+            # Token aggregates that have no other mask for THD padding rows (QSA's indexer
+            # loss, Engram's fixed-capacity lookup) read it from PackedSeqParams, as on the
+            # decoder-only packed path. A shallow copy (no __post_init__ rerun): the MDP replay
+            # record keeps its own params.
+            packed_seq_params = copy.copy(packed_seq_params)
+            packed_seq_params.padding_mask = padding_mask
 
         return dict(
             input_ids=input_ids,
