@@ -3,15 +3,17 @@
 """Forward step, TP broadcast, and loss for multimodal_dev training."""
 
 import math
-from functools import partial
+from functools import lru_cache, partial
 from itertools import accumulate
 from typing import Any, Dict, Iterator, Optional
 
 import torch
 import torch.nn.functional as F
 
+from examples.multimodal_dev.observability import nvtx_phase
 from megatron.core import mpu
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.fp8_utils import get_fp8_align_size
+from megatron.core.packed_seq_params import PackedSeqParams, build_static_thd_metadata
 from megatron.core.parallel_state import (
     get_pipeline_model_parallel_world_size,
     get_tensor_model_parallel_group,
@@ -20,10 +22,8 @@ from megatron.core.parallel_state import (
     is_pipeline_first_stage,
     is_pipeline_last_stage,
 )
-from megatron.core.rerun_state_machine import RerunState, get_rerun_state_machine
 from megatron.core.utils import get_attr_wrapped_model
 from megatron.training import get_args
-from megatron.training.training import update_vision_model_flops_stats
 
 # -------------------------------------------------------------------
 # dtype <-> int mapping for cross-rank broadcast
@@ -95,6 +95,20 @@ def broadcast_data_batch(data, device="cuda"):
     if data is None:
         data = {}
 
+    # Single-member TP group: every rank is the source; ~4 broadcasts per
+    # field (ndim/shape/dtype/payload) would be pure launch overhead. Keep
+    # only the device move. Pinned sources move without the implicit
+    # per-copy device sync of pageable H2D (same bytes, same stream order).
+    if torch.distributed.get_world_size(group=group) == 1:
+        return {
+            key: (
+                value.to(device, non_blocking=value.is_pinned())
+                if isinstance(value, torch.Tensor)
+                else value
+            )
+            for key, value in data.items()
+        }
+
     if get_tensor_model_parallel_rank() == 0:
         keys = list(data.keys())
         key_str = ",".join(keys)
@@ -132,6 +146,126 @@ def broadcast_data_batch(data, device="cuda"):
 # -------------------------------------------------------------------
 # THD (packed sequence) helpers
 # -------------------------------------------------------------------
+
+
+def accumulate_flops_stats(packed_seq_params, real_cu_seqlens=None) -> None:
+    """Feed one micro-batch's real ``cu_seqlens`` into the FLOPs accumulators.
+
+    Called from the forward step -- once per micro-batch, on every rank of the
+    model-parallel group, on the main compute stream -- so the logged TFLOP/s
+    reflects the tokens actually packed instead of the BSHD closed form
+    ``micro_batch_size * seq_length`` (meaningless here: the packed multimodal
+    datasets ignore ``--seq-length`` entirely).
+    ``consume_seqlen_stats_in_iteration`` divides the world all-reduce by
+    ``TP * CP * PP``, which matches this call pattern.
+
+    Deliberately NOT called from the collate path: under
+    ``--mdp-overlap-window-capture`` the collate for iteration ``i+1`` runs on a
+    background thread and a side CUDA stream during iteration ``i``, which would
+    both mis-attribute the tokens by one iteration and enqueue the accumulation
+    off the main stream. The forward step consumes the captured window only
+    after the main stream has waited on the capture event, so it is ordered.
+
+    ``cu_seqlens_q`` is the REAL (unpadded) cumulative length vector;
+    ``cu_seqlens_q_padded`` carries the collate/CP alignment padding and is
+    intentionally not used. The reduction stays on device (no ``.item()``), so
+    no host sync is added to the hot path.
+
+    ``real_cu_seqlens`` overrides ``cu_seqlens_q``. Under ``--thd-static-packing``
+    the tail policy is always ``append_dummy_seq``, so the static pad is
+    represented as an ordinary extra sequence and therefore lands in
+    ``cu_seqlens_q`` itself. Accumulating that would overstate ``sum(L)`` and
+    ``sum(L^2)`` by the padding fraction -- exactly the shape of a false speedup,
+    since it appears only on the padded side. The collator emits the pre-tail
+    vector as ``flops_cu_seqlens`` in that case; without static packing there is
+    no tail and no override.
+
+    Imported lazily: ``megatron.training.training`` pulls in the whole training
+    stack, and this module is also imported by unit tests that never build it.
+    """
+    if packed_seq_params is None:
+        # BSHD path: leave the accumulator untouched so
+        # ``num_floating_point_operations`` keeps its closed-form defaults.
+        return
+    cu_seqlens = (
+        real_cu_seqlens
+        if real_cu_seqlens is not None
+        else getattr(packed_seq_params, "cu_seqlens_q", None)
+    )
+    if cu_seqlens is None:
+        return
+    try:
+        from megatron.training.training import update_seqlen_stats_from_cu_seqlens
+    except ImportError:  # pragma: no cover - training stack unavailable
+        return
+    update_seqlen_stats_from_cu_seqlens(cu_seqlens)
+
+
+def accumulate_vision_flops_stats_from_grids(grid_thw) -> None:
+    """Report one micro-batch's vision work from a ``[N, 3]`` ``grid_thw``.
+
+    Used by the native (in-model encoder) path, where ``image_grid_thw`` is
+    broadcast to every PP stage. Stays on device: the two reductions are fused
+    kernels, no ``.item()``.
+    """
+    if grid_thw is None or grid_thw.numel() == 0:
+        # A text-only DP rank must still enter the global stats reduction.
+        _update_vision_stats(0.0, 0.0)
+        return
+    t, h, w = grid_thw[:, 0], grid_thw[:, 1], grid_thw[:, 2]
+    frame = (h * w).to(torch.float64)
+    t = t.to(torch.float64)
+    _update_vision_stats((t * frame).sum(), (t * frame * frame).sum())
+
+
+def accumulate_vision_flops_stats_from_items(vision_items) -> None:
+    """Report one micro-batch's vision work from MDP's captured vision records.
+
+    The MDP replay record carries ``grid_thw`` as plain Python tuples on every
+    rank (only the pixel payload is owner-sharded), so the two sums are computed
+    on the host and added to the device accumulator as scalars. Byte-for-byte
+    the same quantities the native path reports for the same data.
+    """
+    rows = 0
+    attn_sq = 0
+    for item in vision_items:
+        t, h, w = (int(v) for v in item.grid_thw)
+        frame = h * w
+        rows += t * frame
+        attn_sq += t * frame * frame
+    _update_vision_stats(float(rows), float(attn_sq))
+
+
+def _accumulate_workload_stats(
+    model, packed_seq_params, *, vision_items=None, image_grid_thw=None, real_cu_seqlens=None
+) -> None:
+    """Report one micro-batch's decoder and vision work exactly once per rank.
+
+    With virtual pipeline parallelism, every model chunk on a physical rank
+    invokes the forward step for the same micro-batch. The global consumer
+    de-duplicates replicated statistics by ``TP * CP * PP``, so letting every
+    virtual chunk report would overcount by the VPP size. Chunk zero is the
+    canonical reporter; non-VPP models expose ``vp_stage=None`` and retain the
+    original behavior.
+    """
+    vp_stage = get_attr_wrapped_model(model, "vp_stage")
+    if vp_stage not in (None, 0):
+        return
+
+    accumulate_flops_stats(packed_seq_params, real_cu_seqlens=real_cu_seqlens)
+    if vision_items is not None:
+        accumulate_vision_flops_stats_from_items(vision_items)
+    else:
+        accumulate_vision_flops_stats_from_grids(image_grid_thw)
+
+
+def _update_vision_stats(patch_rows, attn_squared_sum) -> None:
+    """Forward vision work to the training-loop accumulator (lazy import)."""
+    try:
+        from megatron.training.training import update_vision_stats
+    except ImportError:  # pragma: no cover - training stack unavailable
+        return
+    update_vision_stats(patch_rows, attn_squared_sum)
 
 
 def _build_packed_seq_params(seq_lengths: torch.Tensor, device: torch.device) -> PackedSeqParams:
@@ -174,6 +308,92 @@ def _build_packed_seq_params_from_cu_seqlens(
     )
 
 
+def build_vision_sidecar(
+    batch: list[Dict[str, Any]],
+    cu_seqlens_padded: list[int],
+    image_token_id: int,
+    spatial_merge_size: int,
+) -> Dict[str, torch.Tensor]:
+    """Build the per-item vision sidecar for a THD-packed batch.
+
+    For every vision item, records ``(sample_index, image_ordinal, t, h, w,
+    payload_row_start)`` plus that item's decoder image-token positions in the
+    packed ``[1, T]`` layout, ordered by ``(sample_index, image_ordinal)``.
+    Both outputs are plain integer tensors so they survive the TP broadcast.
+
+    Consistency guards (fail the batch rather than silently degrade):
+
+    * pixel data and grid metadata are all-or-nothing per sample;
+    * per-sample pixel rows equal ``sum(t*h*w)`` over its grids;
+    * per-sample image-token slots equal ``sum(t*(h/m)*(w/m))``, so truncation
+      can never leave a cut image block;
+    * every item's token slots are contiguous in the sample.
+    """
+    meta_rows = []
+    position_chunks = []
+    payload_row_start = 0
+    merge = spatial_merge_size
+    for sample_index, sample in enumerate(batch):
+        grids = sample.get("image_grid_thw")
+        pixels = sample.get("pixel_values")
+        num_items = 0 if grids is None else int(grids.shape[0])
+        pixel_rows = 0 if pixels is None else int(pixels.shape[0])
+        if (num_items == 0) != (pixel_rows == 0):
+            raise ValueError(
+                f"sample {sample_index}: pixel data and grid metadata must either both "
+                f"exist or both be absent (items={num_items}, pixel_rows={pixel_rows})"
+            )
+        input_ids = sample["input_ids"]
+        image_positions = (input_ids == image_token_id).nonzero(as_tuple=True)[0]
+        expected_rows = 0
+        expected_slots = 0
+        item_slot_counts = []
+        for ordinal in range(num_items):
+            t, h, w = (int(v) for v in grids[ordinal])
+            if h % merge != 0 or w % merge != 0:
+                raise ValueError(
+                    f"sample {sample_index} item {ordinal}: grid ({t},{h},{w}) not "
+                    f"divisible by spatial_merge_size={merge}"
+                )
+            expected_rows += t * h * w
+            item_slot_counts.append(t * (h // merge) * (w // merge))
+            expected_slots += item_slot_counts[-1]
+        if expected_rows != pixel_rows:
+            raise ValueError(
+                f"sample {sample_index}: pixel rows {pixel_rows} != sum(t*h*w) "
+                f"{expected_rows} over its grids"
+            )
+        if int(image_positions.numel()) != expected_slots:
+            raise ValueError(
+                f"sample {sample_index}: {int(image_positions.numel())} image-token "
+                f"slots != sum(t*(h/m)*(w/m)) {expected_slots}; truncation must never "
+                "cut an image-token block"
+            )
+        slot_cursor = 0
+        for ordinal in range(num_items):
+            t, h, w = (int(v) for v in grids[ordinal])
+            slots = item_slot_counts[ordinal]
+            item_positions = image_positions[slot_cursor : slot_cursor + slots]
+            slot_cursor += slots
+            if slots and int(item_positions[-1] - item_positions[0]) != slots - 1:
+                raise ValueError(
+                    f"sample {sample_index} item {ordinal}: image-token slots are not "
+                    "contiguous"
+                )
+            meta_rows.append(
+                [sample_index, ordinal, t, h, w, payload_row_start]
+            )
+            payload_row_start += t * h * w
+            position_chunks.append(item_positions.to(torch.int64) + cu_seqlens_padded[sample_index])
+    if meta_rows:
+        return {
+            "vision_item_meta": torch.tensor(meta_rows, dtype=torch.int64),
+            "vision_decoder_positions": torch.cat(position_chunks),
+        }
+    return {
+        "vision_item_meta": torch.empty(0, 6, dtype=torch.int64),
+        "vision_decoder_positions": torch.empty(0, dtype=torch.int64),
+    }
 def seqlen_alignment_factor(tp_size: int, cp_size: int, sequence_parallel: bool) -> int:
     """Return the factor a batched sequence length must be divisible by.
 
@@ -192,6 +412,8 @@ def pack_or_pad_batch(
     seq_length: Optional[int] = None,
     device="cuda",
     include_pixel_values: bool = True,
+    pad_to_multiple: Optional[int] = None,
+    with_vision_sidecar: bool = False,
 ) -> Dict[str, Any]:
     """Pack or pad a ``[B, S]`` batch into ``[1, T]`` THD or ``[B, S]`` BSHD.
 
@@ -213,6 +435,21 @@ def pack_or_pad_batch(
     cp_size = mpu.get_context_parallel_world_size()
     is_src = mpu.get_tensor_model_parallel_rank() == 0
 
+    # Owner-sharded pixel reading: during MDP window capture of a microbatch
+    # owned by another worker, skip pixel materialization + H2D wholesale. All
+    # text tensors and vision item metadata (grid_thw, sidecar) are still built
+    # from input_ids/grids, so every offset stays valid. False outside a
+    # sharded MDP capture.
+    from megatron.core.mdp.window import pixel_capture_suppressed
+
+    suppress_pixels = pixel_capture_suppressed()
+
+    # Two independent reasons not to materialize pixels, and either is
+    # sufficient: upstream drops them off every non-first PP stage, MDP drops
+    # them when this rank is not the owner of the capture window. Computed
+    # here, ahead of the THD/BSHD split, because both layouts consult it.
+    emit_pixels = include_pixel_values and not suppress_pixels
+
     # SP is an explicit runtime option; TP>1 does not imply SP is enabled.
     # get_args() itself raises in test contexts where megatron globals are
     # not initialised.
@@ -222,9 +459,62 @@ def pack_or_pad_batch(
         has_sp = False
 
     divisible_by = seqlen_alignment_factor(tp_size, cp_size, has_sp)
+    if pad_to_multiple is not None:
+        # Quantized GEMMs check the rank-local tensor (after the CP slice and,
+        # under SP, before the all-gather), so lift the multiple by both factors.
+        # See knowledge.md, "Decoder packed-row alignment: derivation".
+        divisible_by = math.lcm(
+            divisible_by, pad_to_multiple * cp_size * (tp_size if has_sp else 1)
+        )
+    # cp_size == 1: only the total has to be aligned, so pack samples back to back
+    # and put the whole tail on the last sample (keeps TE on fused attention).
+    # CP > 1 keeps per-sample alignment. Derivation in knowledge.md.
+    use_tail_only_alignment_padding = pad_to_multiple is not None and cp_size == 1
 
     if use_packed_sequence:
         packed_batch: Dict[str, Any] = {}
+
+        # --thd-static-packing: emit a fixed-shape THD batch. Every microbatch
+        # becomes exactly `max_seqlen_per_dp_cp_rank * cp_size` rows with
+        # cu_seqlens* of `thd_max_packed_sequences + 1` entries, which is the
+        # contract MCore's THD CUDA-graph machinery expects from a packing
+        # scheduler. This collator works in GLOBAL (pre-CP-slice) coordinates:
+        # CP slicing happens later in models/base.py.
+        static_target_T = None
+        static_max_num_seqs = None
+        try:
+            static_args = get_args()
+        except AssertionError:
+            static_args = None
+        if static_args is not None and getattr(static_args, "thd_static_packing", False):
+            static_target_T = int(static_args.max_seqlen_per_dp_cp_rank) * cp_size
+            static_max_num_seqs = int(static_args.thd_max_packed_sequences)
+            # The tail policy is always append_dummy_seq here, matching what
+            # --sequence-packing-scheduler produces; TransformerConfig rejects
+            # thd_static_packing + extend_last, which is unusable at any CP size
+            # (it leaves cu_seqlens_q ending at the real token count while the
+            # tensors are padded to target_T, and TE then returns a shorter
+            # attention output than the padded input -- a view mismatch in
+            # Attention._apply_output_gate).
+            #
+            # The cost is that the pad tail becomes an ordinary sequence in
+            # cu_seqlens_q, which would inflate the FLOPs accumulator; the
+            # pre-tail vector is therefore emitted separately (see
+            # accumulate_flops_stats).
+
+        # MDP capture fast path (TP=1): build each packed field directly in
+        # one pinned buffer (no per-sample F.pad + concat churn) and move it
+        # with a non-blocking copy. Pageable H2D copies each carry an implicit
+        # device sync that serializes the window-capture (prefetch) thread;
+        # pinned + non_blocking removes the sync and the staging pass. Output
+        # bytes are identical to the generic path. torch's caching host
+        # allocator recycles the pinned blocks and event-tracks their reuse.
+        try:
+            use_pinned = (
+                bool(getattr(get_args(), "mdp_enable", False)) and tp_size == 1
+            )
+        except AssertionError:
+            use_pinned = False
 
         if is_src:
             assert batch is not None, "source TP rank must provide a batch"
@@ -237,18 +527,58 @@ def pack_or_pad_batch(
                 assert (
                     sample["labels"].shape == sample["input_ids"].shape == sample["loss_mask"].shape
                 ), "labels, input_ids, and loss_mask must have the same shape"
-                target_len = math.ceil(seqlen / divisible_by) * divisible_by
-                input_ids_list.append(F.pad(sample["input_ids"], (0, target_len - seqlen), value=0))
-                labels_list.append(F.pad(sample["labels"], (0, target_len - seqlen), value=-100))
-                loss_mask_list.append(F.pad(sample["loss_mask"], (0, target_len - seqlen), value=0))
+                if use_tail_only_alignment_padding:
+                    # Keep every sample at its own real length; the alignment
+                    # tail is absorbed once, after the loop.
+                    target_len = seqlen
+                else:
+                    target_len = math.ceil(seqlen / divisible_by) * divisible_by
+                if not use_pinned:
+                    input_ids_list.append(
+                        F.pad(sample["input_ids"], (0, target_len - seqlen), value=0)
+                    )
+                    labels_list.append(
+                        F.pad(sample["labels"], (0, target_len - seqlen), value=-100)
+                    )
+                    loss_mask_list.append(
+                        F.pad(sample["loss_mask"], (0, target_len - seqlen), value=0)
+                    )
                 seqlens_list.append(seqlen)
                 seqlens_padded_list.append(target_len)
-                if include_pixel_values:
+                if emit_pixels:
                     pixel_values_list.append(sample["pixel_values"])
                 image_grid_thw_list.append(sample["image_grid_thw"])
 
             cu_seqlens = list(accumulate(seqlens_list, initial=0))
             cu_seqlens_padded = list(accumulate(seqlens_padded_list, initial=0))
+
+            # Samples were packed at their exact lengths, so extend only the last
+            # sample's padded region; cu_seqlens[:-1] stays equal to
+            # cu_seqlens_padded[:-1], which pad_between_seqs=False below relies on.
+            if use_tail_only_alignment_padding and cu_seqlens_padded:
+                total_real = cu_seqlens_padded[-1]
+                target_total = math.ceil(total_real / divisible_by) * divisible_by
+                fp8_tail_dummy_len = target_total - total_real
+                if fp8_tail_dummy_len > 0:
+                    cu_seqlens_padded[-1] = target_total
+                    # Keep seqlens_padded_list in sync -- the is_src/use_pinned
+                    # branch below derives max_seqlen_q from this list, not
+                    # from cu_seqlens_padded.
+                    seqlens_padded_list[-1] += fp8_tail_dummy_len
+                    if not use_pinned:
+                        input_ids_list[-1] = F.pad(
+                            input_ids_list[-1], (0, fp8_tail_dummy_len), value=0
+                        )
+                        labels_list[-1] = F.pad(
+                            labels_list[-1], (0, fp8_tail_dummy_len), value=-100
+                        )
+                        loss_mask_list[-1] = F.pad(
+                            loss_mask_list[-1], (0, fp8_tail_dummy_len), value=0
+                        )
+                assert cu_seqlens[:-1] == cu_seqlens_padded[:-1], (
+                    "tail-only padding must leave every sample but the last at its "
+                    "exact real length; pad_between_seqs=False below relies on it"
+                )
 
             # padding_mask: True at collate-padded positions within each packed
             # sample. Real tokens occupy [cu_seqlens_padded[i], +seqlens_list[i]);
@@ -256,35 +586,172 @@ def pack_or_pad_batch(
             # routing in megatron.core to exclude padded tokens from aux loss,
             # z-loss, and expert-bias accumulation.
             total_tokens_padded = cu_seqlens_padded[-1]
-            padding_mask_thd = torch.zeros(total_tokens_padded, dtype=torch.bool)
+            # Physical row count of the emitted tensors. Under static packing it
+            # is the fixed target, so the tail beyond the pack is padding too.
+            physical_T = total_tokens_padded
+            if static_target_T is not None:
+                assert total_tokens_padded <= static_target_T, (
+                    f"Packed THD length ({total_tokens_padded}) exceeds the static "
+                    f"target ({static_target_T}). Increase "
+                    "--max-seqlen-per-dp-cp-rank, or lower the number of samples per "
+                    "microbatch (--micro-batch-size, or the greedy token budget)."
+                )
+                physical_T = static_target_T
+            padding_mask_thd = torch.zeros(
+                physical_T, dtype=torch.bool, pin_memory=use_pinned
+            )
             for i, real_seqlen in enumerate(seqlens_list):
                 pad_start = cu_seqlens_padded[i] + real_seqlen
                 pad_end = cu_seqlens_padded[i + 1]
                 if pad_end > pad_start:
                     padding_mask_thd[pad_start:pad_end] = True
+            if physical_T > total_tokens_padded:
+                padding_mask_thd[total_tokens_padded:] = True
 
-            packed_batch["input_ids"] = torch.concat(input_ids_list, dim=0).unsqueeze(0)
-            packed_batch["labels"] = torch.concat(labels_list, dim=0).unsqueeze(0)
-            packed_batch["loss_mask"] = torch.concat(loss_mask_list, dim=0).unsqueeze(0)
+            if use_pinned:
+                # Single padded buffer per field; pad regions filled with the
+                # same values F.pad used, sample slices copied in place. Sized to
+                # physical_T so static packing costs no second copy.
+                def _packed_field(key, fill):
+                    out = torch.empty(
+                        physical_T, dtype=batch[0][key].dtype, pin_memory=True
+                    )
+                    out.fill_(fill)
+                    for i, sample in enumerate(batch):
+                        start = cu_seqlens_padded[i]
+                        out[start : start + seqlens_list[i]].copy_(sample[key])
+                    return out
+
+                input_ids_list = [_packed_field("input_ids", 0)]
+                labels_list = [_packed_field("labels", -100)]
+                loss_mask_list = [_packed_field("loss_mask", 0)]
+
+            if with_vision_sidecar:
+                try:
+                    args = get_args()
+                    sidecar_image_token_id = getattr(args, "image_token_id", 248056)
+                    sidecar_merge = getattr(args, "vision_spatial_merge_size", None) or 2
+                except AssertionError:
+                    sidecar_image_token_id = 248056
+                    sidecar_merge = 2
+                packed_batch.update(
+                    build_vision_sidecar(
+                        batch,
+                        cu_seqlens_padded,
+                        image_token_id=sidecar_image_token_id,
+                        spatial_merge_size=sidecar_merge,
+                    )
+                )
+
+            if use_pinned:
+                # The fields already live in single pinned buffers; a concat
+                # of a one-element list would copy them into fresh pageable
+                # memory and forfeit the non-blocking upload.
+                packed_batch["input_ids"] = input_ids_list[0].unsqueeze(0)
+                packed_batch["labels"] = labels_list[0].unsqueeze(0)
+                packed_batch["loss_mask"] = loss_mask_list[0].unsqueeze(0)
+            else:
+                def _concat_field(pieces, fill):
+                    packed = torch.concat(pieces, dim=0)
+                    tail = physical_T - packed.shape[0]
+                    if tail:
+                        packed = F.pad(packed, (0, tail), value=fill)
+                    return packed.unsqueeze(0)
+
+                packed_batch["input_ids"] = _concat_field(input_ids_list, 0)
+                packed_batch["labels"] = _concat_field(labels_list, -100)
+                packed_batch["loss_mask"] = _concat_field(loss_mask_list, 0)
             packed_batch["padding_mask"] = padding_mask_thd.unsqueeze(0)
-            if include_pixel_values:
-                packed_batch["pixel_values"] = torch.concat(pixel_values_list)
-            packed_batch["image_grid_thw"] = torch.concat(image_grid_thw_list)
+            if emit_pixels:
+                if use_pinned and pixel_values_list:
+                    total_rows = sum(int(p.shape[0]) for p in pixel_values_list)
+                    pixels = torch.empty(
+                        (total_rows,) + tuple(pixel_values_list[0].shape[1:]),
+                        dtype=pixel_values_list[0].dtype,
+                        pin_memory=True,
+                    )
+                    torch.cat(pixel_values_list, out=pixels)
+                    packed_batch["pixel_values"] = pixels
+                else:
+                    packed_batch["pixel_values"] = torch.concat(pixel_values_list)
+            grid_thw = torch.concat(image_grid_thw_list)
+            packed_batch["image_grid_thw"] = (
+                grid_thw.pin_memory() if use_pinned else grid_thw
+            )
             # cu_seqlens / cu_seqlens_padded need to reach non-source TP ranks
             # so each rank can build an identical PackedSeqParams.
-            packed_batch["cu_seqlens"] = torch.tensor(cu_seqlens, dtype=torch.int32, device=device)
-            packed_batch["cu_seqlens_padded"] = torch.tensor(
-                cu_seqlens_padded, dtype=torch.int32, device=device
-            )
+            if use_pinned:
+                packed_batch["cu_seqlens"] = torch.tensor(
+                    cu_seqlens, dtype=torch.int32
+                ).pin_memory()
+                packed_batch["cu_seqlens_padded"] = torch.tensor(
+                    cu_seqlens_padded, dtype=torch.int32
+                ).pin_memory()
+            else:
+                packed_batch["cu_seqlens"] = torch.tensor(
+                    cu_seqlens, dtype=torch.int32, device=device
+                )
+                packed_batch["cu_seqlens_padded"] = torch.tensor(
+                    cu_seqlens_padded, dtype=torch.int32, device=device
+                )
+
+        # The vision sidecar is consumed on the CPU by the MDP adapter; with a
+        # single-member TP group there is no broadcast, so skip the GPU round
+        # trip (H2D here + D2H in the adapter) entirely.
+        sidecar_cpu = {}
+        if is_src and use_pinned:
+            for key in ("vision_item_meta", "vision_decoder_positions"):
+                if key in packed_batch:
+                    sidecar_cpu[key] = packed_batch.pop(key)
 
         packed_batch = broadcast_data_batch(packed_batch, device=device)
+        packed_batch.update(sidecar_cpu)
 
         cu_seqlens_t = packed_batch.pop("cu_seqlens")
         cu_seqlens_padded_t = packed_batch.pop("cu_seqlens_padded")
-        # Derive max_seqlen / total_tokens from the (broadcast) cu_seqlens —
-        # no extra collective needed.
-        max_seqlen_q = int((cu_seqlens_padded_t[1:] - cu_seqlens_padded_t[:-1]).max().item())
-        total_tokens = int(cu_seqlens_padded_t[-1].item())
+        if is_src and use_pinned:
+            # Known on the host already; reading them back from the device
+            # would force a sync against the in-flight non-blocking copies.
+            max_seqlen_q = max(seqlens_padded_list) if seqlens_padded_list else 0
+            total_tokens = cu_seqlens_padded[-1]
+        else:
+            # Derive max_seqlen / total_tokens from the (broadcast) cu_seqlens —
+            # no extra collective needed.
+            max_seqlen_q = int((cu_seqlens_padded_t[1:] - cu_seqlens_padded_t[:-1]).max().item())
+            total_tokens = int(cu_seqlens_padded_t[-1].item())
+
+        # Tail-only layout: TE may use cu_seqlens_q_padded as the attention
+        # boundary. Safe only under the causal decoder mask (tail rows follow
+        # every real row and are loss-masked); see knowledge.md.
+        pad_between_seqs = False if use_tail_only_alignment_padding else None
+        if static_target_T is not None:
+            cu_seqlens_t, cu_seqlens_padded_t, real_cu_seqlens_t = build_static_thd_metadata(
+                cu_seqlens_t,
+                cu_seqlens_padded_t,
+                target_len=static_target_T,
+                max_num_seqs=static_max_num_seqs,
+                cp_size=cp_size,
+            )
+            # max_seqlen must be the padded static value: the tail belongs to a
+            # sequence now, and a stale (shorter) max silently produces wrong
+            # attention rather than a crash.
+            max_seqlen_q = static_target_T
+            total_tokens = static_target_T
+            # Must be batch-independent (that is the point of static shapes), so
+            # derive it from the alignment rather than from this batch's
+            # vectors: with divisible_by == 1 no sample is ever padded, so
+            # cu_seqlens and cu_seqlens_padded coincide and there is provably no
+            # gap between sequences. Saying True there is not free -- it makes
+            # FlashAttention ineligible and, when the fused cuDNN backend is not
+            # selected either, drops TE onto its unfused O(T^2) attention, which
+            # OOMs at these lengths.
+            # ... and under the tail-only layout no sample but the last is
+            # padded either, whatever divisible_by says.
+            pad_between_seqs = divisible_by > 1 and not use_tail_only_alignment_padding
+            if real_cu_seqlens_t is not None:
+                # append_dummy_seq put the tail into cu_seqlens_q itself, which
+                # would inflate sum(L) and sum(L^2) in the FLOPs accumulator.
+                packed_batch["flops_cu_seqlens"] = real_cu_seqlens_t
 
         packed_batch["packed_seq_params"] = PackedSeqParams(
             qkv_format="thd",
@@ -295,6 +762,7 @@ def pack_or_pad_batch(
             max_seqlen_q=max_seqlen_q,
             max_seqlen_kv=max_seqlen_q,
             total_tokens=total_tokens,
+            pad_between_seqs=pad_between_seqs,
         )
         return packed_batch
 
@@ -349,7 +817,7 @@ def pack_or_pad_batch(
         if has_padding:
             positions = torch.arange(target_seqlens).unsqueeze(0)
             padded_batch["padding_mask"] = positions >= torch.tensor(real_seqlens).unsqueeze(1)
-        if include_pixel_values:
+        if emit_pixels:
             padded_batch["pixel_values"] = torch.concat([x["pixel_values"] for x in batch])
         padded_batch["image_grid_thw"] = torch.concat([x["image_grid_thw"] for x in batch])
 
@@ -361,29 +829,100 @@ def pack_or_pad_batch(
 # -------------------------------------------------------------------
 
 
+@lru_cache(maxsize=None)
+def _row_alignment(packed: bool, fp4, fp8, fp8_recipe) -> Optional[int]:
+    """Row multiple the packed (THD) decoder sequence needs for quantized GEMMs.
+
+    ``None`` for BSHD collation or without quantization; otherwise
+    ``get_fp8_align_size(recipe)``. Raises for recipes it cannot align (NVFP4,
+    custom). Sources of the 8/16/32 requirements: knowledge.md. Cached on the
+    argument values: get_batch() asks once per microbatch and the answer only
+    depends on static launch arguments.
+    """
+    if not packed:
+        # BSHD derives its own common per-batch length and is out of scope here.
+        return None
+    if fp4 is not None:
+        # NVFP4 is mutually exclusive with --fp8-format and has no
+        # get_fp8_align_size() counterpart, so no alignment can be derived.
+        raise NotImplementedError(
+            "--fp4-format is not supported by examples/multimodal_dev together with "
+            "--use-packed-sequence: no row alignment is derived for NVFP4, so the "
+            "first NVFP4 GEMM would see an unaligned leading dimension"
+        )
+    if fp8 is None:
+        return None
+    if fp8_recipe == "custom":
+        # get_fp8_align_size() reports 16 for "custom", but a custom block-scaled
+        # quantizer may need a coarser alignment (MXFP8 needs 32).
+        raise NotImplementedError(
+            "--fp8-recipe custom is not supported by examples/multimodal_dev "
+            "together with --use-packed-sequence: get_fp8_align_size() reports 16 "
+            "for it, but a custom block-scaled quantizer may need a coarser "
+            "alignment (MXFP8 needs 32)"
+        )
+    return get_fp8_align_size(fp8_recipe)
+
+
+def quantized_row_alignment(args) -> Optional[int]:
+    """``_row_alignment`` read off the launch arguments (see its docstring)."""
+    return _row_alignment(
+        bool(getattr(args, "use_packed_sequence", False)),
+        getattr(args, "fp4", None),
+        getattr(args, "fp8", None),
+        getattr(args, "fp8_recipe", None),
+    )
+
+
 def get_batch(data_iterator: Iterator[list[Dict[str, Any]]], vp_stage: Optional[int] = None):
     """Get a batch from *data_iterator* and broadcast across TP ranks."""
     device = "cuda"
     args = get_args()
-    include_pixel_values = is_pipeline_first_stage(ignore_virtual=False, vp_stage=vp_stage)
 
-    if get_tensor_model_parallel_rank() == 0:
+    # Dropping pixels off non-first pipeline stages is correct only when the
+    # in-model encoder is what consumes them, i.e. when that encoder lives on
+    # the first stage. Under MDP the encoder is a separate, replicated domain
+    # and ownership of a microbatch's pixels is decided by the capture window,
+    # not by pipeline rank: a rank that is not PP stage 0 can still be the
+    # owner and must materialize the pixels. MDP applies its own suppression
+    # inside pack_or_pad_batch (pixel_capture_suppressed()), so leave the
+    # pipeline rule out of it here.
+    #
+    # Getting this wrong is not a silent slowdown: the collate still emits
+    # image_grid_thw on every stage, so a stage that drops the pixels but
+    # keeps the grids trips MDP's payload check with
+    #   "pixel data and grid metadata either both exist or both are absent".
+    if getattr(args, "mdp_enable", False):
+        include_pixel_values = True
+    else:
+        include_pixel_values = is_pipeline_first_stage(ignore_virtual=False, vp_stage=vp_stage)
+
+    group = get_tensor_model_parallel_group()
+    # Single-member TP group: skip the device flag tensor and the broadcast
+    # entirely. Behavior-identical, and it keeps the MDP window-capture
+    # prefetch thread free of NCCL calls (--mdp-overlap-window-capture).
+    if torch.distributed.get_world_size(group=group) == 1:
         try:
             data = next(data_iterator)
-            has_data = torch.tensor([1], dtype=torch.uint8, device=device)
         except StopIteration:
-            has_data = torch.tensor([0], dtype=torch.uint8, device=device)
-            data = None
+            return None
     else:
-        has_data = torch.empty(1, dtype=torch.uint8, device=device)
-        data = None
+        if get_tensor_model_parallel_rank() == 0:
+            try:
+                data = next(data_iterator)
+                has_data = torch.tensor([1], dtype=torch.uint8, device=device)
+            except StopIteration:
+                has_data = torch.tensor([0], dtype=torch.uint8, device=device)
+                data = None
+        else:
+            has_data = torch.empty(1, dtype=torch.uint8, device=device)
+            data = None
 
-    src = get_tensor_model_parallel_src_rank()
-    group = get_tensor_model_parallel_group()
-    torch.distributed.broadcast(has_data, src, group=group)
+        src = get_tensor_model_parallel_src_rank()
+        torch.distributed.broadcast(has_data, src, group=group)
 
-    if has_data.item() == 0:
-        return None
+        if has_data.item() == 0:
+            return None
 
     # Because broadcast will not broadcast packed_seq_params, we move it into pack_or_pad_batch
     batch = pack_or_pad_batch(
@@ -392,6 +931,8 @@ def get_batch(data_iterator: Iterator[list[Dict[str, Any]]], vp_stage: Optional[
         args.seq_length,
         device=device,
         include_pixel_values=include_pixel_values,
+        with_vision_sidecar=getattr(args, "mdp_enable", False),
+        pad_to_multiple=quantized_row_alignment(args),
     )
 
     # Fix shapes produced by default_collate.
@@ -436,53 +977,96 @@ def loss_func(loss_mask, output_tensor):
 # -------------------------------------------------------------------
 
 
-def record_vision_model_flops(args, model, batch):
-    """Report this microbatch's vision grids to the FLOPs accumulator.
+def mdp_forward_step(runtime, data_iterator, model, return_schedule_plan: bool = False):
+    """Forward step over an MDP replay record.
 
-    Called from :func:`forward_step` BEFORE its ``batch is None``
-    early-return, so a rank whose data iterator ran dry still reports an
-    explicit zero (``grid_thw=None``) instead of silently dropping its share
-    of the global batch. Entering the collective in
-    ``consume_vision_model_flops_stats`` is keyed off
-    ``args.count_vision_model_flops`` alone, so a missed report here cannot
-    desync the job -- it would only skew the reported number.
-
-    Two executions of a microbatch must not both be counted:
-
-    * ``model.training`` excludes ``evaluate()``, which calls
-      ``model.eval()``. ``evaluate()`` reuses this same forward step but never
-      drains the accumulator, so anything it added would leak into the next
-      ``train()`` iteration.
-    * ``RerunState.RERUNNING_IN_PLACE`` excludes the rerun state machine's
-      in-place replay of the SAME microbatches (``--check-for-nan-in-loss`` /
-      ``--check-for-spiky-loss``), which re-executes with the model still in
-      train mode. The accepted execution is the initial run, whose
-      contribution is already in the accumulator; the replay must add nothing.
-      The other rerun states replay in a freshly restarted process, whose
-      accumulator starts empty.
+    The iterator yields immutable ``MdpMicrobatchRecord`` objects captured in
+    P1. Pixels never reach the decoder: the first PP stage receives the
+    pre-encoded detached leaf from endpoint storage instead.  The EP-overlap
+    path builds a decoder-only schedule plan from that same leaf.
     """
-    if not getattr(args, "count_vision_model_flops", False):
-        return
-    if not getattr(model, "training", True):
-        return
-    if get_rerun_state_machine().state == RerunState.RERUNNING_IN_PLACE:
-        return
-    update_vision_model_flops_stats(
-        batch.get("image_grid_thw", None) if batch is not None else None,
-        spatial_merge_size=getattr(args, "vision_spatial_merge_size", None),
+    record = next(data_iterator)
+    batch = dict(record.model_payload)
+
+    _accumulate_workload_stats(
+        model,
+        record.decoder_packed_seq_params,
+        vision_items=record.vision_items,
+        real_cu_seqlens=batch.get("flops_cu_seqlens"),
     )
 
+    vision_embeddings = None
+    if is_pipeline_first_stage() and not record.text_only:
+        vision_embeddings = runtime.storage.get_leaf(record.microbatch_id)
+        if vision_embeddings is None:
+            raise RuntimeError(
+                f"MDP: microbatch {record.microbatch_id} has vision items but no "
+                "leaf in endpoint storage; P3 embedding routing did not complete"
+            )
 
-def forward_step(data_iterator, model):
-    """Forward step for multimodal_dev training."""
+    model_inputs = dict(
+        input_ids=batch["input_ids"],
+        position_ids=batch.get("position_ids"),
+        attention_mask=batch.get("attention_mask", None),
+        labels=batch.get("labels", None),
+        loss_mask=batch.get("loss_mask", None),
+        padding_mask=batch.get("padding_mask", None),
+        pixel_values=None,
+        image_grid_thw=batch.get("image_grid_thw", None),
+        packed_seq_params=record.decoder_packed_seq_params,
+        vision_embeddings=vision_embeddings,
+    )
+    if return_schedule_plan:
+        assert get_args().overlap_moe_expert_parallel_comm, (
+            "overlap_moe_expert_parallel_comm must be enabled to return a schedule plan"
+        )
+        output_tensor = model.build_schedule_plan(**model_inputs)
+    else:
+        output_tensor = model(**model_inputs)
+
+    loss_mask = batch.get("loss_mask", None)
+    if loss_mask is None:
+        loss_mask = torch.ones_like(batch["input_ids"], dtype=torch.float)
+    if is_pipeline_last_stage():
+        from examples.multimodal_dev.models.base import MultimodalModel
+
+        loss_mask = MultimodalModel.cp_split_loss_mask(
+            loss_mask, record.decoder_packed_seq_params
+        )
+    return output_tensor, partial(loss_func, loss_mask)
+
+
+def forward_step(data_iterator, model, return_schedule_plan: bool = False):
+    """Forward step for multimodal_dev training.
+
+    ``return_schedule_plan`` is requested only by MCore's native decoder EP
+    communication-overlap scheduler.  The default path remains an eager model
+    forward.
+    """
+    from megatron.core.mdp import integration as mdp_integration
+
+    mdp_runtime = mdp_integration.get_runtime()
+    if mdp_runtime is not None:
+        return mdp_forward_step(
+            mdp_runtime, data_iterator, model, return_schedule_plan=return_schedule_plan
+        )
+
+    # Native counterpart of mdp.p1_get_batch: the dataset fetch + THD pack
+    # + TP broadcast. MDP hoists this out of the schedule into window capture,
+    # so a like-for-like timeline comparison needs it named on both sides.
     vp_stage = get_attr_wrapped_model(model, "vp_stage")
-    batch = get_batch(data_iterator, vp_stage=vp_stage)
-
-    args = get_args()
-    record_vision_model_flops(args, model, batch)
+    with nvtx_phase("get_batch"):
+        batch = get_batch(data_iterator, vp_stage=vp_stage)
 
     if batch is None:
         return None, None
+
+    _accumulate_workload_stats(
+        model,
+        batch.get("packed_seq_params", None),
+        image_grid_thw=batch.get("image_grid_thw", None),
+        real_cu_seqlens=batch.get("flops_cu_seqlens"),
+    )
 
     # ``pixel_values`` is absent here on non-first stages (see pack_or_pad_batch).
     pixel_values = batch.get("pixel_values", None)
@@ -493,8 +1077,7 @@ def forward_step(data_iterator, model):
     ):
         pixel_values = pixel_values.bfloat16()
 
-    # We don't provide position_ids, now. Let model handle it itself.
-    output_tensor = model(
+    model_inputs = dict(
         input_ids=batch["input_ids"],
         position_ids=batch.get("position_ids"),
         attention_mask=batch.get("attention_mask", None),
@@ -505,6 +1088,13 @@ def forward_step(data_iterator, model):
         image_grid_thw=batch.get("image_grid_thw", None),
         packed_seq_params=batch.get("packed_seq_params", None),
     )
+    if return_schedule_plan:
+        assert get_args().overlap_moe_expert_parallel_comm, (
+            "overlap_moe_expert_parallel_comm must be enabled to return a schedule plan"
+        )
+        output_tensor = model.build_schedule_plan(**model_inputs)
+    else:
+        output_tensor = model(**model_inputs)
 
     loss_mask = batch.get("loss_mask", None)
     if loss_mask is None:

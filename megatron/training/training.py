@@ -288,38 +288,99 @@ _seqlen_stats_in_iteration: Optional[torch.Tensor] = None
 _seqlen_stats_active: bool = False
 _seqlen_stats_are_global: bool = False
 
-# Per-iteration vision-work stats, accumulated from the actual ``grid_thw``
-# tensors consumed by multimodal forward steps:
-#   index 0 -> total input patches, ``sum_i(T_i * H_i * W_i)``
-#   index 1 -> bidirectional attention work, ``sum_i(T_i * (H_i * W_i) ** 2)``
-#   index 2 -> total output tokens after spatial patch merging
-#   index 3 -> "this rank saw runtime grid data" flag (0.0 / 1.0)
-#   index 4 -> count of malformed grid rows seen (see ``update_*``)
-#
-# Slots 3 and 4 ride along in the same tensor so the whole protocol costs one
-# all-reduce and one host sync per iteration. Slot 3 is summed and tested
-# ``> 0``: it distinguishes "some rank reported vision work" from "every
-# microbatch this iteration was text-only" (legitimately all-zero stats) and
-# from "nothing was ever reported".
-#
-# As with language packed-sequence stats, every model-parallel rank sees the
-# same grids while data-parallel ranks see different samples. ``consume_*``
-# therefore all-reduces once and removes TP/CP/PP replication. Unlike the
-# language decoder, the vision encoder itself is NOT partitioned by context
-# parallelism -- it runs before ``_cp_split_for_forward`` and is forced onto a
-# size-1 attention group, so every CP rank redundantly computes the entire
-# vision forward. Dividing by ``cp_size`` here is still correct for a MODEL
-# FLOPs metric (redundant compute is not useful work), it just means vision
-# and language replicate across CP for different reasons -- the vision
-# encoder isn't actually doing 1/cp_size of the work per rank the way the
-# decoder is.
-_VISION_FLOPS_STATS_SLOTS = 5
-_VISION_FLOPS_PATCHES_SLOT = 0
-_VISION_FLOPS_ATTN_SLOT = 1
-_VISION_FLOPS_MERGED_SLOT = 2
-_VISION_FLOPS_REPORTED_SLOT = 3
-_VISION_FLOPS_INVALID_SLOT = 4
-_vision_flops_stats_in_iteration: Optional[torch.Tensor] = None
+# Per-iteration vision-encoder work, accumulated the same way as the seqlen
+# stats above (fp64 on GPU, one all-reduce + one host sync at consume time):
+#   index 0 -> ``sum_items(t * h * w)``      total vision patch rows; drives all
+#                                            token-linear vision FLOPs
+#   index 1 -> ``sum_items(t * (h * w)**2)`` drives the vision core-attention
+#                                            term (each temporal frame of each
+#                                            item is its own attention chunk,
+#                                            matching the encoder's cu_seqlens)
+# ``None``/inactive means "no vision work reported this iteration", in which
+# case ``num_floating_point_operations`` counts the language model only --
+# exactly today's behavior.
+_vision_stats_in_iteration: Optional[torch.Tensor] = None
+_vision_stats_active: bool = False
+
+
+def update_vision_stats(patch_rows, attn_squared_sum) -> None:
+    """Add one micro-batch's vision-encoder work to the per-iteration stats.
+
+    Args:
+        patch_rows: ``sum_items(t * h * w)`` -- patch rows fed to the vision
+            encoder. Python number or 0-dim tensor.
+        attn_squared_sum: ``sum_items(t * (h * w) ** 2)`` -- the vision
+            attention ``L^2`` term. Each temporal frame of each item is a
+            separate attention chunk of length ``h * w``, matching the
+            ``cu_seqlens`` the encoder builds from ``grid_thw``.
+
+    Both arguments may be device tensors; the accumulation stays on device (no
+    ``.item()``), so callers on the hot path pay no host sync. Must be called
+    once per micro-batch on every rank of the model-parallel group -- the same
+    contract as ``update_seqlen_stats_from_cu_seqlens`` -- because the consume
+    step divides the world all-reduce by ``TP * CP * PP``.
+    """
+    global _vision_stats_in_iteration, _vision_stats_active
+    if _vision_stats_in_iteration is None:
+        device = (
+            torch.device(f'cuda:{torch.cuda.current_device()}')
+            if torch.cuda.is_available()
+            else torch.device('cpu')
+        )
+        _vision_stats_in_iteration = torch.zeros(2, dtype=torch.float64, device=device)
+    _vision_stats_in_iteration[0] += patch_rows
+    _vision_stats_in_iteration[1] += attn_squared_sum
+    _vision_stats_active = True
+
+
+def consume_vision_stats_in_iteration() -> Tuple[Optional[float], Optional[float]]:
+    """Read, reset and globally reduce the per-iteration vision-encoder stats.
+
+    Returns ``(patch_rows, attn_squared_sum)`` for the whole global batch, or
+    ``(None, None)`` when nothing reported vision work this iteration (in which
+    case no collective is issued and the FLOPs metric stays language-only).
+    """
+    global _vision_stats_in_iteration, _vision_stats_active
+    if not _vision_stats_active:
+        return None, None
+    t = _vision_stats_in_iteration
+    if torch.distributed.is_initialized() and mpu.model_parallel_is_initialized():
+        torch.distributed.all_reduce(t)
+        dedup = (
+            max(mpu.get_tensor_model_parallel_world_size(), 1)
+            * max(mpu.get_context_parallel_world_size(), 1)
+            * max(mpu.get_pipeline_model_parallel_world_size(), 1)
+        )
+    else:
+        dedup = 1
+    patch_rows, attn_squared_sum = t.tolist()
+    t.zero_()
+    _vision_stats_active = False
+    return patch_rows / dedup, attn_squared_sum / dedup
+
+
+def reset_vision_stats_in_iteration() -> None:
+    """Drop accumulated vision stats without reducing them (see the seqlen twin)."""
+    global _vision_stats_in_iteration, _vision_stats_active
+    if _vision_stats_in_iteration is not None:
+        _vision_stats_in_iteration.zero_()
+    _vision_stats_active = False
+
+
+def reset_seqlen_stats_in_iteration() -> None:
+    """Drop any accumulated packed-sequence stats without reducing them.
+
+    The training loop drains the accumulator once per iteration (in
+    ``training_log``) and evaluation runs *after* that drain, so anything an
+    evaluation pass accumulates would otherwise leak into the next training
+    iteration's FLOPs. Evaluation calls this on exit to discard its own
+    contribution; at that point the accumulator provably holds eval data only.
+    """
+    global _seqlen_stats_in_iteration, _seqlen_stats_active
+    if _seqlen_stats_in_iteration is not None:
+        _seqlen_stats_in_iteration.zero_()
+    _seqlen_stats_active = False
+
 
 # Only report memory for first 3 checkpoint saves.
 num_checkpoints_memory_reported = 0
@@ -770,6 +831,41 @@ def print_datetime(string, override_timestamp=None):
     print_rank_0(f'[{string}] datetime: {time_str} ')
 
 
+def _mdp_greedy_consumed_samples(args):
+    """Real samples this iteration under ``--mdp-greedy-packing``, summed over DP.
+
+    Returns ``None`` when MDP greedy packing is off, so the caller keeps the
+    closed-form ``dp * mbs * num_microbatches``. Under greedy packing that form
+    is wrong: each rank fills a fixed number of bins to a token budget and
+    consumes however many samples that takes, which differs per iteration and
+    per rank.
+
+    The MDP runtime keeps a cumulative per-rank counter; this returns the delta
+    since the previous call, all-reduced over the data-parallel group. One small
+    D2H per iteration on the logging path, next to the existing host-side
+    ``consumed_train_samples`` arithmetic.
+    """
+    if not getattr(args, "mdp_enable", False) or not getattr(args, "mdp_greedy_packing", False):
+        return None
+    from megatron.core.mdp import integration as mdp_integration
+
+    runtime = mdp_integration.get_runtime()
+    if runtime is None:
+        return None
+    consumed = runtime.consumed_samples()
+    if consumed is None:
+        return None
+    previous = getattr(args, "_mdp_prev_consumed_samples", 0)
+    args._mdp_prev_consumed_samples = consumed
+    delta = torch.tensor(
+        [consumed - previous],
+        dtype=torch.long,
+        device=torch.cuda.current_device() if torch.cuda.is_available() else 'cpu',
+    )
+    torch.distributed.all_reduce(delta, group=mpu.get_data_parallel_group())
+    return int(delta.item())
+
+
 def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
     """Add ``sum(L_i)`` and ``sum(L_i ** 2)`` from one micro-batch's REAL ``cu_seqlens``.
 
@@ -1100,141 +1196,6 @@ def _num_dsa_indexer_layers(
     )
 
 
-def _vision_flops_stats_tensor(reference: torch.Tensor | None = None) -> torch.Tensor:
-    """Return the per-iteration vision stats buffer, allocating it on first use."""
-    global _vision_flops_stats_in_iteration
-    if _vision_flops_stats_in_iteration is None:
-        if torch.cuda.is_available():
-            device = torch.device(f'cuda:{torch.cuda.current_device()}')
-        elif reference is not None:
-            device = reference.device
-        else:
-            device = torch.device("cpu")
-        _vision_flops_stats_in_iteration = torch.zeros(
-            _VISION_FLOPS_STATS_SLOTS, dtype=torch.float64, device=device
-        )
-    return _vision_flops_stats_in_iteration
-
-
-def update_vision_model_flops_stats(grid_thw: torch.Tensor | None, spatial_merge_size: int) -> None:
-    """Accumulate vision-token shape statistics for one microbatch.
-
-    Args:
-        grid_thw: ``[num_images_or_videos, 3]`` tensor containing the
-            post-patch-embedding ``(T, H, W)`` grid for each vision input.
-            ``None`` records an explicit text-only microbatch.
-        spatial_merge_size: Spatial patch-merger factor used by the vision
-            encoder.
-
-    Must be called by every rank on every microbatch whenever
-    ``args.count_vision_model_flops`` is set -- including for text-only or
-    empty microbatches, for which ``grid_thw=None`` records an explicit zero.
-    ``consume_vision_model_flops_stats`` decides whether to enter its
-    collective from that config flag alone, so a rank that silently skipped
-    the update would not desync the job, but it would drop its share of the
-    global batch from the reported FLOPs.
-
-    The update stays on device and records the three sufficient statistics
-    needed by the Qwen3.5-VL FLOPs formula. Each temporal frame is a separate
-    bidirectional-attention sequence, matching the encoder's packed THD
-    ``cu_seqlens`` construction. Malformed grid values are accumulated into a
-    device-side counter rather than checked eagerly, so production CUDA grids
-    are validated with the same strictness as CPU ones at no extra host sync;
-    ``consume_*`` raises on the reduced counter.
-    """
-    if spatial_merge_size is None or spatial_merge_size <= 0:
-        raise ValueError(f"vision spatial_merge_size must be positive, got {spatial_merge_size}")
-    stats = _vision_flops_stats_tensor(grid_thw)
-    if grid_thw is None or grid_thw.numel() == 0:
-        # An explicit text-only (or vision-free) microbatch still counts as a
-        # report: the iteration's vision work is genuinely zero, which is a
-        # different statement from "no runtime grids were ever available".
-        stats[_VISION_FLOPS_REPORTED_SLOT] += 1.0
-        return
-    if grid_thw.ndim != 2 or grid_thw.shape[1] != 3:
-        raise ValueError(
-            "vision grid_thw must have shape [num_images_or_videos, 3], "
-            f"got {tuple(grid_thw.shape)}"
-        )
-
-    grid = grid_thw.to(device=stats.device, dtype=torch.float64)
-    temporal, height, width = grid.unbind(dim=1)
-    # Device-side validation: non-positive extents, or an H/W that the patch
-    # merger's ``view(-1, merge_dim)`` reshape could not consume. Counted, not
-    # raised, to keep this path free of a device-to-host sync.
-    not_positive = (grid <= 0).any(dim=1)
-    not_mergeable = (torch.remainder(grid[:, 1:], spatial_merge_size) != 0).any(dim=1)
-    invalid = not_positive | not_mergeable
-    stats[_VISION_FLOPS_INVALID_SLOT] += invalid.to(torch.float64).sum()
-
-    patches_per_frame = height * width
-    merged_height = torch.div(height, spatial_merge_size, rounding_mode='floor')
-    merged_width = torch.div(width, spatial_merge_size, rounding_mode='floor')
-    stats[_VISION_FLOPS_PATCHES_SLOT] += (temporal * patches_per_frame).sum()
-    stats[_VISION_FLOPS_ATTN_SLOT] += (temporal * patches_per_frame * patches_per_frame).sum()
-    stats[_VISION_FLOPS_MERGED_SLOT] += (temporal * merged_height * merged_width).sum()
-    stats[_VISION_FLOPS_REPORTED_SLOT] += 1.0
-
-
-def consume_vision_model_flops_stats(
-    count_vision_model_flops: bool,
-) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    """Read, reset, and globally reduce per-iteration vision shape stats.
-
-    Args:
-        count_vision_model_flops: ``args.count_vision_model_flops`` -- a
-            config value identical on every rank. Whether to enter the
-            distributed all-reduce is decided by THIS value alone, never by
-            whether ``update_vision_model_flops_stats`` happened to be called
-            locally this iteration: a rank whose data iterator ran dry (or
-            whose model wrapper lacks a ``.training`` attribute) must still
-            enter the same collective its peers enter, or the job desyncs.
-            Ranks with nothing to report contribute a zero tensor, and the
-            "did anyone report" flag is reduced inside the same collective.
-
-    Returns:
-        ``(total_patches, attention_seqlen_squared_sum, merged_tokens)`` for
-        the global batch. Returns ``(None, None, None)`` when vision FLOPs
-        counting is disabled, or when it is enabled but no rank supplied any
-        runtime grid this iteration.
-
-    Raises:
-        ValueError: if any rank accumulated a malformed ``grid_thw`` row.
-    """
-    if not count_vision_model_flops:
-        return None, None, None
-
-    stats = _vision_flops_stats_tensor()
-    if torch.distributed.is_initialized() and mpu.model_parallel_is_initialized():
-        # Unconditional when the feature is on, so collective participation is
-        # a global invariant rather than a function of local activity.
-        torch.distributed.all_reduce(stats)
-        tp_size = max(mpu.get_tensor_model_parallel_world_size(), 1)
-        cp_size = max(mpu.get_context_parallel_world_size(), 1)
-        pp_size = max(mpu.get_pipeline_model_parallel_world_size(), 1)
-        dedup = tp_size * cp_size * pp_size
-    else:
-        # No model-parallel state -> single-rank path (standalone unit tests;
-        # production always initializes mpu).
-        dedup = 1
-
-    # Single host sync drains every slot at once.
-    total_patches, attention_seqlen_squared_sum, merged_tokens, num_reported, num_invalid = (
-        stats.tolist()
-    )
-    # Reset for the next iteration, keeping the tensor allocated.
-    stats.zero_()
-
-    if num_invalid > 0:
-        raise ValueError(
-            f"{int(num_invalid)} vision grid_thw row(s) this iteration had a non-positive "
-            "extent, or a height/width not divisible by vision_spatial_merge_size"
-        )
-    if num_reported == 0:
-        return None, None, None
-    return (total_patches / dedup, attention_seqlen_squared_sum / dedup, merged_tokens / dedup)
-
-
 def _num_hybrid_dsa_indexer_layers(hybrid_layer_pattern, num_layers, skip_topk_offset, topk_freq):
     """Count DSA indexer executions at actual main and nested-MTP layer numbers."""
     from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, parse_hybrid_pattern
@@ -1370,221 +1331,13 @@ def _dsv4_hybrid_self_attention_flops(
     return token_linear, core
 
 
-_vision_flops_missing_runtime_stats_warned: bool = False
-
-
-def validate_vision_flops_metadata(args) -> None:
-    """Validate ``count_vision_model_flops`` metadata and precompute derived scalars.
-
-    Call this once, at model-construction time, right after a model
-    registry's ``vision_flops_fn`` sets ``args.count_vision_model_flops`` and
-    the ``vision_*`` fields (see
-    ``examples/multimodal_dev/pretrain_multimodal.py:model_provider``, which
-    calls this centrally right after ``vision_flops_fn`` -- individual
-    ``vision_flops_fn`` implementations, e.g.
-    ``examples/multimodal_dev/models/qwen35_vl/factory.py:set_vision_flops_metadata``,
-    do not need to call it themselves).
-    Doing this eagerly means a misconfigured variant or missing/invalid field
-    raises before the dataloader and optimizer are built, instead of at
-    iteration 1 inside the training loop. It also means
-    ``_num_multimodal_extra_floating_point_operations`` -- which runs every
-    iteration, from both the train loop and ``training_log``'s throughput
-    computation -- only has to do arithmetic on the precomputed scalars set
-    here, not re-validate config that cannot change after model construction.
-    """
-    if not getattr(args, "count_vision_model_flops", False):
-        return
-
-    vision_flops_variant = getattr(args, "vision_flops_variant", None)
-    if vision_flops_variant != "qwen35_vl":
-        raise ValueError(f"Unsupported vision FLOPs variant: {vision_flops_variant!r}")
-
-    required_fields = (
-        "vision_num_layers",
-        "vision_hidden_size",
-        "vision_ffn_hidden_size",
-        "vision_num_attention_heads",
-        "vision_patch_size",
-        "vision_temporal_patch_size",
-        "vision_spatial_merge_size",
-        "vision_in_channels",
-        "vision_out_hidden_size",
-    )
-    missing_fields = [field for field in required_fields if getattr(args, field, None) is None]
-    if missing_fields:
-        raise ValueError("Missing Qwen3.5-VL vision FLOPs metadata: " + ", ".join(missing_fields))
-
-    hidden_size = args.vision_hidden_size
-    num_attention_heads = args.vision_num_attention_heads
-    spatial_merge_size = args.vision_spatial_merge_size
-    positive_fields = {
-        "vision_num_layers": args.vision_num_layers,
-        "vision_hidden_size": hidden_size,
-        "vision_ffn_hidden_size": args.vision_ffn_hidden_size,
-        "vision_num_attention_heads": num_attention_heads,
-        "vision_patch_size": args.vision_patch_size,
-        "vision_temporal_patch_size": args.vision_temporal_patch_size,
-        "vision_spatial_merge_size": spatial_merge_size,
-        "vision_in_channels": args.vision_in_channels,
-        "vision_out_hidden_size": args.vision_out_hidden_size,
-    }
-    invalid_fields = [f"{field}={value}" for field, value in positive_fields.items() if value <= 0]
-    if invalid_fields:
-        raise ValueError(
-            "Qwen3.5-VL vision FLOPs metadata must be positive: " + ", ".join(invalid_fields)
-        )
-
-    kv_channels = getattr(args, "vision_kv_channels", None)
-    if kv_channels is None:
-        if hidden_size % num_attention_heads != 0:
-            raise ValueError(
-                "vision_hidden_size must be divisible by vision_num_attention_heads "
-                "when vision_kv_channels is unset"
-            )
-        kv_channels = hidden_size // num_attention_heads
-    elif kv_channels <= 0:
-        raise ValueError(f"vision_kv_channels must be positive, got {kv_channels}")
-
-    # Derived scalars fixed at model-construction time; the per-iteration
-    # path below reads these directly instead of recomputing them.
-    args.vision_projection_size = kv_channels * num_attention_heads
-    args.vision_patch_dim = (
-        args.vision_in_channels
-        * args.vision_temporal_patch_size
-        * args.vision_patch_size
-        * args.vision_patch_size
-    )
-    args.vision_merge_dim = hidden_size * spatial_merge_size**2
-
-
-def _num_multimodal_extra_floating_point_operations(
-    args,
-    vision_total_tokens_in_batch=None,
-    vision_seqlen_squared_sum_in_batch=None,
-    vision_merged_tokens_in_batch=None,
-):
-    """Estimate training FLOPs outside the language decoder stack.
-
-    This follows the existing decoder convention: count the dominant
-    projections and attention matrix multiplications, including forward,
-    weight-gradient, and data-gradient work, while omitting comparatively
-    small elementwise operations such as normalization, GELU, RoPE, and
-    residual additions.
-
-    Metadata validation and derived-scalar precomputation happen once, at
-    model-construction time, in ``validate_vision_flops_metadata`` -- see
-    there. This function assumes that already ran successfully whenever
-    ``count_vision_model_flops`` is set.
-
-    The vision terms are driven exclusively by the runtime ``grid_thw``
-    statistics the forward step reported. When an entry point does not report
-    them, the vision contribution is omitted (and a one-time warning is
-    logged) rather than synthesised from nominal architecture metadata: a
-    fabricated-but-plausible number would silently feed MFU comparisons and
-    perf regression tracking.
-    """
-    if not getattr(args, "count_vision_model_flops", False):
-        return 0
-
-    global _vision_flops_missing_runtime_stats_warned
-
-    projection_size = getattr(args, "vision_projection_size", None)
-    if projection_size is None:
-        # The derived scalars are only ever set by validate_vision_flops_metadata.
-        # An entry point that sets count_vision_model_flops itself, without
-        # routing through that validator, would otherwise fail here with a bare
-        # AttributeError at the first training iteration.
-        raise ValueError(
-            "count_vision_model_flops is set but the vision FLOPs metadata was never "
-            "validated. Call megatron.training.training.validate_vision_flops_metadata(args) "
-            "at model-construction time (see "
-            "examples/multimodal_dev/pretrain_multimodal.py:model_provider)."
-        )
-    hidden_size = args.vision_hidden_size
-    ffn_hidden_size = args.vision_ffn_hidden_size
-    patch_dim = args.vision_patch_dim
-    merge_dim = args.vision_merge_dim
-
-    vision_stats = (
-        vision_total_tokens_in_batch,
-        vision_seqlen_squared_sum_in_batch,
-        vision_merged_tokens_in_batch,
-    )
-    if any(value is not None for value in vision_stats) and not all(
-        value is not None for value in vision_stats
-    ):
-        raise ValueError(
-            "vision_total_tokens_in_batch, vision_seqlen_squared_sum_in_batch, "
-            "and vision_merged_tokens_in_batch must be provided together"
-        )
-    if all(value is not None for value in vision_stats) and any(
-        value < 0 for value in vision_stats
-    ):
-        raise ValueError(
-            "runtime vision FLOPs statistics must be non-negative, " f"got {vision_stats}"
-        )
-
-    if vision_total_tokens_in_batch is None:
-        if not _vision_flops_missing_runtime_stats_warned:
-            print_rank_0(
-                "[vision FLOPs] count_vision_model_flops is enabled but no runtime "
-                "image_grid_thw was reported, so vision-encoder work is EXCLUDED from "
-                "the reported FLOPs/TFLOP-per-s. Entry points must call "
-                "megatron.training.training.update_vision_model_flops_stats() from "
-                "their forward step (see examples/multimodal_dev/forward_step.py). "
-                "Logged once."
-            )
-            _vision_flops_missing_runtime_stats_warned = True
-        return 0
-
-    # Every weight-bearing matmul runs once in forward and twice in backward.
-    forward_backward_expansion_factor = 3
-    fma_expansion_factor = 2
-    training_matmul_factor = forward_backward_expansion_factor * fma_expansion_factor
-
-    # NOTE: uses the same forward+weight-grad+data-grad factor as the other
-    # terms even though pixel_values is a leaf input with no data-gradient
-    # (factor 4 would be exact here, not 6). Deliberate ~0.4% over-count for
-    # formula uniformity across terms; not worth a separate constant.
-    patch_embed_flops = (
-        training_matmul_factor * vision_total_tokens_in_batch * patch_dim * hidden_size
-    )
-
-    # Per layer: dense QKV + output projections, a two-linear GELU MLP, and
-    # bidirectional QK^T / attention-value matmuls over each temporal frame.
-    vision_projection_flops = (
-        training_matmul_factor
-        * vision_total_tokens_in_batch
-        * (
-            hidden_size * (3 * projection_size)
-            + projection_size * hidden_size
-            + hidden_size * ffn_hidden_size
-            + ffn_hidden_size * hidden_size
-        )
-    )
-    vision_core_attention_flops = (
-        forward_backward_expansion_factor * 4 * vision_seqlen_squared_sum_in_batch * projection_size
-    )
-    vision_transformer_flops = args.vision_num_layers * (
-        vision_projection_flops + vision_core_attention_flops
-    )
-
-    patch_merger_flops = (
-        training_matmul_factor
-        * vision_merged_tokens_in_batch
-        * (merge_dim * merge_dim + merge_dim * args.vision_out_hidden_size)
-    )
-    return patch_embed_flops + vision_transformer_flops + patch_merger_flops
-
-
 def num_floating_point_operations(
     args,
     batch_size,
     seqlen_squared_sum_in_batch=None,
     total_real_tokens_in_batch=None,
-    vision_total_tokens_in_batch=None,
-    vision_seqlen_squared_sum_in_batch=None,
-    vision_merged_tokens_in_batch=None,
+    vision_patch_rows_in_batch=None,
+    vision_attn_squared_sum_in_batch=None,
 ):
     """Compute the number of floating-point operations for one global batch.
 
@@ -1601,6 +1354,17 @@ def num_floating_point_operations(
             For THD it is the actual ragged sum and is strictly less than the
             BSHD value, reflecting per-chunk causal masking AND the fact that
             padding tokens do not contribute to attention scores.
+        vision_patch_rows_in_batch: ``sum_items(t * h * w)`` -- vision patch
+            rows processed by the vision encoder over the global batch. ``None``
+            (the default) means "no vision work reported", and the vision term
+            is omitted entirely, preserving the language-only behavior for every
+            text model. Only consumed when ``args.count_vision_model_flops`` is
+            set by the multimodal entry point.
+        vision_attn_squared_sum_in_batch: ``sum_items(t * (h * w) ** 2)`` -- the
+            vision core-attention ``L^2`` term. The vision encoder gives each
+            temporal frame of each item its own attention chunk of length
+            ``h * w`` (see its ``cu_seqlens``), so this is not
+            ``sum_items((t*h*w)**2)``.
         total_real_tokens_in_batch: ``sum_i(L_i)``, the TOTAL REAL (unpadded)
             token count across the global batch. Drives all token-linear FLOPs
             (QKV+output projections, MLP, MoE, MTP norms/projs, logits). For
@@ -1609,16 +1373,6 @@ def num_floating_point_operations(
             than ``batch_size * llm_seq_length`` whenever the dataloader added
             CP-alignment padding or end-of-sequence padding, so neither kind of
             padding shows up in the reported FLOPs.
-        vision_total_tokens_in_batch: Total pre-merger vision patch tokens
-            from the actual ``grid_thw`` values in the global batch.
-        vision_seqlen_squared_sum_in_batch: ``sum_i(T_i * (H_i * W_i)^2)``
-            for bidirectional vision attention, where each temporal frame is
-            one packed attention sequence.
-        vision_merged_tokens_in_batch: Total vision tokens after spatial patch
-            merging. The three vision statistics must be supplied together.
-            When omitted, the vision-encoder contribution is excluded from the
-            result (with a one-time warning) rather than estimated from
-            nominal architecture metadata.
     """
     # Multimodal --seq-length describes the encoder, while the language model
     # runs at --decoder-seq-length. Plain language models leave the latter unset.
@@ -2661,6 +2415,71 @@ def num_floating_point_operations(
             return False
         return spec_parts[-1] in {'gdp_stack_spec', 'gated_delta_product_stack_spec'}
 
+    def vision_encoder_flops():
+        """ViT-encoder FLOPs for one global batch (0 for text-only models).
+
+        Gated on ``args.count_vision_model_flops``, which the multimodal entry
+        point sets alongside the ``args.vision_*`` dimensions. Text models never
+        set it, so this returns 0 and the metric is bit-for-bit unchanged.
+
+        Notation: ``R`` = vision patch rows (``sum_items t*h*w``), ``A`` = the
+        attention term (``sum_items t*(h*w)^2``), ``m`` = spatial merge size,
+        ``M = R / m^2`` = merged rows handed to the language model (exact: the
+        collate path rejects grids whose ``h``/``w`` are not divisible by ``m``).
+
+        Terms, all already carrying the FMA factor of 2 and multiplied by 3 at
+        the end for forward + backward:
+
+        * patch embed (Conv3d, kernel == stride, so one GEMM per patch row):
+          ``2 * R * (C * T_p * P * P) * h_v``
+        * per layer, attention projections (MHA -- the ViT has no GQA):
+          ``4 * R * h_v * p * 2 * h_v`` with ``p = kv_channels * heads / h_v``
+        * per layer, core attention: ``4 * A * h_v * p``. Note the factor 4 and
+          not the language model's 2: vision attention is BIDIRECTIONAL, so the
+          causal-mask halving that cancels the FMA factor there does not apply.
+        * per layer, MLP (plain GELU, not gated): ``4 * R * h_v * ffn_v``
+        * patch merger: ``2 * M * (d_m^2 + d_m * h_out)`` with ``d_m = h_v * m^2``
+
+        Not counted (deliberate, and identical for the MDP and native arms):
+        norms, GELU/softmax elementwise work, RoPE, and the position-embedding
+        interpolation -- all sub-1% and outside Megatron's FLOPs convention.
+        Recompute is likewise not counted, matching the language-model term:
+        this is a MODEL-FLOPs metric, not a hardware-FLOPs metric.
+        """
+        if not getattr(args, "count_vision_model_flops", False):
+            return 0
+        if vision_patch_rows_in_batch is None:
+            return 0
+        rows = vision_patch_rows_in_batch
+        attn_sq = vision_attn_squared_sum_in_batch or 0
+        h_v = args.vision_hidden_size
+        n_v = args.vision_num_attention_heads
+        merge = args.vision_spatial_merge_size
+        # p mirrors attn_layer_flops: head_dim * heads may differ from hidden.
+        p = (args.vision_kv_channels * n_v / h_v) if args.vision_kv_channels else 1
+        patch_in_dim = (
+            args.vision_in_channels
+            * args.vision_temporal_patch_size
+            * args.vision_patch_size
+            * args.vision_patch_size
+        )
+        merged_rows = rows / (merge * merge)
+        merge_dim = h_v * merge * merge
+
+        patch_embed = 2 * rows * patch_in_dim * h_v
+        per_layer = (
+            4 * rows * h_v * p * (2 * h_v)  # QKV + output projections
+            + 4 * attn_sq * h_v * p  # bidirectional core attention
+            + 4 * rows * h_v * args.vision_ffn_hidden_size  # MLP (non-gated)
+        )
+        merger = 2 * merged_rows * (
+            merge_dim * merge_dim + merge_dim * args.vision_out_hidden_size
+        )
+        forward_backward_expansion_factor = 3
+        return forward_backward_expansion_factor * (
+            patch_embed + args.vision_num_layers * per_layer + merger
+        )
+
     # Main entrypoint for FLOPs calculation.
     if is_hybrid_model(args):
         from megatron.core.models.hybrid.hybrid_layer_allocation import (
@@ -2719,9 +2538,8 @@ def num_floating_point_operations(
         mtp_num_layers = args.mtp_num_layers
         if mtp_num_layers is None:
             mtp_num_layers = 0
-
-        # Compute hybrid decoder FLOPs.
-        total_floating_point_operations = hybrid_flops(
+        # Compute hybrid model FLOPs.
+        language_flops = hybrid_flops(
             total_tokens=total_real_tokens_in_batch,
             seqlen_squared_sum=seqlen_squared_sum_in_batch,
             hidden_size=args.hidden_size,
@@ -2799,17 +2617,9 @@ def num_floating_point_operations(
         )
     else:
         # Compute standard Transformer model FLOPs.
-        total_floating_point_operations = transformer_flops()
+        language_flops = transformer_flops()
 
-    return int(
-        total_floating_point_operations
-        + _num_multimodal_extra_floating_point_operations(
-            args,
-            vision_total_tokens_in_batch=vision_total_tokens_in_batch,
-            vision_seqlen_squared_sum_in_batch=vision_seqlen_squared_sum_in_batch,
-            vision_merged_tokens_in_batch=vision_merged_tokens_in_batch,
-        )
-    )
+    return int(language_flops + vision_encoder_flops())
 
 
 def get_start_time_from_progress_log():
@@ -4487,6 +4297,19 @@ def setup_model_and_optimizer(
             use_gloo_process_groups=args.use_gloo_process_groups,
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
         )
+        if getattr(args, "mdp_enable", False):
+            # MDP (modality decoupled parallelism): build the replicated
+            # encoder domain and its optimizer before the LR scheduler binds.
+            # No-op unless --mdp-enable is set.
+            from megatron.core.mdp import integration as mdp_integration
+
+            optimizer = mdp_integration.maybe_build_mdp_domain(
+                args=args,
+                model=model,
+                optimizer=optimizer,
+                optimizer_config=config,
+                ddp_config=get_megatron_ddp_config(args),
+            )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
     one_logger and one_logger.log_metrics(
@@ -5272,9 +5095,8 @@ def training_log(
     is_first_iteration=False,
     seqlen_squared_sum_in_batch: float | None = None,
     total_real_tokens_in_batch: float | None = None,
-    vision_total_tokens_in_batch: float | None = None,
-    vision_seqlen_squared_sum_in_batch: float | None = None,
-    vision_merged_tokens_in_batch: float | None = None,
+    vision_patch_rows_in_batch: float | None = None,
+    vision_attn_squared_sum_in_batch: float | None = None,
     num_microbatches: int | None = None,
     schedule_pg_collection=None,
     model=None,
@@ -5667,9 +5489,8 @@ def training_log(
             batch_size,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
-            vision_total_tokens_in_batch=vision_total_tokens_in_batch,
-            vision_seqlen_squared_sum_in_batch=vision_seqlen_squared_sum_in_batch,
-            vision_merged_tokens_in_batch=vision_merged_tokens_in_batch,
+            vision_patch_rows_in_batch=vision_patch_rows_in_batch,
+            vision_attn_squared_sum_in_batch=vision_attn_squared_sum_in_batch,
         ) / (elapsed_time_per_iteration * 10**12 * llm_world_size)
 
         one_logger_utils.track_e2e_metrics(cfg.logger.log_throughput, throughput)
@@ -6631,6 +6452,13 @@ def train(
     eval_iterations = 0
     # Wrap forward_backward_func for Full iteration CUDA graph
     forward_backward_func = get_forward_backward_func(schedule_pg_collection=pg_collection)
+    if getattr(args, "mdp_enable", False):
+        # MDP phase machine around the native schedule; no-op when MDP is off.
+        from megatron.core.mdp import integration as mdp_integration
+
+        forward_backward_func = mdp_integration.maybe_wrap_forward_backward(
+            forward_backward_func, config
+        )
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
@@ -7096,6 +6924,14 @@ def train(
         else:
             batch_size = _dp_world_size() * args.micro_batch_size * get_num_microbatches()
             iteration_sequences = batch_size
+            mdp_consumed = _mdp_greedy_consumed_samples(args)
+            if mdp_consumed is not None:
+                # --mdp-greedy-packing fills a fixed number of bins to a token
+                # budget, so the number of samples consumed floats per iteration
+                # AND per DP rank. The closed form above is simply wrong then;
+                # report the real all-reduced count instead. Same hook shape as
+                # rl_utils.get_iteration_sequence_count above.
+                iteration_sequences = mdp_consumed
 
         # Update consumed samples (always means sequences now)
         args.consumed_train_samples += iteration_sequences
@@ -7124,19 +6960,19 @@ def train(
         packed_sequence_stats = None
         if getattr(args, 'log_packed_sequence_stats', False):
             packed_sequence_stats = consume_packed_sequence_stats_in_iteration()
-        (
-            vision_total_tokens_in_batch,
-            vision_seqlen_squared_sum_in_batch,
-            vision_merged_tokens_in_batch,
-        ) = consume_vision_model_flops_stats(getattr(args, "count_vision_model_flops", False))
+        # Vision-encoder work for this global batch. ``(None, None)`` for text
+        # models and for any multimodal iteration that reported no vision items,
+        # in which case the FLOPs metric stays language-only.
+        vision_patch_rows_in_batch, vision_attn_squared_sum_in_batch = (
+            consume_vision_stats_in_iteration()
+        )
         num_floating_point_operations_in_batch = num_floating_point_operations(
             args,
             batch_size,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
-            vision_total_tokens_in_batch=vision_total_tokens_in_batch,
-            vision_seqlen_squared_sum_in_batch=vision_seqlen_squared_sum_in_batch,
-            vision_merged_tokens_in_batch=vision_merged_tokens_in_batch,
+            vision_patch_rows_in_batch=vision_patch_rows_in_batch,
+            vision_attn_squared_sum_in_batch=vision_attn_squared_sum_in_batch,
         )
         num_floating_point_operations_so_far += num_floating_point_operations_in_batch
         num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
@@ -7200,9 +7036,8 @@ def train(
                     is_first_iteration=is_first_iteration,
                     seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
                     total_real_tokens_in_batch=total_real_tokens_in_batch,
-                    vision_total_tokens_in_batch=vision_total_tokens_in_batch,
-                    vision_seqlen_squared_sum_in_batch=vision_seqlen_squared_sum_in_batch,
-                    vision_merged_tokens_in_batch=vision_merged_tokens_in_batch,
+                    vision_patch_rows_in_batch=vision_patch_rows_in_batch,
+                    vision_attn_squared_sum_in_batch=vision_attn_squared_sum_in_batch,
                     num_microbatches=num_microbatches,
                     schedule_pg_collection=pg_collection,
                     model=model,
@@ -7473,6 +7308,14 @@ def evaluate(
         eval_micro_batch_size * args.data_parallel_size * args.gtp_weight_remat_size
     )
     forward_backward_func = get_forward_backward_func(schedule_pg_collection=pg_collection)
+    if getattr(args, "mdp_enable", False):
+        # MDP phase machine around the native schedule (evaluation builds its
+        # own callable); no-op when MDP is off.
+        from megatron.core.mdp import integration as mdp_integration
+
+        forward_backward_func = mdp_integration.maybe_wrap_forward_backward(
+            forward_backward_func, config
+        )
     # Reductions source per-rank groups from the model (encoder rank -> encoder groups).
     eval_pgc = get_attr_wrapped_model(model[0], "pg_collection")
     if eval_pgc is None:
@@ -7617,6 +7460,12 @@ def evaluate(
                 pg_collection=pg_collection,
                 p2p_communicator=p2p_communicator,
             )
+
+    # Evaluation micro-batches feed the same packed-sequence accumulators as
+    # training when the data path is THD. Discard them so the next training
+    # iteration's FLOPs count training tokens only.
+    reset_seqlen_stats_in_iteration()
+    reset_vision_stats_in_iteration()
 
     # Move model back to the train mode.
     for model_module in model:

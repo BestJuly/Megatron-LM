@@ -29,6 +29,11 @@ from torch import Tensor
 
 from megatron.core.packed_seq_params import PackedSeqParams
 
+from .mrope_triton import (
+    fused_thd_mrope_position_ids,
+    get_fused_thd_mrope_unavailable_reason,
+)
+
 
 def _build_sample_mrope_positions(
     sample_input_ids: Tensor,
@@ -210,6 +215,24 @@ def get_rope_index(
         )
         if cu_seqlens_padded is None:
             cu_seqlens_padded = cu_seqlens
+
+        fused_unavailable_reason = get_fused_thd_mrope_unavailable_reason(
+            input_ids,
+            cu_seqlens,
+            cu_seqlens_padded,
+            image_grid_thw,
+            video_grid_thw,
+        )
+        if fused_unavailable_reason is None:
+            return fused_thd_mrope_position_ids(
+                input_ids,
+                cu_seqlens,
+                cu_seqlens_padded,
+                image_grid_thw,
+                spatial_merge_size=spatial_merge_size,
+                image_token_id=image_token_id,
+                vision_start_token_id=vision_start_token_id,
+            )
 
         assert (
             input_ids.dim() == 2 and input_ids.shape[0] == 1

@@ -32,19 +32,9 @@ def post_language_config(language_config, args):
 
 
 def set_vision_flops_metadata(args, language_config, vision_config):
-    """Expose Qwen3.5-VL vision-model dimensions for FLOPs estimation.
-
-    ``pretrain_multimodal.py:model_provider`` calls
-    ``megatron.training.training.validate_vision_flops_metadata(args)`` right
-    after invoking this function, so the fields set here are validated (and
-    derived scalars precomputed) centrally -- this function does not need to
-    call it itself.
-    """
+    """Expose Qwen3.5-VL vision-model dimensions for FLOPs estimation."""
     args.count_vision_model_flops = True
-    # No "v1"/"v2" versioning exists for this variant; matches the
-    # "qwen35_vl" model-arch registry key used everywhere else in
-    # examples/multimodal_dev.
-    args.vision_flops_variant = "qwen35_vl"
+    args.vision_flops_variant = "qwen35_vl_v2"
     args.vision_num_layers = vision_config.num_layers
     args.vision_hidden_size = vision_config.hidden_size
     args.vision_ffn_hidden_size = vision_config.ffn_hidden_size
@@ -119,6 +109,8 @@ def build_model(
         hybrid_stack_spec=hybrid_stack_spec,
         hybrid_layer_pattern=hybrid_layer_pattern,
         vision_config=vision_config,
+        # Under MDP the replicated encoder domain owns the vision weights.
+        build_vision_encoder=not getattr(args, "mdp_enable", False),
         vocab_size=args.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
         image_token_id=getattr(args, "image_token_id", 248056),
