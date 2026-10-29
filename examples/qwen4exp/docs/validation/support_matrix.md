@@ -68,6 +68,27 @@ Proxy, 4 × GB300, mock data, the image of [`../../Dockerfile.gb300`](../../Dock
 | MTP on the hybrid path | `mtp_1 loss` finite and tracking `lm loss` in every case |
 | Losses | finite and decreasing in all 11 passing cases |
 
+## Vision-language (Qwen3.8-VL) under MDP
+
+The multimodal model of [`examples/multimodal_dev/models/qwen38_vl`](../../../multimodal_dev/models/qwen38_vl)
+— the Qwen3.5-VL vision encoder in front of the decoder above — trained through Multimodal
+Disaggregated Parallelism (`--mdp`, [`megatron/core/mdp/README.md`](../../../../megatron/core/mdp/README.md)).
+Single node, 4 × GB300, EP4, mock vision data, static THD packing
+(`--thd-static-packing --pad-packed-seq-alignment max --max-seqlen-per-dp-cp-rank 8192 --thd-max-packed-sequences 4`).
+
+| Feature | Whole model | How it was run | Notes |
+|---|:---:|---|---|
+| **Native (no MDP) VL training** | ✅ | `pretrain_multimodal.py` without `--mdp` | the reference arm for the MDP rows |
+| **MDP VL training** | ✅ | `--mdp` | encoder on its own Adam ZeRO-1 domain over WORLD, decoder on the native schedule |
+| **mRoPE in QSA** | ✅ | `--position-embedding-type mrope` | per-token rotary rows, THD-aware (padded `cu_seqlens` on every path). QSA + mRoPE + CP is rejected at config time |
+| **Engram with image tokens** | ✅ | `--no-engram-token-prefetch` | the multimodal entry collates the full batch (packed THD rows) on every stage and the MDP schedule replays the iterator, so the pre-schedule token broadcast is skipped; fixed-capacity buckets use the padded `cu_seqlens` |
+| **MTP with mRoPE** | ✅ | `--mtp-num-layers 1` | the hybrid MTP block accepts mRoPE position embeddings |
+| **Muon under MDP** | ✅ | `--optimizer muon` (layer-wise distributed) | the decoder keeps Muon; the encoder is always projected to Adam + distributed optimizer (the `muon_*` options are reset for it). `torch_dist` save → resume reproduces the uninterrupted run's losses |
+| **TE per-layer CUDA graphs under MDP** | ✅ | `--cuda-graph-impl transformer_engine --cuda-graph-modules attn moe_router --cuda-graph-warmup-steps 2` | decoder layers only; mRoPE rotary tables and the THD padding mask are graph inputs. Requires `--thd-static-packing`. Losses match the eager MDP arm |
+| **Padding mask in graphs under SP** | ⛔ | `--sequence-parallel` with `attn` capture | the graphed layer drops `PackedSeqParams.padding_mask` under SP (the layer's mask is SP-scattered); QSA's indexer loss then also counts padding rows |
+| **`full_iteration` / `overlap_window_capture` graphs under MDP** | ⛔ | `--cuda-graph-impl full_iteration` | rejected by the MDP gate. Design note: the MDP wrapper would have to sit outside the captured native schedule |
+| **HF parity (VL)** | ✅ | `d1_vl_parity.py` (fp32 dense bridge, bf16 sparse) | BSHD logits and grads vs the HF `qwen4_exp` reference; THD single- and two-document packing vs BSHD |
+
 ## TODO — what this matrix says is missing
 
 1. **CUDA graphs beyond the MoE scopes** — the gated-residual blocker is fixed and the MoE-scoped

@@ -162,6 +162,7 @@ Supported models (keep in sync with the README support matrix):
 | `--model-arch` | Encoder package | Decoder hook | Shape key | Notes |
 |---|---|---|---|---|
 | `qwen35_vl` | `models/qwen35_vl` (ViT, merge 2) | default `build_language_model`; factory pins `rotary_percent`/`rotary_base` | `(t, h, w)`, width 3 | reference model |
+| `qwen38_vl` | reuses `models/qwen35_vl` ViT, collate spec and MDP adapter | default `build_language_model` (gated residual / QSA / Engram selected by the builder from args); factory pins RoPE and rejects non-HF decoder args | `(t, h, w)`, width 3 | QSA needs `--qsa-use-sparse-attention` under THD; Engram runs without the token prefetch |
 
 Adding a model is a package under `models/<arch>/` plus a registry entry; it
 must not need edits to `pretrain_multimodal.py`, `forward_step.py` or MDP core.

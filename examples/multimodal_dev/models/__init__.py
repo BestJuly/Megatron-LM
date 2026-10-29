@@ -69,6 +69,14 @@ from examples.multimodal_dev.models.qwen35_vl.mdp_adapter import (
 from examples.multimodal_dev.models.qwen35_vl.mdp_adapter import (
     build_mdp_adapter as _qwen35_vl_mdp_adapter,
 )
+from examples.multimodal_dev.models.qwen38_vl.configuration import get_qwen38_vl_vision_config
+from examples.multimodal_dev.models.qwen38_vl.factory import build_model as _build_qwen38_vl_model
+from examples.multimodal_dev.models.qwen38_vl.factory import (
+    post_language_config as _qwen38_vl_post_language_config,
+)
+from examples.multimodal_dev.models.qwen38_vl.factory import (
+    set_vision_flops_metadata as _qwen38_vl_vision_flops,
+)
 
 MODEL_REGISTRY = {
     "qwen35_vl": {
@@ -85,6 +93,27 @@ MODEL_REGISTRY = {
             ),
             "cord_v2": (
                 "examples.multimodal_dev.data.cord_v2"
+                ".train_valid_test_datasets_provider"
+            ),
+            "mdp_mock": (
+                "examples.multimodal_dev.data.mdp_mock"
+                ".train_valid_test_datasets_provider"
+            ),
+        },
+    },
+    # Qwen3.8-Flash-Next VL: Qwen3.5-VL ViT, token ids, collate spec, MDP adapter and data
+    # providers (all identical in HF qwen4_exp); the Qwen3.8 decoder comes from the default
+    # decoder hook.
+    "qwen38_vl": {
+        "model_factory_fn": _build_qwen38_vl_model,
+        "vision_config_fn": get_qwen38_vl_vision_config,
+        "post_language_config_fn": _qwen38_vl_post_language_config,
+        "vision_flops_fn": _qwen38_vl_vision_flops,
+        "vision_collate_spec_fn": _qwen35_vl_collate_spec,
+        "mdp_adapter_fn": _qwen35_vl_mdp_adapter,
+        "dataset_providers": {
+            "mock": (
+                "examples.multimodal_dev.data.mock"
                 ".train_valid_test_datasets_provider"
             ),
             "mdp_mock": (

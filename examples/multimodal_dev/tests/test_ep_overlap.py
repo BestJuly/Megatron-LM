@@ -56,6 +56,7 @@ def _make_model(*, pre_process=True):
     model.vp_stage = 0
     model.language_model = _FakeLanguageModel()
     model.vision_model = _FakeVisionModel() if pre_process else None
+    model.decoder_padding_token_id = None  # no Engram layers in the fake decoder
     return model
 
 
