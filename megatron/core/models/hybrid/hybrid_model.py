@@ -306,11 +306,17 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 "freeze_base_model_for_mtp requires the HybridModel architecture "
                 "to define at least one MTP head"
             )
-        if self.mtp_num_depths > 0 and self.position_embedding_type not in ('rope', 'none'):
+        # MTP rolls position_ids along the sequence (last) axis, which also covers the
+        # [3, b, s] ids of 'mrope', and its layers reuse the model's rotary embedding.
+        if self.mtp_num_depths > 0 and self.position_embedding_type not in (
+            'rope',
+            'mrope',
+            'none',
+        ):
             raise ValueError(
                 "Multi-Token Prediction (MTP) is not supported with "
                 f"{self.position_embedding_type} position embedding type. "
-                "The supported position embedding types are rope and none."
+                "The supported position embedding types are rope, mrope and none."
             )
         if self.config.mtp_hsm and self.mtp_num_depths < 2:
             raise ValueError(

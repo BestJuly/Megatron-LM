@@ -749,6 +749,56 @@ class TestHybridModel:
             assert expected == layer.layer_number, "layer numbers are incorrect"
 
 
+class TestHybridMTPPositionEmbedding:
+    """Which position embeddings a HybridModel with an MTP head accepts (constructor only)."""
+
+    def setup_method(self, method):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("position_embedding_type", ["rope", "mrope", "none"])
+    def test_mtp_accepts_position_embedding_type(self, mocker, position_embedding_type):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_num_layers=1,
+            mrope_section=[1, 1, 0] if position_embedding_type == "mrope" else None,
+        )
+        mocker.patch("megatron.core.models.hybrid.hybrid_model.build_module")
+        HybridModel(
+            config=config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=100,
+            max_sequence_length=4,
+            hybrid_layer_pattern="-/-",
+            position_embedding_type=position_embedding_type,
+        )
+
+    def test_mtp_rejects_learned_absolute_positions(self, mocker):
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            mtp_num_layers=1,
+        )
+        mocker.patch("megatron.core.models.hybrid.hybrid_model.build_module")
+        with pytest.raises(ValueError, match="rope, mrope and none"):
+            HybridModel(
+                config=config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=100,
+                max_sequence_length=4,
+                hybrid_layer_pattern="-/-",
+                position_embedding_type="learned_absolute",
+            )
+
+
 class TestHybridQKLayernorm:
 
     # Subclasses override these to retarget the same tests at MLA's
