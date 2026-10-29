@@ -543,10 +543,16 @@ if HAVE_TRITON:
         S,
         N: tl.constexpr,
         NC: tl.constexpr,
+        ACC_GAM: tl.constexpr,
+        ACC_WI: tl.constexpr,
         BLOCK: tl.constexpr,
     ):
         """Fixed-order sum over the row splits of the dgamma (output 0) / dW_inject row i
-        (output 1 + i) partials; grid = (column blocks, 1 + n or 1)."""
+        (output 1 + i) partials; grid = (column blocks, 1 + n or 1).
+
+        With ACC_GAM / ACC_WI the output is the parameter's main_grad and the finished sum is
+        added to it, the same single addition the DDP grad hook would perform.
+        """
         k = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
         o = tl.program_id(1)
         kmask = k < NC
@@ -554,11 +560,15 @@ if HAVE_TRITON:
         if o == 0:
             for s in range(0, S):
                 acc += tl.load(dgam_part_ptr + s * NC + k, mask=kmask, other=0.0)
+            if ACC_GAM:
+                acc += tl.load(dgam_ptr + k, mask=kmask, other=0.0).to(tl.float32)
             tl.store(dgam_ptr + k, acc.to(dgam_ptr.dtype.element_ty), mask=kmask)
         else:
             i = o - 1
             for s in range(0, S):
                 acc += tl.load(dwi_part_ptr + (s * N + i) * NC + k, mask=kmask, other=0.0)
+            if ACC_WI:
+                acc += tl.load(dwi_ptr + i * NC + k, mask=kmask, other=0.0).to(tl.float32)
             tl.store(dwi_ptr + i * NC + k, acc.to(dwi_ptr.dtype.element_ty), mask=kmask)
 
     @triton.jit
@@ -710,11 +720,61 @@ def _launch_gates_fwd(h2, gamma, wd, wi, eps, n, C, zero_centered):
     return rstd, xnb, p, z, down, u, gate
 
 
+def _accumulates_into_main_grad(param: Optional[Tensor]) -> bool:
+    """Whether the backward adds ``param``'s gradient into its ``main_grad`` itself.
+
+    The gradient-accumulation-fusion contract of Megatron's DDP (as for the linear and
+    embedding layers): a ``main_grad`` owned by DDP, not Megatron-FSDP, and not
+    ``zero_out_wgrad``, which mixes the gradients of a shared weight through ``param.grad``.
+    """
+    return (
+        param is not None
+        and param.requires_grad
+        and getattr(param, "main_grad", None) is not None
+        and hasattr(param, "grad_added_to_main_grad")
+        and not getattr(param, "zero_out_wgrad", False)
+        and not hasattr(param, "__fsdp_param__")
+        and param.main_grad.shape == param.shape
+        and param.main_grad.is_contiguous()
+    )
+
+
+_ADDMM_OUT_DTYPE = [True]  # cleared once if this torch's addmm has no out_dtype
+
+
+def _accumulate_wgrad(main_grad: Tensor, grad_output: Tensor, inp: Tensor) -> None:
+    """``main_grad += grad_output^T @ inp`` with fp32 accumulation, in one GEMM.
+
+    torch's addmm (bf16 operands, ``out_dtype`` fp32, in place via ``out=``) costs about a third
+    of the host time of the TE GEMM wrapper behind ``_wgrad_gemm``, which this module calls
+    several times per layer in eager mode; ``_wgrad_gemm`` remains the fallback.
+    """
+    if main_grad.dtype == grad_output.dtype:
+        torch.addmm(main_grad, grad_output.t(), inp, out=main_grad)
+        return
+    if main_grad.dtype == torch.float32 and _ADDMM_OUT_DTYPE[0]:
+        try:
+            torch.addmm(main_grad, grad_output.t(), inp, out_dtype=torch.float32, out=main_grad)
+            return
+        except TypeError:
+            _ADDMM_OUT_DTYPE[0] = False
+    from megatron.core.tensor_parallel.layers import _wgrad_gemm
+
+    _wgrad_gemm(main_grad, grad_output, inp, accumulate=True)
+
+
+def _main_grad_placeholder(param: Tensor) -> Tensor:
+    """Mark ``param``'s gradient as already in ``main_grad`` and return a storage-less zero
+    gradient, so the DDP grad hook still runs but adds nothing."""
+    param.grad_added_to_main_grad = True
+    return torch._efficientzerotensor(param.shape, dtype=param.dtype, device=param.device)
+
+
 class _GatedResidualGatesFn(torch.autograd.Function):
     """(h, gamma, W_down, W_up[, W_inject]) -> (mixed[, g_write]) with a fused backward."""
 
     @staticmethod
-    def forward(ctx, h, gamma, wd, wu, wi, eps, n, zero_centered, link):
+    def forward(ctx, h, gamma, wd, wu, wi, eps, n, zero_centered, link, accumulate_wgrad):
         """Run the fused read and write gates; save what the fused backward needs."""
         shape = h.shape
         nC = shape[-1]
@@ -746,6 +806,8 @@ class _GatedResidualGatesFn(torch.autograd.Function):
         ctx.save_for_backward(h2, gamma, wd, wu, wi, rstd, xnb, p, z, down, u, logits)
         ctx.has_gate = wi is not None
         ctx.link = link
+        # The parameters themselves (not the saved tensors) carry main_grad.
+        ctx.wgrad_params = (gamma, wd, wu, wi) if accumulate_wgrad else None
         ctx.n, ctx.C, ctx.zero_centered, ctx.shape = n, C, zero_centered, shape
         mixed = mixed.view(*shape[:-1], C)
         if wi is None:
@@ -789,7 +851,15 @@ class _GatedResidualGatesFn(torch.autograd.Function):
             num_warps=_BMIX_WARPS,
         )
         du = torch.mm(dl, wu)  # [M, R]
-        dwu = torch.mm(dl.t(), u)  # [nC, R]
+        fuse = [False] * 4
+        if ctx.wgrad_params is not None:
+            fuse = [_accumulates_into_main_grad(p) for p in ctx.wgrad_params]
+        if fuse[2]:
+            wu_param = ctx.wgrad_params[2]
+            _accumulate_wgrad(wu_param.main_grad, dl, u)  # += dl^T @ u
+            dwu = _main_grad_placeholder(wu_param)
+        else:
+            dwu = torch.mm(dl.t(), u)  # [nC, R]
         del dl
 
         ddown = torch.empty(M, R, device=dev, dtype=wd.dtype)
@@ -865,9 +935,21 @@ class _GatedResidualGatesFn(torch.autograd.Function):
             num_warps=_BNORM_WARPS,
             num_stages=_BNORM_STAGES,
         )
-        dwd = torch.mm(ddown.t(), xnb)  # [R, nC]
-        dgamma = torch.empty(nC, device=dev, dtype=gamma.dtype)
-        dwi = torch.empty(n, nC, device=dev, dtype=wi.dtype) if has_gate else None
+        if fuse[1]:
+            wd_param = ctx.wgrad_params[1]
+            _accumulate_wgrad(wd_param.main_grad, ddown, xnb)  # += ddown^T @ x̃
+            dwd = _main_grad_placeholder(wd_param)
+        else:
+            dwd = torch.mm(ddown.t(), xnb)  # [R, nC]
+        acc_gam, acc_wi = fuse[0], fuse[3] and has_gate
+        if acc_gam:
+            dgamma = ctx.wgrad_params[0].main_grad
+        else:
+            dgamma = torch.empty(nC, device=dev, dtype=gamma.dtype)
+        if acc_wi:
+            dwi = ctx.wgrad_params[3].main_grad
+        else:
+            dwi = torch.empty(n, nC, device=dev, dtype=wi.dtype) if has_gate else None
         _gr_param_reduce_kernel[(triton.cdiv(nC, _RED_BLOCK), 1 + n if has_gate else 1)](
             dgam_part,
             dwi_part,
@@ -876,10 +958,16 @@ class _GatedResidualGatesFn(torch.autograd.Function):
             splits,
             N=n,
             NC=nC,
+            ACC_GAM=acc_gam,
+            ACC_WI=acc_wi,
             BLOCK=_RED_BLOCK,
             num_warps=4,
         )
-        return dh.view(ctx.shape), dgamma, dwd, dwu, dwi, None, None, None, None
+        if acc_gam:
+            dgamma = _main_grad_placeholder(ctx.wgrad_params[0])
+        if acc_wi:
+            dwi = _main_grad_placeholder(ctx.wgrad_params[3])
+        return dh.view(ctx.shape), dgamma, dwd, dwu, dwi, None, None, None, None, None
 
 
 class _GatedResidualWriteBackFn(torch.autograd.Function):
@@ -970,12 +1058,17 @@ def fused_gated_residual_gates(
     n: int,
     zero_centered_gamma: bool,
     link: Optional[ResidualGradLink] = None,
+    accumulate_wgrad: bool = False,
 ) -> Tuple[Tensor, ...]:
     """Fused read gate (and write gate when ``inject_weight`` is given).
 
     Returns ``(mixed,)`` or ``(mixed, g_write)`` with the same dtypes as the torch path:
     both in the gate-projection weight dtype. ``link`` (see :class:`ResidualGradLink`) lets
-    the write-back on ``hidden_states`` hand its residual gradient to this backward.
+    the write-back on ``hidden_states`` hand its residual gradient to this backward. With
+    ``accumulate_wgrad`` (gradient-accumulation fusion) the backward adds each parameter's
+    gradient into its DDP ``main_grad`` directly when ``_accumulates_into_main_grad`` allows:
+    the two low-rank weight-gradient GEMMs accumulate in fp32 into it, so their gradients are
+    no longer rounded to the parameter dtype first.
     """
     out = _GatedResidualGatesFn.apply(
         hidden_states,
@@ -987,6 +1080,7 @@ def fused_gated_residual_gates(
         n,
         zero_centered_gamma,
         link,
+        accumulate_wgrad,
     )
     return out if isinstance(out, tuple) else (out,)
 

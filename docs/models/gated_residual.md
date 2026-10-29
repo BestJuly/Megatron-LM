@@ -83,6 +83,13 @@ to the gates' backward, and the norm backward kernel adds it while writing `dh`.
 This removes autograd's separate `dh + go` pass over the `[s, b, n*C]` tensor;
 `dh + go` is then rounded once instead of twice.
 
+With `gradient_accumulation_fusion`, the gates' backward adds every gradient
+into the DDP `main_grad` itself (same contract as the linear and embedding
+layers: not under Megatron-FSDP or `zero_out_wgrad`). The norm and write-gate
+weight gradients are added by the final split-reduction kernel, bitwise what the
+DDP hook would add; the two low-rank weight-gradient GEMMs accumulate their fp32
+result into `main_grad`, so it is no longer rounded to bf16 first.
+
 ## dtype policy
 
 | Tensor | dtype |
