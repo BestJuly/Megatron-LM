@@ -281,6 +281,7 @@ class GatedResidualModule(MegatronModule):
                 self.n,
                 self.hc_norm.zero_centered_gamma,
                 residual_grad_link,
+                self.config.gradient_accumulation_fusion,
             )
         x_norm_f32 = grouped_rms_norm(
             hidden_states,

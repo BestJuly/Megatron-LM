@@ -368,6 +368,48 @@ class TestGatedResidualTritonModule:
         # Gate detached and mixed unused: the residual gradient is exactly go.
         assert torch.equal(h.grad, do)
 
+    @pytest.mark.parametrize("zero_out_wgrad", [False, True])
+    def test_accumulate_wgrad_into_main_grad(self, zero_out_wgrad):
+        """With gradient-accumulation fusion the backward adds into main_grad: bitwise what the
+        DDP hook adds for the fp32 norm / write-gate weights; for the low-rank weights the fp32
+        GEMM result skips the rounding to bf16. zero_out_wgrad params keep the param.grad path."""
+        mod = _module(2560, 320)
+        torch.manual_seed(9)
+        M, n, C = 4096, STREAMS, 2560
+        h0 = torch.randn(M, 1, n * C, device="cuda").bfloat16()
+        y = torch.randn(M, 1, C, device="cuda").bfloat16()
+        dm = torch.randn(M, 1, C, device="cuda").bfloat16()
+        do = torch.randn(M, 1, n * C, device="cuda").bfloat16()
+        ref = _run_module(mod, h0, y, dm, do, fused=True)
+
+        mod.config.gradient_accumulation_fusion = True
+        init = {}
+        for name, p in mod.named_parameters():
+            init[name] = torch.randn(p.shape, device="cuda")
+            p.main_grad = init[name].clone()
+            p.grad_added_to_main_grad = False
+            if zero_out_wgrad:
+                p.zero_out_wgrad = True
+        for p in mod.parameters():
+            p.grad = None
+        h = h0.detach().clone().requires_grad_(True)
+        mixed, _, g, res = mod(h)
+        out = mod.fused_h_res_h_post_bda(None, res, g, (y, None), 0.0, True, True)
+        torch.autograd.backward([mixed, out], [dm, do])
+        assert torch.equal(h.grad, ref["dh"])
+        for name, p in mod.named_parameters():
+            grad_ref = ref["d_" + name]
+            if zero_out_wgrad:
+                assert not p.grad_added_to_main_grad, name
+                assert torch.equal(p.grad, grad_ref), name
+                assert torch.equal(p.main_grad, init[name]), name
+                continue
+            assert p.grad_added_to_main_grad, name
+            if p.dtype == torch.float32:
+                assert torch.equal(p.main_grad, init[name] + grad_ref), name
+            else:
+                assert _rel(p.main_grad - init[name], grad_ref) < 4e-3, name
+
     def test_cuda_graph_capture_replay(self):
         mod = _module(2560, 320)
         M, n, C = 4096, STREAMS, 2560
