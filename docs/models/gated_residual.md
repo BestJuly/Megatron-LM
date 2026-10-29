@@ -75,6 +75,14 @@ at most four residual streams; `deterministic_mode`, fp32 gate weights, and
 wider configurations keep the torch (`torch.compile`) path. The fused path is
 not held to bitwise equality with the torch path.
 
+The residual `h` feeds both the gates and the write-back, whose residual
+gradient is its incoming gradient unchanged. When the write-back writes into the
+same tensor the gates read, outside an mHC recompute checkpoint, the module links
+the two calls (`ResidualGradLink`): the write-back's backward hands that gradient
+to the gates' backward, and the norm backward kernel adds it while writing `dh`.
+This removes autograd's separate `dh + go` pass over the `[s, b, n*C]` tensor;
+`dh + go` is then rounded once instead of twice.
+
 ## dtype policy
 
 | Tensor | dtype |
