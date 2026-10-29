@@ -68,7 +68,9 @@ except ImportError:  # pragma: no cover - triton ships with every supported cont
 # Fixed tile shapes. No autotuning: the reduction order of every kernel is a
 # function of these constants only, so results do not depend on a tuning race.
 _NORM_BM, _NORM_BC, _NORM_WARPS = 8, 128, 8
-_MIX_BM, _MIX_BC, _MIX_WARPS = 8, 128, 4
+# fwd mix: 8 warps (GB300 sweep, 8192 x 4 x 2560: 69 us vs 76 us with 4; same tiles, so the
+# result is bitwise unchanged).
+_MIX_BM, _MIX_BC, _MIX_WARPS = 8, 128, 8
 _BMIX_BM, _BMIX_BC, _BMIX_WARPS = 4, 256, 4
 # bwd norm: one program per (channel tile, stream, row split of ~_BNORM_ROWS_PER_SPLIT rows).
 # Swept on GB300 with the residual gradient fused in (8192 rows, 4 x 2560): 256-row splits
