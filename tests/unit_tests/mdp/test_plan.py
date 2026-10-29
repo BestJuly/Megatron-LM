@@ -129,29 +129,30 @@ def test_digest_is_deterministic_and_16_bytes():
 
 def test_digest_covers_the_minimal_sufficient_set():
     policy = RowCapacityPolicy()
-    base = compute_plan_digest(
-        PLAN_SCHEMA_VERSION, policy, [_entry(0)], shape_key_width=3
-    )
+    base = compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [_entry(0)], shape_key_width=3)
     # Same row counts, different shape key -> the producer would build different
     # encoder metadata -> the digest must change (design doc 7.4).
     same_rows_other_shape = (0, 0, 0, 0, 16, 4, 1, 2, 8)
-    assert compute_plan_digest(
-        PLAN_SCHEMA_VERSION, policy, [same_rows_other_shape], shape_key_width=3
-    ) != base
+    assert (
+        compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [same_rows_other_shape], shape_key_width=3)
+        != base
+    )
     # Worker assignment changes the digest.
-    assert compute_plan_digest(
-        PLAN_SCHEMA_VERSION, policy, [_entry(0, worker=1)], shape_key_width=3
-    ) != base
+    assert (
+        compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [_entry(0, worker=1)], shape_key_width=3)
+        != base
+    )
     # The capacity policy is part of the digest.
     assert (
         compute_plan_digest(
-        PLAN_SCHEMA_VERSION, RowCapacityPolicy(16), [_entry(0)], shape_key_width=3
-    ) != base
+            PLAN_SCHEMA_VERSION, RowCapacityPolicy(16), [_entry(0)], shape_key_width=3
+        )
+        != base
     )
     # Schema version is part of the digest.
-    assert compute_plan_digest(
-        PLAN_SCHEMA_VERSION + 1, policy, [_entry(0)], shape_key_width=3
-    ) != base
+    assert (
+        compute_plan_digest(PLAN_SCHEMA_VERSION + 1, policy, [_entry(0)], shape_key_width=3) != base
+    )
 
 
 def test_digest_is_shape_key_width_aware():
@@ -166,9 +167,7 @@ def test_digest_is_shape_key_width_aware():
     wide = (0, 0, 0, 0, 16, 4, 4, 4, 0)
     assert compute_plan_digest(
         PLAN_SCHEMA_VERSION, policy, [narrow], shape_key_width=2
-    ) != compute_plan_digest(
-        PLAN_SCHEMA_VERSION, policy, [wide], shape_key_width=3
-    )
+    ) != compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [wide], shape_key_width=3)
     with pytest.raises(MdpPlanError, match="slots"):
         compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [narrow], shape_key_width=3)
 

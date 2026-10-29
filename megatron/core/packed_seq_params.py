@@ -391,9 +391,7 @@ def build_static_thd_metadata(
         else:
             # Gaps already exist between real sequences; the dummy's valid and
             # physical lengths are both exactly the new tail length.
-            cu_seqlens = _append_dummy_seq(
-                cu_seqlens, int(cu_seqlens[-1].item()) + dummy_seq_len
-            )
+            cu_seqlens = _append_dummy_seq(cu_seqlens, int(cu_seqlens[-1].item()) + dummy_seq_len)
         cu_seqlens_padded = _append_dummy_seq(cu_seqlens_padded, target_len)
 
     target_entries = max_num_seqs + 1

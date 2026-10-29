@@ -502,9 +502,7 @@ def test_thd_kernel_context_parallel_ranks(dtype):
     from megatron.core import parallel_state
     from tests.unit_tests.test_utilities import Utils
 
-    Utils.initialize_model_parallel(
-        context_parallel_size=int(os.environ.get("WORLD_SIZE", "1"))
-    )
+    Utils.initialize_model_parallel(context_parallel_size=int(os.environ.get("WORLD_SIZE", "1")))
     try:
         cp_group = parallel_state.get_context_parallel_group()
         cp_size = torch.distributed.get_world_size(cp_group)

@@ -69,9 +69,7 @@ class TestTEAttentionPackedPaddingMask:
             max_seqlen_kv=64,
             padding_mask=padding_mask,
         )
-        q, k, v = (
-            torch.randn(128, 4, 64, device="cuda", dtype=torch.bfloat16) for _ in range(3)
-        )
+        q, k, v = (torch.randn(128, 4, 64, device="cuda", dtype=torch.bfloat16) for _ in range(3))
         out = module(q, k, v, None, AttnMaskType.causal, packed_seq_params=packed_seq_params)
         assert out.shape[0] == 128
         assert torch.isfinite(out).all()

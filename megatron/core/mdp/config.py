@@ -280,10 +280,7 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
                 "Decoder EP communication overlap requires expert parallelism.",
                 "expert_parallel_size > 1",
             )
-        if (
-            options.pipeline_parallel_size > 1
-            and options.virtual_pipeline_parallel_size is None
-        ):
+        if options.pipeline_parallel_size > 1 and options.virtual_pipeline_parallel_size is None:
             _reject(
                 "overlap_moe_expert_parallel_comm",
                 options.overlap_moe_expert_parallel_comm,
@@ -615,10 +612,7 @@ def _validate_packing(config: MdpConfig, options: MdpCompatibilityOptions) -> No
             "discovering this inside TransformerEngine gives a far worse error.",
         )
     minimum = 2 if options.thd_static_packing else 1
-    if (
-        options.thd_max_packed_sequences is not None
-        and options.thd_max_packed_sequences < minimum
-    ):
+    if options.thd_max_packed_sequences is not None and options.thd_max_packed_sequences < minimum:
         _reject(
             "thd_max_packed_sequences",
             options.thd_max_packed_sequences,
@@ -656,10 +650,7 @@ def validate_effective_vision_config(
 ) -> None:
     """Reject unsupported combinations visible only after adapter resolution."""
     recompute_granularity = getattr(effective_config, "recompute_granularity", None)
-    if (
-        config.encoder_recompute_granularity == "whole"
-        and recompute_granularity is not None
-    ):
+    if config.encoder_recompute_granularity == "whole" and recompute_granularity is not None:
         _reject(
             "effective vision recompute_granularity",
             recompute_granularity,

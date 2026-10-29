@@ -239,11 +239,7 @@ def test_sbhd_kernel_sequence_lengths_not_multiple_of_tile(seq):
     """Sequence lengths that do not divide the tile height must still be exact."""
     case = _build_case(seq, 2, 4, 64, 16, torch.bfloat16, False, seed=seq)
     legacy, tiled = _run_legacy_and_tiled(
-        *case,
-        interleaved_mrope=False,
-        rotary_interleaved=False,
-        inverse=False,
-        fp32_compute=False,
+        *case, interleaved_mrope=False, rotary_interleaved=False, inverse=False, fp32_compute=False
     )
     torch.testing.assert_close(tiled, legacy, rtol=0, atol=0)
 
@@ -253,11 +249,7 @@ def test_sbhd_kernel_head_counts_that_are_not_powers_of_two(heads):
     """The head group must divide the head count, or trailing heads go unwritten."""
     case = _build_case(512, 2, heads, 64, 16, torch.bfloat16, False, seed=heads)
     legacy, tiled = _run_legacy_and_tiled(
-        *case,
-        interleaved_mrope=False,
-        rotary_interleaved=False,
-        inverse=False,
-        fp32_compute=False,
+        *case, interleaved_mrope=False, rotary_interleaved=False, inverse=False, fp32_compute=False
     )
     torch.testing.assert_close(tiled, legacy, rtol=0, atol=0)
 
@@ -267,11 +259,7 @@ def test_sbhd_kernel_batch_sizes(batch):
     """The batch is its own grid dimension; every element must be written."""
     case = _build_case(300, batch, 8, 128, 36, torch.bfloat16, True, seed=batch)
     legacy, tiled = _run_legacy_and_tiled(
-        *case,
-        interleaved_mrope=True,
-        rotary_interleaved=False,
-        inverse=False,
-        fp32_compute=True,
+        *case, interleaved_mrope=True, rotary_interleaved=False, inverse=False, fp32_compute=True
     )
     torch.testing.assert_close(tiled, legacy, rtol=0, atol=0)
 

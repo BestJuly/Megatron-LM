@@ -62,9 +62,7 @@ class EncoderForwardHandle:
                 "MDP: forward handle violates: one layout per chunk output "
                 f"({len(self.chunk_outputs)} outputs, {len(self.chunk_layouts)} layouts)."
             )
-        for index, (output, layout) in enumerate(
-            zip(self.chunk_outputs, self.chunk_layouts)
-        ):
+        for index, (output, layout) in enumerate(zip(self.chunk_outputs, self.chunk_layouts)):
             if output.shape[0] != layout.total_output_rows:
                 raise MdpStateError(
                     f"MDP: chunk {index} violates: output rows == "
@@ -196,17 +194,13 @@ class EncoderWholeRecomputeHandle:
     ) -> None:
         """Replay each chunk, backpropagate it, and consume its pixels and gradient."""
         if self._backward_done:
-            raise MdpStateError(
-                "MDP: whole-recompute handle violates: exactly one backward."
-            )
+            raise MdpStateError("MDP: whole-recompute handle violates: exactly one backward.")
         if len(chunk_grads) != len(self.chunk_layouts):
             raise MdpStateError(
                 "MDP: whole-recompute backward violates: one gradient per chunk "
                 f"({len(chunk_grads)} grads, {len(self.chunk_layouts)} chunks)."
             )
-        for index, (grad, metadata) in enumerate(
-            zip(chunk_grads, self.output_metadata)
-        ):
+        for index, (grad, metadata) in enumerate(zip(chunk_grads, self.output_metadata)):
             if grad is None:
                 raise MdpStateError(
                     f"MDP: whole-recompute chunk {index} gradient was already consumed."
@@ -230,11 +224,7 @@ class EncoderWholeRecomputeHandle:
         # to consume RNG between consecutive replayed forwards.
         with _fork_rng():
             for index, (layout, rng_state, metadata) in enumerate(
-                zip(
-                    self.chunk_layouts,
-                    self.chunk_rng_states,
-                    self.output_metadata,
-                )
+                zip(self.chunk_layouts, self.chunk_rng_states, self.output_metadata)
             ):
                 payload = self.chunk_payloads[index]
                 grad = chunk_grads[index]
@@ -255,9 +245,7 @@ class EncoderWholeRecomputeHandle:
                         f"MDP: whole-recompute chunk {index} violates: replay output "
                         "metadata matches P2."
                     )
-                if output.shape[0] and (
-                    not output.requires_grad or output.grad_fn is None
-                ):
+                if output.shape[0] and (not output.requires_grad or output.grad_fn is None):
                     raise MdpStateError(
                         f"MDP: whole-recompute chunk {index} output is not "
                         "graph-connected during P5 replay."

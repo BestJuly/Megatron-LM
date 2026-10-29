@@ -139,9 +139,7 @@ class ModalityBridge:
             if phase is BridgePhase.EMBEDDING:
                 src, dst = producer_rank, route.endpoint_rank
             elif phase is BridgePhase.PIXEL:
-                owner_ranks = rank_map.worker_ranks(
-                    plan.outer_dp_rank, route.owner_worker_id
-                )
+                owner_ranks = rank_map.worker_ranks(plan.outer_dp_rank, route.owner_worker_id)
                 if len(owner_ranks) != 1:
                     raise MdpBridgeError(
                         f"MDP: owner_worker_id={route.owner_worker_id} resolves to "
@@ -238,8 +236,15 @@ class ModalityBridge:
         start = time.monotonic()
         try:
             received = self._exchange_all_to_all_impl(
-                ledger, local_tensors, tensor_specs, group, group_ranks, global_rank,
-                dtype, device, dest_views,
+                ledger,
+                local_tensors,
+                tensor_specs,
+                group,
+                group_ranks,
+                global_rank,
+                dtype,
+                device,
+                dest_views,
             )
         finally:
             self._in_flight = False
@@ -320,9 +325,7 @@ class ModalityBridge:
         received: dict = {}
 
         def _unpack(entry: BridgeLedgerEntry, flat: Tensor):
-            self._unpack_entry(
-                entry, flat, tensor_specs, dest_views, received, ledger.phase.value
-            )
+            self._unpack_entry(entry, flat, tensor_specs, dest_views, received, ledger.phase.value)
 
         # Issue the collective asynchronously and unpack the local edges while
         # it is in flight: the local copies run on the current stream, the
@@ -372,9 +375,7 @@ class ModalityBridge:
         intermediate capacity-sized buffer is allocated as before.
         """
         if entry.key in received:
-            raise MdpBridgeError(
-                f"MDP: key {entry.key} violates: one received buffer per key."
-            )
+            raise MdpBridgeError(f"MDP: key {entry.key} violates: one received buffer per key.")
         dest = dest_views.get(entry.key) if dest_views is not None else None
         if dest is not None:
             if dest.numel() != entry.element_count:

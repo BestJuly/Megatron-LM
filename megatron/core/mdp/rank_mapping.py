@@ -159,9 +159,7 @@ def build_rank_map(spec: MdpRankSpec) -> MdpRankMap:
     for name in ("world_size", "pp", "cp", "ep", "encoder_cp"):
         value = getattr(spec, name)
         if value < 1:
-            raise MdpConfigurationError(
-                f"MDP: {name}={value} violates: {name} >= 1."
-            )
+            raise MdpConfigurationError(f"MDP: {name}={value} violates: {name} >= 1.")
     model_parallel = spec.tp * spec.pp * spec.cp
     if spec.world_size % model_parallel != 0:
         raise MdpConfigurationError(

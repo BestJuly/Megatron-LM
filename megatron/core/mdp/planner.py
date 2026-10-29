@@ -50,19 +50,14 @@ class MdpPlanner:
         )
 
     def build_plan(
-        self,
-        iteration: int,
-        descriptors: Sequence,
-        microbatch_ids: Sequence[int],
+        self, iteration: int, descriptors: Sequence, microbatch_ids: Sequence[int]
     ) -> MdpBatchPlan:
         """Run deterministic LPT and assemble routes, layouts, and the digest."""
         view = self._rank_view
         self._validate_descriptors(descriptors, microbatch_ids)
 
         # LPT: (cost descending, item_id ascending); integer comparisons only.
-        ordered = sorted(
-            descriptors, key=lambda d: (-d.estimated_cost_units, d.global_item_id)
-        )
+        ordered = sorted(descriptors, key=lambda d: (-d.estimated_cost_units, d.global_item_id))
         loads = {worker_id: 0 for worker_id in view.worker_ids}
         assignment = {}  # global_item_id -> worker_id
         producer_items = {worker_id: [] for worker_id in view.worker_ids}
@@ -136,9 +131,7 @@ class MdpPlanner:
             items_by_microbatch[descriptor.microbatch_id].append(descriptor)
         layouts = []
         for mb_id in microbatch_ids:
-            items = sorted(
-                items_by_microbatch[mb_id], key=lambda d: (d.sample_id, d.image_ordinal)
-            )
+            items = sorted(items_by_microbatch[mb_id], key=lambda d: (d.sample_id, d.image_ordinal))
             segments = []
             leaf_offset = 0
             for descriptor in items:
@@ -232,8 +225,7 @@ class MdpPlanner:
                 )
             if descriptor.payload_rows <= 0 or descriptor.output_rows <= 0:
                 raise MdpPlanError(
-                    f"MDP: item {item_id} violates: payload_rows and output_rows are "
-                    "positive."
+                    f"MDP: item {item_id} violates: payload_rows and output_rows are " "positive."
                 )
             if descriptor.microbatch_id not in known_microbatches:
                 raise MdpPlanError(
@@ -282,9 +274,7 @@ def _validate_plan(plan: MdpBatchPlan, view: MdpRankView) -> None:
                 )
             endpoint_items.add(segment.global_item_id)
     if endpoint_items != route_items:
-        raise MdpPlanError(
-            "MDP: plan violates: endpoint layouts cover exactly the routed items."
-        )
+        raise MdpPlanError("MDP: plan violates: endpoint layouts cover exactly the routed items.")
     for route in plan.routes:
         if route.endpoint_rank not in view.planning_group_ranks:
             raise MdpPlanError(
@@ -348,9 +338,7 @@ def _canonical_plan_payload(plan: MdpBatchPlan):
         plan.iteration,
         plan.outer_dp_rank,
         plan.capacity_policy.alignment_rows,
-        tuple(
-            (r.global_item_id, r.producer_worker_id, r.endpoint_rank) for r in plan.routes
-        ),
+        tuple((r.global_item_id, r.producer_worker_id, r.endpoint_rank) for r in plan.routes),
         tuple(
             (
                 l.microbatch_id,

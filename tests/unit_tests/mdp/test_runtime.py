@@ -132,8 +132,7 @@ class _StubAdapter:
             pieces.append(
                 encoder(
                     payload[
-                        segment.payload_row_start : segment.payload_row_start
-                        + segment.output_rows
+                        segment.payload_row_start : segment.payload_row_start + segment.output_rows
                     ]
                 )
             )
@@ -143,9 +142,7 @@ class _StubAdapter:
 def _build_runtime():
     world = torch.distributed.get_world_size()
     rank = torch.distributed.get_rank()
-    rank_map = build_rank_map(
-        MdpRankSpec(world_size=world, tp=1, pp=2, cp=1, ep=1, encoder_cp=1)
-    )
+    rank_map = build_rank_map(MdpRankSpec(world_size=world, tp=1, pp=2, cp=1, ep=1, encoder_cp=1))
     view = rank_map.view(rank)
     groups = install_mdp_process_groups(rank_map, group_registry=MdpGroupRegistry())
     encoder_pgs = build_encoder_pg_collection(rank_map, encoder_cp=1, process_groups=groups)
@@ -162,9 +159,7 @@ def _build_runtime():
         model_config=model_config,
         mdp_config=MdpConfig(enable=True),
         ddp_config=DistributedDataParallelConfig(
-            use_distributed_optimizer=True,
-            overlap_grad_reduce=False,
-            overlap_param_gather=False,
+            use_distributed_optimizer=True, overlap_grad_reduce=False, overlap_param_gather=False
         ),
         optimizer_config=OptimizerConfig(
             optimizer="adam", lr=1e-3, use_distributed_optimizer=True, clip_grad=1.0
@@ -223,9 +218,7 @@ def test_full_training_iteration_and_state_machine():
     runtime, view = _build_runtime()
     assert runtime.state is MdpRuntimeState.EMPTY
 
-    replay = runtime.begin_iteration(
-        iter(range(10)), num_microbatches=2, forward_only=False
-    )
+    replay = runtime.begin_iteration(iter(range(10)), num_microbatches=2, forward_only=False)
     assert runtime.state is MdpRuntimeState.DECODER_READY
     _drive_decoder(runtime, view, replay, backward=True)
 
@@ -257,9 +250,7 @@ def test_full_training_iteration_and_state_machine():
 
 def test_forward_only_iteration_captures_nothing_and_cleans_up():
     runtime, view = _build_runtime()
-    replay = runtime.begin_iteration(
-        iter(range(10)), num_microbatches=2, forward_only=True
-    )
+    replay = runtime.begin_iteration(iter(range(10)), num_microbatches=2, forward_only=True)
     _drive_decoder(runtime, view, replay, backward=False)
     runtime.mark_decoder_complete()  # eval requires no token capture
     runtime.end_iteration()
@@ -274,9 +265,7 @@ def test_invalid_transitions_raise():
     with pytest.raises(MdpStateError, match="end_iteration"):
         runtime.end_iteration()
 
-    replay = runtime.begin_iteration(
-        iter(range(10)), num_microbatches=2, forward_only=False
-    )
+    replay = runtime.begin_iteration(iter(range(10)), num_microbatches=2, forward_only=False)
     with pytest.raises(MdpStateError, match="begin_iteration"):
         runtime.begin_iteration(iter(range(10)), num_microbatches=2, forward_only=False)
 
@@ -296,9 +285,7 @@ def test_invalid_transitions_raise():
 def test_iteration_metrics_are_populated():
     runtime, view = _build_runtime()
     assert runtime.last_iteration_metrics() is None
-    replay = runtime.begin_iteration(
-        iter(range(10)), num_microbatches=2, forward_only=False
-    )
+    replay = runtime.begin_iteration(iter(range(10)), num_microbatches=2, forward_only=False)
     _drive_decoder(runtime, view, replay, backward=True)
     runtime.capture_global_num_tokens(torch.tensor(20.0, device="cuda"))
     runtime.mark_decoder_complete()

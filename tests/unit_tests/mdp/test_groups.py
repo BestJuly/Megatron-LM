@@ -72,9 +72,7 @@ if _DISTRIBUTED:
 @pytest.mark.skipif(not _DISTRIBUTED, reason="needs torchrun world")
 def test_install_process_groups_and_registry_dedup():
     world = torch.distributed.get_world_size()
-    rank_map = build_rank_map(
-        MdpRankSpec(world_size=world, tp=1, pp=2, cp=1, ep=1, encoder_cp=1)
-    )
+    rank_map = build_rank_map(MdpRankSpec(world_size=world, tp=1, pp=2, cp=1, ep=1, encoder_cp=1))
     registry = MdpGroupRegistry()
     groups = install_mdp_process_groups(rank_map, group_registry=registry)
     # encoder reduction aliases WORLD; no duplicate same-sized group.
@@ -82,9 +80,8 @@ def test_install_process_groups_and_registry_dedup():
     assert groups.world_group is torch.distributed.group.WORLD
     my_rank = torch.distributed.get_rank()
     view = rank_map.view(my_rank)
-    assert (
-        torch.distributed.get_world_size(group=groups.planning_group)
-        == len(view.planning_group_ranks)
+    assert torch.distributed.get_world_size(group=groups.planning_group) == len(
+        view.planning_group_ranks
     )
     # Reinstalling returns existing handles: no second new_group per key.
     first_keys = registry.created_keys()
@@ -97,9 +94,7 @@ def test_install_process_groups_and_registry_dedup():
 @pytest.mark.skipif(not _DISTRIBUTED, reason="needs torchrun world")
 def test_broadcast_descriptors_from_endpoint():
     world = torch.distributed.get_world_size()
-    rank_map = build_rank_map(
-        MdpRankSpec(world_size=world, tp=1, pp=2, cp=1, ep=1, encoder_cp=1)
-    )
+    rank_map = build_rank_map(MdpRankSpec(world_size=world, tp=1, pp=2, cp=1, ep=1, encoder_cp=1))
     registry = MdpGroupRegistry()
     groups = install_mdp_process_groups(rank_map, group_registry=registry)
     my_rank = torch.distributed.get_rank()
@@ -129,19 +124,14 @@ def test_broadcast_descriptors_from_endpoint():
 @pytest.mark.skipif(not _DISTRIBUTED, reason="needs torchrun world")
 def test_broadcast_rejects_misordered_descriptors():
     world = torch.distributed.get_world_size()
-    rank_map = build_rank_map(
-        MdpRankSpec(world_size=world, tp=1, pp=2, cp=1, ep=1, encoder_cp=1)
-    )
+    rank_map = build_rank_map(MdpRankSpec(world_size=world, tp=1, pp=2, cp=1, ep=1, encoder_cp=1))
     registry = MdpGroupRegistry()
     groups = install_mdp_process_groups(rank_map, group_registry=registry)
     view = rank_map.view(torch.distributed.get_rank())
     lane = view.outer_dp_rank
     # (microbatch_id, sample_id, image_ordinal) descending: must be rejected
     # on the endpoint before any collective payload is formed.
-    bad = (
-        _descriptor(0, mb=1, lane=lane),
-        _descriptor(1, mb=0, lane=lane),
-    )
+    bad = (_descriptor(0, mb=1, lane=lane), _descriptor(1, mb=0, lane=lane))
     if view.lane_id is not None:
         with pytest.raises(MdpBridgeError, match="ascending"):
             broadcast_descriptors(

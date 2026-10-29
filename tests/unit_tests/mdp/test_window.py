@@ -35,9 +35,9 @@ def _microbatch(items, total_rows, sentinel_base=0.0):
     if items:
         pixels = torch.zeros(total_rows, 4)
         for index, item in enumerate(items):
-            pixels[
-                item.payload_row_start : item.payload_row_start + item.payload_rows
-            ] = sentinel_base + index + 1
+            pixels[item.payload_row_start : item.payload_row_start + item.payload_rows] = (
+                sentinel_base + index + 1
+            )
     return CapturedMicrobatch(
         decoder_packed_seq_params=SimpleNamespace(qkv_format="thd"),
         vision_items=tuple(items),
@@ -190,9 +190,7 @@ def test_release_pixels_clears_the_sidecar_only():
         (lambda: [_microbatch([_item(0, 0, (1, 3, 4), 0)], 12)], "divisible"),
         # duplicate (sample, ordinal)
         (
-            lambda: [
-                _microbatch([_item(0, 0, (1, 4, 4), 0), _item(0, 0, (1, 4, 4), 16)], 32)
-            ],
+            lambda: [_microbatch([_item(0, 0, (1, 4, 4), 0), _item(0, 0, (1, 4, 4), 16)], 32)],
             "without duplicates",
         ),
         # payload interval out of bounds

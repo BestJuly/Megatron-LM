@@ -144,8 +144,11 @@ def test_padded_layout_boundaries_come_from_cu_seqlens_q_padded():
     real = torch.tensor([0, 11, 20], dtype=torch.int32)
     padded = torch.tensor([0, 16, 25], dtype=torch.int32)
     params = PackedSeqParams(
-        qkv_format="thd", cu_seqlens_q=real, cu_seqlens_kv=real,
-        cu_seqlens_q_padded=padded, cu_seqlens_kv_padded=padded,
+        qkv_format="thd",
+        cu_seqlens_q=real,
+        cu_seqlens_kv=real,
+        cu_seqlens_q_padded=padded,
+        cu_seqlens_kv_padded=padded,
     )
     assert torch.equal(_row_cu_seqlens(params), padded)
     hashes = _hash(packed, cu_seqlens=_row_cu_seqlens(params))

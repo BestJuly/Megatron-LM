@@ -110,9 +110,7 @@ def _fused_mrope_launch_shape(
     target_programs = _multi_processor_count(device_index) * _MROPE_PROGRAMS_PER_SM
 
     block_h = heads
-    while (
-        block_h > 1 and block_h % 2 == 0 and row_programs * (heads // block_h) < target_programs
-    ):
+    while block_h > 1 and block_h % 2 == 0 and row_programs * (heads // block_h) < target_programs:
         block_h //= 2
 
     num_warps = _largest_power_of_2_at_most(

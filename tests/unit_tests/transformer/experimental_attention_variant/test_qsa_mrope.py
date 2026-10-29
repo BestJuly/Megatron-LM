@@ -155,6 +155,7 @@ class _QSAMRoPEBase:
         g = torch.Generator().manual_seed(seed)
         return torch.randn(s, b, HIDDEN, generator=g).cuda().to(self.config.params_dtype)
 
+
 class TestQSAMRoPEIndexer(_QSAMRoPEBase):
     """Indexer selection under mRoPE (fp32, no sparse kernels needed)."""
 
@@ -342,9 +343,7 @@ class TestQSAMRoPESparse(_QSAMRoPEBase):
         return make_sparse_config()
 
     def _attn(self, hidden, freqs, psp=None):
-        out, _ = self.attn(
-            hidden, attention_mask=None, rotary_pos_emb=freqs, packed_seq_params=psp
-        )
+        out, _ = self.attn(hidden, attention_mask=None, rotary_pos_emb=freqs, packed_seq_params=psp)
         return out
 
     def test_1d_positions_bitwise_equal_table_path_thd(self):

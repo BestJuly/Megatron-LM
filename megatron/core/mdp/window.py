@@ -164,12 +164,7 @@ class MdpIterationWindow:
                     f"MDP: data iterator violates: {num_microbatches} microbatches per "
                     f"iteration (exhausted at microbatch {microbatch_id})."
                 )
-            _validate_captured(
-                captured,
-                microbatch_id,
-                adapter,
-                expect_pixels=owns_pixels,
-            )
+            _validate_captured(captured, microbatch_id, adapter, expect_pixels=owns_pixels)
             vision_records = []
             for item in captured.vision_items:
                 output_rows = item.output_rows
@@ -226,8 +221,7 @@ class MdpIterationWindow:
         """``num_vpp_chunks`` independent cursors; a second call raises."""
         if self._replayed:
             raise MdpStateError(
-                "MDP: iteration window violates: replay iterators are created once per "
-                "capture."
+                "MDP: iteration window violates: replay iterators are created once per " "capture."
             )
         self._replayed = True
         return [_ReplayCursor(self._records) for _ in range(self._num_vpp_chunks)]

@@ -85,10 +85,7 @@ def test_leftovers_carry_across_iterations():
 def test_alignment_is_charged_against_the_budget():
     # Aligned to 8, a 5-token sample occupies 8 rows: 3 fit in 24, not 4.
     stream = GreedySampleStream(
-        _microbatches([5] * 8, mbs=8),
-        token_budget=24,
-        align=8,
-        length_of=decoder_sample_length,
+        _microbatches([5] * 8, mbs=8), token_budget=24, align=8, length_of=decoder_sample_length
     )
     assert _bin_lengths([next(stream)]) == [[5, 5, 5]]
 
@@ -124,10 +121,7 @@ def test_oversized_sample_names_the_flag():
 def test_budget_must_be_divisible_by_the_row_alignment():
     with pytest.raises(MdpConfigurationError, match="row alignment"):
         GreedySampleStream(
-            _microbatches([10], mbs=1),
-            token_budget=100,
-            align=8,
-            length_of=decoder_sample_length,
+            _microbatches([10], mbs=1), token_budget=100, align=8, length_of=decoder_sample_length
         )
 
 

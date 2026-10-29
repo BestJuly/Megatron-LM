@@ -107,18 +107,13 @@ def install_mdp_process_groups(
         group = group_registry.get_or_create(("planning", outer_dp_rank), ranks)
         if my_rank in ranks:
             my_planning_group = group
-    group_registry.register_alias(
-        ("world_alias",), tuple(range(rank_map.spec.world_size)), world
-    )
+    group_registry.register_alias(("world_alias",), tuple(range(rank_map.spec.world_size)), world)
     if my_planning_group is None:
         raise MdpConfigurationError(
-            f"MDP: rank {my_rank} violates: every rank belongs to exactly one planning "
-            "group."
+            f"MDP: rank {my_rank} violates: every rank belongs to exactly one planning " "group."
         )
     return MdpProcessGroups(
-        planning_group=my_planning_group,
-        encoder_reduction_group=world,
-        world_group=world,
+        planning_group=my_planning_group, encoder_reduction_group=world, world_group=world
     )
 
 
@@ -261,8 +256,6 @@ def broadcast_descriptors(
         # Wire roundtrip is lossless (unit-tested); skip the D2H readback.
         return tuple(local_descriptors), flags
     return (
-        records_to_descriptors(
-            payload.tolist() if count else [], shape_key_width=shape_key_width
-        ),
+        records_to_descriptors(payload.tolist() if count else [], shape_key_width=shape_key_width),
         flags,
     )

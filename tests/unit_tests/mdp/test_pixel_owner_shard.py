@@ -20,12 +20,7 @@ import pytest
 import torch
 
 from megatron.core.mdp.allocator import DirectBufferAllocator
-from megatron.core.mdp.bridge import (
-    BridgeBufferKey,
-    BridgePhase,
-    BridgeTensorSpec,
-    ModalityBridge,
-)
+from megatron.core.mdp.bridge import BridgeBufferKey, BridgePhase, BridgeTensorSpec, ModalityBridge
 from megatron.core.mdp.errors import MdpConfigurationError
 from megatron.core.mdp.plan import RowCapacityPolicy
 from megatron.core.mdp.planner import MdpPlanner
@@ -212,12 +207,9 @@ def _assignment(plan):
 
 def test_owner_metadata_does_not_change_digest_without_locality():
     baseline = [_descriptor(i, cost=10 + (i * 7) % 5, mb=i % 4, owner=0) for i in range(9)]
-    sharded = [
-        _descriptor(i, cost=10 + (i * 7) % 5, mb=i % 4, owner=(i % 4)) for i in range(9)
-    ]
+    sharded = [_descriptor(i, cost=10 + (i * 7) % 5, mb=i % 4, owner=(i % 4)) for i in range(9)]
     planner = MdpPlanner(
-        _view(), locality_slack_permille=10, capacity_policy=RowCapacityPolicy(),
-        shape_key_width=3,
+        _view(), locality_slack_permille=10, capacity_policy=RowCapacityPolicy(), shape_key_width=3
     )
     plan_a = planner.build_plan(0, baseline, [0, 1, 2, 3])
     plan_b = planner.build_plan(0, sharded, [0, 1, 2, 3])
@@ -257,8 +249,7 @@ def test_locality_prefers_owner_only_within_slack():
         shape_key_width=3,
     )
     strict_base = MdpPlanner(
-        view, locality_slack_permille=0, capacity_policy=RowCapacityPolicy(),
-        shape_key_width=3,
+        view, locality_slack_permille=0, capacity_policy=RowCapacityPolicy(), shape_key_width=3
     )
     plan_local = strict_local.build_plan(0, skewed, list(range(5)))
     plan_base = strict_base.build_plan(0, skewed, list(range(5)))
@@ -298,9 +289,7 @@ GRIDS = ((1, 4, 4), (1, 8, 8), (2, 4, 4), (1, 4, 8), (1, 6, 6), (1, 8, 4), (2, 6
 def _dist_setup(num_items=8, pixel_locality=False):
     world = torch.distributed.get_world_size()
     rank = torch.distributed.get_rank()
-    rank_map = build_rank_map(
-        MdpRankSpec(world_size=world, tp=1, pp=4, cp=1, ep=1, encoder_cp=1)
-    )
+    rank_map = build_rank_map(MdpRankSpec(world_size=world, tp=1, pp=4, cp=1, ep=1, encoder_cp=1))
     view = rank_map.view(rank)
     num_workers = len(view.worker_ids)
     descriptors = []
@@ -430,9 +419,7 @@ def test_alltoall_sentinels_and_zero_split_participation():
     single_plan = planner.build_plan(1, single, [0])
     assert _assignment(single_plan) == {0: 0}
     single_specs = _dist_pixel_specs(single_plan, single)
-    single_ledger = bridge.build_ledger(
-        BridgePhase.PIXEL, single_plan, rank_map, single_specs
-    )
+    single_ledger = bridge.build_ledger(BridgePhase.PIXEL, single_plan, rank_map, single_specs)
     local = _owner_local_tensors(view, rank_map, single)
     received = bridge.exchange_all_to_all(
         single_ledger,
@@ -476,17 +463,12 @@ def test_alltoall_sentinels_and_zero_split_participation():
 def test_owner_zero_routes_pixels_from_worker_zero():
     world = torch.distributed.get_world_size()
     rank = torch.distributed.get_rank()
-    rank_map = build_rank_map(
-        MdpRankSpec(world_size=world, tp=1, pp=4, cp=1, ep=1, encoder_cp=1)
-    )
+    rank_map = build_rank_map(MdpRankSpec(world_size=world, tp=1, pp=4, cp=1, ep=1, encoder_cp=1))
     view = rank_map.view(rank)
     planner = MdpPlanner(
-        view, locality_slack_permille=10, capacity_policy=RowCapacityPolicy(),
-        shape_key_width=3,
+        view, locality_slack_permille=10, capacity_policy=RowCapacityPolicy(), shape_key_width=3
     )
-    baseline = [
-        _descriptor(i, cost=16 + i, mb=i, lane=view.outer_dp_rank) for i in range(4)
-    ]
+    baseline = [_descriptor(i, cost=16 + i, mb=i, lane=view.outer_dp_rank) for i in range(4)]
     bridge = ModalityBridge(DirectBufferAllocator())
     plan = planner.build_plan(0, baseline, [0, 1, 2, 3])
     specs = _dist_pixel_specs(plan, baseline)

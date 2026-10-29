@@ -114,10 +114,7 @@ def _member(config, optimizer_config, data_group, seed):
     )
     module = Float16Module(model_config, _Tiny(model_config, seed).cuda())
     ddp = DistributedDataParallel(
-        config=model_config,
-        ddp_config=config,
-        module=module,
-        pg_collection=_pgs(data_group),
+        config=model_config, ddp_config=config, module=module, pg_collection=_pgs(data_group)
     )
     optimizer = get_megatron_optimizer(
         config=optimizer_config,
@@ -130,9 +127,7 @@ def _member(config, optimizer_config, data_group, seed):
 
 def _build(composite_cls):
     ddp_config = DistributedDataParallelConfig(
-        use_distributed_optimizer=True,
-        overlap_grad_reduce=False,
-        overlap_param_gather=False,
+        use_distributed_optimizer=True, overlap_grad_reduce=False, overlap_param_gather=False
     )
     optimizer_config = OptimizerConfig(
         optimizer="adam",
@@ -235,9 +230,7 @@ def test_member_order_is_flat_dense_expert_encoder():
     _, _, composite = _build(MdpChainedOptimizer)
     assert isinstance(composite, MdpChainedOptimizer)
     assert len(composite.chained_optimizers) == 2
-    assert not any(
-        isinstance(member, ChainedOptimizer) for member in composite.chained_optimizers
-    )
+    assert not any(isinstance(member, ChainedOptimizer) for member in composite.chained_optimizers)
     # get_loss_scale asserts the members agree before returning member 0's.
     assert float(composite.get_loss_scale()) == 2.0**16
 

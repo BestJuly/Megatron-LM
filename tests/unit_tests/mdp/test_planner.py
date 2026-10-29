@@ -83,11 +83,7 @@ def test_locality_prefers_the_endpoint_worker_within_slack():
     # item: with slack 10 permille (1000*10 <= 1000*9 + 10*100) worker 0 is
     # eligible and preferred for hosting the endpoint; with zero slack only
     # the min-load worker 1 is eligible.
-    descriptors = [
-        _descriptor(0, cost=30),
-        _descriptor(1, cost=29),
-        _descriptor(2, cost=25),
-    ]
+    descriptors = [_descriptor(0, cost=30), _descriptor(1, cost=29), _descriptor(2, cost=25)]
     # LPT order 30 -> worker 0 (endpoint), 29 -> worker 1. For the cost-25
     # item, worker 0 is eligible iff 1000*30 <= 1000*29 + slack*25, i.e.
     # slack >= 40; the endpoint preference then keeps the item local.
@@ -204,6 +200,4 @@ def test_descriptor_validation(mutate, match):
 def test_consistency_check_interval_must_be_positive():
     plan = _planner().build_plan(0, [_descriptor(0, cost=1)], [0])
     with pytest.raises(MdpPlanError, match="never be fully disabled"):
-        assert_consistent_plan(
-            plan, planning_group=None, iteration=0, interval=0
-        )
+        assert_consistent_plan(plan, planning_group=None, iteration=0, interval=0)

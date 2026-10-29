@@ -110,9 +110,9 @@ def test_bridge_supports_two_slices_of_one_item():
         remote_bytes=total_bytes,
     )
 
-    source_item = torch.arange(24 * WIDTH, dtype=torch.float32, device="cuda").view(
-        24, WIDTH
-    ) + 1000.0 * src
+    source_item = (
+        torch.arange(24 * WIDTH, dtype=torch.float32, device="cuda").view(24, WIDTH) + 1000.0 * src
+    )
     local_tensors = {}
     if rank == src:
         local_tensors = {keys[0]: source_item[:16], keys[1]: source_item[16:]}
@@ -131,9 +131,10 @@ def test_bridge_supports_two_slices_of_one_item():
     if rank == dst:
         assert set(received) == set(keys)
         reassembled = torch.cat([received[keys[0]], received[keys[1]]])
-        expected = torch.arange(24 * WIDTH, dtype=torch.float32, device="cuda").view(
-            24, WIDTH
-        ) + 1000.0 * src
+        expected = (
+            torch.arange(24 * WIDTH, dtype=torch.float32, device="cuda").view(24, WIDTH)
+            + 1000.0 * src
+        )
         assert torch.equal(reassembled, expected)
     else:
         assert received == {}
@@ -160,13 +161,10 @@ def test_full_iteration_at_row_alignment_16():
 
     runtime.config = MdpConfig(enable=True, row_alignment=16)
     runtime.planner = MdpPlanner(
-        view, locality_slack_permille=10, capacity_policy=policy,
-        shape_key_width=3,
+        view, locality_slack_permille=10, capacity_policy=policy, shape_key_width=3
     )
 
-    replay = runtime.begin_iteration(
-        iter(range(10)), num_microbatches=2, forward_only=False
-    )
+    replay = runtime.begin_iteration(iter(range(10)), num_microbatches=2, forward_only=False)
     harness._drive_decoder(runtime, view, replay, backward=True)
     tokens = torch.tensor(16.0, device="cuda")
     runtime.capture_global_num_tokens(tokens)

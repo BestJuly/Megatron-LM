@@ -14,12 +14,7 @@ import pytest
 import torch
 
 from megatron.core.mdp.allocator import DirectBufferAllocator
-from megatron.core.mdp.bridge import (
-    BridgeBufferKey,
-    BridgePhase,
-    BridgeTensorSpec,
-    ModalityBridge,
-)
+from megatron.core.mdp.bridge import BridgeBufferKey, BridgePhase, BridgeTensorSpec, ModalityBridge
 from megatron.core.mdp.groups import MdpGroupRegistry, install_mdp_process_groups
 from megatron.core.mdp.plan import RowCapacityPolicy
 from megatron.core.mdp.planner import MdpPlanner
@@ -52,9 +47,7 @@ def _sentinel(outer_dp_rank, item_id):
 def _setup():
     world = torch.distributed.get_world_size()
     rank = torch.distributed.get_rank()
-    rank_map = build_rank_map(
-        MdpRankSpec(world_size=world, tp=1, pp=2, cp=1, ep=1, encoder_cp=1)
-    )
+    rank_map = build_rank_map(MdpRankSpec(world_size=world, tp=1, pp=2, cp=1, ep=1, encoder_cp=1))
     view = rank_map.view(rank)
     # costs 10, 9, 8 over two workers: item 0 -> worker 0 (endpoint-local),
     # items 1 and 2 -> worker 1 (remote edge, coalesced).
@@ -64,8 +57,7 @@ def _setup():
         _make_descriptor(2, 8, view.outer_dp_rank),
     ]
     planner = MdpPlanner(
-        view, locality_slack_permille=0, capacity_policy=RowCapacityPolicy(),
-        shape_key_width=3,
+        view, locality_slack_permille=0, capacity_policy=RowCapacityPolicy(), shape_key_width=3
     )
     plan = planner.build_plan(0, descriptors, [0])
     return rank_map, view, plan, descriptors
@@ -126,9 +118,7 @@ def test_pixel_embedding_gradient_share_one_transport():
     ledger = bridge.build_ledger(BridgePhase.PIXEL, plan, rank_map, specs)
     # Canonical order and coalesced offsets: the two entries for the remote
     # edge carry cumulative element offsets.
-    remote_entries = [
-        e for e in ledger.entries if e.src_global_rank != e.dst_global_rank
-    ]
+    remote_entries = [e for e in ledger.entries if e.src_global_rank != e.dst_global_rank]
     assert [e.key.global_item_id for e in remote_entries] == [1, 2]
     assert remote_entries[0].plan_offset == 0
     assert remote_entries[1].plan_offset == 64 * WIDTH
@@ -144,9 +134,11 @@ def test_pixel_embedding_gradient_share_one_transport():
                 device="cuda",
             )
     received = exchange(ledger, local_tensors, specs)
-    my_items = [
-        r.global_item_id for r in plan.routes_for_producer(view.my_worker_id)
-    ] if view.my_worker_id is not None else []
+    my_items = (
+        [r.global_item_id for r in plan.routes_for_producer(view.my_worker_id)]
+        if view.my_worker_id is not None
+        else []
+    )
     expected_keys = {BridgeBufferKey(i) for i in my_items}
     if view.lane_id is None and view.my_worker_id == 0:
         expected_keys = set()  # non-endpoint rank hosting no items
@@ -173,9 +165,7 @@ def test_pixel_embedding_gradient_share_one_transport():
     for item_id in my_items:
         d = descriptors[item_id]
         emb_local[BridgeBufferKey(item_id)] = torch.full(
-            (d.output_rows, WIDTH),
-            -_sentinel(view.outer_dp_rank, item_id),
-            device="cuda",
+            (d.output_rows, WIDTH), -_sentinel(view.outer_dp_rank, item_id), device="cuda"
         )
     emb_received = exchange(emb_ledger, emb_local, emb_specs)
     if view.lane_id is not None:
@@ -213,8 +203,7 @@ def test_empty_member_performs_noop_exchange():
     # An artificial plan with no routes: every member still calls exchange
     # exactly once and gets an empty mapping back.
     empty_planner = MdpPlanner(
-        view, locality_slack_permille=0, capacity_policy=RowCapacityPolicy(),
-        shape_key_width=3,
+        view, locality_slack_permille=0, capacity_policy=RowCapacityPolicy(), shape_key_width=3
     )
     empty_plan = empty_planner.build_plan(1, [], [0])
     ledger = bridge.build_ledger(BridgePhase.PIXEL, empty_plan, rank_map, {})

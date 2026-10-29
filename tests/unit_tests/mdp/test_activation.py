@@ -76,10 +76,7 @@ def test_multi_tensor_backward_matches_unchunked_backward():
     weight = weight_ref.detach().clone().requires_grad_(True)
     outputs = _run_encoder(weight, [c.total_output_rows for c in chunks])
     handle = EncoderForwardHandle(
-        iteration=0,
-        producer_worker_id=0,
-        chunk_outputs=tuple(outputs),
-        chunk_layouts=chunks,
+        iteration=0, producer_worker_id=0, chunk_outputs=tuple(outputs), chunk_layouts=chunks
     )
     detached = handle.detached_outputs()
     assert all(t.grad_fn is None and not t.requires_grad for t in detached)
@@ -96,10 +93,7 @@ def test_handle_validates_shapes_and_lifecycle():
     weight = torch.randn(4, 4, requires_grad=True)
     (output,) = _run_encoder(weight, [layout.total_output_rows])
     handle = EncoderForwardHandle(
-        iteration=0,
-        producer_worker_id=0,
-        chunk_outputs=(output,),
-        chunk_layouts=(layout,),
+        iteration=0, producer_worker_id=0, chunk_outputs=(output,), chunk_layouts=(layout,)
     )
     with pytest.raises(MdpStateError, match="release only after backward"):
         handle.release()
@@ -129,10 +123,7 @@ def test_forward_only_release_needs_no_backward():
         weight = torch.randn(4, 4)
         (output,) = _run_encoder(weight, [layout.total_output_rows])
     handle = EncoderForwardHandle(
-        iteration=0,
-        producer_worker_id=0,
-        chunk_outputs=(output,),
-        chunk_layouts=(layout,),
+        iteration=0, producer_worker_id=0, chunk_outputs=(output,), chunk_layouts=(layout,)
     )
     handle.release_forward_only()
     assert handle.consumed
@@ -153,14 +144,12 @@ def test_whole_recompute_handle_replays_and_releases(monkeypatch):
         return module(pixels[: chunk_layout.total_output_rows])
 
     reference_outputs = tuple(
-        encode(reference, payload, chunk)
-        for payload, chunk in zip(payloads, chunks)
+        encode(reference, payload, chunk) for payload, chunk in zip(payloads, chunks)
     )
     torch.autograd.backward(reference_outputs, grads)
     with torch.no_grad():
         p2_outputs = tuple(
-            encode(replay, payload, chunk)
-            for payload, chunk in zip(payloads, chunks)
+            encode(replay, payload, chunk) for payload, chunk in zip(payloads, chunks)
         )
 
     @contextmanager
@@ -177,9 +166,7 @@ def test_whole_recompute_handle_replays_and_releases(monkeypatch):
         producer_worker_id=0,
         chunk_payloads=payloads,
         chunk_layouts=chunks,
-        output_metadata=tuple(
-            EncoderOutputMetadata.from_tensor(output) for output in p2_outputs
-        ),
+        output_metadata=tuple(EncoderOutputMetadata.from_tensor(output) for output in p2_outputs),
         chunk_rng_states=((), ()),
     )
     assert handle.output_dtype(0) == p2_outputs[0].dtype

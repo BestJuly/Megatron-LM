@@ -690,11 +690,7 @@ class TestA2AOverlap:
                 total_tokens=seq_len,
             )
             _, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, _, _padding_mask = (
-                gpt_model._preprocess(
-                    input_ids,
-                    position_ids,
-                    packed_seq_params=packed_seq_params,
-                )
+                gpt_model._preprocess(input_ids, position_ids, packed_seq_params=packed_seq_params)
             )
 
             capture_ref = run_mtp_layer_ref_with_capture(

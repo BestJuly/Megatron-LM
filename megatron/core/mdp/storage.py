@@ -25,8 +25,7 @@ class MdpEmbeddingStorage:
         """Store one detached leaf; duplicate insertion for the same id fails."""
         if mb_id in self._leaves:
             raise MdpStateError(
-                f"MDP: microbatch_id={mb_id} violates: one leaf per microbatch per "
-                "iteration."
+                f"MDP: microbatch_id={mb_id} violates: one leaf per microbatch per " "iteration."
             )
         if not leaf.is_leaf or not leaf.requires_grad or leaf.grad_fn is not None:
             raise MdpStateError(

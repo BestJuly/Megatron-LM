@@ -145,9 +145,7 @@ class MdpModelAdapter(Protocol):
         """Build the vision encoder through the same factory as the non-MDP path."""
         ...
 
-    def encode(
-        self, encoder: "Module", payload: "Tensor", layout: "EncoderThdLayout"
-    ) -> "Tensor":
+    def encode(self, encoder: "Module", payload: "Tensor", layout: "EncoderThdLayout") -> "Tensor":
         """Run encoder forward on one already-rebased chunk sub-layout.
 
         The adapter reads the ordered ``shape_key`` from ``layout.segments`` and

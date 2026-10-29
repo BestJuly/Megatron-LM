@@ -11,7 +11,6 @@ from examples.multimodal_dev.arguments import (
     validate_encoder_recompute_args,
 )
 
-
 _DEFAULTS = {
     "encoder_recompute_granularity": None,
     "encoder_recompute_method": None,
@@ -29,46 +28,25 @@ def _args(*, mdp_enable, **overrides):
 @pytest.mark.parametrize(
     "granularity, options",
     [
-        (
-            "selective",
-            {"encoder_recompute_modules": ["core_attn", "mlp"]},
-        ),
-        (
-            "full",
-            {
-                "encoder_recompute_method": "uniform",
-                "encoder_recompute_num_layers": 1,
-            },
-        ),
+        ("selective", {"encoder_recompute_modules": ["core_attn", "mlp"]}),
+        ("full", {"encoder_recompute_method": "uniform", "encoder_recompute_num_layers": 1}),
     ],
 )
 def test_native_transformer_recompute_is_accepted_without_mdp(granularity, options):
     validate_encoder_recompute_args(
-        _args(
-            mdp_enable=False,
-            encoder_recompute_granularity=granularity,
-            **options,
-        )
+        _args(mdp_enable=False, encoder_recompute_granularity=granularity, **options)
     )
 
 
 def test_whole_encoder_recompute_requires_mdp():
     with pytest.raises(RuntimeError, match="whole requires --mdp-enable"):
         validate_encoder_recompute_args(
-            _args(
-                mdp_enable=False,
-                encoder_recompute_granularity="whole",
-            )
+            _args(mdp_enable=False, encoder_recompute_granularity="whole")
         )
 
 
 def test_whole_encoder_recompute_is_accepted_with_mdp():
-    validate_encoder_recompute_args(
-        _args(
-            mdp_enable=True,
-            encoder_recompute_granularity="whole",
-        )
-    )
+    validate_encoder_recompute_args(_args(mdp_enable=True, encoder_recompute_granularity="whole"))
 
 
 @pytest.mark.parametrize(
@@ -86,11 +64,7 @@ def test_whole_encoder_recompute_is_accepted_with_mdp():
 def test_encoder_recompute_rejects_options_for_other_modes(granularity, option, value):
     with pytest.raises(RuntimeError, match="cannot be used with"):
         validate_encoder_recompute_args(
-            _args(
-                mdp_enable=True,
-                encoder_recompute_granularity=granularity,
-                **{option: value},
-            )
+            _args(mdp_enable=True, encoder_recompute_granularity=granularity, **{option: value})
         )
 
 
@@ -115,10 +89,7 @@ def test_native_encoder_recompute_overrides_are_typed():
 def test_non_native_recompute_modes_do_not_override_transformer_config(granularity):
     assert (
         encoder_recompute_overrides_from_args(
-            _args(
-                mdp_enable=granularity == "whole",
-                encoder_recompute_granularity=granularity,
-            )
+            _args(mdp_enable=granularity == "whole", encoder_recompute_granularity=granularity)
         )
         == {}
     )

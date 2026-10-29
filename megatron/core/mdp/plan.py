@@ -201,9 +201,7 @@ def compute_plan_digest(
     entry_width = DIGEST_FIXED_SLOTS + shape_key_width
     hasher = hashlib.blake2b(digest_size=16)
     hasher.update(
-        struct.pack(
-            "<3q", schema_version, capacity_policy.alignment_rows, shape_key_width
-        )
+        struct.pack("<3q", schema_version, capacity_policy.alignment_rows, shape_key_width)
     )
     packer = struct.Struct(f"<{entry_width}q")
     for entry in entries:

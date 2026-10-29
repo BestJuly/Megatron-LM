@@ -471,7 +471,6 @@ class TestAccumulator:
         reset_seqlen_stats_in_iteration()
         assert consume_seqlen_stats_in_iteration() == (None, None)
 
-
     def test_no_updates_returns_none(self):
         """BSHD path: never calling update must NOT issue a collective. The
         flag stays ``False`` and consume returns ``(None, None)``."""
@@ -777,8 +776,8 @@ class TestVisionEncoderFlops:
 
         h = args.vision_hidden_size
         p = args.vision_kv_channels * args.vision_num_attention_heads / h
-        patch_in = args.vision_in_channels * args.vision_temporal_patch_size * (
-            args.vision_patch_size**2
+        patch_in = (
+            args.vision_in_channels * args.vision_temporal_patch_size * (args.vision_patch_size**2)
         )
         merge_dim = args.vision_merge_dim
         expected = 3 * (
@@ -819,9 +818,7 @@ class TestVisionEncoderFlops:
         """Merge policies that are not exact (ceil division under padding,
         temporal pooling) must not be reconstructed from a merge factor."""
         args = _add_vision_args(_make_gpt_args())
-        kwargs = dict(
-            vision_patch_rows_in_batch=64, vision_attn_squared_sum_in_batch=0
-        )
+        kwargs = dict(vision_patch_rows_in_batch=64, vision_attn_squared_sum_in_batch=0)
         few = num_floating_point_operations(args, 8, vision_output_rows_in_batch=8, **kwargs)
         many = num_floating_point_operations(args, 8, vision_output_rows_in_batch=16, **kwargs)
         assert many > few
@@ -859,7 +856,6 @@ class TestVisionEncoderFlops:
         update_vision_stats(64, 4096, 16)
         reset_vision_stats_in_iteration()
         assert consume_vision_stats_in_iteration() == (None, None, None)
-
 
 
 def _make_dsa_args(dsa_indexer_loss_coeff=0.01, dsa_indexer_use_sparse_loss=False):
