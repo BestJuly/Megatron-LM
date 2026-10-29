@@ -109,6 +109,8 @@ def build_model(
         hybrid_stack_spec=hybrid_stack_spec,
         hybrid_layer_pattern=hybrid_layer_pattern,
         vision_config=vision_config,
+        # Under MDP the replicated encoder domain owns the vision weights.
+        build_vision_encoder=not getattr(args, "mdp_enable", False),
         vocab_size=args.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
         image_token_id=getattr(args, "image_token_id", 248056),
