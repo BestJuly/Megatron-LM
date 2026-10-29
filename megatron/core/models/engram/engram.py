@@ -163,10 +163,17 @@ def _row_cu_seqlens(packed_seq_params: PackedSeqParams | None) -> Tensor | None:
 
     ``get_batch`` keeps ``cu_seqlens`` as ``(1, N)`` for consistency and squeezes it to 1-D
     before building PackedSeqParams, so accept either and hand back a 1-D tensor.
+
+    The boundaries must say where each document's tokens sit in the row. When documents are
+    padded individually that is ``cu_seqlens_q_padded``: pretrain_hybrid also copies it into
+    ``cu_seqlens_q``, but multimodal_dev keeps the real lengths there, which would let every
+    later document's windows reach back into the previous document's padding.
     """
     if packed_seq_params is None:
         return None
-    cu_seqlens = getattr(packed_seq_params, "cu_seqlens_q", None)
+    cu_seqlens = getattr(packed_seq_params, "cu_seqlens_q_padded", None)
+    if cu_seqlens is None:
+        cu_seqlens = getattr(packed_seq_params, "cu_seqlens_q", None)
     if cu_seqlens is None:
         return None
     return cu_seqlens.reshape(-1)

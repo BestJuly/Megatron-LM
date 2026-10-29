@@ -3752,6 +3752,27 @@ def _mxfp8_param_buffer_staging_optimizers(optimizer):
     ]
 
 
+def _maybe_prefetch_engram_tokens(args, data_iterator, num_microbatches, micro_batch_size):
+    """Wrap ``data_iterator`` in the Engram pipeline token prefetch when the entry needs it.
+
+    pretrain_gpt / pretrain_hybrid read a batch only on the first and last pipeline stages,
+    so Engram layers on the other stages get their token IDs from this pre-schedule
+    broadcast. Entry points that collate a full batch on every stage (examples/multimodal_dev,
+    whose batches are lists of samples or packed THD rows and whose MDP schedule captures and
+    replays the iterator) already have the IDs and opt out with --no-engram-token-prefetch.
+    """
+    if not (args.engram_enabled and getattr(args, "engram_token_prefetch", True)):
+        return data_iterator
+    return prepare_tokens_for_pipeline(
+        data_iterator,
+        num_microbatches,
+        micro_batch_size,
+        args.seq_length,
+        mpu.get_pipeline_model_parallel_group(),
+        mpu.get_tensor_model_parallel_group(),
+    )
+
+
 def _capture_engram_table_training_state(model):
     """Capture scalar evidence before an Engram optimizer step.
 
@@ -4116,14 +4137,9 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # a separate name: the rerun state machine sanitizes `data_iterator` downstream and
         # requires it to still be a RerunDataIterator. (Engram rejects the sequence-packing
         # scheduler, so forward_backward_data_iterator is data_iterator here.)
-        if args.engram_enabled:
-            forward_backward_data_iterator = prepare_tokens_for_pipeline(
-                data_iterator,
-                scheduled_num_microbatches,
-                args.micro_batch_size,
-                args.seq_length,
-                mpu.get_pipeline_model_parallel_group(),
-                mpu.get_tensor_model_parallel_group(),
+        if args.engram_enabled and getattr(args, "engram_token_prefetch", True):
+            forward_backward_data_iterator = _maybe_prefetch_engram_tokens(
+                args, data_iterator, scheduled_num_microbatches, args.micro_batch_size
             )
 
         # Forward pass.
@@ -6550,15 +6566,9 @@ def evaluate(
                 packed_data_iterator = data_iterator
                 scheduled_eval_num_microbatches = eval_num_microbatches
 
-            if args.engram_enabled:
-                packed_data_iterator = prepare_tokens_for_pipeline(
-                    packed_data_iterator,
-                    scheduled_eval_num_microbatches,
-                    eval_micro_batch_size,
-                    args.seq_length,
-                    mpu.get_pipeline_model_parallel_group(),
-                    mpu.get_tensor_model_parallel_group(),
-                )
+            packed_data_iterator = _maybe_prefetch_engram_tokens(
+                args, packed_data_iterator, scheduled_eval_num_microbatches, eval_micro_batch_size
+            )
 
             ft_integration.on_eval_step_start()
 

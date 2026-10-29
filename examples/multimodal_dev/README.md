@@ -82,6 +82,20 @@ a multiple of 4 leaves trailing GatedDeltaNet blocks (and a `/G-` or `/GE` MTP
 depth), which is what `--linear-attention-freq 4` produced on the GPT path, so
 shallow proxy runs keep working.
 
+### Token-indexed decoder features (Engram / PLE)
+
+The decoder is called with `input_ids` on every pipeline stage, because every
+stage collates its own batch. So Engram layers read token IDs directly, and the
+decoder-only pre-schedule token broadcast is switched off for this entry
+(`--no-engram-token-prefetch` is the parser default here). That broadcast expects
+`batch["tokens"]` and would consume the MDP capture/replay iterator. Engram
+hashes follow HF `qwen4_exp`: image/video placeholder IDs are hashed as-is, and
+collate padding (`padding_mask`) is rewritten to the Engram boundary token
+(EOS for the qwen variant) before the decoder sees `input_ids`. Packed documents
+reset their n-gram windows at `cu_seqlens_q_padded`, where the rows actually
+sit. Engram with `--use-packed-sequence` and `--context-parallel-size > 1` is
+rejected at startup.
+
 ### Existing checkpoints
 
 The decoder checkpoint layout changes when moving from GPTModel to
