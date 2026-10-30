@@ -17,6 +17,7 @@ multimodal_dev/
 │   ├── __init__.py          # MODEL_REGISTRY — central model registry
 │   ├── base.py              # MultimodalModel (vision encoder + built decoder), default decoder hook
 │   ├── vision_base.py       # VisionCollateSpec, BaseGridVisionAdapter (shared MDP plumbing)
+│   ├── kimi_k3_vl/          # Kimi-K3 VL: MoonViT 3D + Kimi-K3 hybrid decoder (see below)
 │   └── qwen35_vl/           # Qwen3.5-VL architecture
 │       ├── factory.py       # Factory functions for pretrain entry point
 │       ├── mdp_adapter.py   # Qwen3.5-VL MDP adapter + collate spec
@@ -156,6 +157,47 @@ Requires
 correctly but the script exits non-zero after save with
 `AttributeError: 'TokenizerConfig' object has no attribute 'make_vocab_size_divisible_by'`
 against this branch's `megatron.core.tokenizers.utils.build_tokenizer`.
+
+## Kimi-K3 VL (`--model-arch kimi_k3_vl`)
+
+MoonViT 3D vision tower and `patchmergerv2` projector in MCore modules, combined
+with the Kimi-K3 hybrid decoder (KDA, NoPE MLA, latent MoE, attention residuals,
+SiTU-GLU, MTP) built by `HybridModelBuilder` from the recipe. Reference: HF
+`moonshotai/Kimi-K3` remote code at revision `f831ab6`.
+
+| Piece | Where | Notes |
+|---|---|---|
+| Vision config | `kimi_k3_vl/configuration.py` | 27 layers (`--model-variant full`) or 4 (`proxy`); 1024 hidden, 12 x 128 QKV, 4096 tanh-GELU MLP, no biases |
+| Tower | `kimi_k3_vl/vision_encoder.py` | patch embed as a GEMM on 588-wide rows; 64 x 64 bilinear position table + sin-cos time rows (t <= 4); interleaved 2-D RoPE; one attention sequence per item (all frames); final RMSNorm; mean over frames then 2 x 2 merge |
+| Layer spec | `kimi_k3_vl/specs.py` | TE ViT layer + fp32-RoPE vision attention; `get_kimi_k3_vl_vision_reference_spec()` is a TF32-free numerics reference |
+| Data | `kimi_k3_vl/data.py`, `preprocessing.py` | `mock`, `mdp_mock` (video items t in {1, 2, 4}), `cord_v2` (Kimi tokenizer + native port of the HF processor) |
+| HF mapping | `kimi_k3_vl/hf_mapping.py` | full HF <-> MCore state-dict mapping (also mirrored by the agentic-mcore-dev `ckpt_tools` converter) |
+
+Model-specific facts worth knowing:
+
+* `<|media_pad|>` (163605) is expanded in the data: an item of grid `(t, h, w)`
+  fills `(h/2)*(w/2)` decoder slots regardless of `t`.
+* The decoder has no positional embedding, so the factory requires
+  `--position-embedding-type none` and no position ids are built.
+* MoonViT norms use `torch.finfo(dtype).eps` (no explicit eps in HF); the
+  factory sets `layernorm_epsilon` from the vision dtype (7.8e-3 for bf16).
+* Transformer Engine runs pure-fp32 GEMMs as TF32, so fp32 HF parity of the TE
+  spec is ~4e-4 relative; the reference spec reaches ~1e-6
+  (`tests/test_kimi_k3_vl_vision_parity.py`).
+* On H100 the Blackwell-only Kimi-K3 features (MoK, MXFP8, FA4, MLA latent CP)
+  must stay off; MDP additionally requires `TP=1`.
+
+```bash
+torchrun --nproc_per_node 8 examples/multimodal_dev/pretrain_multimodal.py \
+    --model-arch kimi_k3_vl --model-variant proxy \
+    --dataset-provider mdp_mock --use-packed-sequence --use-vanilla-collate-fn \
+    --mdp-enable ...   # decoder args: see scripts/run_kimi_k3_vl.sh
+```
+
+Tests: `tests/test_kimi_k3_vl_vision_parity.py`, `test_kimi_k3_vl_crosscheck.py`
+(full model through the mapping, plus a bitwise HF -> MCore -> HF round trip),
+`test_kimi_k3_vl_preprocessing.py`, `test_kimi_k3_vl_data.py`. The HF-reference
+tests need transformers 4.56 - 5.0 (see `tests/_kimi_hf.py`).
 
 ## Architecture
 

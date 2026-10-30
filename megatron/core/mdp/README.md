@@ -76,6 +76,7 @@ builder-side stack features apply.
 | `--model-arch` | Vision encoder | Decoder build path | Status |
 |---|---|---|---|
 | `qwen35_vl` | Qwen3.5 ViT (grid shape key `(t, h, w)`, merge 2) | default hook (`HybridModelBuilder`), RoPE fraction/base pinned | supported |
+| `kimi_k3_vl` | MoonViT 3D (grid shape key `(t, h, w)`, frames pooled then merge 2; whole-item attention) | default hook (`HybridModelBuilder`), nothing pinned (NoPE decoder) | supported |
 
 Supported: one vision encoder per model, `TP=1`, decoder `CP=1`,
 `encoder_cp=1`, native PP/VPP/EP, fully replicated encoder with WORLD ZeRO-1,

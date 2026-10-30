@@ -162,6 +162,7 @@ Supported models (keep in sync with the README support matrix):
 | `--model-arch` | Encoder package | Decoder hook | Shape key | Notes |
 |---|---|---|---|---|
 | `qwen35_vl` | `models/qwen35_vl` (ViT, merge 2) | default `build_language_model`; factory pins `rotary_percent`/`rotary_base` | `(t, h, w)`, width 3 | reference model |
+| `kimi_k3_vl` | `models/kimi_k3_vl` (MoonViT, frame pool + merge 2) | default `build_language_model`; nothing pinned | `(t, h, w)`, width 3 | `output_rows = (h/2)(w/2)` independent of `t`; attention `L^2` is `(t*h*w)^2` per item |
 
 Adding a model is a package under `models/<arch>/` plus a registry entry; it
 must not need edits to `pretrain_multimodal.py`, `forward_step.py` or MDP core.
