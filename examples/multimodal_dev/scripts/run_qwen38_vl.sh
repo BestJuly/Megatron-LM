@@ -23,6 +23,8 @@
 #   QSA_LOSS_COEFF     indexer KL coefficient (default 0.01)
 #   VERIFY_ENGRAM=0|1  --engram-verify-training (non-MDP only: it is incompatible with the
 #                      distributed optimizer, which MDP requires)
+#   FORCE_BALANCE=1|0  --moe-router-force-load-balancing (default 1: random routing, the
+#                      benchmark setting); 0 = the learned router
 #   DETERMINISTIC=0|1  --deterministic-mode, with the two fusions it rejects turned off (the
 #                      fused cross entropy and the fused MoE aux loss); for bitwise A/B runs
 #   ENTRY=<path>       entry script (default pretrain_multimodal.py)
@@ -58,6 +60,7 @@ MTP_NUM_LAYERS=${MTP_NUM_LAYERS:-1}
 QSA_LOSS_COEFF=${QSA_LOSS_COEFF:-0.01}
 VERIFY_ENGRAM=${VERIFY_ENGRAM:-0}
 DETERMINISTIC=${DETERMINISTIC:-0}
+FORCE_BALANCE=${FORCE_BALANCE:-1}
 MASTER_PORT=${MASTER_PORT:-29500}
 ENTRY=${ENTRY:-$REPO_ROOT/examples/multimodal_dev/pretrain_multimodal.py}
 EXTRA=${EXTRA:-}
@@ -120,6 +123,11 @@ if [ "$ENGRAM_BASE" -gt 0 ]; then
                   --engram-hash-seed 1234 --engram-eos-token-id 248044 )
 fi
 
+ROUTER_ARGS=()
+if [ "$FORCE_BALANCE" = "1" ]; then
+    ROUTER_ARGS=( --moe-router-force-load-balancing )
+fi
+
 CE_ARGS=( --cross-entropy-loss-fusion --cross-entropy-fusion-impl native )
 if [ "$DETERMINISTIC" = "1" ]; then
     CE_ARGS=( --deterministic-mode --no-moe-router-aux-loss-fusion )
@@ -157,7 +165,7 @@ torchrun --nnodes 1 --nproc_per_node "$NPROC" --master_addr 127.0.0.1 --master_p
     --moe-shared-expert-gate --moe-router-topk "$MOE_TOPK" --moe-router-score-function softmax \
     --moe-router-load-balancing-type aux_loss --moe-aux-loss-coeff 1e-3 --moe-router-dtype fp32 \
     --moe-token-dispatcher-type alltoall --moe-grouped-gemm --moe-permute-fusion \
-    --moe-router-force-load-balancing \
+    "${ROUTER_ARGS[@]}" \
     "${ENGRAM_ARGS[@]}" \
     "${MTP_ARGS[@]}" \
     --normalization RMSNorm --apply-layernorm-1p --norm-epsilon 1e-6 --swiglu \
