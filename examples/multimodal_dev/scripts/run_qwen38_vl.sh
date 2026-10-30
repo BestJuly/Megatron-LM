@@ -23,6 +23,8 @@
 #   QSA_LOSS_COEFF     indexer KL coefficient (default 0.01)
 #   VERIFY_ENGRAM=0|1  --engram-verify-training (non-MDP only: it is incompatible with the
 #                      distributed optimizer, which MDP requires)
+#   DETERMINISTIC=0|1  --deterministic-mode, with the two fusions it rejects turned off (the
+#                      fused cross entropy and the fused MoE aux loss); for bitwise A/B runs
 #   ENTRY=<path>       entry script (default pretrain_multimodal.py)
 #   EXTRA="..."        extra args appended verbatim
 #
@@ -55,6 +57,7 @@ VARIANT=${VARIANT:-proxy}
 MTP_NUM_LAYERS=${MTP_NUM_LAYERS:-1}
 QSA_LOSS_COEFF=${QSA_LOSS_COEFF:-0.01}
 VERIFY_ENGRAM=${VERIFY_ENGRAM:-0}
+DETERMINISTIC=${DETERMINISTIC:-0}
 MASTER_PORT=${MASTER_PORT:-29500}
 ENTRY=${ENTRY:-$REPO_ROOT/examples/multimodal_dev/pretrain_multimodal.py}
 EXTRA=${EXTRA:-}
@@ -117,6 +120,11 @@ if [ "$ENGRAM_BASE" -gt 0 ]; then
                   --engram-hash-seed 1234 --engram-eos-token-id 248044 )
 fi
 
+CE_ARGS=( --cross-entropy-loss-fusion --cross-entropy-fusion-impl native )
+if [ "$DETERMINISTIC" = "1" ]; then
+    CE_ARGS=( --deterministic-mode --no-moe-router-aux-loss-fusion )
+fi
+
 OPT_ARGS=( --use-distributed-optimizer )
 if [ "$VERIFY_ENGRAM" = "1" ]; then
     OPT_ARGS=( --engram-verify-training )
@@ -163,7 +171,7 @@ torchrun --nnodes 1 --nproc_per_node "$NPROC" --master_addr 127.0.0.1 --master_p
     --micro-batch-size "$MBS" --global-batch-size "$GBS" \
     --bf16 --transformer-impl transformer_engine --use-mcore-models --enable-experimental \
     --use-flash-attn --calculate-per-token-loss \
-    --cross-entropy-loss-fusion --cross-entropy-fusion-impl native \
+    "${CE_ARGS[@]}" \
     --train-iters "$ITERS" --lr 1e-4 --min-lr 1e-5 --lr-decay-style constant --lr-warmup-iters 0 \
     --weight-decay 0.1 --clip-grad 1.0 --adam-beta1 0.9 --adam-beta2 0.95 \
     --init-method-std 0.02 --seed "$SEED" \
