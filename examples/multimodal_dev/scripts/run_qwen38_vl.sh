@@ -16,6 +16,9 @@
 #   MBS GBS SEQ_LEN ITERS SEED NPROC
 #   VARIANT=proxy|full vision depth default (4 / 27) and decoder depth (8 / 48 Qwen layers)
 #   NUM_QWEN_LAYERS    decoder depth in Qwen layers, cadence GGGQ (default per variant)
+#   HYBRID_PATTERN     full --hybrid-layer-pattern override, MTP depth included (e.g. GDN
+#                      swapped for attention, "*E*E*EQE*E*E*EQE/QE", for --deterministic-mode,
+#                      which GDN rejects on packed THD)
 #   NUM_EXPERTS MOE_TOPK  (defaults 32 / 10 for proxy, 512 / 10 for full)
 #   VISION_NUM_LAYERS  ViT depth override
 #   MTP_NUM_LAYERS     0 or 1 (default 1)
@@ -98,6 +101,7 @@ if [ "$MTP_NUM_LAYERS" -gt 0 ]; then
     PATTERN+="/QE"
     MTP_ARGS=( --mtp-num-layers "$MTP_NUM_LAYERS" --mtp-loss-scaling-factor 0.1 )
 fi
+PATTERN=${HYBRID_PATTERN:-$PATTERN}
 
 DATA_ARGS=()
 if [ "$PACKED" = "1" ]; then

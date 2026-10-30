@@ -54,6 +54,14 @@ if _REPO_ROOT not in sys.path:
 
 from megatron.core import config  # noqa: E402
 
+# Ring context parallelism (CP=4 in test_cp_correctness / test_cp_thd_correctness) gives every
+# rank NCCL P2P communicators to two neighbours. With blocking communicators,
+# destroy_process_group finalizes each rank's communicators in that rank's own order and each
+# finalize waits for its peer -- a cycle around the ring, so torchrun -np 4 hung at exit after
+# every test had passed. Non-blocking communicators finalize without waiting on the peer. It has
+# to be set before the first process group exists, i.e. here.
+os.environ.setdefault("TORCH_NCCL_USE_COMM_NONBLOCKING", "1")
+
 
 def pytest_addoption(parser):
     """Mirror the ``--experimental`` option from tests/unit_tests/conftest.py."""
