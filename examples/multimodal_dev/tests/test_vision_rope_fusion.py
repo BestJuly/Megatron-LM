@@ -47,7 +47,13 @@ def test_model_provider_propagates_rope_fusion_to_vision(monkeypatch):
     args = SimpleNamespace(
         model_arch="qwen35_vl", model_variant="0.8b", vision_num_layers=None
     )
-    language_config = SimpleNamespace(apply_rope_fusion=True, bf16=True, fp16=False)
+    language_config = SimpleNamespace(
+        apply_rope_fusion=True,
+        bf16=True,
+        fp16=False,
+        attention_backend="auto",
+        flash_attention_version=None,
+    )
     vision_config = SimpleNamespace(apply_rope_fusion=False, bf16=False, fp16=False)
     captured = {}
 
@@ -68,6 +74,9 @@ def test_model_provider_propagates_rope_fusion_to_vision(monkeypatch):
     assert captured["language_config"] is language_config
     assert captured["vision_config"] is vision_config
     assert vision_config.apply_rope_fusion is True
+    # Transformer Engine's attention backend is process-wide: the encoder follows the decoder.
+    assert vision_config.attention_backend == language_config.attention_backend
+    assert vision_config.flash_attention_version == language_config.flash_attention_version
 
 
 def test_model_provider_applies_native_encoder_recompute(monkeypatch):
@@ -88,6 +97,8 @@ def test_model_provider_applies_native_encoder_recompute(monkeypatch):
         apply_rope_fusion=False,
         bf16=True,
         fp16=False,
+        attention_backend="auto",
+        flash_attention_version=None,
     )
     captured = {}
 

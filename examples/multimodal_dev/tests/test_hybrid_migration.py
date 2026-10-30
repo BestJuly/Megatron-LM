@@ -253,7 +253,13 @@ def test_model_provider_binds_registry_language_model_builder(monkeypatch):
     from examples.multimodal_dev.models import MODEL_REGISTRY
 
     args = SimpleNamespace(model_arch="qwen35_vl", model_variant=None, vision_num_layers=None)
-    language_config = SimpleNamespace(apply_rope_fusion=False, bf16=True, fp16=False)
+    language_config = SimpleNamespace(
+        apply_rope_fusion=False,
+        bf16=True,
+        fp16=False,
+        attention_backend="auto",
+        flash_attention_version=None,
+    )
     hook_calls = []
 
     def hook(hook_args, hook_language_config, **kwargs):
