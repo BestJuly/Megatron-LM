@@ -53,6 +53,7 @@ def test_model_provider_propagates_rope_fusion_to_vision(monkeypatch):
         fp16=False,
         attention_backend="auto",
         flash_attention_version=None,
+        gradient_accumulation_fusion=False,
     )
     vision_config = SimpleNamespace(apply_rope_fusion=False, bf16=False, fp16=False)
     captured = {}
@@ -99,6 +100,7 @@ def test_model_provider_applies_native_encoder_recompute(monkeypatch):
         fp16=False,
         attention_backend="auto",
         flash_attention_version=None,
+        gradient_accumulation_fusion=False,
     )
     captured = {}
 
