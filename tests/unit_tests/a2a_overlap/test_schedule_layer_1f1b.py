@@ -645,10 +645,13 @@ class TestA2AOverlap:
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
     def test_mtp_layer_overlap_packed_sequence(self):
         """Verify MTP overlap parity for a THD pack containing two sequences."""
+        qk_layernorm = True
         extra_kwargs = {
             "mtp_num_layers": 1,
             "mtp_loss_scaling_factor": 1.1,
             "moe_token_dispatcher_type": "alltoall",
+            # The config must agree with the spec's fused norm-linear q/kv up-projections.
+            "qk_layernorm": qk_layernorm,
         }
         config = get_test_config(extra_kwargs=extra_kwargs)
         seq_len = 32
@@ -656,7 +659,7 @@ class TestA2AOverlap:
             transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
                 num_experts=16,
                 moe_grouped_gemm=True,
-                qk_layernorm=True,
+                qk_layernorm=qk_layernorm,
                 multi_latent_attention=True,
             )
             mtp_block_spec = get_gpt_mtp_block_spec(config, transformer_layer_spec, True)
