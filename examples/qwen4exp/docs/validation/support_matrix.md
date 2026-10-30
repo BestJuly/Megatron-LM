@@ -87,6 +87,8 @@ Single node, 4 × GB300, EP4, mock vision data, static THD packing
 | **TE per-layer CUDA graphs under MDP** | ✅ | `--cuda-graph-impl transformer_engine --cuda-graph-modules attn moe_router --cuda-graph-warmup-steps 2` | decoder layers only; mRoPE rotary tables and the THD padding mask are graph inputs. Requires `--thd-static-packing`. Losses match the eager MDP arm |
 | **Padding mask in graphs under SP** | ⛔ | `--sequence-parallel` with `attn` capture | the graphed layer drops `PackedSeqParams.padding_mask` under SP (the layer's mask is SP-scattered); QSA's indexer loss then also counts padding rows |
 | **`full_iteration` / `overlap_window_capture` graphs under MDP** | ⛔ | `--cuda-graph-impl full_iteration` | rejected by the MDP gate. Design note: the MDP wrapper would have to sit outside the captured native schedule |
+| **Checkpoints, native ↔ MDP (weights)** | ✅ | `--load <other mode's checkpoint> --no-load-optim` | the encoder is checkpointed under the native keys `vision_model.<param>`; equal weights give a bitwise-equal next-iteration loss in both directions. MDP checkpoints with the older `vision_model.module.*` keys still resume |
+| **`--overlap-param-gather`, eager** | ✅ | default of the recipes | the gated-residual, GDN-conv, Engram and MoE-megakernel kernels publish the overlapped all-gather of the child weights they read (`ensure_params_ready`); before that, eager runs read stale weights from the second iteration on |
 | **HF parity (VL)** | ✅ | `d1_vl_parity.py` (fp32 dense bridge, bf16 sparse) | BSHD logits and grads vs the HF `qwen4_exp` reference; THD single- and two-document packing vs BSHD |
 
 ## TODO — what this matrix says is missing

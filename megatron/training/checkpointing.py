@@ -1705,7 +1705,13 @@ def generate_state_dict(
 
         mdp_runtime = mdp_integration.get_runtime()
         if mdp_runtime is not None:
-            add_encoder_state(state_dict, mdp_runtime.encoder_domain.encoder_ddp)
+            # A load skeleton follows the checkpoint's encoder key layout (see load_checkpoint).
+            legacy_keys = bool(
+                ((model_sd_kwargs or {}).get('metadata') or {}).get('mdp_legacy_encoder_keys')
+            )
+            add_encoder_state(
+                state_dict, mdp_runtime.encoder_domain.encoder_ddp, legacy_ddp_keys=legacy_keys
+            )
 
     # Optimizer stuff.
     if not args.no_save_optim:
@@ -2932,6 +2938,14 @@ def load_checkpoint(
             )
         if loading_pretrained_checkpoint and getattr(args, 'allow_llm_only_checkpoint', False):
             sharded_sd_metadata['load_from_llm_only_checkpoint'] = True
+        if getattr(args, "mdp_enable", False):
+            # MDP checkpoints written before the encoder was published under native keys
+            # store it as vision_model.module.*; build the load skeleton to match.
+            from megatron.core.mdp.checkpoint import uses_legacy_encoder_keys
+
+            sharded_sd_metadata['mdp_legacy_encoder_keys'] = uses_legacy_encoder_keys(
+                dist_checkpointing.load_tensors_metadata(checkpoint_name).keys()
+            )
 
         optim_sd_kwargs = dict(metadata=sharded_sd_metadata, is_loading=True)
         model_sd_kwargs = dict(metadata=sharded_sd_metadata)

@@ -20,6 +20,7 @@ from megatron.core.mdp.checkpoint import (
     add_encoder_state,
     assert_supported_checkpoint_config,
     load_encoder_state,
+    uses_legacy_encoder_keys,
 )
 from megatron.core.mdp.errors import MdpCheckpointError
 
@@ -110,15 +111,39 @@ def test_unsupported_checkpoint_execution_modes_rejected():
     assert_supported_checkpoint_config(quiet)
 
 
-def test_add_encoder_state_rejects_duplicates():
-    class _FakeDdp:
-        def sharded_state_dict(self, prefix="", metadata=None):
-            return {"marker": prefix}
+class _FakeShardedModule:
+    def __init__(self, owner):
+        self.owner = owner
 
-    state = add_encoder_state({}, _FakeDdp())
-    assert state[ENCODER_STATE_KEY] == {"marker": "vision_model."}
+    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        return {"owner": self.owner, "prefix": prefix}
+
+
+class _FakeShardedDdp(_FakeShardedModule):
+    def __init__(self):
+        super().__init__("ddp")
+        self.module = _FakeShardedModule("module")
+
+
+def test_add_encoder_state_rejects_duplicates():
+    state = add_encoder_state({}, _FakeShardedDdp())
     with pytest.raises(MdpCheckpointError, match="exactly once"):
-        add_encoder_state(state, _FakeDdp())
+        add_encoder_state(state, _FakeShardedDdp())
+
+
+def test_encoder_is_published_under_native_keys():
+    """The wrapped module, not the DDP, publishes the encoder, so the keys are a native
+    multimodal checkpoint's ``vision_model.<param>``; a legacy skeleton keeps the DDP level."""
+    state = add_encoder_state({}, _FakeShardedDdp())
+    assert state[ENCODER_STATE_KEY] == {"owner": "module", "prefix": "vision_model."}
+    legacy = add_encoder_state({}, _FakeShardedDdp(), legacy_ddp_keys=True)
+    assert legacy[ENCODER_STATE_KEY] == {"owner": "ddp", "prefix": "vision_model."}
+
+
+def test_legacy_encoder_keys_are_detected_from_checkpoint_metadata():
+    assert uses_legacy_encoder_keys(["language_model.x", "vision_model.module.proj.weight"])
+    assert not uses_legacy_encoder_keys(["language_model.x", "vision_model.proj.weight"])
+    assert not uses_legacy_encoder_keys(["language_model.x"])
 
 
 def test_load_encoder_state_strips_both_prefix_levels():
@@ -143,6 +168,9 @@ def test_load_encoder_state_strips_both_prefix_levels():
     )
     assert encoder.loaded == {"proj.weight": "w"}
     assert encoder.strict is False
+    # Native keys (current MDP checkpoints and native multimodal checkpoints).
+    load_encoder_state({ENCODER_STATE_KEY: {"vision_model.proj.weight": "w"}}, encoder)
+    assert encoder.loaded == {"proj.weight": "w"}
 
     with pytest.raises(MdpCheckpointError, match=ENCODER_STATE_KEY):
         load_encoder_state({"model": {}}, _FakeDdp())
@@ -244,7 +272,8 @@ def test_load_encoder_state_tolerates_absent_te_extra_state():
 
 
 @pytest.mark.skipif(not _DISTRIBUTED, reason="needs torchrun world")
-def test_encoder_state_round_trips_strictly(tmp_path_factory):
+@pytest.mark.parametrize("saved_with_legacy_keys", [False, True])
+def test_encoder_state_round_trips_strictly(tmp_path_factory, saved_with_legacy_keys):
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
     from megatron.core.mdp.encoder import build_encoder_pg_collection
     from megatron.core.mdp.groups import MdpGroupRegistry, install_mdp_process_groups
@@ -302,11 +331,16 @@ def test_encoder_state_round_trips_strictly(tmp_path_factory):
     torch.distributed.broadcast_object_list(holder, src=0)
     directory = holder[0]
 
-    state = add_encoder_state({}, source)
+    state = add_encoder_state({}, source, legacy_ddp_keys=saved_with_legacy_keys)
     dist_checkpointing.save(state[ENCODER_STATE_KEY], directory)
     torch.distributed.barrier()
 
-    load_skeleton = add_encoder_state({}, target)
+    # load_checkpoint picks the skeleton from the checkpoint's own tensor keys.
+    saved_keys = dist_checkpointing.load_tensors_metadata(directory).keys()
+    assert any(key.startswith("vision_model.proj") for key in saved_keys) != saved_with_legacy_keys
+    legacy = uses_legacy_encoder_keys(saved_keys)
+    assert legacy == saved_with_legacy_keys
+    load_skeleton = add_encoder_state({}, target, legacy_ddp_keys=legacy)
     loaded = dist_checkpointing.load(load_skeleton[ENCODER_STATE_KEY], directory)
     load_encoder_state({ENCODER_STATE_KEY: loaded}, target, strict=True)
 
