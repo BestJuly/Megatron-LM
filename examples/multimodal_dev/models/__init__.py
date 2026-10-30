@@ -55,6 +55,19 @@ Registry entry fields
     ``(train_val_test_num_samples) -> (train_ds, val_ds, test_ds)``.
 """
 
+from examples.multimodal_dev.models.kimi_k3_vl.configuration import (
+    get_kimi_k3_vl_vision_config,
+)
+from examples.multimodal_dev.models.kimi_k3_vl.factory import build_model as _build_kimi_k3_vl_model
+from examples.multimodal_dev.models.kimi_k3_vl.factory import (
+    set_vision_flops_metadata as _kimi_k3_vl_vision_flops,
+)
+from examples.multimodal_dev.models.kimi_k3_vl.mdp_adapter import (
+    build_collate_spec as _kimi_k3_vl_collate_spec,
+)
+from examples.multimodal_dev.models.kimi_k3_vl.mdp_adapter import (
+    build_mdp_adapter as _kimi_k3_vl_mdp_adapter,
+)
 from examples.multimodal_dev.models.qwen35_vl.configuration import get_qwen35_vl_vision_config
 from examples.multimodal_dev.models.qwen35_vl.factory import build_model as _build_qwen35_vl_model
 from examples.multimodal_dev.models.qwen35_vl.factory import (
@@ -91,6 +104,18 @@ MODEL_REGISTRY = {
                 "examples.multimodal_dev.data.mdp_mock"
                 ".train_valid_test_datasets_provider"
             ),
+        },
+    },
+    "kimi_k3_vl": {
+        "model_factory_fn": _build_kimi_k3_vl_model,
+        "vision_config_fn": get_kimi_k3_vl_vision_config,
+        "vision_flops_fn": _kimi_k3_vl_vision_flops,
+        "vision_collate_spec_fn": _kimi_k3_vl_collate_spec,
+        "mdp_adapter_fn": _kimi_k3_vl_mdp_adapter,
+        "dataset_providers": {
+            "mock": "examples.multimodal_dev.models.kimi_k3_vl.data.mock_provider",
+            "mdp_mock": "examples.multimodal_dev.models.kimi_k3_vl.data.mdp_mock_provider",
+            "cord_v2": "examples.multimodal_dev.models.kimi_k3_vl.data.cord_v2_provider",
         },
     },
 }
