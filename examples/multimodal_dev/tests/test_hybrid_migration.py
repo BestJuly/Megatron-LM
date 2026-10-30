@@ -259,6 +259,7 @@ def test_model_provider_binds_registry_language_model_builder(monkeypatch):
         fp16=False,
         attention_backend="auto",
         flash_attention_version=None,
+        gradient_accumulation_fusion=False,
     )
     hook_calls = []
 

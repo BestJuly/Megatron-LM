@@ -110,6 +110,9 @@ def model_provider(
     # every model in the process agrees), so the encoder follows the decoder's choice.
     vision_config.attention_backend = language_config.attention_backend
     vision_config.flash_attention_version = language_config.flash_attention_version
+    # Accumulate the encoder's weight gradients in the fp32 main_grad like the decoder does;
+    # without it TE computes them in bf16 per microbatch and adds the rounded partials.
+    vision_config.gradient_accumulation_fusion = language_config.gradient_accumulation_fusion
 
     encoder_recompute_overrides = encoder_recompute_overrides_from_args(args)
     if encoder_recompute_overrides:
@@ -219,6 +222,9 @@ def _mdp_adapter_builder(args):
     # every model in the process agrees), so the encoder follows the decoder's choice.
     vision_config.attention_backend = language_config.attention_backend
     vision_config.flash_attention_version = language_config.flash_attention_version
+    # Accumulate the encoder's weight gradients in the fp32 main_grad like the decoder does;
+    # without it TE computes them in bf16 per microbatch and adds the rounded partials.
+    vision_config.gradient_accumulation_fusion = language_config.gradient_accumulation_fusion
     vision_config.params_dtype = language_config.params_dtype
     # The encoder DDP derives its gradient prescale from this flag; MDP
     # requires prescale 1 (WORLD sum, normalized once by 1/T_global).

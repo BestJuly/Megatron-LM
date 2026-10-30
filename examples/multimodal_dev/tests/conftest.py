@@ -84,7 +84,18 @@ def cleanup():
                 torch.distributed.barrier()
         except Exception:
             return
-        torch.distributed.destroy_process_group()
+        # Abort rather than finalize: the CP correctness tests (ring CP) leave every rank with
+        # NCCL P2P communicators to its two neighbours, across several CP group generations,
+        # and destroy_process_group's blocking per-communicator finalize then waits on peers
+        # finalizing in a different order -- torchrun -np 4 hung at exit after every test had
+        # passed. After the barrier and with all GPU work drained there is nothing left to
+        # flush, so aborting the communicators is a complete teardown.
+        abort = getattr(torch.distributed.distributed_c10d, "_abort_process_group", None)
+        if abort is None:
+            torch.distributed.destroy_process_group()
+            return
+        torch.cuda.synchronize()
+        abort()
 
 
 # Tests that must actually execute -- not merely be collected -- whenever the
