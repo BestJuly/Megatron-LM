@@ -24,6 +24,7 @@ from typing import Mapping
 import torch
 
 from megatron.core.mdp.errors import MdpCheckpointError
+from megatron.core.transformer.utils import sharded_state_dict_default
 
 #: The state-dict key the encoder state travels under. It sits next to the
 #: native ``model``/``model<N>`` keys so the sharded save/load skeleton is
@@ -34,9 +35,9 @@ ENCODER_STATE_KEY = "mdp_vision_model"
 #: keys a native (non-MDP) multimodal checkpoint carries.
 ENCODER_STATE_PREFIX = "vision_model."
 
-#: ``DistributedDataParallel`` contributes one ``module.`` level below the
-#: logical prefix, and ``DDP.load_state_dict`` delegates straight to that
-#: child — so both levels come off before the state is handed back.
+#: ``DistributedDataParallel`` contributes one ``module.`` level below its
+#: owner. Checkpoints written before the encoder was published from the
+#: wrapped module carry it (``vision_model.module.<param>``); they still load.
 _DDP_CHILD_PREFIX = "module."
 
 #: TransformerEngine's per-module opaque state. It appears in ``state_dict()``
@@ -47,26 +48,48 @@ _DDP_CHILD_PREFIX = "module."
 _EXTRA_STATE_SUFFIX = "_extra_state"
 
 
-def encoder_sharded_state_dict(encoder_ddp) -> Mapping:
+def encoder_sharded_state_dict(encoder_ddp, *, legacy_ddp_keys: bool = False) -> Mapping:
     """The encoder's sharded model-weight state with WORLD replica metadata.
 
     The encoder is fully replicated: its replica domain is WORLD, not the
     decoder's DP-CP group — reusing the decoder metadata here would make
     every PP stage claim a distinct (wrong) replica coordinate.
+
+    The tensors are published from the wrapped module, so their keys are
+    ``vision_model.<param>`` — the keys of a native (non-MDP) multimodal
+    checkpoint, which makes native and MDP checkpoints interchangeable.
+    ``legacy_ddp_keys`` builds the load skeleton of a checkpoint written with
+    the DDP level in its keys (see :func:`uses_legacy_encoder_keys`).
     """
-    return encoder_ddp.sharded_state_dict(
-        prefix=ENCODER_STATE_PREFIX, metadata={"dp_cp_group": torch.distributed.group.WORLD}
+    metadata = {"dp_cp_group": torch.distributed.group.WORLD}
+    if legacy_ddp_keys:
+        return encoder_ddp.sharded_state_dict(prefix=ENCODER_STATE_PREFIX, metadata=metadata)
+    # What the DDP's own (MegatronModule) recursion does for its ``module`` child, minus the
+    # ``module.`` key level: same tensors, same TP group, same replica metadata.
+    return sharded_state_dict_default(
+        encoder_ddp.module,
+        ENCODER_STATE_PREFIX,
+        metadata=metadata,
+        tp_group=getattr(encoder_ddp, "tp_group", None),
     )
 
 
-def add_encoder_state(state_dict: dict, encoder_ddp) -> dict:
+def uses_legacy_encoder_keys(checkpoint_tensor_keys) -> bool:
+    """Whether a checkpoint stores the encoder under ``vision_model.module.*``."""
+    legacy = ENCODER_STATE_PREFIX + _DDP_CHILD_PREFIX
+    return any(key.startswith(legacy) for key in checkpoint_tensor_keys)
+
+
+def add_encoder_state(state_dict: dict, encoder_ddp, *, legacy_ddp_keys: bool = False) -> dict:
     """Add the encoder weights to a torch_dist checkpoint state dict."""
     if ENCODER_STATE_KEY in state_dict:
         raise MdpCheckpointError(
             f"MDP: state dict already contains {ENCODER_STATE_KEY!r}; the encoder "
             "state must be contributed exactly once."
         )
-    state_dict[ENCODER_STATE_KEY] = encoder_sharded_state_dict(encoder_ddp)
+    state_dict[ENCODER_STATE_KEY] = encoder_sharded_state_dict(
+        encoder_ddp, legacy_ddp_keys=legacy_ddp_keys
+    )
     return state_dict
 
 
@@ -85,15 +108,21 @@ def load_encoder_state(state_dict: Mapping, encoder_ddp, *, strict: bool = True)
             f"MDP: the checkpoint has no {ENCODER_STATE_KEY!r} entry; it was not "
             "written by an MDP run and carries no vision-encoder weights."
         )
-    prefix = ENCODER_STATE_PREFIX + _DDP_CHILD_PREFIX
+    # Current skeletons key the tensors ``vision_model.<param>``; skeletons built
+    # for a legacy checkpoint keep the DDP level, ``vision_model.module.<param>``.
+    legacy = ENCODER_STATE_PREFIX + _DDP_CHILD_PREFIX
     inner = {}
     for key, value in state_dict[ENCODER_STATE_KEY].items():
-        if not key.startswith(prefix):
+        if key.startswith(legacy):
+            inner[key[len(legacy) :]] = value
+        elif key.startswith(ENCODER_STATE_PREFIX):
+            inner[key[len(ENCODER_STATE_PREFIX) :]] = value
+        else:
             raise MdpCheckpointError(
-                f"MDP: encoder state key {key!r} does not start with {prefix!r}; the "
-                "encoder save and load skeletons have drifted apart."
+                f"MDP: encoder state key {key!r} does not start with "
+                f"{ENCODER_STATE_PREFIX!r}; the encoder save and load skeletons have "
+                "drifted apart."
             )
-        inner[key[len(prefix) :]] = value
 
     # ``strict`` arrives from ``load_checkpoint``'s own parameter, and
     # ``load_state_dict(strict=False)`` merely reports missing keys -- and

@@ -54,7 +54,7 @@ schedule model list.
 | `packing.py` | Greedy token-budget bin filling and the cross-iteration sample buffer |
 | `runtime.py` / `schedule.py` | Phase machine; schedule and finalizer wrappers |
 | `encoder.py` / `optimizer.py` | Encoder DDP over WORLD + ZeRO-1; composite optimizer with WORLD overflow union |
-| `checkpoint.py` | torch_dist facade: `vision_model.*` save and load with WORLD replica metadata |
+| `checkpoint.py` | torch_dist facade: `vision_model.*` (native keys) save and load with WORLD replica metadata |
 | `integration.py` / `observability.py` | Training-loop seams; iteration metrics and NVTX markers |
 
 ## Support matrix (v1)
@@ -168,7 +168,8 @@ this shape is ~8.6e-2 in grad norm.
 | Checkpoint missing encoder weights (e.g. a non-strict `--dist-ckpt-strictness` dropped them) | **Rejected, loudly** | `load_encoder_state` raises `MdpCheckpointError` instead of resuming from the random initialization |
 | TransformerEngine `_extra_state` drift between the checkpoint and the running TE | **Tolerated** | The delegated load retries non-strictly, matching what `load_model_state_dict` gives every decoder chunk |
 | Cross-TP / cross-EP / cross-CP restart, and changing the world size | **Untested** | Only the pipeline dimension was moved; no claim either way |
-| native (non-MDP) checkpoint -> MDP, or MDP -> native | **Not supported** | Decoder keys line up, but the encoder is saved through its DDP wrapper and carries an extra `module.` level (`vision_model.module.<param>` vs `vision_model.<param>`) |
+| native (non-MDP) checkpoint -> MDP, or MDP -> native, weights (`--no-load-optim`) | **Supported** | The encoder is published from the module its DDP wraps, under the native keys `vision_model.<param>`. A native checkpoint loaded into MDP reproduces the native run's next-iteration loss on the same weights (Qwen3.8-VL proxy) |
+| MDP checkpoint written with the DDP level in its encoder keys (`vision_model.module.<param>`) | **Supported** | `load_checkpoint` detects the layout from the checkpoint's tensor keys and builds a matching load skeleton |
 | Fully-parallel save/load, asynchronous, non-persistent, constant-structure caching, non-`torch_dist` formats | **Rejected at startup** | `assert_supported_checkpoint_config` and `validate_mdp_config` |
 
 Whole-encoder replay is deliberately exclusive with native vision
