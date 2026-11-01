@@ -22,7 +22,7 @@ Each item's ``t*h*w`` rows form one attention sequence (all frames attend to
 each other), whereas Qwen3.5-VL attends frame by frame.
 """
 
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -34,6 +34,7 @@ from examples.multimodal_dev.observability import backward_range_begin, backward
 from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.models.common.vision_module.vision_module import VisionModule
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -220,7 +221,12 @@ class KimiK3VLProjector(MegatronModule):
     """``PatchMergerMLPV2``: ``Linear -> GELU(erf) -> Linear -> RMSNorm``, no biases."""
 
     def __init__(
-        self, config: TransformerConfig, merge_dim: int, out_hidden_size: int, norm_eps: float
+        self,
+        config: TransformerConfig,
+        merge_dim: int,
+        out_hidden_size: int,
+        norm_eps: float,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super().__init__(config=config)
         self.linear_fc1 = build_module(
@@ -231,6 +237,7 @@ class KimiK3VLProjector(MegatronModule):
             init_method=config.init_method,
             bias=False,
             gather_output=False,
+            tp_group=tp_group,
         )
         self.linear_fc2 = build_module(
             RowParallelLinear,
@@ -241,6 +248,7 @@ class KimiK3VLProjector(MegatronModule):
             bias=False,
             input_is_parallel=True,
             skip_bias_add=False,
+            tp_group=tp_group,
         )
         self.post_norm = TENorm(config=config, hidden_size=out_hidden_size, eps=norm_eps)
 
@@ -268,6 +276,7 @@ class KimiK3VLVisionEncoder(VisionModule):
         transformer_layer_spec: ModuleSpec = None,
         out_hidden_size: int = VISION_KWARGS["out_hidden_size"],
         vision_kwargs: dict = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super().__init__(config=config)
         kw = dict(VISION_KWARGS)
@@ -294,6 +303,7 @@ class KimiK3VLVisionEncoder(VisionModule):
             pre_process=True,
             post_process=True,
             post_layer_norm=True,
+            pg_collection=pg_collection,
         )
 
         merge = self.spatial_merge_size
@@ -302,6 +312,7 @@ class KimiK3VLVisionEncoder(VisionModule):
             merge_dim=config.hidden_size * merge * merge,
             out_hidden_size=out_hidden_size,
             norm_eps=kw["projector_norm_eps"],
+            tp_group=pg_collection.tp if pg_collection is not None else None,
         )
 
     def check_grids(self, grids) -> None:

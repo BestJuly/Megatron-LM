@@ -628,3 +628,25 @@ def validate_effective_vision_config(
             "wires encoder FP8; only the decoder's --fp8 flags are supported here.",
             "None",
         )
+    # The encoder is replicated and TP-unaware under every decoder TP size: its
+    # process groups are rank-local singletons, so a vision config that inherited
+    # the decoder's tensor/sequence parallelism would build mis-sharded layers.
+    vision_tp = getattr(effective_config, "tensor_model_parallel_size", 1)
+    if vision_tp != 1:
+        _reject(
+            "effective vision tensor_model_parallel_size",
+            vision_tp,
+            "1",
+            "The MDP encoder is fully replicated; decoder TP must not leak into the "
+            "vision TransformerConfig.",
+            "1",
+        )
+    if getattr(effective_config, "sequence_parallel", False):
+        _reject(
+            "effective vision sequence_parallel",
+            True,
+            "False",
+            "The MDP encoder is fully replicated; decoder sequence parallelism must not "
+            "leak into the vision TransformerConfig.",
+            "False",
+        )

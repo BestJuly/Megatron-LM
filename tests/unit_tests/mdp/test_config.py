@@ -222,6 +222,8 @@ class _FakeTransformerConfig:
     recompute_modules: object = None
     hidden_size: int = 64
     fp8: object = None
+    tensor_model_parallel_size: int = 1
+    sequence_parallel: bool = False
 
     def __post_init__(self):
         if self.recompute_granularity not in (None, "selective", "full"):
@@ -664,6 +666,21 @@ def test_effective_vision_config_with_fp8_is_rejected():
     with pytest.raises(MdpConfigurationError, match="effective vision fp8"):
         validate_effective_vision_config(
             MdpConfig(enable=True), _FakeTransformerConfig(fp8="hybrid")
+        )
+
+
+@pytest.mark.parametrize(
+    "fields, match",
+    [
+        (dict(tensor_model_parallel_size=2), "effective vision tensor_model_parallel_size"),
+        (dict(sequence_parallel=True), "effective vision sequence_parallel"),
+    ],
+)
+def test_effective_vision_config_must_stay_replicated(fields, match):
+    # Decoder TP/SP must never leak into the replicated MDP encoder's config.
+    with pytest.raises(MdpConfigurationError, match=match):
+        validate_effective_vision_config(
+            MdpConfig(enable=True), _FakeTransformerConfig(**fields)
         )
 
 
