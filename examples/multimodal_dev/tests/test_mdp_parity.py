@@ -19,6 +19,13 @@ Recompute None/selective/full run a *stochastic* encoder (dropout > 0) and
 must agree bitwise with each other, without perturbing the RNG stream visible
 after the decoder.
 
+The TP2 variants (with and without sequence parallelism) run both paths with a
+TP=2 decoder: four decoder replicas, eight encoder workers. The endpoint
+broadcasts its leaf to its TP peer and alone returns the gradient, so the
+WORLD-summed encoder gradient over T=4 replicas must again equal the native
+single-model gradient; a twin injects the factor-of-TP error that peers
+returning their (identical) gradients would cause and must be caught.
+
 Run with::
 
     torchrun --nproc_per_node=8 -m pytest -q examples/multimodal_dev/tests/test_mdp_parity.py
@@ -37,6 +44,7 @@ if _REPO_ROOT not in sys.path:
 
 from examples.multimodal_dev.models.base import MultimodalModel
 from examples.multimodal_dev.models.qwen35_vl.vision_encoder import Qwen35VLVisionEncoder
+from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.mdp.allocator import DirectBufferAllocator
 from megatron.core.mdp.bridge import ModalityBridge
@@ -53,6 +61,7 @@ from megatron.core.mdp.protocols import CapturedMicrobatch, CapturedVisionItem
 from megatron.core.mdp.rank_mapping import MdpRankSpec, build_rank_map
 from megatron.core.mdp.runtime import MdpRuntime
 from megatron.core.mdp.storage import MdpEmbeddingStorage
+from megatron.core.mdp.window import pixel_capture_suppressed
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.tensor_parallel.random import (
@@ -79,6 +88,14 @@ if _DISTRIBUTED:
         model_parallel_cuda_manual_seed(1234)
         yield
         Utils.destroy_model_parallel()
+
+    @pytest.fixture
+    def _tp2_parallel():
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+        model_parallel_cuda_manual_seed(1234)
+        yield
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+        model_parallel_cuda_manual_seed(1234)
 
 
 HIDDEN = 128
@@ -107,7 +124,7 @@ def _vision_config(dropout=0.0):
     )
 
 
-def _language_config():
+def _language_config(tp=1, sp=False):
     return TransformerConfig(
         num_layers=2,
         hidden_size=HIDDEN,
@@ -119,12 +136,41 @@ def _language_config():
         hidden_dropout=0.0,
         attention_dropout=0.0,
         calculate_per_token_loss=True,
-        tensor_model_parallel_size=1,
-        sequence_parallel=False,
+        tensor_model_parallel_size=tp,
+        sequence_parallel=sp,
     )
 
 
-def _build_vision_encoder(config):
+_ENCODER_PGS = {}
+
+
+def _encoder_pg_collection(tp):
+    """MDP's rank-local encoder groups, so both paths build the same replicated
+    encoder: under TP the native encoder would otherwise shard over the
+    decoder's TP group and its weights could not be transplanted."""
+    if tp not in _ENCODER_PGS:
+        rank_map = build_rank_map(
+            MdpRankSpec(
+                world_size=torch.distributed.get_world_size(),
+                tp=tp,
+                pp=1,
+                cp=1,
+                ep=1,
+                encoder_cp=1,
+            )
+        )
+        groups = install_mdp_process_groups(
+            rank_map,
+            group_registry=MdpGroupRegistry(),
+            decoder_tp_group=parallel_state.get_tensor_model_parallel_group() if tp > 1 else None,
+        )
+        _ENCODER_PGS[tp] = build_encoder_pg_collection(
+            rank_map, encoder_cp=1, process_groups=groups
+        )
+    return _ENCODER_PGS[tp]
+
+
+def _build_vision_encoder(config, pg_collection=None):
     torch.manual_seed(4321)
     model_parallel_cuda_manual_seed(4321)
     encoder = Qwen35VLVisionEncoder(
@@ -135,24 +181,37 @@ def _build_vision_encoder(config):
         spatial_merge_size=2,
         out_hidden_size=HIDDEN,
         max_num_positions=2304,
+        pg_collection=pg_collection,
     )
     # Mirror the Float16Module wrapping depth: the Conv3d patch embed and the
     # learned position embedding are plain torch modules and stay fp32
     # otherwise, which TE rejects outside autocast.
-    return encoder.bfloat16().cuda()
+    encoder = encoder.bfloat16().cuda()
+    # A replicated encoder starts identical everywhere, as build_encoder_domain
+    # guarantees in production: under TP the model-parallel RNG tracker that
+    # initializes its linears differs per TP rank.
+    for param in encoder.parameters():
+        torch.distributed.broadcast(param.data, src=0)
+    return encoder
 
 
-def _build_language_model(with_encoder, vision_config):
+def _build_language_model(with_encoder, vision_config, tp=1, sp=False):
     torch.manual_seed(1234)
     model_parallel_cuda_manual_seed(1234)
-    encoder = _build_vision_encoder(vision_config) if with_encoder else None
+    encoder = (
+        _build_vision_encoder(
+            vision_config, pg_collection=_encoder_pg_collection(tp) if tp > 1 else None
+        )
+        if with_encoder
+        else None
+    )
     # Reset both RNG sources so the language weights are identical whether or
     # not an encoder was built first.
     torch.manual_seed(1234)
     model_parallel_cuda_manual_seed(1234)
     # Any decoder MCore builds can sit behind MultimodalModel; a plain GPTModel
     # keeps this test about MDP routing rather than a particular stack.
-    language_config = _language_config()
+    language_config = _language_config(tp, sp)
     language_model = GPTModel(
         config=language_config,
         transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
@@ -211,7 +270,17 @@ class _ParityAdapter:
 
     def get_batch(self, iterator):
         next(iterator)
-        return self._microbatches.pop(0)
+        captured = self._microbatches.pop(0)
+        if pixel_capture_suppressed():
+            # Honor owner-sharded capture like the real collate path: under
+            # TP only the TP source owns pixels.
+            captured = CapturedMicrobatch(
+                decoder_packed_seq_params=captured.decoder_packed_seq_params,
+                vision_items=captured.vision_items,
+                flat_pixel_payload=None,
+                model_payload=captured.model_payload,
+            )
+        return captured
 
     def estimate_cost(self, item):
         return item.payload_rows
@@ -222,7 +291,7 @@ class _ParityAdapter:
         assert item.output_rows == t * (h // 2) * (w // 2)
 
     def build_encoder(self, model_config, *, pg_collection):
-        return _build_vision_encoder(model_config)
+        return _build_vision_encoder(model_config, pg_collection=pg_collection)
 
     def encode(self, encoder, payload, layout):
         grid_thw = torch.tensor(
@@ -260,13 +329,17 @@ def _captured_microbatch(pixel_values, slots):
     )
 
 
-def _build_runtime(vision_config, microbatches, *, mdp_config=None):
+def _build_runtime(vision_config, microbatches, *, mdp_config=None, tp=1):
     world = torch.distributed.get_world_size()
     rank_map = build_rank_map(
-        MdpRankSpec(world_size=world, tp=1, pp=1, cp=1, ep=1, encoder_cp=1)
+        MdpRankSpec(world_size=world, tp=tp, pp=1, cp=1, ep=1, encoder_cp=1)
     )
     view = rank_map.view(torch.distributed.get_rank())
-    groups = install_mdp_process_groups(rank_map, group_registry=MdpGroupRegistry())
+    groups = install_mdp_process_groups(
+        rank_map,
+        group_registry=MdpGroupRegistry(),
+        decoder_tp_group=parallel_state.get_tensor_model_parallel_group() if tp > 1 else None,
+    )
     encoder_pgs = build_encoder_pg_collection(rank_map, encoder_cp=1, process_groups=groups)
     adapter = _ParityAdapter(vision_config, microbatches)
     encoder = adapter.build_encoder(vision_config, pg_collection=encoder_pgs)
@@ -309,9 +382,9 @@ def _build_runtime(vision_config, microbatches, *, mdp_config=None):
     return runtime, encoder_ddp
 
 
-def _run_native(vision_config, batch):
+def _run_native(vision_config, batch, tp=1, sp=False):
     input_ids, labels, loss_mask, position_ids, pixel_values, image_grid_thw, _ = batch
-    model = _build_language_model(with_encoder=True, vision_config=vision_config)
+    model = _build_language_model(with_encoder=True, vision_config=vision_config, tp=tp, sp=sp)
     # Stochastic-encoder parity: both paths run encoder forward from the same
     # seeded stream (the MDP path reseeds identically before P2).
     torch.manual_seed(99)
@@ -337,9 +410,14 @@ def _run_mdp(
     corrupt_leaf_grad=False,
     mdp_config=None,
     num_iterations=1,
+    tp=1,
+    sp=False,
+    leaf_grad_scale=None,
 ):
     input_ids, labels, loss_mask, position_ids, pixel_values, _grid, slots = batch
-    model = _build_language_model(with_encoder=False, vision_config=vision_config)
+    model = _build_language_model(
+        with_encoder=False, vision_config=vision_config, tp=tp, sp=sp
+    )
     # Identical language weights by construction (same seeds); assert one.
     native_emb = native_model.language_model.embedding.word_embeddings.weight
     mdp_emb = model.language_model.embedding.word_embeddings.weight
@@ -351,6 +429,7 @@ def _run_mdp(
         vision_config,
         [_captured_microbatch(pixel_values, slots) for _ in range(num_windows)],
         mdp_config=config,
+        tp=tp,
     )
     # Transplant the native encoder weights so both paths run the same model.
     encoder_ddp.module.load_state_dict(native_model.vision_model.state_dict())
@@ -369,6 +448,13 @@ def _run_mdp(
         next(replay[0])
         leaf = runtime.storage.get_leaf(0)
         assert leaf is not None and leaf.shape[0] == sum(len(s) for s in slots)
+        # Only the endpoint's copy is trainable; a TP peer holds a bitwise copy.
+        assert leaf.requires_grad == runtime.rank_view.is_endpoint
+        if tp > 1:
+            tp_group = parallel_state.get_tensor_model_parallel_group()
+            copies = [torch.empty_like(leaf) for _ in range(tp)]
+            torch.distributed.all_gather(copies, leaf.detach(), group=tp_group)
+            assert all(torch.equal(copies[0], copy) for copy in copies[1:])
 
         losses = model(
             input_ids=input_ids,
@@ -383,13 +469,17 @@ def _run_mdp(
         total_loss.backward()
         if corrupt_leaf_grad:
             leaf.grad.mul_(-1.0)
+        if leaf_grad_scale is not None and leaf.grad is not None:
+            leaf.grad.mul_(leaf_grad_scale)
 
         rng_before_p5 = torch.cuda.get_rng_state()
         tracker_before_p5 = {
             name: state.clone()
             for name, state in get_cuda_rng_tracker().get_states().items()
         }
-        tokens = torch.tensor(float(torch.distributed.get_world_size()), device="cuda")
+        # One decoder replica per TP group: the global token count sums over DP
+        # only, exactly as finalize_model_grads reduces it.
+        tokens = torch.tensor(float(torch.distributed.get_world_size() // tp), device="cuda")
         runtime.capture_global_num_tokens(tokens)
         runtime.mark_decoder_complete()
         runtime.end_iteration()
@@ -461,6 +551,76 @@ def test_g1_mdp_matches_native_pixel_path():
     # Routing exactness is proven bitwise by the sentinel tests and the
     # fault-injection twin below.
     _assert_encoder_grads_match(encoder_ddp, native_model)
+
+
+def _decoder_grads_bitwise(native_model, mdp_model):
+    native_grads = {
+        name: param.grad
+        for name, param in native_model.language_model.named_parameters()
+        if param.grad is not None
+    }
+    for name, param in mdp_model.language_model.named_parameters():
+        if param.grad is None:
+            assert name not in native_grads, name
+            continue
+        assert torch.equal(param.grad, native_grads[name]), name
+
+
+def _encoder_grad_mismatches(encoder_ddp, native_model):
+    native_encoder_grads = {
+        name: param.grad.float()
+        for name, param in native_model.vision_model.named_parameters()
+        if param.grad is not None
+    }
+    return sum(
+        0
+        if torch.allclose(
+            param.main_grad.float(),
+            native_encoder_grads[name],
+            rtol=8e-3,
+            atol=max(1e-5, 2e-3 * float(native_encoder_grads[name].abs().max())),
+        )
+        else 1
+        for name, param in encoder_ddp.module.named_parameters()
+    )
+
+
+@pytest.mark.parametrize("sequence_parallel", [False, True], ids=["tp2", "tp2-sp"])
+def test_g1_tp2_mdp_matches_native_pixel_path(_tp2_parallel, sequence_parallel):
+    batch = _make_batch()
+    native_model, native_loss = _seeded(
+        _run_native, _vision_config(dropout=0.0), batch, tp=2, sp=sequence_parallel
+    )
+    mdp_model, mdp_loss, encoder_ddp = _run_mdp(
+        _vision_config(dropout=0.0),
+        batch,
+        native_model=native_model,
+        tp=2,
+        sp=sequence_parallel,
+    )
+    assert torch.equal(native_loss, mdp_loss), (float(native_loss), float(mdp_loss))
+    _decoder_grads_bitwise(native_model, mdp_model)
+    # WORLD sum over 8 producers of the 4 endpoints' gradients / T(=4) is the
+    # native single-model gradient; the peers contributed nothing.
+    _assert_encoder_grads_match(encoder_ddp, native_model)
+
+
+def test_g1_tp2_detects_encoder_grads_scaled_by_tp(_tp2_parallel):
+    # If both TP ranks of a replica returned their (identical) leaf gradient,
+    # the WORLD sum would see it TP times. Inject exactly that factor on the
+    # endpoint: the tolerance used above must reject it.
+    batch = _make_batch()
+    native_model, _ = _seeded(_run_native, _vision_config(dropout=0.0), batch, tp=2)
+    _, _, encoder_ddp = _run_mdp(
+        _vision_config(dropout=0.0),
+        batch,
+        native_model=native_model,
+        tp=2,
+        leaf_grad_scale=2.0,
+    )
+    assert _encoder_grad_mismatches(encoder_ddp, native_model) > 0, (
+        "a factor-of-TP encoder gradient must fail the parity tolerance"
+    )
 
 
 def test_g1_fault_injection_detects_broken_reverse_routing():
