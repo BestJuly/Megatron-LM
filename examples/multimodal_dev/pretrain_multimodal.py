@@ -101,6 +101,10 @@ def model_provider(pre_process: bool = True, post_process: bool = True, **kwargs
     vision_config.bf16 = language_config.bf16
     vision_config.fp16 = language_config.fp16
     vision_config.apply_rope_fusion = language_config.apply_rope_fusion
+    # Transformer Engine's attention backend is process-wide (set_attention_backend asserts
+    # every model in the process agrees), so the encoder follows the decoder's choice.
+    vision_config.attention_backend = language_config.attention_backend
+    vision_config.flash_attention_version = language_config.flash_attention_version
 
     encoder_recompute_overrides = encoder_recompute_overrides_from_args(args)
     if encoder_recompute_overrides:
@@ -198,6 +202,10 @@ def _mdp_adapter_builder(args):
     vision_config.bf16 = language_config.bf16
     vision_config.fp16 = language_config.fp16
     vision_config.apply_rope_fusion = language_config.apply_rope_fusion
+    # Transformer Engine's attention backend is process-wide (set_attention_backend asserts
+    # every model in the process agrees), so the encoder follows the decoder's choice.
+    vision_config.attention_backend = language_config.attention_backend
+    vision_config.flash_attention_version = language_config.flash_attention_version
     vision_config.params_dtype = language_config.params_dtype
     # The encoder DDP derives its gradient prescale from this flag; MDP
     # requires prescale 1 (WORLD sum, normalized once by 1/T_global).
