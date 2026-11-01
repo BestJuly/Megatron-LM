@@ -876,6 +876,26 @@ def _mdp_greedy_consumed_samples(args):
     return int(delta.item())
 
 
+def _iteration_sequence_count(args, samples_seen_in_iteration, closed_form_count):
+    """Samples (sequences) one training iteration consumed, summed over DP.
+
+    ``--mdp-greedy-packing`` fills a fixed number of bins to a token budget, so
+    the number of samples consumed floats per iteration AND per DP rank. Its
+    real all-reduced count therefore takes precedence over
+    ``samples_seen_in_iteration``, whose fallback is the closed form
+    ``num_microbatches x mbs x dp`` (``closed_form_count``) -- the bin count
+    under greedy packing, not the sample count. Otherwise the reported count
+    wins over the closed form.
+    Called on every rank each iteration (the MDP count is a DP collective).
+    """
+    mdp_consumed = _mdp_greedy_consumed_samples(args)
+    if mdp_consumed is not None:
+        return mdp_consumed
+    if samples_seen_in_iteration is not None:
+        return samples_seen_in_iteration
+    return closed_form_count
+
+
 def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
     """Add ``sum(L_i)`` and ``sum(L_i ** 2)`` from one micro-batch's REAL ``cu_seqlens``.
 
@@ -6946,19 +6966,12 @@ def train(
             # Track bins separately for packed mode
             bin_count = _dp_world_size() * args.micro_batch_size * get_num_microbatches()
             args.consumed_train_bins += bin_count
-        elif samples_seen_in_iteration is not None:
-            iteration_sequences = samples_seen_in_iteration
         else:
-            batch_size = _dp_world_size() * args.micro_batch_size * get_num_microbatches()
-            iteration_sequences = batch_size
-            mdp_consumed = _mdp_greedy_consumed_samples(args)
-            if mdp_consumed is not None:
-                # --mdp-greedy-packing fills a fixed number of bins to a token
-                # budget, so the number of samples consumed floats per iteration
-                # AND per DP rank. The closed form above is simply wrong then;
-                # report the real all-reduced count instead. Same hook shape as
-                # rl_utils.get_iteration_sequence_count above.
-                iteration_sequences = mdp_consumed
+            iteration_sequences = _iteration_sequence_count(
+                args,
+                samples_seen_in_iteration,
+                _dp_world_size() * args.micro_batch_size * get_num_microbatches(),
+            )
 
         # Update consumed samples (always means sequences now)
         args.consumed_train_samples += iteration_sequences

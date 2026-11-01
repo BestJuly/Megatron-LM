@@ -542,6 +542,19 @@ class TestPackedSampleAccounting:
 
         assert _get_optimizer_param_scheduler_increment(args, 3342) == 3342
 
+    def test_mdp_greedy_count_wins_over_samples_seen_fallback(self, monkeypatch):
+        # Under --mdp-greedy-packing samples_seen falls back to the closed form, which counts
+        # bins (here 16); the real all-reduced greedy sample count must be reported instead.
+        monkeypatch.setattr(training_module, "_mdp_greedy_consumed_samples", lambda args: 57)
+
+        assert training_module._iteration_sequence_count(SimpleNamespace(), 16, 16) == 57
+
+    def test_iteration_count_without_mdp_greedy(self, monkeypatch):
+        monkeypatch.setattr(training_module, "_mdp_greedy_consumed_samples", lambda args: None)
+
+        assert training_module._iteration_sequence_count(SimpleNamespace(), 3342, 256) == 3342
+        assert training_module._iteration_sequence_count(SimpleNamespace(), None, 256) == 256
+
 
 class TestSaveGrads:
     """Tests for the save_grads function."""
