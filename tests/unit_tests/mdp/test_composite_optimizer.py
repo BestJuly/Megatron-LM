@@ -375,7 +375,9 @@ def test_mxfp8_reuse_preserves_both_domains_and_global_clipping(overlap, monkeyp
 
         success, norm, _ = composite.step()
         assert success
-        assert norm == pytest.approx(expected_norm, rel=1e-6)
+        # The chain returns its global norm as a float64 device tensor when the member norms
+        # are tensors (no host sync, for optimizer-step CUDA graphs).
+        assert float(norm) == pytest.approx(expected_norm, rel=1e-6)
         for actual, reference in zip(
             decoder_opt.get_parameters(), ref_decoder_opt.get_parameters()
         ):
