@@ -86,8 +86,11 @@ class KimiK3VLMdpAdapter(BaseGridVisionAdapter):
         )
 
     def build_encoder(self, model_config, *, pg_collection) -> torch.nn.Module:
-        """Same factory as the native path (``models/kimi_k3_vl/model.py``)."""
-        del pg_collection  # the encoder has no model parallelism in v1
+        """Same factory as the native path (``models/kimi_k3_vl/model.py``).
+
+        The encoder is built on MDP's rank-local process groups: without them its
+        layers would shard over the decoder's TP group when TP > 1.
+        """
         from examples.multimodal_dev.models.kimi_k3_vl.factory import align_vision_norm_epsilon
 
         align_vision_norm_epsilon(model_config)
@@ -95,6 +98,7 @@ class KimiK3VLMdpAdapter(BaseGridVisionAdapter):
             config=model_config,
             transformer_layer_spec=get_kimi_k3_vl_vision_spec(),
             out_hidden_size=self._out_hidden_size,
+            pg_collection=pg_collection,
         )
 
     def encode(self, encoder: torch.nn.Module, payload: torch.Tensor, layout) -> torch.Tensor:
