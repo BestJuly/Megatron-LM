@@ -289,6 +289,10 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
         greedy_token_budget=greedy_token_budget,
         greedy_max_num_seqs=greedy_max_num_seqs,
         greedy_row_alignment=thd_row_alignment(compat),
+        # A microbatch never carries more vision rows than its static token capacity.
+        static_leaf_rows=(
+            args.max_seqlen_per_dp_cp_rank if compat.cuda_graph_impl == "full_iteration" else None
+        ),
     )
     logger.info(
         "MDP: runtime installed (outer_dp_rank=%d, worker_id=%s, endpoint=%d, "

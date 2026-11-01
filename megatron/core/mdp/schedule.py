@@ -19,6 +19,7 @@ Two wrappers, neither of which modifies MCore:
 from inspect import signature
 from typing import Callable
 
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.mdp.errors import MdpConfigurationError
 from megatron.core.mdp.runtime import MdpRuntime
 
@@ -32,7 +33,11 @@ def wrap_forward_backward(forward_backward_func: Callable, runtime: MdpRuntime) 
             "MDP: forward_backward_func is already wrapped; a callable must not be "
             "wrapped twice."
         )
-    schedule_signature = signature(forward_backward_func)
+    # A full-iteration graph wrapper takes **kwargs; bind against the schedule it wraps.
+    graph_wrapper = isinstance(forward_backward_func, FullCudaGraphWrapper)
+    schedule_signature = signature(
+        forward_backward_func.forward_backward_func if graph_wrapper else forward_backward_func
+    )
 
     def wrapped(*args, **kwargs):
         bound = schedule_signature.bind(*args, **kwargs)
@@ -50,6 +55,10 @@ def wrap_forward_backward(forward_backward_func: Callable, runtime: MdpRuntime) 
 
         result = forward_backward_func(*bound.args, **bound.kwargs)
 
+        if graph_wrapper and not bound.arguments["forward_only"]:
+            # A replay runs no Python, so the finalizer wrapper did not record the token
+            # tensor this step; the graph reduced the one it captured in place.
+            runtime.restore_graph_num_tokens()
         runtime.mark_decoder_complete()
         runtime.end_iteration()
         return result

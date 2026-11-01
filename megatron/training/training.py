@@ -5687,18 +5687,19 @@ def train(
     forward_backward_func = get_forward_backward_func(
         schedule_pg_collection=pg_collection
     )
-    if getattr(args, "mdp_enable", False):
-        # MDP phase machine around the native schedule; no-op when MDP is off.
-        from megatron.core.mdp import integration as mdp_integration
-
-        forward_backward_func = mdp_integration.maybe_wrap_forward_backward(
-            forward_backward_func, config
-        )
     if args.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
             use_single_mempool=config.cuda_graph_use_single_mempool,
+        )
+    if getattr(args, "mdp_enable", False):
+        # MDP phase machine around the native schedule; no-op when MDP is off. Outside the
+        # full-iteration graph wrapper, so only the decoder schedule (P4) is captured.
+        from megatron.core.mdp import integration as mdp_integration
+
+        forward_backward_func = mdp_integration.maybe_wrap_forward_backward(
+            forward_backward_func, config
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:
@@ -6496,14 +6497,6 @@ def evaluate(
         eval_micro_batch_size * get_batch_parallel_size(args)
     )
     forward_backward_func = get_forward_backward_func(schedule_pg_collection=pg_collection)
-    if getattr(args, "mdp_enable", False):
-        # MDP phase machine around the native schedule (evaluation builds its
-        # own callable); no-op when MDP is off.
-        from megatron.core.mdp import integration as mdp_integration
-
-        forward_backward_func = mdp_integration.maybe_wrap_forward_backward(
-            forward_backward_func, config
-        )
     # Reductions source per-rank groups from the model (encoder rank -> encoder groups).
     eval_pgc = get_attr_wrapped_model(model[0], "pg_collection")
     if eval_pgc is None:
@@ -6518,6 +6511,14 @@ def evaluate(
             forward_backward_func,
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
             use_single_mempool=config.cuda_graph_use_single_mempool,
+        )
+    if getattr(args, "mdp_enable", False):
+        # MDP phase machine around the native schedule (evaluation builds its
+        # own callable), outside the full-iteration graph wrapper; no-op when MDP is off.
+        from megatron.core.mdp import integration as mdp_integration
+
+        forward_backward_func = mdp_integration.maybe_wrap_forward_backward(
+            forward_backward_func, config
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:

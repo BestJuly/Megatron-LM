@@ -22,6 +22,7 @@ from typing import Iterator, Optional, Sequence, Union
 
 import torch
 
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.mdp.activation import (
     EncoderForwardHandle,
     EncoderOutputMetadata,
@@ -77,6 +78,7 @@ class MdpRuntime:
         greedy_token_budget: Optional[int] = None,
         greedy_max_num_seqs: Optional[int] = None,
         greedy_row_alignment: int = 1,
+        static_leaf_rows: Optional[int] = None,
     ) -> None:
         self.config = config
         self.rank_map = rank_map
@@ -131,6 +133,13 @@ class MdpRuntime:
         self._greedy_max_num_seqs = greedy_max_num_seqs
         self._greedy_row_alignment = greedy_row_alignment
         self._greedy_streams: dict = {}
+        # Full-iteration decoder graphs (--cuda-graph-impl full_iteration): the graph reads
+        # the endpoint leaves at the addresses it captured, so every microbatch slot gets one
+        # persistent leaf of ``static_leaf_rows`` rows (vision-bearing or not; text-only slots
+        # splice zero rows), and the decoder's token tensor captured once is reused on replay.
+        self._static_leaf_rows = static_leaf_rows
+        self._static_leaves: dict = {}
+        self._graph_num_tokens: Optional[torch.Tensor] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -345,20 +354,27 @@ class MdpRuntime:
         if self.rank_view.lane_id is not None:
             with nvtx_phase("p3_leaf_assembly"):
                 for layout in plan.layouts:
-                    if layout.text_only:
+                    if self._static_leaf_rows is not None:
+                        leaf = self._static_leaf(layout.microbatch_id, layout.total_output_rows)
+                        # Written through a detached alias: the leaf already requires grad.
+                        target = leaf.detach()
+                    elif layout.text_only:
                         continue
-                    leaf = self.allocator.acquire(
-                        rows=plan.capacity_policy.capacity_of(layout.total_output_rows),
-                        width=self.output_hidden_size,
-                        dtype=self.params_dtype,
-                        device=self.device,
-                        tag="leaf",
-                    )
+                    else:
+                        target = leaf = self.allocator.acquire(
+                            rows=plan.capacity_policy.capacity_of(layout.total_output_rows),
+                            width=self.output_hidden_size,
+                            dtype=self.params_dtype,
+                            device=self.device,
+                            tag="leaf",
+                        )
                     for segment in layout.segments:
-                        emb_dest[BridgeBufferKey(segment.global_item_id)] = leaf[
+                        emb_dest[BridgeBufferKey(segment.global_item_id)] = target[
                             segment.leaf_row_start : segment.leaf_row_start + segment.output_rows
                         ]
-                    leaves.append((layout.microbatch_id, leaf[: layout.total_output_rows]))
+                    if self._static_leaf_rows is None:
+                        leaf = leaf[: layout.total_output_rows]
+                    leaves.append((layout.microbatch_id, leaf))
         with nvtx_phase("p3_embedding_exchange"):
             emb_specs = self._iter_specs[BridgePhase.EMBEDDING]
             emb_local = {}
@@ -381,9 +397,12 @@ class MdpRuntime:
                 dest_views=emb_dest,
             )
         # requires_grad only after every exchange copy into the leaf is done.
-        for microbatch_id, leaf_valid in leaves:
-            leaf_valid.requires_grad_(True)
-            self.storage.put_leaf(microbatch_id, leaf_valid)
+        for microbatch_id, leaf in leaves:
+            if self._static_leaf_rows is None:
+                leaf.requires_grad_(True)
+                self.storage.put_leaf(microbatch_id, leaf)
+            else:
+                self.storage.put_leaf(microbatch_id, leaf, persistent=True)
         if forward_only and self._eval_outputs:
             # Evaluation releases producer outputs once the bridge completed.
             self._eval_outputs = ()
@@ -391,6 +410,38 @@ class MdpRuntime:
         self._state = MdpRuntimeState.DECODER_READY
         self._decoder_start = time.monotonic()
         return window.replay_iterators()
+
+    def _static_leaf(self, microbatch_id: int, valid_rows: int) -> torch.Tensor:
+        """The persistent full-capacity leaf of one microbatch slot (full-iteration graphs)."""
+        if valid_rows > self._static_leaf_rows:
+            raise MdpStateError(
+                f"MDP: microbatch {microbatch_id} carries {valid_rows} vision rows, more than "
+                f"the persistent leaf capacity {self._static_leaf_rows} "
+                "(max_seqlen_per_dp_cp_rank)."
+            )
+        leaf = self._static_leaves.get(microbatch_id)
+        if leaf is None:
+            leaf = torch.zeros(
+                self._static_leaf_rows,
+                self.output_hidden_size,
+                dtype=self.params_dtype,
+                device=self.device,
+                requires_grad=True,
+            )
+            self._static_leaves[microbatch_id] = leaf
+        return leaf
+
+    def _reset_static_leaf_grads(self) -> None:
+        """Drop the persistent leaves' gradients while the decoder still runs eagerly.
+
+        Eager steps (graph warmup) must not accumulate into the previous step's gradient, and
+        the capture must start from ``grad is None`` so the graph owns the gradient storage.
+        Once captured, ``leaf.grad`` is that graph-owned tensor, rewritten by every replay.
+        """
+        if not self._static_leaves or FullCudaGraphWrapper.cuda_graph.get("training") is not None:
+            return
+        for leaf in self._static_leaves.values():
+            leaf.grad = None
 
     def capture_global_num_tokens(self, token_tensor: Optional[torch.Tensor]) -> None:
         """Store a reference to the in-place reduced global token tensor.
@@ -409,6 +460,25 @@ class MdpRuntime:
                 "MDP: the global token tensor was captured more than once this " "iteration."
             )
         self._captured_num_tokens = token_tensor
+        self._token_capture_count = 1
+        self._graph_num_tokens = token_tensor
+
+    def restore_graph_num_tokens(self) -> None:
+        """Reuse the token tensor recorded at full-iteration graph capture.
+
+        Called after a full-iteration decoder schedule. On a replay no Python runs, so the
+        finalizer wrapper records nothing; the graph all-reduced the captured tensor in place,
+        which therefore holds this step's global count. A step that ran the schedule eagerly
+        (warmup or capture) already recorded it and is left alone.
+        """
+        if self._token_capture_count != 0:
+            return
+        if self._graph_num_tokens is None:
+            raise MdpStateError(
+                "MDP: a full-iteration decoder graph replayed before any step recorded the "
+                "global token tensor."
+            )
+        self._captured_num_tokens = self._graph_num_tokens
         self._token_capture_count = 1
 
     def mark_decoder_complete(self) -> None:
@@ -471,6 +541,8 @@ class MdpRuntime:
                 if self.rank_view.lane_id is not None:
                     for layout in plan.layouts:
                         if layout.text_only:
+                            # A persistent text-only leaf spliced zero rows: nothing to route.
+                            self.storage.release(layout.microbatch_id)
                             continue
                         grad = self.storage.pop_grad(layout.microbatch_id)
                         for segment in layout.segments:
@@ -492,6 +564,7 @@ class MdpRuntime:
                 # The chunk views remain in chunk_grads; segment views are no
                 # longer needed after the collective has populated them.
                 grad_dest.clear()
+                self._reset_static_leaf_grads()
             if self._handle is not None:
                 with nvtx_phase("p5_encoder_backward"):
                     if isinstance(self._handle, EncoderWholeRecomputeHandle):

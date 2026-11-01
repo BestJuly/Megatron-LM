@@ -54,6 +54,32 @@ def test_storage_round_trip_and_pop_grad():
     storage.assert_empty()
 
 
+def test_storage_persistent_leaves_are_not_returned_to_the_allocator():
+    released = []
+
+    class _Recorder(DirectBufferAllocator):
+        def release(self, tensor):
+            released.append(tensor)
+            super().release(tensor)
+
+    storage = MdpEmbeddingStorage(_Recorder())
+    persistent, transient, text_only = _leaf(), _leaf(), _leaf()
+    storage.put_leaf(0, persistent, persistent=True)
+    storage.put_leaf(1, transient)
+    storage.put_leaf(2, text_only, persistent=True)
+    (persistent.sum() + transient.sum()).backward()
+    assert torch.equal(storage.pop_grad(0), torch.ones_like(persistent))
+    storage.pop_grad(1)
+    storage.release(2)
+    assert len(released) == 1 and released[0] is transient
+    storage.assert_empty()
+    # The same persistent leaf is handed out again next iteration.
+    storage.put_leaf(0, persistent, persistent=True)
+    assert storage.get_leaf(0) is persistent
+    storage.release(0)
+    assert len(released) == 1
+
+
 def test_storage_text_only_reads_return_none():
     storage = MdpEmbeddingStorage(DirectBufferAllocator())
     assert storage.get_leaf(3) is None
