@@ -151,6 +151,12 @@ def model_provider(
         **kwargs,
     )
 
+    if getattr(args, "mdp_enable", False) and args.cuda_graph_impl == "full_iteration":
+        from examples.multimodal_dev.forward_step import set_mdp_static_graph_model
+
+        model.vision_embeddings_padded = True
+        set_mdp_static_graph_model(model)
+
     vision_model = getattr(model, "vision_model", None)
     if not getattr(args, "vision_muon", True) and vision_model is not None:
         # Muon routes parameters marked use_muon=False to its scalar optimizer.
@@ -267,6 +273,11 @@ if __name__ == "__main__":
     quantized_row_alignment(args)
     if getattr(args, "mdp_enable", False):
         _setup_mdp(args)
+        if args.cuda_graph_impl == "full_iteration":
+            from examples.multimodal_dev.forward_step import mdp_static_graph_batch
+            from megatron.core.full_cuda_graph import set_pre_graph_batch_transform
+
+            set_pre_graph_batch_transform(mdp_static_graph_batch)
     if args.pipeline_model_parallel_size > 1 and not args.use_packed_sequence:
         # The BSHD collate pads to --seq-length and rounds *up* to the CP/SP
         # alignment factor, while the pipeline scheduler sizes its static P2P

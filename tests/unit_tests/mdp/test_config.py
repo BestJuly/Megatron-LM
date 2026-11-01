@@ -691,8 +691,31 @@ def test_per_layer_cuda_graphs_reject_overlapped_window_capture():
         )
 
 
-def test_full_iteration_graph_stays_rejected_under_static_packing():
-    with pytest.raises(MdpConfigurationError, match="full_iteration"):
+def _full_iteration_options(**overrides):
+    kwargs = dict(cuda_graph_impl="full_iteration", pipeline_parallel_size=1)
+    kwargs.update(overrides)
+    return _static_packing_options(**kwargs)
+
+
+def test_full_iteration_graph_passes_under_static_packing():
+    validate_mdp_config(MdpConfig(enable=True), _full_iteration_options())
+
+
+@pytest.mark.parametrize(
+    "overrides, match",
+    [
+        (dict(pipeline_parallel_size=2), "PP == 1"),
+        (dict(max_seqlen_per_dp_cp_rank=None), "max_seqlen_per_dp_cp_rank"),
+        (dict(thd_static_packing=False), "thd_static_packing"),
+    ],
+)
+def test_full_iteration_graph_rejections(overrides, match):
+    with pytest.raises(MdpConfigurationError, match=match):
+        validate_mdp_config(MdpConfig(enable=True), _full_iteration_options(**overrides))
+
+
+def test_full_iteration_graph_rejects_overlapped_window_capture():
+    with pytest.raises(MdpConfigurationError, match="overlap_window_capture"):
         validate_mdp_config(
-            MdpConfig(enable=True), _static_packing_options(cuda_graph_impl="full_iteration")
+            MdpConfig(enable=True, overlap_window_capture=True), _full_iteration_options()
         )

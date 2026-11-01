@@ -139,7 +139,7 @@ class _StubAdapter:
         return torch.cat(pieces) if pieces else payload[:0]
 
 
-def _build_runtime():
+def _build_runtime(static_leaf_rows=None):
     world = torch.distributed.get_world_size()
     rank = torch.distributed.get_rank()
     rank_map = build_rank_map(MdpRankSpec(world_size=world, tp=1, pp=2, cp=1, ep=1, encoder_cp=1))
@@ -188,6 +188,7 @@ def _build_runtime():
         output_hidden_size=WIDTH,
         params_dtype=torch.float32,
         num_vpp_chunks=1,
+        static_leaf_rows=static_leaf_rows,
     )
     return runtime, view
 
@@ -300,3 +301,87 @@ def test_iteration_metrics_are_populated():
     assert set(metrics.bridge_stats) == {"pixel", "embedding", "gradient"}
     assert metrics.bridge_stats["pixel"].total_bytes > 0
     assert all(count == 0 for count in metrics.allocator_reuse.values())
+
+
+STATIC_ROWS = 64  # > the 28 output rows of microbatch 0
+
+
+def _static_iteration(runtime, view, data, *, backward=True):
+    """One training iteration with persistent leaves; returns the two leaves (endpoint)."""
+    replay = runtime.begin_iteration(data, num_microbatches=2, forward_only=False)
+    for _ in range(2):
+        next(replay[0])
+    leaves = (None, None)
+    if view.lane_id is not None:
+        leaves = (runtime.storage.get_leaf(0), runtime.storage.get_leaf(1))
+        for leaf in leaves:
+            # Every slot, text-only included, is a full-capacity leaf the graph can capture.
+            assert leaf is not None and leaf.shape == (STATIC_ROWS, WIDTH)
+            assert leaf.is_leaf and leaf.requires_grad and leaf.grad is None
+        offset = 0
+        for index, (t, h, w) in enumerate(GRIDS):
+            rows = t * (h // MERGE) * (w // MERGE)
+            block = leaves[0][offset : offset + rows]
+            assert (block == _sentinel(view.outer_dp_rank, index)).all(), index
+            offset += rows
+        if backward:
+            # The splice reads the leading rows of the vision slot, none of the text-only one.
+            (leaves[0][:offset] * 2.0).sum().backward()
+            (leaves[1][:0] * 2.0).sum().backward()
+    runtime.capture_global_num_tokens(torch.tensor(20.0, device="cuda"))
+    runtime.mark_decoder_complete()
+    runtime.end_iteration()
+    runtime.storage.assert_empty()
+    return leaves
+
+
+def test_static_leaves_match_the_transient_path_and_persist():
+    reference, view = _build_runtime()
+    replay = reference.begin_iteration(iter(range(10)), num_microbatches=2, forward_only=False)
+    _drive_decoder(reference, view, replay, backward=True)
+    reference.capture_global_num_tokens(torch.tensor(20.0, device="cuda"))
+    reference.mark_decoder_complete()
+    reference.end_iteration()
+
+    runtime, view = _build_runtime(static_leaf_rows=STATIC_ROWS)
+    first = _static_iteration(runtime, view, iter(range(10)))
+    ref_param = next(reference.encoder_domain.encoder_ddp.module.parameters())
+    param = next(runtime.encoder_domain.encoder_ddp.module.parameters())
+    # Same routed gradient rows reach the encoder as with per-iteration leaves.
+    assert torch.equal(param.main_grad, ref_param.main_grad)
+    if view.lane_id is not None:
+        # No graph captured: P5 dropped the gradients so the next eager step starts clean.
+        assert all(leaf.grad is None for leaf in first)
+    second = _static_iteration(runtime, view, iter(range(10)))
+    if view.lane_id is not None:
+        assert second[0] is first[0] and second[1] is first[1]
+
+
+def test_static_leaf_capacity_overflow_raises():
+    # Called directly: inside begin_iteration only the endpoints would raise, before the
+    # embedding collective the other ranks are already in.
+    runtime, _ = _build_runtime(static_leaf_rows=8)
+    assert runtime._static_leaf(0, 8).shape == (8, WIDTH)
+    with pytest.raises(MdpStateError, match="persistent leaf capacity"):
+        runtime._static_leaf(1, 9)
+
+
+def test_restore_graph_num_tokens_reuses_the_captured_tensor():
+    runtime, view = _build_runtime()
+    with pytest.raises(MdpStateError, match="before any step recorded"):
+        runtime.restore_graph_num_tokens()
+    replay = runtime.begin_iteration(iter(range(10)), num_microbatches=2, forward_only=False)
+    _drive_decoder(runtime, view, replay, backward=True)
+    tokens = torch.tensor(20.0, device="cuda")
+    runtime.capture_global_num_tokens(tokens)
+    runtime.restore_graph_num_tokens()  # eager step: already recorded, left alone
+    runtime.mark_decoder_complete()
+    runtime.end_iteration()
+
+    # A replayed step records nothing; the captured tensor (rewritten in place) is reused.
+    replay = runtime.begin_iteration(iter(range(10)), num_microbatches=2, forward_only=False)
+    _drive_decoder(runtime, view, replay, backward=True)
+    runtime.restore_graph_num_tokens()
+    assert runtime.consumed_num_tokens() is tokens
+    runtime.mark_decoder_complete()
+    runtime.end_iteration()

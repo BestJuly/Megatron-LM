@@ -20,8 +20,11 @@ class MdpEmbeddingStorage:
     def __init__(self, allocator: MdpBufferAllocator) -> None:
         self._allocator = allocator
         self._leaves: dict = {}
+        # Leaves the runtime owns across iterations (full-iteration graphs): handed out and
+        # taken back every iteration like the others, but never returned to the allocator.
+        self._persistent: set = set()
 
-    def put_leaf(self, mb_id: int, leaf: Tensor) -> None:
+    def put_leaf(self, mb_id: int, leaf: Tensor, persistent: bool = False) -> None:
         """Store one detached leaf; duplicate insertion for the same id fails."""
         if mb_id in self._leaves:
             raise MdpStateError(
@@ -34,6 +37,10 @@ class MdpEmbeddingStorage:
                 "decoder domain."
             )
         self._leaves[mb_id] = leaf
+        if persistent:
+            self._persistent.add(mb_id)
+        else:
+            self._persistent.discard(mb_id)
 
     def get_leaf(self, mb_id: int) -> Optional[Tensor]:
         """Non-destructive read; ``None`` for text-only microbatches."""
@@ -51,13 +58,19 @@ class MdpEmbeddingStorage:
                 "written the unnormalized numerator gradient into the leaf."
             )
         grad = leaf.grad
-        self._allocator.release(leaf)
+        self._release(mb_id, leaf)
         return grad
 
     def release(self, mb_id: int) -> None:
-        """Explicit release for the evaluation path."""
+        """Explicit release (evaluation, and text-only slots of persistent leaves)."""
         leaf = self._leaves.pop(mb_id, None)
         if leaf is not None:
+            self._release(mb_id, leaf)
+
+    def _release(self, mb_id: int, leaf: Tensor) -> None:
+        if mb_id in self._persistent:
+            self._persistent.discard(mb_id)
+        else:
             self._allocator.release(leaf)
 
     def assert_empty(self) -> None:

@@ -2,6 +2,8 @@
 
 """Forward step, TP broadcast, and loss for multimodal_dev training."""
 
+import copy
+import dataclasses
 import math
 from functools import lru_cache, partial
 from itertools import accumulate
@@ -1002,6 +1004,125 @@ def loss_func(loss_mask, output_tensor):
 # -------------------------------------------------------------------
 
 
+# -------------------------------------------------------------------
+# Full-iteration decoder graphs under MDP
+# -------------------------------------------------------------------
+
+MDP_STATIC_GRAPH_KEY = "mdp_static_graph"
+_STATIC_GRAPH_MODEL = None
+# The non-tensor PackedSeqParams fields of the first step; the graph bakes them in.
+_STATIC_GRAPH_PSP_CONSTANTS = None
+
+
+def set_mdp_static_graph_model(model) -> None:
+    """Register the (unwrapped) model whose ``compute_position_ids`` the transform calls."""
+    global _STATIC_GRAPH_MODEL, _STATIC_GRAPH_PSP_CONSTANTS
+    _STATIC_GRAPH_MODEL = model
+    _STATIC_GRAPH_PSP_CONSTANTS = None
+
+
+def _split_static_packed_seq_params(params: PackedSeqParams):
+    """Split ``params`` into its tensors (static graph inputs) and a tensor-free template.
+
+    A captured graph reads every tensor at the address it had during capture, so each one must
+    reach the forward step through the static buffers: a tensor left on the template (e.g. the
+    ``seq_idx`` that ``__post_init__`` derives from ``cu_seqlens``) belongs to the capture
+    step's batch and is freed once that batch is replaced. The remaining fields are baked into
+    the graph and must not change between steps.
+    """
+    global _STATIC_GRAPH_PSP_CONSTANTS
+    tensors, constants = {}, {}
+    for field in dataclasses.fields(params):
+        value = getattr(params, field.name)
+        if isinstance(value, torch.Tensor):
+            tensors[field.name] = value
+        else:
+            constants[field.name] = value
+    if constants.get("cp_scatter_cache") is not None:
+        raise RuntimeError(
+            "MDP full-iteration decoder graph: PackedSeqParams.cp_scatter_cache holds "
+            "per-step state and cannot be a static graph input."
+        )
+    if _STATIC_GRAPH_PSP_CONSTANTS is None:
+        _STATIC_GRAPH_PSP_CONSTANTS = constants
+    elif constants != _STATIC_GRAPH_PSP_CONSTANTS:
+        changed = sorted(k for k in constants if constants[k] != _STATIC_GRAPH_PSP_CONSTANTS[k])
+        raise RuntimeError(
+            "MDP full-iteration decoder graph: the PackedSeqParams fields "
+            f"{changed} changed between steps, but the captured graph bakes them in; "
+            "--thd-static-packing must keep them constant."
+        )
+    # Field assignment on a shallow copy: dataclasses.replace would rerun __post_init__.
+    template = copy.copy(params)
+    for name in tensors:
+        setattr(template, name, None)
+    return tensors, template
+
+
+def mdp_static_graph_batch(record):
+    """Pre-graph batch transform for MDP's full-iteration decoder graph.
+
+    ``FullCudaGraphWrapper`` drains the MDP replay records and applies this transform eagerly,
+    before copying the result into the graph's static buffers. Under ``--thd-static-packing``
+    every tensor of a record already has the static token capacity; what remains
+    data-dependent is moved out of the captured forward step here:
+
+    * the mRoPE position ids, a function of the variable-length ``image_grid_thw``, are
+      computed now and passed as a ``[3, 1, T]`` input;
+    * the decoder and vision workload statistics are reported now (a replay runs no Python);
+    * ``PackedSeqParams`` is split: every tensor field (``cu_seqlens``, the derived ``seq_idx``,
+      ...) becomes a static input, and a tensor-free template carries the remaining fields,
+      which must be identical every step (checked).
+
+    The vision leaf is not part of the batch: the forward step reads the microbatch slot's
+    persistent leaf from MDP storage, whose address the graph captured.
+    """
+    if isinstance(record, dict):
+        return record
+    model = _STATIC_GRAPH_MODEL
+    assert model is not None, "set_mdp_static_graph_model() was not called"
+    payload = record.model_payload
+    params = record.decoder_packed_seq_params
+    _accumulate_workload_stats(
+        model,
+        params,
+        shape_keys=shape_keys_from_vision_items(record.vision_items),
+        real_cu_seqlens=payload.get("flops_cu_seqlens"),
+    )
+    position_ids = payload.get("position_ids")
+    if position_ids is None:
+        position_ids = model.compute_position_ids(
+            input_ids=payload["input_ids"],
+            image_grid_thw=payload.get("image_grid_thw", None),
+            packed_seq_params=params,
+        )
+    psp_tensors, psp_template = _split_static_packed_seq_params(params)
+    return {
+        MDP_STATIC_GRAPH_KEY: True,
+        "microbatch_id": record.microbatch_id,
+        "input_ids": payload["input_ids"],
+        "labels": payload.get("labels", None),
+        "loss_mask": payload.get("loss_mask", None),
+        "attention_mask": payload.get("attention_mask", None),
+        "padding_mask": payload.get("padding_mask", None),
+        "position_ids": position_ids,
+        "packed_seq_tensors": psp_tensors,
+        "packed_seq_params": psp_template,
+    }
+
+
+def _static_graph_packed_seq_params(batch) -> PackedSeqParams:
+    """The tensor-free template ``PackedSeqParams`` pointed at the static tensor buffers.
+
+    Field assignment on a shallow copy, not dataclasses.replace: rerunning ``__post_init__``
+    would recompute ``seq_idx`` with a data-dependent shape inside the capture.
+    """
+    params = copy.copy(batch["packed_seq_params"])
+    for name, tensor in batch["packed_seq_tensors"].items():
+        setattr(params, name, tensor)
+    return params
+
+
 def mdp_forward_step(runtime, data_iterator, model, return_schedule_plan: bool = False):
     """Forward step over an MDP replay record.
 
@@ -1010,35 +1131,49 @@ def mdp_forward_step(runtime, data_iterator, model, return_schedule_plan: bool =
     pre-encoded detached leaf from endpoint storage instead.  The EP-overlap
     path builds a decoder-only schedule plan from that same leaf.
     """
-    record = next(data_iterator)
-    batch = dict(record.model_payload)
+    item = next(data_iterator)
+    if isinstance(item, dict) and item.get(MDP_STATIC_GRAPH_KEY, False):
+        # A full-iteration decoder graph's static batch (see mdp_static_graph_batch): the
+        # workload statistics were reported eagerly by the transform, the position ids are
+        # precomputed, and every microbatch slot reads its persistent leaf.
+        batch = item
+        packed_seq_params = _static_graph_packed_seq_params(batch)
+        position_ids = batch["position_ids"]
+        image_grid_thw = None
+        vision_embeddings = runtime.storage.get_leaf(batch["microbatch_id"])
+    else:
+        record = item
+        batch = dict(record.model_payload)
+        packed_seq_params = record.decoder_packed_seq_params
+        position_ids = batch.get("position_ids")
+        image_grid_thw = batch.get("image_grid_thw", None)
 
-    _accumulate_workload_stats(
-        model,
-        record.decoder_packed_seq_params,
-        shape_keys=shape_keys_from_vision_items(record.vision_items),
-        real_cu_seqlens=batch.get("flops_cu_seqlens"),
-    )
+        _accumulate_workload_stats(
+            model,
+            packed_seq_params,
+            shape_keys=shape_keys_from_vision_items(record.vision_items),
+            real_cu_seqlens=batch.get("flops_cu_seqlens"),
+        )
 
-    vision_embeddings = None
-    if is_pipeline_first_stage() and not record.text_only:
-        vision_embeddings = runtime.storage.get_leaf(record.microbatch_id)
-        if vision_embeddings is None:
-            raise RuntimeError(
-                f"MDP: microbatch {record.microbatch_id} has vision items but no "
-                "leaf in endpoint storage; P3 embedding routing did not complete"
-            )
+        vision_embeddings = None
+        if is_pipeline_first_stage() and not record.text_only:
+            vision_embeddings = runtime.storage.get_leaf(record.microbatch_id)
+            if vision_embeddings is None:
+                raise RuntimeError(
+                    f"MDP: microbatch {record.microbatch_id} has vision items but no "
+                    "leaf in endpoint storage; P3 embedding routing did not complete"
+                )
 
     model_inputs = dict(
         input_ids=batch["input_ids"],
-        position_ids=batch.get("position_ids"),
+        position_ids=position_ids,
         attention_mask=batch.get("attention_mask", None),
         labels=batch.get("labels", None),
         loss_mask=batch.get("loss_mask", None),
         padding_mask=batch.get("padding_mask", None),
         pixel_values=None,
-        image_grid_thw=batch.get("image_grid_thw", None),
-        packed_seq_params=record.decoder_packed_seq_params,
+        image_grid_thw=image_grid_thw,
+        packed_seq_params=packed_seq_params,
         vision_embeddings=vision_embeddings,
     )
     if return_schedule_plan:
@@ -1055,9 +1190,7 @@ def mdp_forward_step(runtime, data_iterator, model, return_schedule_plan: bool =
     if is_pipeline_last_stage():
         from examples.multimodal_dev.models.base import MultimodalModel
 
-        loss_mask = MultimodalModel.cp_split_loss_mask(
-            loss_mask, record.decoder_packed_seq_params
-        )
+        loss_mask = MultimodalModel.cp_split_loss_mask(loss_mask, packed_seq_params)
     return output_tensor, partial(loss_func, loss_mask)
 
 

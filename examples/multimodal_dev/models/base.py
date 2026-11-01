@@ -189,6 +189,12 @@ class MultimodalModel(MegatronModule):
         vp_stage: Virtual pipeline stage (must match the decoder's).
     """
 
+    # Set under MDP with a full-iteration decoder graph: ``vision_embeddings`` is then the
+    # microbatch slot's persistent leaf of static capacity, of which the splice consumes the
+    # leading rows, with static shapes and no host sync. The row count was checked eagerly
+    # when MDP captured the window.
+    vision_embeddings_padded: bool = False
+
     def __init__(
         self,
         language_config: TransformerConfig,
@@ -439,17 +445,29 @@ class MultimodalModel(MegatronModule):
 
         combined = text_embeddings.transpose(0, 1).contiguous()
         image_mask = input_ids == self.image_token_id
-        num_slots = int(image_mask.sum())
-        if num_slots != vision_embeddings.shape[0]:
-            raise RuntimeError(
-                f"image-token slot count {num_slots} != vision embedding rows "
-                f"{vision_embeddings.shape[0]}; masked_scatter would silently "
-                "mis-fill the sequence"
+        if self.vision_embeddings_padded:
+            # Slot k of the sequence takes source row k, by index: masked_scatter's backward
+            # (masked_select) has a data-dependent shape, which a CUDA graph cannot capture.
+            # The values and gradients are the same plain copies.
+            slots = torch.cumsum(image_mask.reshape(-1), dim=0) - 1
+            gathered = vision_embeddings.index_select(0, slots.clamp(min=0))
+            combined = torch.where(
+                image_mask.unsqueeze(-1),
+                gathered.view_as(combined).to(combined.dtype),
+                combined,
             )
-        mask_expanded = image_mask.unsqueeze(-1).expand_as(combined)
-        combined = combined.masked_scatter(
-            mask_expanded, vision_embeddings.to(combined.dtype)
-        )
+        else:
+            num_slots = int(image_mask.sum())
+            if num_slots != vision_embeddings.shape[0]:
+                raise RuntimeError(
+                    f"image-token slot count {num_slots} != vision embedding rows "
+                    f"{vision_embeddings.shape[0]}; masked_scatter would silently "
+                    "mis-fill the sequence"
+                )
+            mask_expanded = image_mask.unsqueeze(-1).expand_as(combined)
+            combined = combined.masked_scatter(
+                mask_expanded, vision_embeddings.to(combined.dtype)
+            )
         combined = combined.transpose(0, 1).contiguous()
 
         if sp:

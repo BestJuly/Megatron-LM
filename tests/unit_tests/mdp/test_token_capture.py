@@ -159,3 +159,47 @@ def test_forward_backward_wrapper_order_and_double_wrap():
     ]
     with pytest.raises(MdpConfigurationError, match="wrapped twice"):
         wrap_forward_backward(wrapped, runtime)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FullCudaGraphWrapper needs CUDA")
+@pytest.mark.parametrize("forward_only", [False, True])
+def test_forward_backward_wrapper_around_a_full_iteration_graph_wrapper(forward_only):
+    from megatron.core.full_cuda_graph import FullCudaGraphWrapper
+
+    batches = [{"x": torch.full((2,), float(i), device="cuda")} for i in range(3)]
+
+    class _Runtime(_FakeRuntime):
+        def begin_iteration(self, data_iterator, *, num_microbatches, forward_only):
+            self.events.append(("begin", num_microbatches, forward_only))
+            return [iter(batches)]
+
+        def restore_graph_num_tokens(self):
+            self.events.append(("restore",))
+
+    runtime = _Runtime()
+
+    def schedule(*, data_iterator, model, num_microbatches, seq_length, forward_only):
+        # The graph wrapper hands the schedule its static copies of the drained batches.
+        (iterator,) = data_iterator
+        seen = [float(next(iterator)["x"][0]) for _ in range(num_microbatches)]
+        runtime.events.append(("schedule", seen))
+        return "result"
+
+    # Warmup longer than the test: the wrapper runs the schedule eagerly, no capture.
+    graph = FullCudaGraphWrapper(schedule, cuda_graph_warmup_steps=100)
+    wrapped = wrap_forward_backward(graph, runtime)
+    try:
+        result = wrapped(
+            data_iterator="real-iter",
+            model=["m"],
+            num_microbatches=3,
+            seq_length=4,
+            forward_only=forward_only,
+        )
+    finally:
+        graph.reset_cuda_graph()
+    assert result == "result"
+    expected = [("begin", 3, forward_only), ("schedule", [0.0, 1.0, 2.0])]
+    if not forward_only:
+        expected.append(("restore",))
+    assert runtime.events == expected + [("decoder_done",), ("end",)]

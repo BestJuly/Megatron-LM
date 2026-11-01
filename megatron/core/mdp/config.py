@@ -410,28 +410,40 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
 # implementations: they graph individual decoder submodules and leave the schedule, the
 # encoder and every MDP collective eager. MDP's P4 runs the unmodified decoder schedule, so
 # the decoder layers a per-layer graph owns are never touched by the bridge.
-SUPPORTED_CUDA_GRAPH_IMPLS: frozenset = frozenset({"none", "local", "transformer_engine"})
+# "full_iteration" graphs that whole P4 schedule; the MDP wrapper sits outside the graph.
+SUPPORTED_CUDA_GRAPH_IMPLS: frozenset = frozenset(
+    {"none", "local", "transformer_engine", "full_iteration"}
+)
 
 
 def _validate_cuda_graph_options(config: MdpConfig, options: MdpCompatibilityOptions) -> None:
-    """Accept per-layer CUDA graphs on the decoder; reject full-iteration graphs.
+    """Accept per-layer CUDA graphs and decoder-only full-iteration graphs.
 
     The bridge only touches the decoder's embedding leaves (P3) and their gradients (P5),
     never the transformer layers, so a per-layer graph and the phase machine do not
-    interact. A full-iteration graph would instead capture P4 itself, together with the
-    Python-level control flow of P1-P3/P5 around it.
+    interact. A full-iteration graph captures only the native decoder schedule (P4): the
+    MDP wrapper stays outside it, so P1-P3 and P5 run eagerly around each replay, and the
+    endpoint leaves become persistent buffers of the static token capacity.
     """
     impl = options.cuda_graph_impl or "none"
     if impl == "full_iteration":
-        _reject(
-            "cuda_graph_impl",
-            impl,
-            "cuda_graph_impl != 'full_iteration'",
-            "A full-iteration graph captures the decoder schedule itself, so the phase "
-            "machine around it (pixel/embedding/gradient exchange, per-iteration plan, "
-            "variable vision item counts) cannot run. Per-layer graphs are supported.",
-            "transformer_engine",
-        )
+        if options.pipeline_parallel_size != 1 or options.context_parallel_size != 1:
+            _reject(
+                "cuda_graph_impl",
+                impl,
+                "PP == 1 and CP == 1 with cuda_graph_impl == 'full_iteration'",
+                "The decoder's full-iteration graph uses the static THD contract, which is "
+                "defined for one pipeline stage and no context parallelism.",
+                "transformer_engine",
+            )
+        if not options.max_seqlen_per_dp_cp_rank:
+            _reject(
+                "max_seqlen_per_dp_cp_rank",
+                options.max_seqlen_per_dp_cp_rank,
+                "max_seqlen_per_dp_cp_rank is set with cuda_graph_impl == 'full_iteration'",
+                "It sizes the persistent embedding leaves the graph reads: a microbatch "
+                "never carries more vision rows than tokens.",
+            )
     if impl not in SUPPORTED_CUDA_GRAPH_IMPLS:
         _reject(
             "cuda_graph_impl",
@@ -446,7 +458,7 @@ def _validate_cuda_graph_options(config: MdpConfig, options: MdpCompatibilityOpt
         _reject(
             "overlap_window_capture",
             config.overlap_window_capture,
-            "overlap_window_capture == False when per-layer CUDA graphs are enabled",
+            "overlap_window_capture == False when CUDA graphs are enabled",
             "Window prefetch runs H2D copies and allocations from a background thread on a "
             "side stream while graph capture is in flight, which global-mode stream "
             "capture treats as an unsafe concurrent action; whether it collides depends "
@@ -457,7 +469,7 @@ def _validate_cuda_graph_options(config: MdpConfig, options: MdpCompatibilityOpt
         _reject(
             "thd_static_packing",
             options.thd_static_packing,
-            "thd_static_packing == True when per-layer CUDA graphs are enabled",
+            "thd_static_packing == True when CUDA graphs are enabled",
             "The MDP decoder is THD-packed, and a CUDA graph replays into fixed-size static "
             "inputs ([max_seqlen_per_dp_cp_rank, 1, H] hidden states and "
             "thd_max_packed_sequences + 1 cu_seqlens entries). Only --thd-static-packing "
