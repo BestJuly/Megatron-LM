@@ -4,7 +4,8 @@ MDP addresses GPU stalls caused by long-tail vision workloads in multimodal
 training. It does not change sample ownership or decoder data-parallel
 semantics: every physical rank co-locates a complete (replicated) vision
 encoder with its language-decoder shard, and each iteration's visual items are
-rebalanced across the `CP x PP` encoder workers inside each decoder replica.
+rebalanced across the `TP x CP x PP` encoder workers inside each decoder
+replica.
 The native decoder PP/VPP/EP schedule, sampler, microbatch, LR, and
 consumed-sample accounting run unchanged.
 
@@ -26,7 +27,7 @@ EMPTY`) driving seven phases:
 | P0 | `begin_iteration` | Zero encoder grads, reset iteration state |
 | P1 | `begin_iteration` | Capture the iteration window, broadcast fixed-width descriptors from the PP0 endpoint, run deterministic LPT to logical workers, check the plan digest across the group, exchange pixels |
 | P2 | `begin_iteration` | Chunked encoder forward on encoder THD. Default training retains graph-connected outputs; `--encoder-recompute-granularity whole` runs under `no_grad` and retains pixels/layouts/RNG recipes; evaluation retains neither graph nor recipe |
-| P3 | `begin_iteration` | Exchange detached embeddings; endpoint assembles one detached leaf per vision-bearing microbatch |
+| P3 | `begin_iteration` | Exchange detached embeddings; endpoint assembles one detached leaf per vision-bearing microbatch and, under decoder TP, broadcasts it to its TP peers (untrainable copies) |
 | P4 | native schedule | Replay iterators feed the unmodified decoder schedule; the wrapped `finalize_model_grads_func` captures the in-place-reduced global token count |
 | P5 | `end_iteration` | Exchange leaf gradients back; default mode runs one multi-tensor backward (native MCore Transformer recompute replays here), while `whole` restores RNG and replays complete encoder chunks one by one before backward; WORLD sum-reduce with prescale 1, scale by `1/clamp(T_global, 1)` |
 | P6 | composite optimizer | WORLD MAX overflow union before any scaler update, combined-norm shared clipping, one atomic step for `[decoder_dense, decoder_expert?, encoder]` |
@@ -57,7 +58,8 @@ schedule model list.
 
 ## Support matrix (v1)
 
-Supported: Qwen3.5-VL (one vision encoder), `TP=1`, decoder `CP=1`,
+Supported: Qwen3.5-VL (one vision encoder), decoder `TP>=1` with or without
+sequence parallelism (`--mdp-overlap-window-capture` needs `TP=1`), decoder `CP=1`,
 `encoder_cp=1`, native PP/VPP/EP, fully replicated encoder with WORLD ZeRO-1,
 `calculate_per_token_loss=True`, bf16 main path (fp16 covered by
 overflow-union tests), THD packed sequences on both sides, native MCore vision
@@ -72,6 +74,15 @@ in P5/P6. Decoder-only EP A2A overlap via
 `--overlap-moe-expert-parallel-comm --delay-wgrad-compute` is supported with
 the native MCore requirements (`EP>1`, and VPP when `PP>1`); the vision encoder
 remains outside that schedule.
+
+Decoder tensor parallelism (with or without SP) keeps the encoder replicated
+and TP-unaware: every rank of a planning group is an encoder worker, only TP
+source ranks own pixels (they are the ranks that load data), the endpoint
+(tp0 of PP0) broadcasts each embedding leaf over the decoder TP group, and only
+the endpoint returns the leaf gradient. That gradient is identical on every TP
+rank, so a second sender would scale the WORLD-reduced encoder gradient by TP.
+The encoder is built on MDP's rank-local process groups and its weights are
+broadcast from WORLD rank 0 when the domain is built.
 
 Decoder FP8 is supported. The decoder uses the native `--fp8`/`--fp8-recipe`
 flags; the vision `TransformerConfig` is built separately by the model adapter
