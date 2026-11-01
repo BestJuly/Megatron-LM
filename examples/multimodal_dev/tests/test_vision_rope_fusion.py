@@ -47,7 +47,13 @@ def test_model_provider_propagates_rope_fusion_to_vision(monkeypatch):
     args = SimpleNamespace(
         model_arch="qwen35_vl", model_variant="0.8b", vision_num_layers=None
     )
-    language_config = SimpleNamespace(apply_rope_fusion=True, bf16=True, fp16=False)
+    language_config = SimpleNamespace(
+        apply_rope_fusion=True,
+        bf16=True,
+        fp16=False,
+        attention_backend="auto",
+        flash_attention_version=None,
+    )
     vision_config = SimpleNamespace(apply_rope_fusion=False, bf16=False, fp16=False)
     captured = {}
 
@@ -70,6 +76,75 @@ def test_model_provider_propagates_rope_fusion_to_vision(monkeypatch):
     assert vision_config.apply_rope_fusion is True
 
 
+@pytest.mark.parametrize("backend,flash_version", [("fused", None), ("flash", 4)])
+def test_model_provider_propagates_attention_backend_to_vision(monkeypatch, backend, flash_version):
+    # TE's attention backend is process-wide: an encoder left at "auto" next to a "fused" or
+    # "flash" decoder fails set_attention_backend's consistency assert at model build.
+    import examples.multimodal_dev.pretrain_multimodal as training_entrypoint
+    from examples.multimodal_dev.models import MODEL_REGISTRY
+
+    args = SimpleNamespace(model_arch="qwen35_vl", model_variant="0.8b", vision_num_layers=None)
+    language_config = SimpleNamespace(
+        apply_rope_fusion=False,
+        bf16=True,
+        fp16=False,
+        attention_backend=backend,
+        flash_attention_version=flash_version,
+    )
+    vision_config = SimpleNamespace(
+        apply_rope_fusion=False,
+        bf16=False,
+        fp16=False,
+        attention_backend="auto",
+        flash_attention_version=None,
+    )
+    registry = {
+        "vision_config_fn": lambda **kwargs: vision_config,
+        "model_factory_fn": lambda **kwargs: object(),
+    }
+    monkeypatch.setattr(training_entrypoint, "get_args", lambda: args)
+    monkeypatch.setattr(
+        training_entrypoint, "core_transformer_config_from_args", lambda args: language_config
+    )
+    monkeypatch.setitem(MODEL_REGISTRY, "qwen35_vl", registry)
+
+    training_entrypoint.model_provider()
+
+    assert vision_config.attention_backend == backend
+    assert vision_config.flash_attention_version == flash_version
+
+
+def test_mdp_adapter_builder_propagates_attention_backend_to_vision(monkeypatch):
+    import examples.multimodal_dev.mdp_adapter as mdp_adapter_module
+    import examples.multimodal_dev.pretrain_multimodal as training_entrypoint
+    from examples.multimodal_dev.models import MODEL_REGISTRY
+
+    args = SimpleNamespace(model_arch="qwen35_vl", model_variant="0.8b", vision_num_layers=None)
+    language_config = SimpleNamespace(
+        apply_rope_fusion=False,
+        bf16=True,
+        fp16=False,
+        attention_backend="fused",
+        flash_attention_version=None,
+        params_dtype=torch.bfloat16,
+        calculate_per_token_loss=True,
+    )
+    vision_config = SimpleNamespace(attention_backend="auto", flash_attention_version=None)
+    registry = {"vision_config_fn": lambda **kwargs: vision_config}
+    monkeypatch.setattr(
+        training_entrypoint, "core_transformer_config_from_args", lambda args: language_config
+    )
+    monkeypatch.setattr(mdp_adapter_module, "build_mdp_adapter", lambda *a: "adapter")
+    monkeypatch.setitem(MODEL_REGISTRY, "qwen35_vl", registry)
+
+    adapter, built_vision_config = training_entrypoint._mdp_adapter_builder(args)
+
+    assert adapter == "adapter"
+    assert built_vision_config is vision_config
+    assert vision_config.attention_backend == "fused"
+    assert vision_config.flash_attention_version is None
+
+
 def test_model_provider_applies_native_encoder_recompute(monkeypatch):
     import examples.multimodal_dev.pretrain_multimodal as training_entrypoint
     from examples.multimodal_dev.models import MODEL_REGISTRY
@@ -88,6 +163,8 @@ def test_model_provider_applies_native_encoder_recompute(monkeypatch):
         apply_rope_fusion=False,
         bf16=True,
         fp16=False,
+        attention_backend="auto",
+        flash_attention_version=None,
     )
     captured = {}
 
