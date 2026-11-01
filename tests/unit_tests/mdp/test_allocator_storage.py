@@ -89,3 +89,16 @@ def test_storage_assert_empty_names_leftovers():
         storage.assert_empty()
     storage.release(4)  # evaluation-path release
     storage.assert_empty()
+
+
+def test_storage_tp_peer_copy_is_untrainable_and_released():
+    # A decoder-TP peer stores the broadcast copy without requires_grad: only
+    # the endpoint's copy is routed back, so a trainable peer copy is rejected.
+    storage = MdpEmbeddingStorage(DirectBufferAllocator())
+    peer_copy = torch.zeros(4, 8)
+    storage.put_leaf(0, peer_copy, trainable=False)
+    assert storage.get_leaf(0) is peer_copy
+    with pytest.raises(MdpStateError, match="requires_grad == False"):
+        storage.put_leaf(1, _leaf(), trainable=False)
+    storage.release(0)
+    storage.assert_empty()
