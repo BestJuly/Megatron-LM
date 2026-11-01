@@ -23,7 +23,11 @@ from typing import Optional, Sequence
 import torch
 from torch.utils.data import Dataset
 
-from examples.multimodal_dev.data.mdp_scenarios import build_scenarios, scenario_totals
+from examples.multimodal_dev.data.mdp_scenarios import (
+    build_scenario_pool,
+    build_scenarios,
+    scenario_totals,
+)
 from examples.multimodal_dev.models.qwen35_vl.configuration import (
     QWEN35_VL_IMAGE_TOKEN_ID,
     QWEN35_VL_VISION_START_TOKEN_ID,
@@ -221,7 +225,9 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         length_config = load_json_arg(length_config)
     # Built once and shared: the pool is a deterministic function of the length
     # config, and drawing it re-samples a million lognormal lengths.
-    scenarios = build_scenarios(length_config=length_config)
+    scenarios = build_scenario_pool(
+        getattr(args, "mdp_mock_scenario", "default"), length_config=length_config
+    )
     kwargs = dict(
         vocab_size=getattr(args, "padded_vocab_size", 1024),
         image_token_id=resolve_image_token_id(args),

@@ -223,6 +223,92 @@ def build_scenarios(pool_size=POOL_SIZE, seed=GENERATOR_SEED, length_config=None
     return tuple(pool)
 
 
+# ---------------------------------------------------------------------------
+# ECD-like pool (``--mdp-mock-scenario ecd``)
+# ---------------------------------------------------------------------------
+# Measured on the first 8,192 complete samples of nvidia/Nemotron-Image-Training-v3
+# ``ecd/ecd.jsonl`` @ 7656391d (chart QA conversations; images from
+# ChartFoundation/ECD-10k-Images @ 284489f1) under the Qwen/Qwen3.8-Flash-Next @ de4b8e4d
+# processor with 65,536-262,144 image pixels, keeping whole samples whose total length
+# (aligned to 8) fits 2048 -- the selection of Megatron-Bridge PR #6354's image-SFT
+# subset. 12,729 rows scanned, 4,537 overlength skipped. Every sample has exactly one
+# still image; image tokens are p50 240 / p1 225 / max 256 (most charts hit the pixel
+# cap), total length mean 1038, p50 918, max 2047.
+
+#: Total-length quantiles at 0, 2, ..., 100 % (51 entries). Lengths are drawn by
+#: linear interpolation between neighbouring quantiles (inverse CDF).
+ECD_TOTAL_LENGTH_QUANTILES = (
+    419, 522, 556, 583, 603, 619, 636, 651, 665, 678, 690, 703, 717, 729, 742, 754, 769,
+    785, 799, 814, 829, 846, 863, 882, 898, 918, 939, 960, 984, 1008, 1033, 1060, 1091,
+    1123, 1156, 1195, 1237, 1278, 1321, 1365, 1407, 1453, 1509, 1572, 1629, 1686, 1745,
+    1801, 1876, 1962, 2047,
+)
+
+#: (h, w) image grids in patch units (t = 1) with their sample counts out of 8,192.
+ECD_IMAGE_GRIDS = (
+    (24, 40, 2055), (28, 34, 996), (26, 38, 924), (26, 36, 885), (22, 44, 878),
+    (34, 28, 424), (30, 32, 301), (20, 48, 210), (28, 36, 143), (18, 54, 139),
+    (24, 42, 125), (38, 26, 123), (32, 32, 117), (24, 38, 104), (22, 42, 99),
+    (32, 30, 93), (36, 26, 91), (16, 58, 67), (18, 52, 56), (40, 24, 52), (22, 46, 48),
+    (20, 46, 43), (18, 50, 23), (30, 34, 22), (44, 22, 22), (36, 28, 19), (28, 32, 15),
+    (20, 50, 15), (26, 34, 11), (16, 60, 9), (14, 64, 8), (28, 30, 8), (18, 56, 7),
+    (16, 62, 7), (34, 30, 6), (28, 28, 5), (26, 30, 5), (16, 56, 5), (38, 24, 5),
+    (42, 22, 4), (16, 64, 4), (30, 30, 4), (48, 20, 4), (42, 24, 2), (20, 34, 2),
+    (46, 20, 2), (58, 16, 1), (50, 20, 1), (14, 66, 1), (54, 18, 1), (50, 18, 1),
+)
+
+#: Text tokens before the image (``<|im_start|>user\n`` -- ECD puts the image first).
+ECD_PREFIX_TEXT_TOKENS = 3
+ECD_POOL_SIZE = 1024
+ECD_MAX_TOTAL_TOKENS = ECD_TOTAL_LENGTH_QUANTILES[-1]
+
+
+def _ecd_total_length(rng):
+    u = rng.random() * (len(ECD_TOTAL_LENGTH_QUANTILES) - 1)
+    i = min(int(u), len(ECD_TOTAL_LENGTH_QUANTILES) - 2)
+    lo, hi = ECD_TOTAL_LENGTH_QUANTILES[i], ECD_TOTAL_LENGTH_QUANTILES[i + 1]
+    return int(round(lo + (u - i) * (hi - lo)))
+
+
+def build_ecd_scenarios(pool_size=ECD_POOL_SIZE, seed=GENERATOR_SEED):
+    """Deterministic pool of ECD-like scenarios: one still image + text per sample.
+
+    Image grid and total length are drawn independently from the measured ECD tables
+    above (the image token count is nearly constant, so the joint distribution is
+    essentially the product). Layout: ``ECD_PREFIX_TEXT_TOKENS`` text tokens, the
+    vision-start sentinel, the image rows, then the remaining text (question + answer).
+    No text-only samples, no video, total length <= ``ECD_MAX_TOTAL_TOKENS``.
+    """
+    rng = random.Random(seed)
+    grids = [(1, h, w) for h, w, _ in ECD_IMAGE_GRIDS]
+    weights = [n for _, _, n in ECD_IMAGE_GRIDS]
+    pool = []
+    for i in range(pool_size):
+        grid = rng.choices(grids, weights=weights)[0]
+        total = _ecd_total_length(rng)
+        image_tokens = _item_tokens(grid)
+        tail = total - image_tokens - 1 - ECD_PREFIX_TEXT_TOKENS
+        assert tail >= 1, f"ECD scenario {i}: total {total} too short for {grid}"
+        scenario = ((grid,), (ECD_PREFIX_TEXT_TOKENS, tail))
+        assert scenario_totals(scenario) == (total, image_tokens)
+        pool.append(scenario)
+    return tuple(pool)
+
+
+def build_scenario_pool(kind="default", length_config=None):
+    """Scenario pool selected by ``--mdp-mock-scenario`` (``default`` or ``ecd``)."""
+    if kind == "ecd":
+        if length_config is not None:
+            raise ValueError(
+                "--mdp-mock-scenario ecd draws lengths from the measured ECD distribution; "
+                "it cannot be combined with --mdp-mock-dataset-config-json."
+            )
+        return build_ecd_scenarios()
+    if kind != "default":
+        raise ValueError(f"unknown --mdp-mock-scenario {kind!r}; expected 'default' or 'ecd'")
+    return build_scenarios(length_config=length_config)
+
+
 if __name__ == "__main__":
     pool = build_scenarios()
     totals = []
