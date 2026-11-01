@@ -185,7 +185,8 @@ Model-specific facts worth knowing:
   spec is ~4e-4 relative; the reference spec reaches ~1e-6
   (`tests/test_kimi_k3_vl_vision_parity.py`).
 * On H100 the Blackwell-only Kimi-K3 features (MoK, MXFP8, FA4, MLA latent CP)
-  must stay off; MDP additionally requires `TP=1`.
+  must stay off. MDP runs with decoder TP (e.g. TP2+SP EP4 on 8 H100s);
+  `--mdp-overlap-window-capture` still needs `TP=1`.
 * `--optimizer muon` trains the decoder with the layer-wise distributed
   optimizer under MDP; the MoonViT encoder trains with Adam ZeRO-1 (decoder lr,
   schedule, weight decay and betas).
