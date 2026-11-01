@@ -305,6 +305,21 @@ def add_multimodal_args(parser):
         ),
     )
     group.add_argument(
+        "--mdp-mock-scenario",
+        type=str,
+        default="default",
+        choices=["default", "ecd"],
+        help=(
+            "Scenario pool of the MDP mock dataset. 'default': general VLM mix "
+            "(1-3 images, ~25%% video items, ~1/5 text-only, 1000-2000 tokens). "
+            "'ecd': chart-QA SFT like Nemotron-Image-Training-v3 ECD as selected for "
+            "Megatron-Bridge's Qwen3.8 image SFT -- exactly one still image of "
+            "~240 (170-256) decoder tokens per sample and the measured total-length "
+            "distribution (419-2047, mean ~1040). Not combinable with "
+            "--mdp-mock-dataset-config-json."
+        ),
+    )
+    group.add_argument(
         "--mdp-mock-dataset-config-json",
         type=str,
         default=None,
