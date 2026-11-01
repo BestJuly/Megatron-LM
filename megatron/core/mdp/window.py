@@ -123,6 +123,7 @@ class MdpIterationWindow:
         lane_id: Optional[int],
         my_worker_id: int,
         num_workers: int,
+        pixel_owners: Optional[Sequence[int]] = None,
     ) -> "MdpIterationWindow":
         """Consume one real iterator and build records, descriptors, and sidecar.
 
@@ -132,9 +133,11 @@ class MdpIterationWindow:
         planning group (one endpoint per group generates them).
 
         Every worker materializes and cuts pixels only for the microbatches it owns
-        (``microbatch_id % num_workers == my_worker_id``); the ownership context
-        set around each ``adapter.get_batch`` call lets the model collate path
-        skip pixel materialization on non-owners.
+        (``pixel_owners[microbatch_id % len(pixel_owners)] == my_worker_id``); the
+        ownership context set around each ``adapter.get_batch`` call lets the model
+        collate path skip pixel materialization on non-owners. ``pixel_owners``
+        defaults to every worker; under decoder TP it holds only the workers on TP
+        source ranks, since those are the only ranks that load data.
         """
         if isinstance(data_iterators, (list, tuple)):
             iterator = data_iterators[0] if data_iterators else None
@@ -145,6 +148,12 @@ class MdpIterationWindow:
                 "MDP: owner-sharded capture requires 0 <= my_worker_id < num_workers "
                 f"(got {my_worker_id}, {num_workers})."
             )
+        owners = tuple(range(num_workers)) if pixel_owners is None else tuple(pixel_owners)
+        if not owners or any(not 0 <= owner < num_workers for owner in owners):
+            raise MdpConfigurationError(
+                f"MDP: pixel_owners={owners} violates: non-empty and every owner in "
+                f"[0, {num_workers})."
+            )
 
         records = []
         descriptors = []
@@ -152,7 +161,7 @@ class MdpIterationWindow:
         next_item_id = 0
         merge = adapter.spatial_merge_size
         for microbatch_id in range(num_microbatches):
-            owner_worker_id = microbatch_id % num_workers
+            owner_worker_id = owners[microbatch_id % len(owners)]
             owns_pixels = owner_worker_id == my_worker_id
             try:
                 _PIXEL_OWNERSHIP.value = (owner_worker_id, my_worker_id)

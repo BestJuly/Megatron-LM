@@ -660,6 +660,7 @@ class MdpRuntime:
             lane_id=self.rank_view.lane_id,
             my_worker_id=self.rank_view.my_worker_id,
             num_workers=len(self.rank_view.worker_ids),
+            pixel_owners=self.rank_view.pixel_owners,
         )
 
     @staticmethod
