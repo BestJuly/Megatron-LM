@@ -1736,14 +1736,18 @@ class MultiTokenPredictionLayer(MegatronModule):
 
     def _get_precomputed_embeddings(self, decoder_input: torch.Tensor, hidden_states: torch.Tensor):
         """Prepare externally composed embeddings for an MTP depth."""
-        row_norms = decoder_input.norm(dim=-1)
-        zero_norm_mask = row_norms < 1e-6
-        if zero_norm_mask.any():
-            non_zero_mask = ~zero_norm_mask
-            if non_zero_mask.any():
-                fill_embedding = decoder_input[non_zero_mask].mean(dim=0)
-                decoder_input = decoder_input.clone()
-                decoder_input[zero_norm_mask] = fill_embedding
+        # Zero-norm rows take the mean of the non-zero rows. Computed without host syncs or
+        # data-dependent shapes so a full-iteration CUDA graph can capture it; rows that are not
+        # zero pass through unchanged (and receive their gradient unchanged).
+        zero_norm_mask = (decoder_input.norm(dim=-1) < 1e-6).unsqueeze(-1)
+        non_zero_mask = ~zero_norm_mask
+        num_non_zero = non_zero_mask.sum(dim=(0, 1))
+        fill_embedding = (decoder_input * non_zero_mask).sum(dim=(0, 1)) / num_non_zero.clamp(
+            min=1
+        ).to(decoder_input.dtype)
+        decoder_input = torch.where(
+            zero_norm_mask & (num_non_zero > 0), fill_embedding, decoder_input
+        )
 
         if self.config.mtp_detach_heads:
             decoder_input = decoder_input.detach()
