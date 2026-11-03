@@ -264,3 +264,87 @@ def test_disjointness_assertion_catches_leaked_parameter():
     assert_parameter_disjointness(
         domain.encoder_ddp, [torch.nn.Linear(4, 4).cuda()]
     )
+
+
+class _TPEncoder(torch.nn.Module):
+    """A Column/RowParallel pair plus plain-torch parameters: under TP the
+    linears draw their shards from the per-TP-rank model-parallel RNG, the
+    rest from the global torch RNG -- the two ways a native ViT initializes."""
+
+    def __init__(self, config, pg_collection):
+        super().__init__()
+        from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
+
+        tp_group = pg_collection.tp
+        self.pos = torch.nn.Parameter(torch.randn(4, 16, device="cuda"))
+        self.fc1 = ColumnParallelLinear(
+            16, 32, config=config, init_method=config.init_method, bias=True,
+            gather_output=False, tp_group=tp_group,
+        )
+        self.fc2 = RowParallelLinear(
+            32, 16, config=config, init_method=config.output_layer_init_method, bias=True,
+            input_is_parallel=True, skip_bias_add=False, tp_group=tp_group,
+        )
+
+
+class _TPAdapter:
+    def build_encoder(self, model_config, *, pg_collection):
+        return _TPEncoder(model_config, pg_collection)
+
+
+@pytest.mark.skipif(
+    int(os.environ.get("WORLD_SIZE", "1")) % 2, reason="needs an even world for TP2"
+)
+def test_native_init_copies_the_tp_sharded_native_encoder():
+    # The multimodal model builds its encoder natively (sharded over the decoder
+    # TP group) and hands it over; the replicated encoder must equal its shards
+    # gathered, bitwise, and differ from its own initialization without it.
+    from megatron.core import parallel_state
+    from megatron.core.mdp.encoder import build_encoder_with_native_init
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+    try:
+        world = torch.distributed.get_world_size()
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        config = TransformerConfig(
+            num_layers=1, hidden_size=16, num_attention_heads=1, use_cpu_initialization=False
+        )
+        rank_map = build_rank_map(
+            MdpRankSpec(world_size=world, tp=2, pp=1, cp=1, ep=1, encoder_cp=1)
+        )
+        groups = install_mdp_process_groups(
+            rank_map, group_registry=MdpGroupRegistry(), decoder_tp_group=tp_group
+        )
+        encoder_pgs = build_encoder_pg_collection(rank_map, encoder_cp=1, process_groups=groups)
+
+        torch.manual_seed(1234)
+        model_parallel_cuda_manual_seed(1234)
+        native_pgs = build_encoder_pg_collection(rank_map, encoder_cp=1, process_groups=groups)
+        native_pgs.tp = tp_group
+        native = _TPEncoder(config, native_pgs)
+        expected = {}
+        for name, param in native.named_parameters():
+            full = param.detach()
+            if getattr(param, "tensor_model_parallel", False):
+                parts = [torch.empty_like(full) for _ in range(2)]
+                torch.distributed.all_gather(parts, full.contiguous(), group=tp_group)
+                full = torch.cat(parts, dim=param.partition_dim)
+            expected[name] = full
+        assert native.fc1.weight.shape == (16, 16)  # really sharded
+
+        encoder = build_encoder_with_native_init(
+            _TPAdapter(), config, encoder_pgs, init_source=native, init_tp_group=tp_group
+        )
+        got = dict(encoder.named_parameters())
+        assert set(got) == set(expected)
+        assert got["fc1.weight"].shape == (32, 16)
+        for name, full in expected.items():
+            assert torch.equal(got[name], full), name
+
+        plain = build_encoder_with_native_init(_TPAdapter(), config, encoder_pgs)
+        assert not torch.equal(dict(plain.named_parameters())["fc1.weight"], expected["fc1.weight"])
+    finally:
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=2
+        )

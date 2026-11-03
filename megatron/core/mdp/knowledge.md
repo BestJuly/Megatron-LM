@@ -90,6 +90,12 @@ Preserve these unless the feature design is intentionally changed:
   all-gather backward), and a second sender would scale encoder gradients by
   TP. The encoder itself never sees TP: it is built on MDP's rank-local
   `pg_collection` and its weights are broadcast from WORLD rank 0 at build.
+  Its initial weights are the native model's: the multimodal model provider
+  still builds the vision encoder natively under MDP (so the decoder's
+  initialization sees the same RNG history), stashes it outside its module
+  tree (`stash_mdp_init_vision_encoder`), and MDP gathers its TP shards into
+  the replicated encoder (`build_encoder_with_native_init`); gated vision MLPs
+  under TP keep the replicated init.
 - Decoder CP: the plan stays CP-agnostic and the endpoint stays its only
   decoder rank. The shard owners are the PP0 TP sources, one per `cp_rank`
   (planning-group index `k * tp`; element 0 is the endpoint). After P3 the

@@ -104,7 +104,13 @@ source ranks own pixels (they are the ranks that load data), the endpoint
 the endpoint returns the leaf gradient. That gradient is identical on every TP
 rank, so a second sender would scale the WORLD-reduced encoder gradient by TP.
 The encoder is built on MDP's rank-local process groups and its weights are
-broadcast from WORLD rank 0 when the domain is built.
+broadcast from WORLD rank 0 when the domain is built. Its initial weights are
+the native model's: under MDP the multimodal model provider still builds the
+vision encoder where the native model does (stage 0, before the decoder,
+sharded over the decoder TP group), keeps it out of the model's module tree, and MDP gathers its TP
+shards into the replicated encoder (`build_encoder_with_native_init`). An MDP
+run and a native run of the same recipe and seed therefore start from the same
+model, decoder included.
 
 Decoder context parallelism keeps the plan CP-agnostic. The endpoint still
 assembles one full leaf per vision microbatch, then cuts it into per-CP-rank

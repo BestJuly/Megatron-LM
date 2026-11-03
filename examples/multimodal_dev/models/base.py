@@ -213,6 +213,24 @@ class MultimodalModel(MegatronModule):
         self.vision_model = vision_encoder if pre_process else None
         self.language_model = language_model
 
+    def stash_mdp_init_vision_encoder(self, encoder: Optional[MegatronModule]) -> None:
+        """Keep a natively built vision encoder for MDP without making it a submodule.
+
+        Under MDP ``pretrain_multimodal.model_provider`` still builds the vision
+        encoder where the native model does -- before the decoder, so the
+        decoder initializes from the same RNG history -- but MDP's replicated
+        encoder domain owns the vision weights. The built encoder is held outside
+        the module tree (no parameters, no checkpoint keys, no DDP buffer) until
+        MDP copies its initial weights (:meth:`take_mdp_init_vision_encoder`).
+        """
+        object.__setattr__(self, "_mdp_init_vision_encoder", encoder)
+
+    def take_mdp_init_vision_encoder(self) -> Optional[MegatronModule]:
+        """Hand the stashed native encoder to MDP once, and drop the reference."""
+        encoder = getattr(self, "_mdp_init_vision_encoder", None)
+        object.__setattr__(self, "_mdp_init_vision_encoder", None)
+        return encoder
+
     def shared_embedding_or_output_weight(self):
         """Surface the wrapped language model's shared embedding / output
         weight to the PP grad-finalize step (mirrors the LLaVA wrapper).

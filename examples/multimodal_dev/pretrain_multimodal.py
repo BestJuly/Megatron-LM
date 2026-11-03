@@ -133,6 +133,20 @@ def model_provider(pre_process: bool = True, post_process: bool = True, **kwargs
     )
 
     # --- build model (fully delegated to the arch factory) ---
+    # Under MDP the model omits its vision encoder: the replicated encoder domain
+    # owns it. Build it here anyway, exactly as the model builds it natively
+    # (the arch's own encoder factory, the model's own process groups, right
+    # before the decoder), so the decoder initializes from the same RNG history
+    # as a native run and MDP can start its encoder from these weights
+    # (megatron.core.mdp.encoder.build_encoder_with_native_init).
+    native_init_encoder = None
+    if getattr(args, "mdp_enable", False) and pre_process:
+        from examples.multimodal_dev.mdp_adapter import build_mdp_adapter
+
+        native_init_encoder = build_mdp_adapter(
+            args, language_config, vision_config
+        ).build_encoder(vision_config, pg_collection=None)
+
     model = registry["model_factory_fn"](
         args=args,
         language_config=language_config,
@@ -142,6 +156,8 @@ def model_provider(pre_process: bool = True, post_process: bool = True, **kwargs
         language_model_builder=language_model_builder,
         **kwargs,
     )
+    if native_init_encoder is not None:
+        model.stash_mdp_init_vision_encoder(native_init_encoder)
 
     return model
 

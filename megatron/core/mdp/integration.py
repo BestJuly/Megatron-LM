@@ -183,6 +183,20 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
     )
 
 
+def _take_native_init_encoder(model):
+    """The vision encoder the multimodal model built natively under MDP (or None).
+
+    Chunk 0 is the first pipeline stage's chunk; later stages build none.
+    """
+    if not model:
+        return None
+    module = model[0]
+    while not hasattr(module, "take_mdp_init_vision_encoder") and hasattr(module, "module"):
+        module = module.module
+    take = getattr(module, "take_mdp_init_vision_encoder", None)
+    return take() if take is not None else None
+
+
 def validate_from_args(args) -> None:
     """Run the full support-matrix validation from the parsed args."""
     config = mdp_config_from_args(args)
@@ -264,6 +278,14 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
         ddp_config=ddp_config,
         optimizer_config=optimizer_config,
         encoder_pgs=encoder_pgs,
+        # Start from the weights the native model of the same recipe and seed
+        # initializes (see build_encoder_with_native_init).
+        native_init_source=_take_native_init_encoder(model),
+        native_init_tp_group=(
+            parallel_state.get_tensor_model_parallel_group()
+            if args.tensor_model_parallel_size > 1
+            else None
+        ),
     )
     assert_parameter_disjointness(encoder_domain.encoder_ddp, model)
 

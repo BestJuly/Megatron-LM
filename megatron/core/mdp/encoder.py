@@ -11,7 +11,7 @@ domain. The encoder never enters the decoder schedule model list.
 
 import logging
 from dataclasses import dataclass, replace
-from typing import Any, Sequence
+from typing import Any, Optional, Sequence
 
 import torch
 
@@ -116,6 +116,8 @@ def build_encoder_domain(
     optimizer_config,
     encoder_pgs: ProcessGroupCollection,
     wrap_mixed_precision: bool = True,
+    native_init_source: Optional[torch.nn.Module] = None,
+    native_init_tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> EncoderDomain:
     """Assemble the encoder domain (API design 14.2).
 
@@ -123,6 +125,11 @@ def build_encoder_domain(
     factory; the same mixed-precision wrapper depth as the decoder;
     DDP over the encoder process groups; DistributedOptimizer from the DDP
     buffers.
+
+    ``native_init_source`` (the encoder the multimodal model built natively but
+    did not keep) and ``native_init_tp_group`` (the decoder TP group) make the
+    replicated encoder start from exactly the native model's initial weights;
+    see :func:`build_encoder_with_native_init`.
     """
     if getattr(ddp_config, "num_distributed_optimizer_instances", 1) != 1:
         raise MdpConfigurationError(
@@ -149,7 +156,13 @@ def build_encoder_domain(
         "MDP: effective encoder recompute granularity: %s",
         mdp_config.encoder_recompute_granularity,
     )
-    encoder = adapter.build_encoder(effective_config, pg_collection=encoder_pgs)
+    encoder = build_encoder_with_native_init(
+        adapter,
+        effective_config,
+        encoder_pgs,
+        init_source=native_init_source,
+        init_tp_group=native_init_tp_group,
+    )
     if wrap_mixed_precision and (
         getattr(effective_config, "fp16", False) or getattr(effective_config, "bf16", False)
     ):
@@ -188,6 +201,69 @@ def build_encoder_domain(
         encoder_optimizer=encoder_optimizer,
         effective_config=effective_config,
     )
+
+
+def build_encoder_with_native_init(
+    adapter: MdpModelAdapter,
+    config,
+    encoder_pgs: ProcessGroupCollection,
+    *,
+    init_source: Optional[torch.nn.Module] = None,
+    init_tp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.nn.Module:
+    """Build the replicated encoder, starting from the native model's weights.
+
+    The native multimodal model builds its vision encoder on pipeline stage 0
+    before the decoder, sharded over the decoder TP group (each TP rank draws
+    its own shard from its own model-parallel RNG stream). Under MDP the model
+    still performs that construction, so the decoder sees the same RNG history,
+    but keeps the result out of its parameters and hands it over as
+    ``init_source``. Its parameters are copied into the replicated encoder; at
+    TP > 1 the tensor-parallel ones are all-gathered over ``init_tp_group``
+    along their partition dim first. Ranks without a source (later pipeline
+    stages) keep their own initialization; the WORLD broadcast from rank 0
+    (a stage-0 rank) that follows makes every replica equal. Gated (GLU) linears
+    interleave their halves per TP shard; that case keeps the replicated
+    initialization.
+    """
+    encoder = adapter.build_encoder(config, pg_collection=encoder_pgs)
+    if init_source is None:
+        return encoder
+    tp = 1 if init_tp_group is None else torch.distributed.get_world_size(init_tp_group)
+    if tp > 1 and getattr(config, "gated_linear_unit", False):
+        logger.warning(
+            "MDP: gated vision MLP under decoder TP=%d; the encoder keeps its replicated "
+            "initialization instead of the native TP-sharded one.",
+            tp,
+        )
+        return encoder
+    targets = dict(encoder.named_parameters())
+    with torch.no_grad():
+        for name, source in init_source.named_parameters():
+            if name not in targets:
+                raise MdpConfigurationError(
+                    f"MDP: native encoder parameter {name!r} violates: present in the "
+                    "replicated encoder."
+                )
+            target = targets.pop(name)
+            full = source.detach()
+            if tp > 1 and getattr(source, "tensor_model_parallel", False):
+                full = full.cuda().contiguous()
+                parts = [torch.empty_like(full) for _ in range(tp)]
+                torch.distributed.all_gather(parts, full, group=init_tp_group)
+                full = torch.cat(parts, dim=source.partition_dim)
+            if full.shape != target.shape:
+                raise MdpConfigurationError(
+                    f"MDP: native encoder parameter {name!r} {tuple(full.shape)} violates: "
+                    f"equals the replicated shape {tuple(target.shape)}."
+                )
+            target.copy_(full)
+    if targets:
+        raise MdpConfigurationError(
+            f"MDP: replicated encoder parameters {sorted(targets)[:3]} violate: present in "
+            "the native encoder."
+        )
+    return encoder
 
 
 def assert_encoder_prescale_is_one(encoder_ddp) -> None:
