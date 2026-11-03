@@ -173,6 +173,44 @@ def test_capture_rejects_unsuppressed_pixels_on_non_owner():
         )
 
 
+@pytest.mark.parametrize("my_worker_id", [0, 1, 2, 3])
+def test_capture_under_tp2_deals_pixels_to_tp_sources_only(my_worker_id):
+    # TP=2 PP=2: workers 0 and 2 sit on TP source ranks (the only ranks that
+    # load data); workers 1 and 3 are TP peers and must never own pixels, even
+    # though they still run the encoder.
+    window = MdpIterationWindow.capture(
+        iter(range(10)),
+        num_microbatches=5,
+        adapter=_ShardAwareAdapter(_window_microbatches()),
+        num_vpp_chunks=1,
+        lane_id=0 if my_worker_id == 0 else None,
+        my_worker_id=my_worker_id,
+        num_workers=4,
+        pixel_owners=(0, 2),
+    )
+    # Owners by microbatch: 0, 2, 0, 2, 0 -> items mb0 {0, 1}, mb1 {2}, mb3 {3}, mb4 {4}.
+    owned_items = {0: {0, 1, 4}, 1: set(), 2: {2, 3}, 3: set()}[my_worker_id]
+    assert set(window.payload_sidecar()) == owned_items
+    if my_worker_id == 0:
+        assert [d.owner_worker_id for d in window.descriptors()] == [0, 0, 2, 2, 0]
+    assert len(window.records()) == 5
+
+
+@pytest.mark.parametrize("pixel_owners", [(), (4,), (-1,)])
+def test_capture_rejects_invalid_pixel_owners(pixel_owners):
+    with pytest.raises(MdpConfigurationError, match="pixel_owners"):
+        MdpIterationWindow.capture(
+            iter(range(10)),
+            num_microbatches=1,
+            adapter=_ShardAwareAdapter(_window_microbatches()[:1]),
+            num_vpp_chunks=1,
+            lane_id=0,
+            my_worker_id=0,
+            num_workers=4,
+            pixel_owners=pixel_owners,
+        )
+
+
 # ----------------------------------------------------------------------
 # Planner: owner metadata and locality preference (pure compute)
 # ----------------------------------------------------------------------

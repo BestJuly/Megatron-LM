@@ -729,8 +729,18 @@ def pack_or_pad_batch(
                 if key in packed_batch:
                     sidecar_cpu[key] = packed_batch.pop(key)
 
+        # Under MDP the pixels go to the encoder through the planning group's
+        # all-to-all, never into the decoder, so TP peers do not need them: the
+        # TP source is the only pixel owner of its TP group (rank map
+        # ``pixel_owners``), and a peer that received them would also trip the
+        # capture's "non-owned microbatch carries pixels" check.
+        mdp_local_pixels = None
+        if with_vision_sidecar and tp_size > 1 and is_src:
+            mdp_local_pixels = packed_batch.pop("pixel_values", None)
         packed_batch = broadcast_data_batch(packed_batch, device=device)
         packed_batch.update(sidecar_cpu)
+        if mdp_local_pixels is not None:
+            packed_batch["pixel_values"] = mdp_local_pixels.to(device, non_blocking=True)
 
         cu_seqlens_t = packed_batch.pop("cu_seqlens")
         cu_seqlens_padded_t = packed_batch.pop("cu_seqlens_padded")

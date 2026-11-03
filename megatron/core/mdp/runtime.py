@@ -357,10 +357,13 @@ class MdpRuntime:
             self._eval_outputs = tuple(chunk_outputs)
             detached = tuple(output.detach() for output in chunk_outputs)
 
-        # P3: embedding exchange straight into the endpoint leaves.
+        # P3: embedding exchange straight into the endpoint leaves. Under decoder
+        # TP the endpoint's TP peers allocate the same leaves (the plan is identical
+        # on every group member) and receive them by broadcast below.
         emb_dest = {}
         leaves = []  # (microbatch_id, valid leaf view)
-        if self.rank_view.lane_id is not None:
+        is_endpoint = self.rank_view.lane_id is not None
+        if is_endpoint or self.rank_view.is_leaf_peer:
             with nvtx_phase("p3_leaf_assembly"):
                 for layout in plan.layouts:
                     if layout.text_only:
@@ -372,11 +375,12 @@ class MdpRuntime:
                         device=self.device,
                         tag="leaf",
                     )
-                    for segment in layout.segments:
-                        emb_dest[BridgeBufferKey(segment.global_item_id)] = leaf[
-                            segment.leaf_row_start : segment.leaf_row_start
-                            + segment.output_rows
-                        ]
+                    if is_endpoint:
+                        for segment in layout.segments:
+                            emb_dest[BridgeBufferKey(segment.global_item_id)] = leaf[
+                                segment.leaf_row_start : segment.leaf_row_start
+                                + segment.output_rows
+                            ]
                     leaves.append((layout.microbatch_id, leaf[: layout.total_output_rows]))
         with nvtx_phase("p3_embedding_exchange"):
             emb_specs = self._iter_specs[BridgePhase.EMBEDDING]
@@ -399,10 +403,25 @@ class MdpRuntime:
                 device=self.device,
                 dest_views=emb_dest,
             )
+        leaf_tp_group = self.process_groups.leaf_tp_group
+        if leaf_tp_group is not None and leaves:
+            # Every first-stage TP rank runs the decoder input layer, so every one
+            # of them needs the full leaf. One broadcast per vision microbatch over
+            # the decoder TP group; the encoder never sees TP.
+            with nvtx_phase("p3_leaf_tp_broadcast"):
+                for _, leaf_valid in leaves:
+                    torch.distributed.broadcast(
+                        leaf_valid, src=self.rank_view.endpoint_rank, group=leaf_tp_group
+                    )
         # requires_grad only after every exchange copy into the leaf is done.
+        # Only the endpoint's copy is trainable: the leaf gradient is identical
+        # on every TP rank (the first column-parallel layer all-reduces it, or the
+        # SP scatter's backward all-gathers it), so one copy goes back to the
+        # encoder and a peer returning its own would scale encoder grads by TP.
         for microbatch_id, leaf_valid in leaves:
-            leaf_valid.requires_grad_(True)
-            self.storage.put_leaf(microbatch_id, leaf_valid)
+            if is_endpoint:
+                leaf_valid.requires_grad_(True)
+            self.storage.put_leaf(microbatch_id, leaf_valid, trainable=is_endpoint)
         if forward_only and self._eval_outputs:
             # Evaluation releases producer outputs once the bridge completed.
             self._eval_outputs = ()
@@ -488,6 +507,10 @@ class MdpRuntime:
             with nvtx_phase("p5_grad_exchange"):
                 grad_specs = self._iter_specs[BridgePhase.GRADIENT]
                 grad_local = {}
+                if self.rank_view.is_leaf_peer:
+                    # TP peers hold untrainable copies; release them, send nothing.
+                    for layout in plan.layouts:
+                        self.storage.release(layout.microbatch_id)
                 if self.rank_view.lane_id is not None:
                     for layout in plan.layouts:
                         if layout.text_only:
@@ -661,6 +684,7 @@ class MdpRuntime:
             lane_id=self.rank_view.lane_id,
             my_worker_id=self.rank_view.my_worker_id,
             num_workers=len(self.rank_view.worker_ids),
+            pixel_owners=self.rank_view.pixel_owners,
         )
 
     @staticmethod

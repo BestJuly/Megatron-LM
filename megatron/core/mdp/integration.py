@@ -233,8 +233,18 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
         )
     )
     rank_view = rank_map.view(torch.distributed.get_rank())
+    # Bootstrap point: the decoder TP group is materialized from the MPU globals
+    # here, once, and passed explicitly to everything downstream.
+    from megatron.core import parallel_state
+
     process_groups = install_mdp_process_groups(
-        rank_map, group_registry=MdpGroupRegistry()
+        rank_map,
+        group_registry=MdpGroupRegistry(),
+        decoder_tp_group=(
+            parallel_state.get_tensor_model_parallel_group()
+            if args.tensor_model_parallel_size > 1
+            else None
+        ),
     )
     encoder_pgs = build_encoder_pg_collection(
         rank_map, encoder_cp=mdp_config.encoder_cp, process_groups=process_groups

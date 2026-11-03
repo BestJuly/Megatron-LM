@@ -241,13 +241,16 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "has not been validated against other orders.",
             SUPPORTED_RANK_ORDER,
         )
-    if options.tensor_parallel_size != 1:
+    # Decoder TP > 1 (with or without SP) is supported: the encoder stays
+    # replicated and TP-unaware, the endpoint broadcasts each embedding leaf to
+    # its decoder-TP peers, and only the endpoint returns gradients. The window
+    # capture overlap above is still rejected with TP > 1.
+    if options.tensor_parallel_size < 1:
         _reject(
             "tensor_parallel_size",
             options.tensor_parallel_size,
-            "TP == 1",
-            "The current MDP support matrix requires TP=1.",
-            "1",
+            "TP >= 1",
+            "Tensor parallel size must be positive.",
         )
     if options.context_parallel_size != 1:
         _reject(

@@ -23,9 +23,9 @@ entry point changes.
 
 ## Mental model
 
-MDP keeps the decoder's sample ownership and native PP/VPP/EP schedule intact,
-but rebalances vision items across the `CP x PP` workers that belong to one
-outer data-parallel decoder replica.
+MDP keeps the decoder's sample ownership and native TP/PP/VPP/EP schedule
+intact, but rebalances vision items across the `TP x CP x PP` workers that
+belong to one outer data-parallel decoder replica.
 
 Each physical rank contains:
 
@@ -38,10 +38,13 @@ For every iteration, all workers see the same text tensors and vision metadata.
 Pixel payload materialization is sharded by microbatch:
 
 ```text
-pixel_owner_worker = microbatch_id % num_workers
+pixel_owner_worker = pixel_owners[microbatch_id % len(pixel_owners)]
 ```
 
-Only that worker materializes the microbatch's pixels. The deterministic planner
+`pixel_owners` is every worker at TP=1. Under decoder TP only the TP source
+rank loads data (and broadcasts the text tensors to its peers), so only the
+workers on TP-source ranks own pixels; `pack_or_pad_batch` keeps pixels out of
+the TP broadcast under MDP. Only the owner materializes the microbatch's pixels. The deterministic planner
 may assign each vision item to any producer worker. One canonical bridge ledger
 then drives three `all_to_all_single` phases:
 
@@ -80,6 +83,13 @@ Preserve these unless the feature design is intentionally changed:
 - Encoder and decoder parameter sets are disjoint.
 - Encoder gradients are reduced over WORLD and normalized with the decoder
   finalizer's in-place-reduced global token count.
+- Decoder TP: the endpoint (tp0 of PP0) is the only rank in the plan; its TP
+  peers receive each leaf by a broadcast over the decoder TP group and hold an
+  untrainable copy. Only the endpoint returns leaf gradients: the gradient is
+  identical on every TP rank (column-parallel all-reduce, or the SP scatter's
+  all-gather backward), and a second sender would scale encoder gradients by
+  TP. The encoder itself never sees TP: it is built on MDP's rank-local
+  `pg_collection` and its weights are broadcast from WORLD rank 0 at build.
 - Decoder DDP overlap stays inside the native decoder schedule. The encoder
   uses an independent synchronous DDP configuration for its P5/P6 lifecycle.
 - The composite optimizer treats decoder and encoder overflow, norm clipping,
@@ -104,7 +114,7 @@ The iteration phases are:
 | P0 | `MdpRuntime.begin_iteration` | Reset iteration state and encoder gradients. |
 | P1 | `window.py`, `groups.py`, `planner.py`, `bridge.py` | Capture the full iteration, shard pixel reads, broadcast descriptors, build/check the plan, and route pixels. |
 | P2 | `runtime.py`, `activation.py`, model adapter | Pack producer chunks. Default training runs the encoder with autograd; complete-encoder recompute runs it under `no_grad` and saves pixels/layouts/output metadata/RNG recipes. |
-| P3 | `bridge.py`, `storage.py` | Route detached vision embeddings to decoder endpoints and create endpoint leaves. |
+| P3 | `bridge.py`, `storage.py` | Route detached vision embeddings to decoder endpoints and create endpoint leaves; under decoder TP, broadcast each leaf to the endpoint's TP peers. |
 | P4 | Native Megatron schedule | Replay captured microbatches through the unchanged decoder schedule, finish any native decoder gradient-reduce overlap, and capture global token count. |
 | P5 | `runtime.py`, `activation.py`, `encoder.py` | Route leaf gradients back; run retained-graph backward or replay complete encoder chunks with restored RNG before backward; reduce WORLD gradients and normalize them. |
 | P6 | `optimizer.py` | Union overflow state, compute a combined norm, clip consistently, and step decoder plus encoder optimizers. |
@@ -547,8 +557,10 @@ Core changes are needed only when the wire schema must change (a different
 Current major constraints:
 
 - one adapter per run, one encoder per model;
-- TP=1;
-- decoder CP=1;
+- decoder TP >= 1, with or without SP (encoder always replicated, TP-unaware);
+  `--mdp-overlap-window-capture` requires TP=1;
+- decoder CP=1 (with CP the leaf broadcast would have to cover the endpoint's
+  CP ranks too);
 - encoder CP=1;
 - distributed optimizer enabled;
 - per-token loss enabled;
@@ -623,6 +635,11 @@ torchrun --nproc_per_node=1 -m pytest -q \
 torchrun --nproc_per_node=8 -m pytest -q \
   examples/multimodal_dev/tests/test_mdp_parity.py
 ```
+
+`test_mdp_parity.py` includes the decoder TP=2 cases (with and without SP)
+and the factor-of-TP fault-injection twin; set `CUDA_DEVICE_MAX_CONNECTIONS=1`
+for the SP case. `test_mdp_tp_collate.py` (any even world) checks that pixels
+stay on the TP source under MDP.
 
 Reference launcher:
 
