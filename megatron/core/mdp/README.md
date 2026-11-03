@@ -76,7 +76,7 @@ builder-side stack features apply.
 | `--model-arch` | Vision encoder | Decoder build path | Status |
 |---|---|---|---|
 | `qwen35_vl` | Qwen3.5 ViT (grid shape key `(t, h, w)`, merge 2) | default hook (`HybridModelBuilder`), RoPE fraction/base pinned | supported |
-| `qwen38_vl` | Qwen3.5 ViT, reused (HF `qwen4_exp` code identical; output width = decoder hidden 2560) | default hook; Qwen3.8 decoder (GDN + QSA + MoE, gated residual, Engram/PLE, MTP) from CLI args, RoPE fraction/base pinned | supported (proxy-validated) |
+| `qwen38_vl` | Qwen3.5 ViT, reused (HF `qwen4_exp` code identical; output width = decoder hidden 2560) | default hook; Qwen3.8 decoder (GDN + QSA + MoE, gated residual, Engram/PLE, MTP) from CLI args, RoPE fraction/base pinned | supported (proxy-validated), decoder CP 1 and 2 (all-gather CP, headwise GDN; same weights: MDP CP2 equals native CP2) |
 
 Supported: one vision encoder per model, `TP=1`, decoder `CP>=1`
 (`cp_partition_mode=zigzag`; not combined with the full-iteration decoder graph),
@@ -168,7 +168,9 @@ this shape is ~8.6e-2 in grad norm.
 | Cross-PP restart with optimizer state, checkpoint saved with the defaults | **Rejected, by design** | Upstream raises before training starts (`distrib_optim_sharding_type == 'dp_reshardable'`). The flag is a **save-time** decision; a checkpoint already written without it can only be restarted weight-only. Note the upstream message names `--ckpt-fully-parallel-save`, which is a different flag and is itself rejected under MDP |
 | Checkpoint missing encoder weights (e.g. a non-strict `--dist-ckpt-strictness` dropped them) | **Rejected, loudly** | `load_encoder_state` raises `MdpCheckpointError` instead of resuming from the random initialization |
 | TransformerEngine `_extra_state` drift between the checkpoint and the running TE | **Tolerated** | The delegated load retries non-strictly, matching what `load_model_state_dict` gives every decoder chunk |
-| Cross-TP / cross-EP / cross-CP restart, and changing the world size | **Untested** | Only the pipeline dimension was moved; no claim either way. Note that at `TP=PP=1, CP>1` the decoder and the WORLD encoder optimizer both shard over WORLD-sized groups and both compute `data_parallel_group_idx == 0`, which is exactly the collision the encoder's fixed key exists to prevent |
+| Same-topology restart at `TP=PP=1, CP=2` (decoder CP), optimizer included | **Supported** | Qwen3.8-VL proxy, CP2 x DP2: saved at iteration 10, the resumed iterations 11-18 reproduce the uninterrupted run exactly (19-20 within 4e-6 in loss) |
+| CP=1 checkpoint -> CP=2, weights only (`--no-load-optim`), native or MDP | **Supported** | The loaded weights give the same next-iteration loss as at CP=1 to 1e-5 (bf16 reduction order) |
+| Cross-TP / cross-EP restart with optimizer state, cross-CP restart with optimizer state, and changing the world size | **Untested** | Only the pipeline dimension was moved with optimizer state; no claim either way. Note that at `TP=PP=1, CP>1` the decoder and the WORLD encoder optimizer both shard over WORLD-sized groups and both compute `data_parallel_group_idx == 0`, which is exactly the collision the encoder's fixed key exists to prevent |
 | native (non-MDP) checkpoint -> MDP, or MDP -> native, weights (`--no-load-optim`) | **Supported** | The encoder is published from the module its DDP wraps, under the native keys `vision_model.<param>`. A native checkpoint loaded into MDP reproduces the native run's next-iteration loss on the same weights (Qwen3.8-VL proxy) |
 | MDP checkpoint written with the DDP level in its encoder keys (`vision_model.module.<param>`) | **Supported** | `load_checkpoint` detects the layout from the checkpoint's tensor keys and builds a matching load skeleton |
 | Fully-parallel save/load, asynchronous, non-persistent, constant-structure caching, non-`torch_dist` formats | **Rejected at startup** | `assert_supported_checkpoint_config` and `validate_mdp_config` |
