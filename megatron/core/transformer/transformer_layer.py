@@ -1915,7 +1915,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             rotary_shape, rotary_dtype = self._rotary_pos_emb_seen
             rotary_shape = list(rotary_shape)
             mrope_section = getattr(self.config, "mrope_section", None)
-            if (
+            if mrope_section is not None and self._is_thd_cuda_graph():
+                # Per-token mRoPE rows under static THD: every microbatch has the same shape,
+                # so the eager shape is the graph's. Whether the rows are CP-local or cover the
+                # whole pack is the model's choice (a multimodal model keeps the whole pack
+                # under CP and its attention indexes global rows), so it is not re-derived.
+                pass
+            elif (
                 mrope_section is not None
                 and len(rotary_shape) == 4
                 and rotary_shape[0] == 3
