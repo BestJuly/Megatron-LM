@@ -195,7 +195,10 @@ model-agnostic and is driven entirely by the registry's `VisionCollateSpec`
 `workload_of`, `require_contiguous_slots`) -- never by loose `args.vision_*`
 attributes:
 
-- `vision_item_meta`: per-item `(sample, ordinal, payload_row_start, *shape_key)`;
+- `vision_item_meta`: per-item `(sample, ordinal, payload_row_start,
+  sample_padded_start, sample_padded_len, *shape_key)`; the two span columns are
+  the enclosing sample's `cu_seqlens_padded` interval, from which every planning
+  group member derives the decoder-CP row split;
 - `vision_decoder_positions`: absolute image-token positions in the decoder's
   packed physical layout;
 - `vision_item_meta` also carries each item's enclosing sample span
@@ -315,6 +318,23 @@ Consequences that are easy to get wrong:
 `cp_partition_mode` must be `zigzag`. Under `contiguous` the decoder would slice
 its sequence differently from the plan and every embedding would land on the
 wrong rank with no shape error.
+
+The descriptor carries the span as three fixed slots (`sample_padded_start`,
+`sample_padded_len`, `decoder_offset_in_sample`) ahead of the model's
+`shape_key`, so `DESCRIPTOR_FIXED_SLOTS` is 12 and the record stays
+model-agnostic. The window derives `decoder_offset_in_sample` from the item's
+decoder positions and rejects a non-contiguous run: the descriptor describes a
+run by its start and length only.
+
+Decoder CP is not combined with the full-iteration decoder graph (rejected at
+startup): its static THD contract is defined for CP=1.
+
+What the decoder model itself needs under CP is the model's business, not
+MDP's. For the Qwen3.8-VL decoder in `examples/multimodal_dev`: all-gather CP
+(the only QSA CP algorithm), QSA reading the full-length per-token mRoPE rows at
+each local row's global packed index, headwise GDN CP, and Engram restoring the
+per-sample padded layout from `cu_seqlens_q_padded`. The same model runs natively
+(MDP off) at the same CP size, which is the reference for an MDP CP run.
 
 ## Optimizer and checkpoint semantics
 
@@ -615,7 +635,8 @@ Current major constraints:
 
 - one adapter per run, one encoder per model;
 - TP=1;
-- decoder CP>=1 with `cp_partition_mode=zigzag` (`contiguous` is rejected);
+- decoder CP>=1 with `cp_partition_mode=zigzag` (`contiguous` is rejected), not
+  combined with the full-iteration decoder graph;
 - encoder CP=1;
 - distributed optimizer enabled (the byte-level DistributedOptimizer, or the
   layer-wise one of an emerging optimizer such as Muon);

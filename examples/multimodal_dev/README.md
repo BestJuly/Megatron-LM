@@ -119,8 +119,20 @@ hashes follow HF `qwen4_exp`: image/video placeholder IDs are hashed as-is, and
 collate padding (`padding_mask`) is rewritten to the Engram boundary token
 (EOS for the qwen variant) before the decoder sees `input_ids`. Packed documents
 reset their n-gram windows at `cu_seqlens_q_padded`, where the rows actually
-sit. Engram with `--use-packed-sequence` and `--context-parallel-size > 1` is
-rejected at startup.
+sit. Under `--context-parallel-size > 1` Engram restores the per-sample zigzag
+shards from the same `cu_seqlens_q_padded` before hashing and convolving, and
+re-selects the local rows afterwards.
+
+### Decoder context parallelism (Qwen3.8-VL)
+
+`CP=2 bash examples/multimodal_dev/scripts/run_qwen38_vl.sh` runs the decoder with
+all-gather context parallelism, natively or under MDP (`MDP=1`). Packed THD
+only: every sample is padded to a multiple of `2 * CP` and split with
+TransformerEngine's per-sample zigzag. The mRoPE rows stay full-length; QSA reads
+each local row's row at its global packed index (BSHD + mRoPE + CP is rejected),
+GDN uses headwise CP, and Engram works on the restored sequence. Under
+`--thd-static-packing` the per-rank budget `--max-seqlen-per-dp-cp-rank` must be
+even; the static microbatch then holds `max_seqlen_per_dp_cp_rank * CP` tokens.
 
 ### Existing checkpoints
 
