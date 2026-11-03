@@ -203,18 +203,27 @@ def test_digest_covers_the_decoder_cp_slice_table():
     # consistency check, and then hang in all_to_all_single with mismatched
     # split sizes.
     assert (
-        compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [_entry(0, item_row_start=2)], shape_key_width=3)
+        compute_plan_digest(
+            PLAN_SCHEMA_VERSION, policy, [_entry(0, item_row_start=2)], shape_key_width=3
+        )
         != base
     )
     assert (
-        compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [_entry(0, item_rows=1)], shape_key_width=3) != base
+        compute_plan_digest(
+            PLAN_SCHEMA_VERSION, policy, [_entry(0, item_rows=1)], shape_key_width=3
+        )
+        != base
     )
     assert (
-        compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [_entry(0, slice_id=1)], shape_key_width=3) != base
+        compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [_entry(0, slice_id=1)], shape_key_width=3)
+        != base
     )
     # The CP topology itself is in the header, so a cp mismatch is diagnosed
     # even when every per-slice record happens to coincide.
-    assert compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [_entry(0)], shape_key_width=3, cp_size=2) != base
+    assert (
+        compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [_entry(0)], shape_key_width=3, cp_size=2)
+        != base
+    )
 
 
 # ------------------------- batch plan indexes -------------------------
@@ -223,18 +232,10 @@ def test_digest_covers_the_decoder_cp_slice_table():
 def _plan():
     routes = (
         RouteSlice(
-            global_item_id=0,
-            producer_worker_id=1,
-            endpoint_rank=0,
-            owner_worker_id=0,
-            item_rows=16,
+            global_item_id=0, producer_worker_id=1, endpoint_rank=0, owner_worker_id=0, item_rows=16
         ),
         RouteSlice(
-            global_item_id=1,
-            producer_worker_id=0,
-            endpoint_rank=0,
-            owner_worker_id=0,
-            item_rows=4,
+            global_item_id=1, producer_worker_id=0, endpoint_rank=0, owner_worker_id=0, item_rows=4
         ),
     )
     encoder_layouts = (

@@ -106,12 +106,10 @@ def _samples(grids_per_sample, sample_len, seed=17):
     generator = torch.Generator(device="cpu").manual_seed(seed)
     samples = []
     for sample_index, grids in enumerate(grids_per_sample):
-        ids = torch.randint(
-            IMAGE_TOKEN_ID + 1, VOCAB, (sample_len,), generator=generator
-        )
+        ids = torch.randint(IMAGE_TOKEN_ID + 1, VOCAB, (sample_len,), generator=generator)
         cursor = 1  # leave a text token in front so blocks are not at row 0
         grid_rows = []
-        for (t, h, w) in grids:
+        for t, h, w in grids:
             slots = t * (h // MERGE) * (w // MERGE)
             ids[cursor : cursor + slots] = IMAGE_TOKEN_ID
             cursor += slots + 1  # interleave one text token between blocks
@@ -123,20 +121,18 @@ def _samples(grids_per_sample, sample_len, seed=17):
                 "labels": ids.clone().cuda(),
                 "loss_mask": torch.ones(sample_len).cuda(),
                 "pixel_values": pixels.cuda(),
-                "image_grid_thw": torch.tensor(
-                    grid_rows, dtype=torch.long
-                ).cuda()
-                if grid_rows
-                else torch.empty(0, 3, dtype=torch.long).cuda(),
+                "image_grid_thw": (
+                    torch.tensor(grid_rows, dtype=torch.long).cuda()
+                    if grid_rows
+                    else torch.empty(0, 3, dtype=torch.long).cuda()
+                ),
             }
         )
     return samples
 
 
 def _pack(samples):
-    packed = pack_or_pad_batch(
-        [dict(s) for s in samples], use_packed_sequence=True, device="cuda"
-    )
+    packed = pack_or_pad_batch([dict(s) for s in samples], use_packed_sequence=True, device="cuda")
     cu_padded = packed["packed_seq_params"].cu_seqlens_q_padded.tolist()
     spec = build_collate_spec(SimpleNamespace(image_token_id=IMAGE_TOKEN_ID))
     sidecar = build_vision_sidecar(samples, cu_padded, spec)
@@ -176,9 +172,7 @@ def _shard_for_rank(sidecar, full_rows, cp_size, cp_rank):
             if interval.cp_rank != cp_rank:
                 continue
             start = row_cursor + interval.item_row_start
-            entries.append(
-                (interval.local_row_start, full_rows[start : start + interval.rows])
-            )
+            entries.append((interval.local_row_start, full_rows[start : start + interval.rows]))
         row_cursor += output_rows
     entries.sort(key=lambda e: e[0])
     if not entries:
@@ -205,11 +199,7 @@ def _prepare(model, packed, vision_embeddings):
 # Item layouts chosen to hit the cases that matter: a block inside one chunk, a
 # block straddling a chunk boundary, a block spanning both halves of a sample,
 # and a sample with no vision at all.
-_LAYOUTS = [
-    [[(1, 4, 4)], []],
-    [[(1, 8, 8)], [(1, 4, 4), (1, 4, 4)]],
-    [[(2, 8, 8)], [(1, 4, 4)]],
-]
+_LAYOUTS = [[[(1, 4, 4)], []], [[(1, 8, 8)], [(1, 4, 4), (1, 4, 4)]], [[(2, 8, 8)], [(1, 4, 4)]]]
 
 
 @pytest.mark.parametrize("grids_per_sample", _LAYOUTS)
@@ -217,9 +207,7 @@ def test_split_then_scatter_matches_scatter_then_split(grids_per_sample):
     """The linchpin: the two orderings must agree bit for bit."""
     cp_size = _WORLD
     sample_len = 128
-    Utils.initialize_model_parallel(
-        tensor_model_parallel_size=1, context_parallel_size=cp_size
-    )
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp_size)
     model_parallel_cuda_manual_seed(1234)
     try:
         model = _model(cp_size, sample_len * len(grids_per_sample))
@@ -231,12 +219,8 @@ def test_split_then_scatter_matches_scatter_then_split(grids_per_sample):
         # Reference: scatter the FULL vision output into the FULL sequence, then
         # take this rank's shard -- exactly what the native path does.
         with torch.no_grad():
-            text = model.language_model.embedding(
-                input_ids=packed["input_ids"], position_ids=None
-            )
-            scattered = model._scatter_vision_embeddings(
-                packed["input_ids"], text, full_rows
-            )
+            text = model.language_model.embedding(input_ids=packed["input_ids"], position_ids=None)
+            scattered = model._scatter_vision_embeddings(packed["input_ids"], text, full_rows)
             index = _thd_cp_partition_index(
                 packed["packed_seq_params"].cu_seqlens_q_padded,
                 scattered.shape[0],
@@ -263,9 +247,7 @@ def test_an_endpoint_with_no_vision_rows_is_not_an_error():
     """An empty shard is a designed-for state, not a missing-source failure."""
     cp_size = _WORLD
     sample_len = 128
-    Utils.initialize_model_parallel(
-        tensor_model_parallel_size=1, context_parallel_size=cp_size
-    )
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp_size)
     model_parallel_cuda_manual_seed(1234)
     try:
         model = _model(cp_size, sample_len)

@@ -126,10 +126,7 @@ def test_invalid_mdp_config_fields_rejected(config_kwargs, match):
     [
         (dict(rank_order="tp-ep-dp-pp-cp"), "rank_order"),
         (dict(tensor_parallel_size=2), "tensor_parallel_size"),
-        (
-            dict(context_parallel_size=2, cp_partition_mode="contiguous"),
-            "cp_partition_mode",
-        ),
+        (dict(context_parallel_size=2, cp_partition_mode="contiguous"), "cp_partition_mode"),
         (dict(world_size=6, pipeline_parallel_size=4), "world_size"),
         (dict(calculate_per_token_loss=False), "calculate_per_token_loss"),
         (dict(use_distributed_optimizer=False), "use_distributed_optimizer"),
@@ -345,15 +342,11 @@ def test_decoder_context_parallelism_is_accepted(cp_size):
 def test_contiguous_cp_partition_is_rejected_only_when_cp_is_on():
     # At CP=1 the partition mode is inert, so it must not gate the run; at CP>1
     # it decides which rank owns each row and MDP inverts the zigzag map only.
-    validate_mdp_config(
-        MdpConfig(enable=True), _options(cp_partition_mode="contiguous")
-    )
+    validate_mdp_config(MdpConfig(enable=True), _options(cp_partition_mode="contiguous"))
     with pytest.raises(MdpConfigurationError, match="cp_partition_mode"):
         validate_mdp_config(
             MdpConfig(enable=True),
-            _options(
-                world_size=16, context_parallel_size=2, cp_partition_mode="contiguous"
-            ),
+            _options(world_size=16, context_parallel_size=2, cp_partition_mode="contiguous"),
         )
 
 

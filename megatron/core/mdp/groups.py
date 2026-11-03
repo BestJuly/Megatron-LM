@@ -144,9 +144,7 @@ def _assert_rank_map_matches_mpu(rank_map: MdpRankMap, my_rank: int) -> None:
             "rank map and the initialized process groups disagree; every route "
             "and endpoint derived from it would name the wrong rank."
         )
-    if view.is_decoder_endpoint != parallel_state.is_pipeline_first_stage(
-        ignore_virtual=True
-    ):
+    if view.is_decoder_endpoint != parallel_state.is_pipeline_first_stage(ignore_virtual=True):
         raise MdpConfigurationError(
             f"MDP: rank {my_rank} decoder-endpoint status "
             f"{view.is_decoder_endpoint} violates: it equals "

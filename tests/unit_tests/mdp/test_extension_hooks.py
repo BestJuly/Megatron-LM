@@ -155,9 +155,7 @@ def test_build_ledger_emits_one_entry_per_plan_slice():
     from megatron.core.mdp.rank_mapping import MdpRankSpec, build_rank_map
 
     cp_size = 2
-    rank_map = build_rank_map(
-        MdpRankSpec(world_size=4, tp=1, pp=2, cp=cp_size, ep=1, encoder_cp=1)
-    )
+    rank_map = build_rank_map(MdpRankSpec(world_size=4, tp=1, pp=2, cp=cp_size, ep=1, encoder_cp=1))
     view = rank_map.view(rank_map.planning_groups()[0][0])
     descriptor = VisionDescriptor(
         global_item_id=0,
@@ -175,10 +173,7 @@ def test_build_ledger_emits_one_entry_per_plan_slice():
         decoder_offset_in_sample=0,
     )
     plan = MdpPlanner(
-        view,
-        locality_slack_permille=10,
-        capacity_policy=RowCapacityPolicy(),
-        shape_key_width=3,
+        view, locality_slack_permille=10, capacity_policy=RowCapacityPolicy(), shape_key_width=3
     ).build_plan(0, [descriptor], [0])
 
     assert [(r.slice_id, r.item_row_start, r.item_rows) for r in plan.routes] == [
@@ -187,8 +182,11 @@ def test_build_ledger_emits_one_entry_per_plan_slice():
         (2, 24, 8),
     ]
     endpoints = [r.endpoint_rank for r in plan.routes]
-    assert endpoints == [view.decoder_endpoint_ranks[0], view.decoder_endpoint_ranks[1],
-                         view.decoder_endpoint_ranks[0]]
+    assert endpoints == [
+        view.decoder_endpoint_ranks[0],
+        view.decoder_endpoint_ranks[1],
+        view.decoder_endpoint_ranks[0],
+    ]
 
     bridge = ModalityBridge(DirectBufferAllocator())
     device = torch.device("cuda")
@@ -202,9 +200,7 @@ def test_build_ledger_emits_one_entry_per_plan_slice():
         )
         for route in plan.routes
     }
-    emb_ledger = bridge.build_ledger(
-        BridgePhase.EMBEDDING, plan, rank_map, emb_specs
-    )
+    emb_ledger = bridge.build_ledger(BridgePhase.EMBEDDING, plan, rank_map, emb_specs)
     assert len(emb_ledger.entries) == 3
     assert sorted(e.key.slice_id for e in emb_ledger.entries) == [0, 1, 2]
     assert sum(e.element_count for e in emb_ledger.entries) == 32 * WIDTH
@@ -212,28 +208,18 @@ def test_build_ledger_emits_one_entry_per_plan_slice():
     # share one (src, dst) edge and have to occupy disjoint byte ranges.
     by_edge = {}
     for entry in emb_ledger.entries:
-        by_edge.setdefault(
-            (entry.src_global_rank, entry.dst_global_rank), []
-        ).append(entry)
+        by_edge.setdefault((entry.src_global_rank, entry.dst_global_rank), []).append(entry)
     for edge_entries in by_edge.values():
-        spans = sorted(
-            (e.plan_offset, e.plan_offset + e.element_count) for e in edge_entries
-        )
+        spans = sorted((e.plan_offset, e.plan_offset + e.element_count) for e in edge_entries)
         for (_, prev_end), (next_start, _) in zip(spans, spans[1:]):
             assert prev_end == next_start
 
     pixel_specs = {
         BridgeBufferKey(0): BridgeTensorSpec(
-            valid_rows=128,
-            capacity_rows=128,
-            width=WIDTH,
-            dtype=torch.float32,
-            device=device,
+            valid_rows=128, capacity_rows=128, width=WIDTH, dtype=torch.float32, device=device
         )
     }
-    pixel_ledger = bridge.build_ledger(
-        BridgePhase.PIXEL, plan, rank_map, pixel_specs
-    )
+    pixel_ledger = bridge.build_ledger(BridgePhase.PIXEL, plan, rank_map, pixel_specs)
     assert len(pixel_ledger.entries) == 1
     assert pixel_ledger.entries[0].key == BridgeBufferKey(0)
 

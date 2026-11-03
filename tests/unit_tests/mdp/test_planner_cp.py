@@ -121,11 +121,7 @@ def test_an_item_spanning_every_chunk_produces_2cp_minus_1_slices():
     plan = _planner(2).build_plan(0, [descriptor], [0])
     assert len(plan.routes) == 2 * 2 - 1
     assert [r.endpoint_rank for r in plan.routes] == [0, 1, 0]
-    assert [(r.item_row_start, r.item_rows) for r in plan.routes] == [
-        (0, 8),
-        (8, 16),
-        (24, 8),
-    ]
+    assert [(r.item_row_start, r.item_rows) for r in plan.routes] == [(0, 8), (8, 16), (24, 8)]
     # Two disjoint runs of one item on rank 0 -- distinct slice_ids, which is
     # what keeps their bridge buffer keys apart.
     on_rank0 = [r for r in plan.routes if r.endpoint_rank == 0]
@@ -143,12 +139,10 @@ def test_leaf_segments_are_ordered_by_rank_local_row():
     length = 64
     descriptors = [
         _descriptor(
-            0, offset=0, sample_padded_start=0, sample_padded_len=length,
-            grid=(1, 8, 8), ordinal=0,
+            0, offset=0, sample_padded_start=0, sample_padded_len=length, grid=(1, 8, 8), ordinal=0
         ),  # 16 rows, offsets [0, 16)
         _descriptor(
-            1, offset=48, sample_padded_start=0, sample_padded_len=length,
-            grid=(1, 8, 8), ordinal=1,
+            1, offset=48, sample_padded_start=0, sample_padded_len=length, grid=(1, 8, 8), ordinal=1
         ),  # 16 rows, offsets [48, 64)
     ]
     plan = _planner(cp_size).build_plan(0, descriptors, [0])
@@ -158,9 +152,7 @@ def test_leaf_segments_are_ordered_by_rank_local_row():
         # is sorted by it, gapless from 0.
         local_rows = []
         for segment in layout.segments:
-            descriptor = next(
-                d for d in descriptors if d.global_item_id == segment.global_item_id
-            )
+            descriptor = next(d for d in descriptors if d.global_item_id == segment.global_item_id)
             interval = split_item(
                 offset_in_sample=descriptor.decoder_offset_in_sample,
                 output_rows=descriptor.output_rows,
@@ -203,27 +195,18 @@ def test_every_endpoint_gets_a_layout_for_every_microbatch():
 
 def test_routes_and_layouts_agree_slice_for_slice():
     descriptors = [
-        _descriptor(
-            0, offset=0, sample_padded_start=0, sample_padded_len=32, grid=(2, 8, 8)
-        ),
-        _descriptor(
-            1, offset=8, sample_padded_start=32, sample_padded_len=32, sample=1
-        ),
+        _descriptor(0, offset=0, sample_padded_start=0, sample_padded_len=32, grid=(2, 8, 8)),
+        _descriptor(1, offset=8, sample_padded_start=32, sample_padded_len=32, sample=1),
     ]
     plan = _planner(2).build_plan(0, descriptors, [0])
     route_slices = {(r.global_item_id, r.slice_id) for r in plan.routes}
     layout_slices = {
-        (s.global_item_id, s.slice_id)
-        for layout in plan.layouts
-        for s in layout.segments
+        (s.global_item_id, s.slice_id) for layout in plan.layouts for s in layout.segments
     }
     assert route_slices == layout_slices
     # Row conservation: each item's slices tile its output rows exactly.
     for descriptor in descriptors:
-        rows = sum(
-            r.item_rows
-            for r in plan.routes_for_item(descriptor.global_item_id)
-        )
+        rows = sum(r.item_rows for r in plan.routes_for_item(descriptor.global_item_id))
         assert rows == descriptor.output_rows
 
 

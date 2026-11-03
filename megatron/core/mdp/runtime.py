@@ -372,9 +372,12 @@ class MdpRuntime:
                             tag="leaf",
                         )
                     for segment in layout.segments:
-                        emb_dest[BridgeBufferKey(segment.global_item_id, segment.slice_id)] = target[
-                            segment.leaf_row_start : segment.leaf_row_start + segment.output_rows
-                        ]
+                        emb_dest[BridgeBufferKey(segment.global_item_id, segment.slice_id)] = (
+                            target[
+                                segment.leaf_row_start : segment.leaf_row_start
+                                + segment.output_rows
+                            ]
+                        )
                     if self._static_leaf_rows is None:
                         leaf = leaf[: layout.total_output_rows]
                     leaves.append((layout.microbatch_id, leaf))
@@ -447,6 +450,7 @@ class MdpRuntime:
             return
         for leaf in self._static_leaves.values():
             leaf.grad = None
+
     def expects_leaf(self, microbatch_id: int) -> bool:
         """Whether this rank should hold an embedding leaf for a microbatch.
 
@@ -459,9 +463,7 @@ class MdpRuntime:
         if not self.rank_view.is_decoder_endpoint or self._plan is None:
             return False
         try:
-            layout = self._plan.layout_for_microbatch(
-                microbatch_id, self.rank_view.global_rank
-            )
+            layout = self._plan.layout_for_microbatch(microbatch_id, self.rank_view.global_rank)
         except MdpPlanError:
             return False
         return not layout.text_only
@@ -551,9 +553,7 @@ class MdpRuntime:
                             for route in plan.routes_for_item(segment.global_item_id):
                                 start = segment.output_row_start + route.item_row_start
                                 grad_dest[
-                                    BridgeBufferKey(
-                                        segment.global_item_id, route.slice_id
-                                    )
+                                    BridgeBufferKey(segment.global_item_id, route.slice_id)
                                 ] = grad_buffer[start : start + route.item_rows]
                         chunk_grads.append(grad_buffer[: chunk.total_output_rows])
                     # Drop only the loop-local base-tensor reference; this does not

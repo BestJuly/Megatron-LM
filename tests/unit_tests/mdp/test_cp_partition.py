@@ -131,15 +131,9 @@ def test_cp1_is_the_identity():
     covers the merge of the ``cp-1``/``cp`` chunk pair.
     """
     intervals = split_item(
-        offset_in_sample=3,
-        output_rows=5,
-        sample_padded_start=16,
-        sample_padded_len=8,
-        cp_size=1,
+        offset_in_sample=3, output_rows=5, sample_padded_start=16, sample_padded_len=8, cp_size=1
     )
-    assert intervals == (
-        CpRowInterval(cp_rank=0, item_row_start=0, rows=5, local_row_start=19),
-    )
+    assert intervals == (CpRowInterval(cp_rank=0, item_row_start=0, rows=5, local_row_start=19),)
 
 
 def test_a_full_sample_span_splits_into_the_coarsest_legal_runs():
@@ -147,11 +141,7 @@ def test_a_full_sample_span_splits_into_the_coarsest_legal_runs():
     # chunks are one rank and locally contiguous, so they fuse; rank 0 keeps two
     # disjoint runs, which is exactly why a route needs a slice_id.
     intervals = split_item(
-        offset_in_sample=0,
-        output_rows=8,
-        sample_padded_start=0,
-        sample_padded_len=8,
-        cp_size=2,
+        offset_in_sample=0, output_rows=8, sample_padded_start=0, sample_padded_len=8, cp_size=2
     )
     assert intervals == (
         CpRowInterval(cp_rank=0, item_row_start=0, rows=2, local_row_start=0),
@@ -163,20 +153,12 @@ def test_a_full_sample_span_splits_into_the_coarsest_legal_runs():
 def test_an_item_inside_one_chunk_is_never_split():
     # cp=4 over a length-16 sample: chunk size 2, chunks -> ranks 0,1,2,3,3,2,1,0.
     inside = split_item(
-        offset_in_sample=8,
-        output_rows=2,
-        sample_padded_start=0,
-        sample_padded_len=16,
-        cp_size=4,
+        offset_in_sample=8, output_rows=2, sample_padded_start=0, sample_padded_len=16, cp_size=4
     )
     assert len(inside) == 1 and inside[0].cp_rank == 3
     # Rows 9..10 straddle chunks 4 and 5, which are different ranks.
     straddling = split_item(
-        offset_in_sample=9,
-        output_rows=2,
-        sample_padded_start=0,
-        sample_padded_len=16,
-        cp_size=4,
+        offset_in_sample=9, output_rows=2, sample_padded_start=0, sample_padded_len=16, cp_size=4
     )
     assert [i.cp_rank for i in straddling] == [3, 2]
 
@@ -184,11 +166,7 @@ def test_an_item_inside_one_chunk_is_never_split():
 def test_empty_item_yields_no_intervals():
     assert (
         split_item(
-            offset_in_sample=0,
-            output_rows=0,
-            sample_padded_start=0,
-            sample_padded_len=8,
-            cp_size=2,
+            offset_in_sample=0, output_rows=0, sample_padded_start=0, sample_padded_len=8, cp_size=2
         )
         == ()
     )
@@ -202,20 +180,12 @@ def test_span_not_divisible_by_two_cp_is_rejected():
 def test_item_crossing_its_sample_boundary_is_rejected():
     with pytest.raises(MdpConfigurationError, match="contained in its sample"):
         split_item(
-            offset_in_sample=6,
-            output_rows=4,
-            sample_padded_start=0,
-            sample_padded_len=8,
-            cp_size=2,
+            offset_in_sample=6, output_rows=4, sample_padded_start=0, sample_padded_len=8, cp_size=2
         )
 
 
 def test_unaligned_sample_start_is_rejected():
     with pytest.raises(MdpConfigurationError, match="divisible by cp_size"):
         split_item(
-            offset_in_sample=0,
-            output_rows=2,
-            sample_padded_start=3,
-            sample_padded_len=8,
-            cp_size=2,
+            offset_in_sample=0, output_rows=2, sample_padded_start=3, sample_padded_len=8, cp_size=2
         )

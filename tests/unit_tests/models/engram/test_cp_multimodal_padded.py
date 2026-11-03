@@ -125,7 +125,9 @@ def test_cp_shards_match_the_full_pack(tmp_path_factory, cp_size):
     projection = torch.randn(total, 1, _HIDDEN_SIZE, generator=generator, dtype=torch.float64)
     hidden, projection = hidden.to(device), projection.to(device)
 
-    ref_out = reference(hidden, tokens, packed_seq_params=_params(real_cu, padded_cu, total, padding))
+    ref_out = reference(
+        hidden, tokens, packed_seq_params=_params(real_cu, padded_cu, total, padding)
+    )
     (ref_out * projection).sum().backward()
 
     rows = thd_partition_index(padded_cu, cp_size, rank)
@@ -142,4 +144,3 @@ def test_cp_shards_match_the_full_pack(tmp_path_factory, cp_size):
         # The data-parallel reduction runs over dp x cp: CP shards sum to the full-pack grad.
         torch.distributed.all_reduce(grad, group=cp_group)
         torch.testing.assert_close(grad, ref_param.grad, msg=name)
-

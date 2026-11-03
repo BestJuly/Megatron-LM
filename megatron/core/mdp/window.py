@@ -50,10 +50,7 @@ def _decoder_offset_in_sample(item, microbatch_id: int, output_rows: int) -> int
     a violation here does not fail loudly — it silently routes rows to the wrong
     context-parallel rank.
     """
-    where = (
-        f"item (mb={microbatch_id}, sample={item.sample_id}, "
-        f"ordinal={item.image_ordinal})"
-    )
+    where = f"item (mb={microbatch_id}, sample={item.sample_id}, " f"ordinal={item.image_ordinal})"
     positions = item.decoder_positions
     start = positions[0]
     if positions[-1] - start != output_rows - 1:
@@ -227,9 +224,7 @@ class MdpIterationWindow:
                             f"len(decoder_positions) == output_rows "
                             f"({len(item.decoder_positions)} != {output_rows})."
                         )
-                    offset_in_sample = _decoder_offset_in_sample(
-                        item, microbatch_id, output_rows
-                    )
+                    offset_in_sample = _decoder_offset_in_sample(item, microbatch_id, output_rows)
                     descriptors.append(
                         VisionDescriptor(
                             global_item_id=item_id,

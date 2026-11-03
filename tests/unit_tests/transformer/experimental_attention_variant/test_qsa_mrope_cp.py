@@ -24,9 +24,7 @@ import gc
 import pytest
 import torch
 
-from megatron.core.models.common.embeddings.rotary_pos_embedding import (
-    MultimodalRotaryEmbedding,
-)
+from megatron.core.models.common.embeddings.rotary_pos_embedding import MultimodalRotaryEmbedding
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import (
     initialize_rng_tracker,
@@ -252,9 +250,7 @@ class TestQSAMRoPEContextParallel:
             h = torch.randn(T, 1, HIDDEN, generator=g).cuda().bfloat16()
             go = torch.randn(T, 1, HIDDEN, generator=g).cuda().bfloat16()
             rows = self._rows(cu)
-            ref_out, ref_dh, ref_grads = self._single_rank(
-                lambda: self._fwd_bwd(h, freqs, cu, go)
-            )
+            ref_out, ref_dh, ref_grads = self._single_rank(lambda: self._fwd_bwd(h, freqs, cu, go))
             out, dh, grads = self._fwd_bwd(
                 h.index_select(0, rows).contiguous(),
                 freqs,

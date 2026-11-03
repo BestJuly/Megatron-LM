@@ -236,9 +236,7 @@ def compute_plan_digest(
     entry_width = DIGEST_FIXED_SLOTS + shape_key_width
     hasher = hashlib.blake2b(digest_size=16)
     hasher.update(
-        struct.pack(
-            "<4q", schema_version, capacity_policy.alignment_rows, shape_key_width, cp_size
-        )
+        struct.pack("<4q", schema_version, capacity_policy.alignment_rows, shape_key_width, cp_size)
     )
     packer = struct.Struct(f"<{entry_width}q")
     for entry in entries:
@@ -282,9 +280,7 @@ class MdpBatchPlan:
         for route in self.routes:
             key = (route.global_item_id, route.slice_id)
             if key in seen_slices:
-                raise MdpPlanError(
-                    f"MDP: route {key} violates: one route per (item, slice_id)."
-                )
+                raise MdpPlanError(f"MDP: route {key} violates: one route per (item, slice_id).")
             seen_slices.add(key)
             routes_by_producer.setdefault(route.producer_worker_id, []).append(route)
             routes_by_endpoint.setdefault(route.endpoint_rank, []).append(route)
@@ -350,11 +346,7 @@ class MdpBatchPlan:
         The runtime builds leaves only for its own endpoint; at CP>1 iterating
         ``plan.layouts`` would allocate every CP peer's leaf on every rank.
         """
-        return tuple(
-            layout
-            for layout in self.layouts
-            if layout.endpoint_rank == rank
-        )
+        return tuple(layout for layout in self.layouts if layout.endpoint_rank == rank)
 
     def encoder_layout_for_producer(self, worker_id: int) -> EncoderThdLayout:
         """One producer's encoder THD layout; empty layout if it has no work."""
@@ -373,15 +365,12 @@ class MdpBatchPlan:
         programming error, not a defaulted-to-cp0 read.
         """
         if endpoint_rank is None:
-            matches = [
-                layout for layout in self.layouts if layout.microbatch_id == mb_id
-            ]
+            matches = [layout for layout in self.layouts if layout.microbatch_id == mb_id]
             if len(matches) == 1:
                 return matches[0]
             if not matches:
                 raise MdpPlanError(
-                    f"MDP: microbatch_id={mb_id} violates: microbatch is part of "
-                    "this plan."
+                    f"MDP: microbatch_id={mb_id} violates: microbatch is part of " "this plan."
                 )
             raise MdpPlanError(
                 f"MDP: microbatch_id={mb_id} has {len(matches)} endpoint layouts "

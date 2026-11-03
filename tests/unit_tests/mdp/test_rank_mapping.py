@@ -89,8 +89,7 @@ def test_extension_hook_encoder_cp2():
 
 
 @pytest.mark.parametrize(
-    "pp,cp,dp",
-    [(2, 2, 2), (1, 2, 4), (4, 2, 1), (2, 4, 1), (1, 4, 2), (1, 8, 1), (2, 1, 4)],
+    "pp,cp,dp", [(2, 2, 2), (1, 2, 4), (4, 2, 1), (2, 4, 1), (1, 4, 2), (1, 8, 1), (2, 1, 4)]
 )
 def test_decoder_endpoints_are_the_pipeline_stage_zero_ranks(pp, cp, dp):
     """Every PP0 rank runs pre_process, so every PP0 rank consumes vision rows.
@@ -101,9 +100,7 @@ def test_decoder_endpoints_are_the_pipeline_stage_zero_ranks(pp, cp, dp):
     consistent but physically wrong, which surfaces as a bridge hang.
     """
     world = pp * cp * dp
-    rank_map = build_rank_map(
-        MdpRankSpec(world_size=world, tp=1, pp=pp, cp=cp, ep=1, encoder_cp=1)
-    )
+    rank_map = build_rank_map(MdpRankSpec(world_size=world, tp=1, pp=pp, cp=cp, ep=1, encoder_cp=1))
     for outer_dp_rank, group in enumerate(rank_map.planning_groups()):
         endpoints = rank_map.decoder_endpoint_ranks(outer_dp_rank)
         assert endpoints == group[:cp]
@@ -120,9 +117,7 @@ def test_decoder_endpoints_are_the_pipeline_stage_zero_ranks(pp, cp, dp):
 
 
 def test_cp1_leaves_the_endpoint_set_degenerate():
-    rank_map = build_rank_map(
-        MdpRankSpec(world_size=8, tp=1, pp=2, cp=1, ep=1, encoder_cp=1)
-    )
+    rank_map = build_rank_map(MdpRankSpec(world_size=8, tp=1, pp=2, cp=1, ep=1, encoder_cp=1))
     for outer_dp_rank, group in enumerate(rank_map.planning_groups()):
         view = rank_map.view(group[0])
         assert view.decoder_endpoint_ranks == (view.endpoint_rank,)

@@ -51,9 +51,7 @@ class MdpPlanner:
         # omit them; at CP=1 the descriptor source is the only endpoint.
         self._endpoints = rank_view.decoder_endpoint_ranks or (rank_view.endpoint_rank,)
         self._cp_size = len(self._endpoints)
-        self._ranks_per_worker = len(rank_view.planning_group_ranks) // len(
-            rank_view.worker_ids
-        )
+        self._ranks_per_worker = len(rank_view.planning_group_ranks) // len(rank_view.worker_ids)
 
     def build_plan(
         self, iteration: int, descriptors: Sequence, microbatch_ids: Sequence[int]
@@ -135,8 +133,7 @@ class MdpPlanner:
         # per-endpoint runs. At CP=1 this is one whole-item run per item, so
         # both the routes and the layouts below reduce to the pre-CP form.
         slices_by_item = {
-            descriptor.global_item_id: self._slice_item(descriptor)
-            for descriptor in descriptors
+            descriptor.global_item_id: self._slice_item(descriptor) for descriptor in descriptors
         }
 
         # Endpoint microbatch layouts, one per (microbatch, endpoint). Segments
@@ -144,9 +141,7 @@ class MdpPlanner:
         # decoder's post-CP-split image-token mask sees; at CP=1 that is exactly
         # (sample_id, image_ordinal).
         by_microbatch_endpoint = {
-            (mb_id, endpoint): []
-            for mb_id in microbatch_ids
-            for endpoint in self._endpoints
+            (mb_id, endpoint): [] for mb_id in microbatch_ids for endpoint in self._endpoints
         }
         for descriptor in descriptors:
             for slice_id, interval in enumerate(slices_by_item[descriptor.global_item_id]):
@@ -252,10 +247,7 @@ class MdpPlanner:
         rows_by_worker = {}
         for interval in self._slice_item(descriptor):
             endpoint = self._endpoints[interval.cp_rank]
-            worker = (
-                self._rank_view.planning_group_ranks.index(endpoint)
-                // self._ranks_per_worker
-            )
+            worker = self._rank_view.planning_group_ranks.index(endpoint) // self._ranks_per_worker
             rows_by_worker[worker] = rows_by_worker.get(worker, 0) + interval.rows
         return min(rows_by_worker, key=lambda w: (-rows_by_worker[w], w))
 

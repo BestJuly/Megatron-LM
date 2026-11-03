@@ -114,9 +114,7 @@ def split_item(
     """
     chunk_size = validate_sample_span(sample_padded_len, cp_size)
     if output_rows < 0:
-        raise MdpConfigurationError(
-            f"MDP: output_rows={output_rows} violates: output_rows >= 0."
-        )
+        raise MdpConfigurationError(f"MDP: output_rows={output_rows} violates: output_rows >= 0.")
     if output_rows == 0:
         return ()
     if offset_in_sample < 0 or offset_in_sample + output_rows > sample_padded_len:
