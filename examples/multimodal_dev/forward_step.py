@@ -1040,13 +1040,17 @@ def mdp_forward_step(runtime, data_iterator, model, return_schedule_plan: bool =
         real_cu_seqlens=batch.get("flops_cu_seqlens"),
     )
 
+    # `record.text_only` is a whole-microbatch property. Under decoder CP whether
+    # THIS rank holds vision rows is a per-(microbatch, cp_rank) fact the runtime
+    # derived in P3: a CP slice without image tokens gets no leaf, and the model
+    # then scatters nothing on this rank.
     vision_embeddings = None
-    if is_pipeline_first_stage() and not record.text_only:
+    if is_pipeline_first_stage() and runtime.expects_leaf(record.microbatch_id):
         vision_embeddings = runtime.storage.get_leaf(record.microbatch_id)
         if vision_embeddings is None:
             raise RuntimeError(
-                f"MDP: microbatch {record.microbatch_id} has vision items but no "
-                "leaf in endpoint storage; P3 embedding routing did not complete"
+                f"MDP: microbatch {record.microbatch_id} has vision rows for this "
+                "rank but no leaf in storage; P3 embedding routing did not complete"
             )
 
     model_inputs = dict(
