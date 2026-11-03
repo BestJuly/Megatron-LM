@@ -283,6 +283,13 @@ class MultimodalModel(MegatronModule):
         assert len(input_tensor) == 1
         self.language_model.set_input_tensor(input_tensor[0])
 
+    def _vision_grad_anchor(self) -> Tensor:
+        """A zero scalar that depends on every trainable vision-encoder parameter."""
+        params = [p for p in self.vision_model.parameters() if p.requires_grad]
+        if not params:
+            return torch.zeros((), device=torch.cuda.current_device())
+        return sum(p.sum() for p in params) * 0.0
+
     def _prepare_decoder_inputs(
         self,
         *,
@@ -328,12 +335,20 @@ class MultimodalModel(MegatronModule):
         # decoder_input must not be scattered into after the split.
         embedded_here = False
 
+        # A text-only microbatch (no image rows in the grid) on the native path.
+        text_only_native = False
+
         if self.pre_process:
             # The native path encodes pixels here; both feed the same scatter.
             if vision_embeddings is None:
                 if self.vision_model is not None and pixel_values is not None:
-                    with nvtx_phase("native_vision_encoder_forward"):
-                        vision_embeddings = self.vision_model(pixel_values, image_grid_thw)
+                    if image_grid_thw is not None and image_grid_thw.shape[0] == 0:
+                        text_only_native = True
+                    else:
+                        with nvtx_phase("native_vision_encoder_forward"):
+                            vision_embeddings = self.vision_model(
+                                pixel_values, image_grid_thw
+                            )
 
             if decoder_input is None:
                 embedded_here = True
@@ -352,6 +367,13 @@ class MultimodalModel(MegatronModule):
                     # deferred to after the split. Both cases are checked below
                     # against the rank-local sequence.
                     decoder_input = text_embeddings
+                    if text_only_native:
+                        # The encoder did not run, yet every trainable encoder
+                        # parameter must still receive a (zero) gradient: with
+                        # --overlap-grad-reduce a bucket whose grads never become
+                        # ready fails finish_grad_sync when this is the last
+                        # microbatch.
+                        decoder_input = decoder_input + self._vision_grad_anchor()
         else:
             # Intermediate PP/VPP chunks receive their activation through
             # GPTModel.set_input_tensor during scheduled or eager execution.

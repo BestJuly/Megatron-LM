@@ -81,7 +81,15 @@ def _config(cp_size):
     )
 
 
-def _model(cp_size, max_seq_len):
+class _TrainableUnusedVisionEncoder(_UnusedVisionEncoder):
+    """Has a trainable parameter, so the text-only path must still give it a gradient."""
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.weight = torch.nn.Parameter(torch.ones(3, dtype=torch.bfloat16))
+
+
+def _model(cp_size, max_seq_len, encoder_cls=_UnusedVisionEncoder):
     config = _config(cp_size)
     language_model = HybridModel(
         config=config,
@@ -95,7 +103,7 @@ def _model(cp_size, max_seq_len):
     model = MultimodalModel(
         language_config=config,
         language_model=language_model,
-        vision_encoder=_UnusedVisionEncoder(config),
+        vision_encoder=encoder_cls(config),
         image_token_id=IMAGE_TOKEN_ID,
     )
     return model.cuda()
@@ -271,5 +279,40 @@ def test_an_endpoint_with_no_vision_rows_is_not_an_error():
             "this layout is meant to leave at least one rank empty; if every "
             "rank owns rows the empty-shard path is not being exercised"
         )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_native_text_only_microbatch_skips_the_encoder():
+    """A microbatch without images must not call the encoder (an empty grid has no
+    patches to embed), and the encoder parameters must still receive a zero gradient:
+    with --overlap-grad-reduce a bucket whose grads never become ready fails
+    finish_grad_sync when this is the last microbatch."""
+    cp_size = _WORLD
+    sample_len = 128
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=cp_size)
+    model_parallel_cuda_manual_seed(1234)
+    try:
+        model = _model(cp_size, sample_len, encoder_cls=_TrainableUnusedVisionEncoder)
+        packed, _, _ = _pack(_samples([[]], sample_len))
+        with torch.no_grad():
+            reference = _prepare(model, packed, None)["decoder_input"]
+        prepared = model._prepare_decoder_inputs(
+            input_ids=packed["input_ids"],
+            position_ids=None,
+            attention_mask=None,
+            labels=packed["labels"],
+            loss_mask=packed["loss_mask"],
+            padding_mask=packed.get("padding_mask"),
+            pixel_values=torch.zeros(0, 1, device="cuda"),
+            image_grid_thw=torch.empty(0, 3, dtype=torch.long, device="cuda"),
+            decoder_input=None,
+            packed_seq_params=packed["packed_seq_params"],
+            vision_embeddings=None,
+        )["decoder_input"]
+        assert torch.equal(prepared.detach(), reference)
+        prepared.float().sum().backward()
+        grad = model.vision_model.weight.grad
+        assert grad is not None and torch.count_nonzero(grad) == 0
     finally:
         Utils.destroy_model_parallel()
