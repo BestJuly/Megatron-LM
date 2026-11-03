@@ -2641,17 +2641,25 @@ class TransformerConfig(ModelParallelConfig):
         if self.cp_partition_mode == "contiguous" and (
             self.context_parallel_size > 1 or self.dynamic_context_parallel
         ):
-            if self.sequence_packing_scheduler is None and not (
-                self.experimental_attention_variant == "dsv4_hybrid"
-                and not self.dynamic_context_parallel
+            if (
+                self.sequence_packing_scheduler is None
+                and not self.thd_static_packing
+                and not (
+                    self.experimental_attention_variant == "dsv4_hybrid"
+                    and not self.dynamic_context_parallel
+                )
             ):
                 raise ValueError(
                     "cp_partition_mode='contiguous' with context parallelism requires THD "
-                    "inputs from a sequence_packing_scheduler; BSHD inputs are not supported. "
-                    "The legacy non-scheduler CP batch slicing path only supports zigzag layout."
+                    "inputs from a sequence_packing_scheduler (or a static THD collator, "
+                    "thd_static_packing); BSHD inputs are not supported. The legacy "
+                    "non-scheduler CP batch slicing path only supports zigzag layout."
                 )
             # Static DSv4 callers may supply THD metadata directly (main #7469).
             # CSA validates the actual input format at runtime and still rejects SBHD CP.
+            # thd_static_packing declares the same contract for collators that pack
+            # outside the scheduler (examples/multimodal_dev): fixed-shape global THD
+            # batches that the model slices by cp_partition_mode itself.
 
         if has_context_parallelism:
             if self.cp_partition_mode == "contiguous":

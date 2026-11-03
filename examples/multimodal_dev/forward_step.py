@@ -486,6 +486,14 @@ def pack_or_pad_batch(
     except AssertionError:
         has_sp = False
 
+    # The decoder's CP input layout. models/base.py slices the packed THD batch
+    # by it, and the decoder's own layout conversions read it off
+    # PackedSeqParams, so both must see the same value.
+    try:
+        cp_partition_mode = getattr(get_args(), "cp_partition_mode", None) or "zigzag"
+    except AssertionError:
+        cp_partition_mode = "zigzag"
+
     divisible_by = seqlen_alignment_factor(tp_size, cp_size, has_sp)
     if pad_to_multiple is not None:
         # Quantized GEMMs check the rank-local tensor (after the CP slice and,
@@ -766,6 +774,7 @@ def pack_or_pad_batch(
                 target_len=static_target_T,
                 max_num_seqs=static_max_num_seqs,
                 cp_size=cp_size,
+                cp_partition_mode=cp_partition_mode,
             )
             # max_seqlen must be the padded static value: the tail belongs to a
             # sequence now, and a stale (shorter) max silently produces wrong
@@ -798,6 +807,7 @@ def pack_or_pad_batch(
             max_seqlen_kv=max_seqlen_q,
             total_tokens=total_tokens,
             pad_between_seqs=pad_between_seqs,
+            cp_partition_mode=cp_partition_mode,
         )
         return packed_batch
 
