@@ -15,7 +15,8 @@ each pooled block key with the cos/sin of the block's first token.
 * The static (CUDA-graph capturable) THD selection reads the same per-token rows as the
   per-document loop, bitwise.
 * Main attention under THD uses each packed token's own row (sparse kernels, bf16); raw
-  fused-mRoPE frequencies are accepted; context parallelism is rejected explicitly.
+  fused-mRoPE frequencies are accepted; BSHD context parallelism is rejected explicitly
+  (packed THD CP is covered by test_qsa_mrope_cp.py).
 """
 
 import types

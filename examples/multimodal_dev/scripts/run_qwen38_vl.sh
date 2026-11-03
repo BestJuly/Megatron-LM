@@ -12,7 +12,9 @@
 #                      `mock` provider (non-MDP only)
 #   GREEDY=0|1         --mdp-greedy-packing (MDP only); token budget per microbatch per rank
 #                      MAX_SEQLEN (default SEQ_LEN x MBS)
-#   PP EP              parallel sizes (defaults 1, 4); TP=CP=1 (MDP limits)
+#   PP EP CP           parallel sizes (defaults 1, 4, 1); TP=1 (MDP limit). CP>1 needs the
+#                      packed layout and uses all-gather CP (the only QSA CP algorithm) with
+#                      headwise GDN CP; under THD every sample is padded to 2 x CP.
 #   MBS GBS SEQ_LEN ITERS SEED NPROC
 #   VARIANT=proxy|full vision depth default (4 / 27) and decoder depth (8 / 48 Qwen layers)
 #   NUM_QWEN_LAYERS    decoder depth in Qwen layers, cadence GGGQ (default per variant)
@@ -37,6 +39,7 @@
 #   MDP=0 ITERS=10 bash examples/multimodal_dev/scripts/run_qwen38_vl.sh
 #   MDP=1 ITERS=10 bash examples/multimodal_dev/scripts/run_qwen38_vl.sh
 #   MDP=1 PP=2 EP=2 ITERS=10 bash examples/multimodal_dev/scripts/run_qwen38_vl.sh
+#   MDP=1 CP=2 ITERS=10 bash examples/multimodal_dev/scripts/run_qwen38_vl.sh
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -52,6 +55,7 @@ PACKED=${PACKED:-1}
 GREEDY=${GREEDY:-0}
 PP=${PP:-1}
 EP=${EP:-4}
+CP=${CP:-1}
 MBS=${MBS:-2}
 GBS=${GBS:-16}
 SEQ_LEN=${SEQ_LEN:-4096}
@@ -108,6 +112,11 @@ if [ "$PACKED" = "1" ]; then
     DATA_ARGS=( --dataset-provider mdp_mock --use-packed-sequence --qsa-use-sparse-attention )
 else
     DATA_ARGS=( --dataset-provider mock --total-seq-length "$SEQ_LEN" )
+fi
+
+CP_ARGS=( --context-parallel-size "$CP" )
+if [ "$CP" -gt 1 ]; then
+    CP_ARGS+=( --cp-comm-type all_gather )
 fi
 
 MDP_ARGS=()
@@ -178,7 +187,7 @@ torchrun --nnodes 1 --nproc_per_node "$NPROC" --master_addr 127.0.0.1 --master_p
     --apply-wd-to-qk-layernorm \
     --seq-length "$SEQ_LEN" \
     --tensor-model-parallel-size 1 --pipeline-model-parallel-size "$PP" \
-    --expert-model-parallel-size "$EP" --context-parallel-size 1 --expert-tensor-parallel-size 1 \
+    --expert-model-parallel-size "$EP" "${CP_ARGS[@]}" --expert-tensor-parallel-size 1 \
     "${OPT_ARGS[@]}" \
     --micro-batch-size "$MBS" --global-batch-size "$GBS" \
     --bf16 --transformer-impl transformer_engine --use-mcore-models --enable-experimental \
