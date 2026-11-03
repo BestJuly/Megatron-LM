@@ -90,6 +90,20 @@ Preserve these unless the feature design is intentionally changed:
   all-gather backward), and a second sender would scale encoder gradients by
   TP. The encoder itself never sees TP: it is built on MDP's rank-local
   `pg_collection` and its weights are broadcast from WORLD rank 0 at build.
+- Decoder CP: the plan stays CP-agnostic and the endpoint stays its only
+  decoder rank. The shard owners are the PP0 TP sources, one per `cp_rank`
+  (planning-group index `k * tp`; element 0 is the endpoint). After P3 the
+  endpoint cuts each full leaf into CP shards with `cp_partition.cp_shard_rows`
+  -- the decoder input layout applied to the host decoder positions every rank
+  holds in its replay records -- and sends shard `k` to owner `k` over the
+  decoder CP group; owners then TP-broadcast their shard. Shards are disjoint
+  and each row's gradient is complete on its owner, so P5 only gathers them
+  back (no CP reduction); a duplicated or reduced shard gradient scales encoder
+  gradients, a dropped one zeroes them. A CP slice without image tokens holds no
+  leaf (`MdpRuntime.expects_leaf`); `mdp_forward_step` asks the runtime instead
+  of `record.text_only`. The model splits before the embedding
+  (`MultimodalModel._cp_split_sequence`), with the layout read off
+  `PackedSeqParams.cp_partition_mode`, which must equal the decoder config's.
 - Decoder DDP overlap stays inside the native decoder schedule. The encoder
   uses an independent synchronous DDP configuration for its P5/P6 lifecycle.
 - The composite optimizer treats decoder and encoder overflow, norm clipping,
@@ -388,8 +402,8 @@ same `divisible_by` is applied to every sample. That is the tightest *uniform*
 per-sample rule that forces every rank's local row count to be a multiple of
 `pad_to_multiple` (a microbatch can hold a single sample). It is strict --
 up to `divisible_by - 1` padded rows per sample, 256 at `cp_size=8` with MXFP8
-and no SP. A total-only variant would be tighter and is not written because
-MDP rejects CP > 1 outright.
+and no SP. A total-only variant would be tighter (the contiguous CP layout only
+needs the total to divide) and is not written yet.
 
 Why `pad_between_seqs=False` is declared, and when it would be wrong. Declaring
 it lets `TEDotProductAttention.forward()`
@@ -559,8 +573,10 @@ Current major constraints:
 - one adapter per run, one encoder per model;
 - decoder TP >= 1, with or without SP (encoder always replicated, TP-unaware);
   `--mdp-overlap-window-capture` requires TP=1;
-- decoder CP=1 (with CP the leaf broadcast would have to cover the endpoint's
-  CP ranks too);
+- decoder CP >= 1, zigzag or contiguous input layout, with or without TP;
+  `--mdp-overlap-window-capture` requires TP=CP=1; contiguous CP needs
+  `--thd-static-packing` (the `TransformerConfig` gate admits scheduler or
+  static THD only);
 - encoder CP=1;
 - distributed optimizer enabled;
 - per-token loss enabled;
@@ -639,7 +655,12 @@ torchrun --nproc_per_node=8 -m pytest -q \
 `test_mdp_parity.py` includes the decoder TP=2 cases (with and without SP)
 and the factor-of-TP fault-injection twin; set `CUDA_DEVICE_MAX_CONNECTIONS=1`
 for the SP case. `test_mdp_tp_collate.py` (any even world) checks that pixels
-stay on the TP source under MDP.
+stay on the TP source under MDP. The decoder-CP cases (CP2, TP2xCP2 with and
+without SP), their dropped-shard and duplicated-shard twins, and the native
+CP2-vs-CP1 check are in the same file; `test_cp_vision_scatter.py` (world 4)
+proves split-then-local-scatter equals scatter-then-split bitwise for both CP
+layouts, and `tests/unit_tests/mdp/test_cp_partition.py` (CPU) pins the shard
+arithmetic against token-level slicing.
 
 Reference launcher:
 

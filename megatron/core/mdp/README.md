@@ -80,8 +80,9 @@ builder-side stack features apply.
 | `kimi_k3_vl` | MoonViT 3D (grid shape key `(t, h, w)`, frames pooled then merge 2; whole-item attention) | default hook (`HybridModelBuilder`), nothing pinned (NoPE decoder) | supported |
 
 Supported: one vision encoder per model, decoder `TP>=1` with or without
-sequence parallelism (`--mdp-overlap-window-capture` needs `TP=1`), decoder `CP=1`,
-`encoder_cp=1`, native PP/VPP/EP, fully replicated encoder with WORLD ZeRO-1,
+sequence parallelism, decoder `CP>=1` in both CP input layouts
+(`--cp-partition-mode zigzag` or `contiguous`) and combined with TP
+(`--mdp-overlap-window-capture` needs `TP=CP=1`), `encoder_cp=1`, native PP/VPP/EP, fully replicated encoder with WORLD ZeRO-1,
 `calculate_per_token_loss=True`, bf16 main path (fp16 covered by
 overflow-union tests), THD packed sequences on both sides, native MCore vision
 Transformer recompute (`selective`/`full`) or Design-Doc whole-encoder replay
@@ -104,6 +105,21 @@ the endpoint returns the leaf gradient. That gradient is identical on every TP
 rank, so a second sender would scale the WORLD-reduced encoder gradient by TP.
 The encoder is built on MDP's rank-local process groups and its weights are
 broadcast from WORLD rank 0 when the domain is built.
+
+Decoder context parallelism keeps the plan CP-agnostic. The endpoint still
+assembles one full leaf per vision microbatch, then cuts it into per-CP-rank
+shards with the decoder's own input partition (`cp_partition.py`: zigzag per
+packed sequence, or contiguous over the whole pack) and sends shard `k` to the
+PP0 TP source of `cp_rank` `k` over the decoder CP group; each shard owner then
+broadcasts its shard over its TP group. The model splits its inputs before the
+embedding and scatters only the rows its CP slice owns, so the native path
+(which selects those rows from the full encoder output) and MDP run the same
+rank-local scatter. In P5 the shard owners return their shard gradients and the
+endpoint places them back into full-microbatch gradients -- no reduction,
+because the shards are disjoint and CP attention delivers each row's complete
+gradient to its owner. A CP slice without image tokens holds no leaf. The
+contiguous layout (Kimi-K3's release layout) needs fixed-shape THD batches, so
+the multimodal collator runs with `--thd-static-packing` there.
 
 Decoder FP8 is supported. The decoder uses the native `--fp8`/`--fp8-recipe`
 flags; the vision `TransformerConfig` is built separately by the model adapter
@@ -181,8 +197,7 @@ use complete replay when saving patch embedding, position/RoPE, and patch-merger
 activations justifies the extra complete forward.
 
 Registered extension hooks (each exercised by a test at a non-degenerate
-value): logical workers + `worker_ranks()` for encoder CP, single-valued
-endpoints + multi-slice routes for decoder CP, the typed encoder configuration
+value): logical workers + `worker_ranks()` for encoder CP, the typed encoder configuration
 + row-capacity policy for encoder FP8, and the unified buffer allocator
 for full-iteration CUDA graphs. The hooks guarantee no breaking schema change is
 needed later; they do not mean the capability is implemented.
