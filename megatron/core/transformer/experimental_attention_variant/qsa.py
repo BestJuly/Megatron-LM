@@ -272,12 +272,12 @@ class QSAIndexer(MegatronModule):
         """
         cp_group = self.pg_collection.cp
         if cp_group is not None and cp_group.size() > 1:
-            if self.per_token_rope:
-                # The CP paths index a position-deterministic table at zigzag positions
-                # (gathered and cached per length); neither holds for per-token rows.
+            if self.per_token_rope and cu_seqlens is None:
+                # BSHD under CP gathers a position-deterministic table and caches it per
+                # length; per-token rows are neither. Packed THD keeps the rows full-length.
                 raise NotImplementedError(
-                    "QSA with mRoPE (mrope_section is set) does not support context "
-                    "parallelism; run with context_parallel_size=1."
+                    "QSA with mRoPE (mrope_section is set) supports context parallelism "
+                    "only for packed THD inputs."
                 )
             return self._select_cp(hidden_states, rotary_pos_emb, cu_seqlens)
         q_all, raw_keys = self._project(hidden_states, rotary_pos_emb)
@@ -682,6 +682,11 @@ class QSAIndexer(MegatronModule):
         # _select_thd_static: every quantity is a device op over shape-only sizes. The
         # contract is cu_seqlens[-1] == s_loc * cp_size (the pack fills the buffer).
         s_g = s_loc * cp_size
+        if self.per_token_rope and rotary_pos_emb.shape[0] != s_g:
+            raise ValueError(
+                "QSA under mRoPE and CP expects one rotary row per token of the GLOBAL "
+                f"pack: got {rotary_pos_emb.shape[0]} rows for {s_g} tokens."
+            )
         cu = cu_seqlens.to(device=device, dtype=torch.int64)
         n_docs = cu.numel() - 1
         lens = cu[1:] - cu[:-1]
@@ -690,7 +695,12 @@ class QSAIndexer(MegatronModule):
         doc_start = cu[doc_idx]
         pos_doc = q_pos - doc_start
         m_t = (pos_doc + 1) // r
-        q_rot = self._rope_at_positions(q_all, rotary_pos_emb, pos_doc)
+        # mRoPE rows are per token of the global pack (the model keeps them full-length
+        # under THD CP), so each local query reads the row at its global packed index.
+        # The pooled block keys below already take their first token's global row.
+        q_rot = self._rope_at_positions(
+            q_all, rotary_pos_emb, q_pos if self.per_token_rope else pos_doc
+        )
 
         # Block keys of the GLOBAL pack in one fixed [s_g // r] buffer (same layout as
         # the single-rank static path); one top-k scan with a per-row visible window
@@ -1197,10 +1207,14 @@ class QSASelfAttention(SelfAttention):
         """CP shard q/k RoPE at the shard's true positions (layout-exact).
 
         THD: ``freqs`` is a full table — index it at the per-document positions of
-        this rank's rows. BSHD: ``freqs`` is already the rank's zigzag slice and
-        applies to the local rows directly."""
+        this rank's rows, or, for per-token mRoPE rows (one per token of the global
+        pack), at the rows' global packed indices. BSHD: ``freqs`` is already the
+        rank's zigzag slice and applies to the local rows directly."""
         if selection.token_offsets is not None:  # THD: positions restart per document
-            pos = selection.q_positions - selection.token_offsets
+            if self.indexer.per_token_rope:
+                pos = selection.q_positions
+            else:
+                pos = selection.q_positions - selection.token_offsets
             f = freqs.index_select(0, pos).contiguous()
         else:
             f = freqs[: query.shape[0]]
