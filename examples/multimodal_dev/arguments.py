@@ -54,14 +54,9 @@ def validate_engram_args(args) -> None:
             "multimodal_dev collates a full batch on every pipeline stage; the Engram "
             "pipeline token prefetch must stay disabled (engram_token_prefetch=False)"
         )
-    if getattr(args, "use_packed_sequence", False) and args.context_parallel_size > 1:
-        raise RuntimeError(
-            "Engram does not support context parallelism with packed (THD) multimodal "
-            "batches: its n-gram windows and causal convolution are restored across CP "
-            "ranks from the packed boundaries, a layout path that is unvalidated for "
-            "multimodal_dev's per-sample padding. Use --context-parallel-size 1 or the "
-            "padded (BSHD) layout."
-        )
+    # Context parallelism over packed (THD) batches is supported: Engram restores the
+    # per-sample padded layout from cu_seqlens_q_padded, the same boundaries the model
+    # splits with (tests/unit_tests/models/engram/test_cp_multimodal_padded.py).
 
 
 def encoder_recompute_overrides_from_args(args) -> dict:

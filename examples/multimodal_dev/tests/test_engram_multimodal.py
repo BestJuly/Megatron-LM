@@ -86,12 +86,11 @@ def _validation_args(**overrides):
     return SimpleNamespace(**base)
 
 
-def test_engram_thd_with_context_parallel_is_rejected():
-    validate_engram_args(_validation_args())  # THD, CP=1: accepted
+def test_engram_thd_with_context_parallel_is_accepted():
+    validate_engram_args(_validation_args())  # THD, CP=1
+    validate_engram_args(_validation_args(context_parallel_size=2))  # THD, CP=2
     validate_engram_args(_validation_args(use_packed_sequence=False, context_parallel_size=2))
     validate_engram_args(_validation_args(engram_enabled=False, context_parallel_size=2))
-    with pytest.raises(RuntimeError, match="context parallelism with packed"):
-        validate_engram_args(_validation_args(context_parallel_size=2))
     with pytest.raises(RuntimeError, match="token prefetch must stay disabled"):
         validate_engram_args(_validation_args(engram_token_prefetch=True))
 
