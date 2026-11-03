@@ -11,6 +11,7 @@ import pytest
 
 from megatron.core.mdp.errors import MdpConfigurationError
 from megatron.core.mdp.rank_mapping import MdpRankSpec, build_rank_map
+from megatron.core.parallel_state import RankGenerator
 
 
 def _spec(**kwargs):
@@ -98,7 +99,9 @@ def test_tp2_pp1_every_rank_is_a_worker_and_peers_hold_leaves():
     peer = rank_map.view(3)
     assert endpoint.lane_id == 1 and endpoint.is_endpoint and not endpoint.is_leaf_peer
     assert peer.lane_id is None and peer.is_leaf_peer and not peer.is_endpoint
-    assert endpoint.endpoint_tp_ranks == peer.endpoint_tp_ranks == (2, 3)
+    assert endpoint.leaf_tp_ranks == peer.leaf_tp_ranks == (2, 3)
+    assert endpoint.shard_owners == peer.shard_owners == (2,)
+    assert peer.leaf_tp_source == endpoint.leaf_tp_source == 2
     assert (endpoint.my_worker_id, peer.my_worker_id) == (0, 1)
     # Only the TP source loads data, so only its worker owns pixels.
     assert endpoint.pixel_owners == peer.pixel_owners == (0,)
@@ -115,7 +118,8 @@ def test_tp2_pp2_groups_workers_and_pixel_owners():
         assert [ranks[0] for ranks in resolved] == list(group)
         for rank in group:
             view = rank_map.view(rank)
-            assert view.endpoint_tp_ranks == group[:2]
+            # Only PP0 ranks read leaves; PP1 has no leaf TP group.
+            assert view.leaf_tp_ranks == (group[:2] if rank in group[:2] else ())
             # The TP sources are the PP0 and PP1 tp=0 ranks: indices 0 and 2.
             assert view.pixel_owners == (0, 2)
             assert view.is_leaf_peer == (rank == group[1])
@@ -128,7 +132,8 @@ def test_tp1_view_keeps_every_worker_as_pixel_owner():
     rank_map = build_rank_map(_spec())
     view = rank_map.view(4)
     assert view.pixel_owners == view.worker_ids == (0, 1)
-    assert view.endpoint_tp_ranks == (0,)
+    assert view.leaf_tp_ranks == ()  # rank 4 is PP1
+    assert view.shard_owners == (0,) and not view.is_shard_owner
     assert not view.is_leaf_peer
 
 
@@ -152,3 +157,39 @@ def test_local_view_has_no_global_lists():
 def test_invalid_specs_rejected(kwargs, match):
     with pytest.raises(MdpConfigurationError, match=match):
         build_rank_map(_spec(**kwargs))
+
+
+@pytest.mark.parametrize(
+    "tp,cp,pp",
+    [(1, 2, 1), (2, 2, 1), (1, 2, 2), (2, 2, 2), (2, 4, 1), (4, 2, 1), (1, 4, 2)],
+)
+def test_cp_shard_owners_and_leaf_tp_groups_match_rank_generator(tp, cp, pp):
+    # Cross-check the view's index arithmetic against the decoder's own groups:
+    # shard owners are the PP0 tp=0 ranks ordered by cp_rank (= the CP group of
+    # the endpoint), and every PP0 rank's leaf TP group is its decoder TP group.
+    world = 2 * tp * cp * pp
+    rank_map = build_rank_map(_spec(world_size=world, tp=tp, pp=pp, cp=cp))
+    generator = RankGenerator(tp=tp, ep=1, dp=world // (tp * cp * pp), pp=pp, cp=cp,
+                              order="tp-cp-ep-dp-pp")
+    tp_groups = {r: tuple(g) for g in generator.get_ranks("tp") for r in g}
+    cp_groups = {r: tuple(g) for g in generator.get_ranks("cp") for r in g}
+    pp_groups = {r: tuple(g) for g in generator.get_ranks("pp") for r in g}
+    for group in rank_map.planning_groups():
+        endpoint = group[0]
+        pp0 = {r for r in group if pp_groups[r][0] == r}
+        for rank in group:
+            view = rank_map.view(rank)
+            assert view.shard_owners == cp_groups[endpoint]
+            assert len(view.shard_owners) == cp
+            if rank in pp0:
+                assert view.leaf_tp_ranks == tp_groups[rank]
+                assert view.leaf_tp_source == tp_groups[rank][0]
+                assert view.is_shard_owner == (rank == tp_groups[rank][0])
+                assert view.is_leaf_peer == (rank != tp_groups[rank][0])
+            else:
+                assert view.leaf_tp_ranks == () and not view.is_leaf_peer
+                assert not view.is_shard_owner
+            assert view.is_endpoint == (rank == endpoint)
+            # Every rank is an encoder worker; every TP source owns pixels.
+            assert rank_map.num_workers_per_group == tp * cp * pp
+            assert view.pixel_owners == tuple(range(0, tp * cp * pp, tp))

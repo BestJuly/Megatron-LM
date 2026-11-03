@@ -179,6 +179,7 @@ def compatibility_options_from_args(args) -> MdpCompatibilityOptions:
         ),
         train_samples=getattr(args, "train_samples", None),
         rampup_batch_size=getattr(args, "rampup_batch_size", None),
+        cp_partition_mode=getattr(args, "cp_partition_mode", None) or "zigzag",
     )
 
 
@@ -233,8 +234,8 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
         )
     )
     rank_view = rank_map.view(torch.distributed.get_rank())
-    # Bootstrap point: the decoder TP group is materialized from the MPU globals
-    # here, once, and passed explicitly to everything downstream.
+    # Bootstrap point: the decoder TP and CP groups are materialized from the MPU
+    # globals here, once, and passed explicitly to everything downstream.
     from megatron.core import parallel_state
 
     process_groups = install_mdp_process_groups(
@@ -243,6 +244,11 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
         decoder_tp_group=(
             parallel_state.get_tensor_model_parallel_group()
             if args.tensor_model_parallel_size > 1
+            else None
+        ),
+        decoder_cp_group=(
+            parallel_state.get_context_parallel_group()
+            if args.context_parallel_size > 1
             else None
         ),
     )
@@ -309,6 +315,7 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
         greedy_token_budget=greedy_token_budget,
         greedy_max_num_seqs=greedy_max_num_seqs,
         greedy_row_alignment=thd_row_alignment(compat),
+        cp_partition_mode=compat.cp_partition_mode,
     )
     logger.info(
         "MDP: runtime installed (outer_dp_rank=%d, worker_id=%s, endpoint=%d, "

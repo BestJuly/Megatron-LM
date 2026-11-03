@@ -41,11 +41,16 @@ class MdpRankView:
     endpoint_rank: int
     planning_group_ranks: tuple
     worker_ids: tuple
-    # The endpoint's decoder tensor-parallel group (the PP0 ranks of this
-    # planning group). Every member runs the first decoder stage, so every member
-    # needs the vision-embedding leaves; only the endpoint itself routes them.
-    # Empty means "just the endpoint" (TP=1, and hand-built views in tests).
-    endpoint_tp_ranks: tuple = ()
+    # This rank's decoder tensor-parallel group when it runs the first decoder
+    # stage (PP0), else empty. Every member needs the vision rows of its CP shard;
+    # only the group's TP source (a shard owner) receives them and returns their
+    # gradient. Empty also means "no TP peers" (TP=1, and hand-built views).
+    leaf_tp_ranks: tuple = ()
+    # The shard owners: the TP-source ranks of PP0, one per decoder CP rank and
+    # indexed by cp_rank, so element 0 is the endpoint. Under decoder CP each owns
+    # the vision rows of its CP slice. Empty means "just the endpoint" (CP=1, and
+    # hand-built views in tests).
+    endpoint_cp_ranks: tuple = ()
     # Logical workers that may own (materialize and send) pixels. Under TP only
     # the TP source rank of each TP group loads data, so ownership is restricted
     # to the workers hosting those ranks. ``None`` means every worker.
@@ -57,10 +62,28 @@ class MdpRankView:
         return self.global_rank == self.endpoint_rank
 
     @property
+    def shard_owners(self) -> tuple:
+        """The shard-owner ranks indexed by decoder cp_rank (just the endpoint at CP=1)."""
+        return self.endpoint_cp_ranks or (self.endpoint_rank,)
+
+    @property
+    def is_shard_owner(self) -> bool:
+        """This rank holds the trainable leaf of its CP shard and returns its gradient."""
+        return self.global_rank in self.shard_owners
+
+    @property
     def is_leaf_peer(self) -> bool:
-        """A decoder-TP peer of the endpoint: it receives the leaves by broadcast,
-        never routes embeddings and never returns gradients."""
-        return not self.is_endpoint and self.global_rank in self.endpoint_tp_ranks
+        """A decoder-TP peer of a shard owner: it receives that owner's leaves by
+        broadcast, never routes embeddings and never returns gradients."""
+        return not self.is_shard_owner and self.global_rank in self.leaf_tp_ranks
+
+    @property
+    def leaf_tp_source(self) -> Optional[int]:
+        """The shard owner that broadcasts leaves to this rank's TP group."""
+        for rank in self.shard_owners:
+            if rank in self.leaf_tp_ranks:
+                return rank
+        return None
 
     @property
     def pixel_owners(self) -> tuple:
@@ -145,9 +168,15 @@ class MdpRankMap:
         group = self._groups[outer_dp_rank]
         endpoint = group[0]
         tp = self._spec.tp
+        cp = self._spec.cp
         encoder_cp = self._spec.encoder_cp
-        # Group order is 'tp-cp-pp' with tp fastest: indices 0..tp-1 are the
-        # endpoint's TP group, and every index divisible by tp is a TP source.
+        # Group order is 'tp-cp-pp' with tp fastest: index = tp_rank + tp * cp_rank
+        # + tp * cp * pp_rank. Indices below tp * cp are PP0, every index divisible
+        # by tp is a TP source, and index k * tp is the PP0 TP source of cp_rank k.
+        leaf_tp_ranks = ()
+        if index_in_group < tp * cp:
+            tp_start = index_in_group - index_in_group % tp
+            leaf_tp_ranks = tuple(group[tp_start : tp_start + tp])
         return MdpRankView(
             global_rank=global_rank,
             outer_dp_rank=outer_dp_rank,
@@ -156,7 +185,8 @@ class MdpRankMap:
             endpoint_rank=endpoint,
             planning_group_ranks=group,
             worker_ids=tuple(range(self.num_workers_per_group)),
-            endpoint_tp_ranks=tuple(group[:tp]),
+            leaf_tp_ranks=leaf_tp_ranks,
+            endpoint_cp_ranks=tuple(group[k * tp] for k in range(cp)),
             pixel_owner_worker_ids=tuple(
                 sorted({index // encoder_cp for index in range(0, len(group), tp)})
             ),
@@ -179,8 +209,9 @@ def build_rank_map(spec: MdpRankSpec) -> MdpRankMap:
     Planning groups come from ``RankGenerator.get_ranks('tp-cp-pp')``: each group
     holds the ranks that share one decoder ``dp_rank``, ordered with earlier
     dimensions in the rank order changing faster (tp fastest, then cp, then pp),
-    so index 0 in each group is the ``(tp=0, cp=0, pp=0)`` PP0 endpoint and
-    indices ``0..tp-1`` are its decoder TP group.
+    so index 0 in each group is the ``(tp=0, cp=0, pp=0)`` PP0 endpoint, indices
+    ``0..tp-1`` are its decoder TP group and indices ``k * tp`` (``k < cp``) are the
+    PP0 TP sources of the decoder CP ranks.
     """
     if spec.rank_order != SUPPORTED_RANK_ORDER:
         raise MdpConfigurationError(

@@ -40,9 +40,13 @@ class MdpProcessGroups:
     planning_group: dist.ProcessGroup
     encoder_reduction_group: dist.ProcessGroup
     world_group: dist.ProcessGroup
-    # The decoder TP group, set only on the endpoint and its TP peers when
-    # TP > 1: the group the embedding leaves are broadcast over in P3.
+    # The decoder TP group, set on every first-stage (PP0) rank when TP > 1: the
+    # group each shard owner broadcasts its embedding leaves over in P3.
     leaf_tp_group: Optional[dist.ProcessGroup] = None
+    # The decoder CP group of the shard owners (the PP0 TP sources), set on them
+    # when CP > 1: the group the endpoint scatters CP shards over in P3 and
+    # gathers their gradients back over in P5.
+    leaf_cp_group: Optional[dist.ProcessGroup] = None
 
 
 class MdpGroupRegistry:
@@ -94,6 +98,7 @@ def install_mdp_process_groups(
     *,
     group_registry: MdpGroupRegistry,
     decoder_tp_group: Optional[dist.ProcessGroup] = None,
+    decoder_cp_group: Optional[dist.ProcessGroup] = None,
 ) -> MdpProcessGroups:
     """Install MDP process groups; every rank creates groups in the same order.
 
@@ -101,9 +106,11 @@ def install_mdp_process_groups(
     With ``encoder_cp=1`` the encoder reduction group aliases WORLD; no duplicate
     same-sized group is created.
 
-    With TP > 1 the caller passes this rank's decoder TP group. MDP does not
-    create a TP group of its own; it reuses the decoder's for the leaf broadcast
-    and checks that its membership is the endpoint TP group the rank map derives.
+    With TP > 1 (CP > 1) the caller passes this rank's decoder TP (CP) group.
+    MDP creates neither; it reuses the decoder's for the leaf broadcast (the CP
+    shard scatter and gather) and checks that their membership is what the rank
+    map derives, so a decoder/MDP rank-order disagreement fails here instead of
+    hanging or mis-routing later.
     """
     if rank_map.spec.encoder_cp != 1:
         raise MdpConfigurationError(
@@ -125,28 +132,55 @@ def install_mdp_process_groups(
             f"MDP: rank {my_rank} violates: every rank belongs to exactly one planning "
             "group."
         )
-    leaf_tp_group = None
     view = rank_map.view(my_rank)
-    if rank_map.spec.tp > 1 and my_rank in view.endpoint_tp_ranks:
-        if decoder_tp_group is None:
-            raise MdpConfigurationError(
-                f"MDP: tp={rank_map.spec.tp} violates: the decoder TP group is passed "
-                "to install_mdp_process_groups when TP > 1."
-            )
-        members = tuple(dist.get_process_group_ranks(decoder_tp_group))
-        if members != view.endpoint_tp_ranks:
-            raise MdpConfigurationError(
-                f"MDP: decoder TP group {members} violates: equals the endpoint TP "
-                f"group {view.endpoint_tp_ranks} derived from the rank map. The "
-                "decoder and MDP disagree about the rank order."
-            )
-        leaf_tp_group = decoder_tp_group
+    leaf_tp_group = _checked_decoder_group(
+        "TP",
+        rank_map.spec.tp,
+        decoder_tp_group,
+        expected=view.leaf_tp_ranks if rank_map.spec.tp > 1 else (),
+        my_rank=my_rank,
+    )
+    leaf_cp_group = _checked_decoder_group(
+        "CP",
+        rank_map.spec.cp,
+        decoder_cp_group,
+        expected=view.endpoint_cp_ranks if rank_map.spec.cp > 1 else (),
+        my_rank=my_rank,
+    )
     return MdpProcessGroups(
         planning_group=my_planning_group,
         encoder_reduction_group=world,
         world_group=world,
         leaf_tp_group=leaf_tp_group,
+        leaf_cp_group=leaf_cp_group,
     )
+
+
+def _checked_decoder_group(
+    name: str,
+    size: int,
+    group: Optional[dist.ProcessGroup],
+    *,
+    expected: tuple,
+    my_rank: int,
+) -> Optional[dist.ProcessGroup]:
+    """Return the decoder ``name`` group when this rank is in ``expected``, after
+    checking that its members are exactly ``expected``; else ``None``."""
+    if my_rank not in expected:
+        return None
+    if group is None:
+        raise MdpConfigurationError(
+            f"MDP: {name.lower()}={size} violates: the decoder {name} group is passed "
+            f"to install_mdp_process_groups when {name} > 1."
+        )
+    members = tuple(dist.get_process_group_ranks(group))
+    if members != expected:
+        raise MdpConfigurationError(
+            f"MDP: decoder {name} group {members} violates: equals the {name} group "
+            f"{expected} derived from the rank map. The decoder and MDP disagree "
+            "about the rank order."
+        )
+    return group
 
 
 def descriptors_to_records(

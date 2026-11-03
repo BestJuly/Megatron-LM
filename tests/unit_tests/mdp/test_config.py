@@ -72,6 +72,37 @@ def test_window_capture_overlap_still_requires_tp1():
         )
 
 
+@pytest.mark.parametrize("cp_partition_mode", ["zigzag", "contiguous"])
+@pytest.mark.parametrize("tp,sequence_parallel", [(1, False), (2, False), (2, True)])
+def test_decoder_cp_is_accepted_with_and_without_tp(cp_partition_mode, tp, sequence_parallel):
+    validate_mdp_config(
+        MdpConfig(enable=True),
+        _options(
+            world_size=8,
+            tensor_parallel_size=tp,
+            context_parallel_size=2,
+            pipeline_parallel_size=2 if tp == 1 else 1,
+            sequence_parallel=sequence_parallel,
+            cp_partition_mode=cp_partition_mode,
+        ),
+    )
+
+
+def test_window_capture_overlap_still_requires_cp1():
+    with pytest.raises(MdpConfigurationError, match="overlap_window_capture"):
+        validate_mdp_config(
+            MdpConfig(enable=True, overlap_window_capture=True),
+            _options(context_parallel_size=2),
+        )
+
+
+def test_encoder_cp_is_still_rejected_under_decoder_cp():
+    with pytest.raises(MdpConfigurationError, match="encoder_cp"):
+        validate_mdp_config(
+            MdpConfig(enable=True, encoder_cp=2), _options(context_parallel_size=2)
+        )
+
+
 def test_decoder_ep_overlap_configuration_passes_with_vpp():
     validate_mdp_config(
         MdpConfig(enable=True),
@@ -159,7 +190,8 @@ def test_invalid_mdp_config_fields_rejected(config_kwargs, match):
     [
         (dict(rank_order="tp-ep-dp-pp-cp"), "rank_order"),
         (dict(tensor_parallel_size=0), "tensor_parallel_size"),
-        (dict(context_parallel_size=2), "context_parallel_size"),
+        (dict(context_parallel_size=0), "context_parallel_size"),
+        (dict(context_parallel_size=2, cp_partition_mode="bshd"), "cp_partition_mode"),
         (dict(world_size=6, pipeline_parallel_size=4), "world_size"),
         (dict(calculate_per_token_loss=False), "calculate_per_token_loss"),
         (dict(use_distributed_optimizer=False), "use_distributed_optimizer"),

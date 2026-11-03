@@ -154,3 +154,53 @@ def test_broadcast_rejects_misordered_descriptors():
             )
     # Non-endpoint ranks skip; a real run would abort collectively before
     # reaching the broadcast.
+
+
+@pytest.mark.skipif(
+    not _DISTRIBUTED or int(os.environ.get("WORLD_SIZE", "1")) % 4 != 0,
+    reason="needs a torchrun world divisible by TP2 x CP2",
+)
+def test_decoder_tp_cp_groups_are_checked_against_the_rank_map():
+    from megatron.core import parallel_state
+    from megatron.core.mdp.errors import MdpConfigurationError
+    from tests.unit_tests.test_utilities import Utils
+
+    world = torch.distributed.get_world_size()
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2, context_parallel_size=2)
+    try:
+        rank_map = build_rank_map(
+            MdpRankSpec(world_size=world, tp=2, pp=1, cp=2, ep=1, encoder_cp=1)
+        )
+        my_rank = torch.distributed.get_rank()
+        view = rank_map.view(my_rank)
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        cp_group = parallel_state.get_context_parallel_group()
+        groups = install_mdp_process_groups(
+            rank_map,
+            group_registry=MdpGroupRegistry(),
+            decoder_tp_group=tp_group,
+            decoder_cp_group=cp_group,
+        )
+        # PP=1: every rank reads leaves, so every rank has its TP group; only the
+        # TP sources (the shard owners) are on the CP shard group.
+        assert groups.leaf_tp_group is tp_group
+        assert (groups.leaf_cp_group is cp_group) == view.is_shard_owner
+        assert view.is_shard_owner == (parallel_state.get_tensor_model_parallel_rank() == 0)
+        # A wrong CP group describes a different rank order: refuse, do not hang
+        # later. Every rank installs (group creation is collective); only the
+        # shard owners check the CP group.
+        def install_with_wrong_cp_group():
+            install_mdp_process_groups(
+                rank_map,
+                group_registry=MdpGroupRegistry(),
+                decoder_tp_group=tp_group,
+                decoder_cp_group=tp_group,
+            )
+
+        if view.is_shard_owner:
+            with pytest.raises(MdpConfigurationError, match="disagree about the rank order"):
+                install_with_wrong_cp_group()
+        else:
+            install_with_wrong_cp_group()
+    finally:
+        Utils.destroy_model_parallel()

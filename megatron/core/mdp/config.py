@@ -94,6 +94,8 @@ class MdpCompatibilityOptions:
     # exchange rate, which greedy packing invalidates; see _validate_packing.
     train_samples: Optional[int] = None
     rampup_batch_size: Optional[list] = None
+    # The decoder's CP input layout; MDP cuts each leaf into CP shards with it.
+    cp_partition_mode: str = "zigzag"
 
 
 def thd_row_alignment(options: "MdpCompatibilityOptions") -> int:
@@ -219,14 +221,16 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "plan mismatch degrades from a diagnosable error into a collective hang.",
             "1",
         )
-    if config.overlap_window_capture and options.tensor_parallel_size != 1:
+    if config.overlap_window_capture and (
+        options.tensor_parallel_size != 1 or options.context_parallel_size != 1
+    ):
         _reject(
             "overlap_window_capture",
             config.overlap_window_capture,
-            "tensor_parallel_size == 1",
+            "tensor_parallel_size == 1 and context_parallel_size == 1",
             "The capture path performs a TP broadcast per microbatch; running it "
             "on the prefetch thread concurrently with the schedule's NCCL calls "
-            "is only validated without tensor parallelism.",
+            "is only validated without tensor or context parallelism.",
             "False",
         )
     _validate_packing(config, options)
@@ -252,14 +256,27 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "TP >= 1",
             "Tensor parallel size must be positive.",
         )
-    if options.context_parallel_size != 1:
+    # Decoder CP > 1 is supported in both CP input layouts: the plan stays
+    # CP-agnostic, the endpoint cuts each leaf into per-CP-rank shards with the
+    # decoder's own partition (megatron.core.mdp.cp_partition) and scatters them
+    # over its CP group. The encoder stays CP-unaware (encoder_cp == 1).
+    if options.context_parallel_size < 1:
         _reject(
             "context_parallel_size",
             options.context_parallel_size,
-            "decoder CP == 1",
-            "Decoder context parallelism is a registered extension hook, not an "
-            "implemented capability.",
-            "1",
+            "context_parallel_size >= 1",
+            "Context parallel size must be positive.",
+        )
+    if options.context_parallel_size > 1 and options.cp_partition_mode not in (
+        "zigzag",
+        "contiguous",
+    ):
+        _reject(
+            "cp_partition_mode",
+            options.cp_partition_mode,
+            "cp_partition_mode in ('zigzag', 'contiguous')",
+            "MDP cuts vision rows into CP shards with the decoder's input layout.",
+            "zigzag",
         )
     model_parallel = (
         options.tensor_parallel_size
