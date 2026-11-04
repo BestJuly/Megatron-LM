@@ -112,20 +112,27 @@ shards into the replicated encoder (`build_encoder_with_native_init`). An MDP
 run and a native run of the same recipe and seed therefore start from the same
 model, decoder included.
 
-Decoder context parallelism keeps the plan CP-agnostic. The endpoint still
-assembles one full leaf per vision microbatch, then cuts it into per-CP-rank
-shards with the decoder's own input partition (`cp_partition.py`: zigzag per
-packed sequence, or contiguous over the whole pack) and sends shard `k` to the
-PP0 TP source of `cp_rank` `k` over the decoder CP group; each shard owner then
-broadcasts its shard over its TP group. The model splits its inputs before the
-embedding and scatters only the rows its CP slice owns, so the native path
+Decoder context parallelism routes vision rows directly to the CP rank that
+consumes them. The descriptor carries each item's decoder span (its first
+image-token position, its sample's padded span and the microbatch's padded
+rows), and the planner cuts the item into the runs of rows each CP rank owns
+under the decoder's own input partition (`cp_partition.py`: zigzag chunks per
+packed sequence, or contiguous slices of the pack). Each run is a route slice
+to the PP0 TP source of the owning `cp_rank`; that rank lays out its slices in
+its local order (ascending decoder position) and receives them directly in
+the P3 embedding exchange, then broadcasts them over its TP group. In P5 each
+owner sends its slices' gradients straight back to their producers -- no
+reduction, because slices are disjoint and CP attention delivers each row's
+complete gradient to its owner. No rank holds more vision rows than its own
+CP slice (an earlier design staged the whole window on the endpoint, about
+twice the window's vision rows on one rank). Pixels still move per item. A CP
+slice without image tokens holds no leaf. The model splits its inputs before
+the embedding and scatters only the rows its CP slice owns, so the native path
 (which selects those rows from the full encoder output) and MDP run the same
-rank-local scatter. In P5 the shard owners return their shard gradients and the
-endpoint places them back into full-microbatch gradients -- no reduction,
-because the shards are disjoint and CP attention delivers each row's complete
-gradient to its owner. A CP slice without image tokens holds no leaf. The
-contiguous layout (Kimi-K3's release layout) needs fixed-shape THD batches, so
-the multimodal collator runs with `--thd-static-packing` there.
+rank-local scatter. The contiguous layout (Kimi-K3's release layout) needs
+fixed-shape THD batches, so the multimodal collator runs with
+`--thd-static-packing` there; an item whose image-token slots are not one
+contiguous run is rejected under decoder CP.
 
 Decoder FP8 is supported. The decoder uses the native `--fp8`/`--fp8-recipe`
 flags; the vision `TransformerConfig` is built separately by the model adapter
