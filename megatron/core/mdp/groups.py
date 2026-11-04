@@ -44,8 +44,9 @@ class MdpProcessGroups:
     # group each shard owner broadcasts its embedding leaves over in P3.
     leaf_tp_group: Optional[dist.ProcessGroup] = None
     # The decoder CP group of the shard owners (the PP0 TP sources), set on them
-    # when CP > 1: the group the endpoint scatters CP shards over in P3 and
-    # gathers their gradients back over in P5.
+    # when CP > 1. Routing does not use it -- every decoder-CP slice travels in
+    # the planning-group exchanges -- but installing it cross-checks the rank
+    # map's owners against the decoder's real CP groups.
     leaf_cp_group: Optional[dist.ProcessGroup] = None
 
 
@@ -107,9 +108,9 @@ def install_mdp_process_groups(
     same-sized group is created.
 
     With TP > 1 (CP > 1) the caller passes this rank's decoder TP (CP) group.
-    MDP creates neither; it reuses the decoder's for the leaf broadcast (the CP
-    shard scatter and gather) and checks that their membership is what the rank
-    map derives, so a decoder/MDP rank-order disagreement fails here instead of
+    MDP creates neither; it reuses the decoder's TP group for the leaf
+    broadcast, and checks that both groups' membership is what the rank map
+    derives, so a decoder/MDP rank-order disagreement fails here instead of
     hanging or mis-routing later.
     """
     if rank_map.spec.encoder_cp != 1:

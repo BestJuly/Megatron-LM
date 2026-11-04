@@ -324,6 +324,8 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
             capacity_policy=RowCapacityPolicy(mdp_config.row_alignment),
             shape_key_width=adapter.shape_key_width,
             pixel_locality=mdp_config.pixel_locality,
+            cp_size=rank_map.spec.cp,
+            cp_partition_mode=compat.cp_partition_mode,
         ),
         bridge=ModalityBridge(allocator),
         storage=MdpEmbeddingStorage(allocator),
@@ -337,7 +339,6 @@ def maybe_build_mdp_domain(*, args, model, optimizer, optimizer_config, ddp_conf
         greedy_token_budget=greedy_token_budget,
         greedy_max_num_seqs=greedy_max_num_seqs,
         greedy_row_alignment=thd_row_alignment(compat),
-        cp_partition_mode=compat.cp_partition_mode,
     )
     logger.info(
         "MDP: runtime installed (outer_dp_rank=%d, worker_id=%s, endpoint=%d, "

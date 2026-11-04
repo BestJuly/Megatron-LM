@@ -36,7 +36,6 @@ from megatron.core.mdp.bridge import (
     ModalityBridge,
 )
 from megatron.core.mdp.config import MdpConfig
-from megatron.core.mdp.cp_partition import cp_shard_rows
 from megatron.core.mdp.encoder import EncoderDomain, finalize_encoder_grads
 from megatron.core.mdp.errors import MdpConfigurationError, MdpStateError
 from megatron.core.mdp.groups import MdpProcessGroups, broadcast_descriptors
@@ -87,7 +86,6 @@ class MdpRuntime:
         greedy_token_budget: Optional[int] = None,
         greedy_max_num_seqs: Optional[int] = None,
         greedy_row_alignment: int = 1,
-        cp_partition_mode: str = "zigzag",
     ) -> None:
         self.config = config
         self.rank_map = rank_map
@@ -102,7 +100,6 @@ class MdpRuntime:
         self.output_hidden_size = output_hidden_size
         self.params_dtype = params_dtype
         self.num_vpp_chunks = num_vpp_chunks
-        self.cp_partition_mode = cp_partition_mode
         self.device = device or torch.device("cuda", torch.cuda.current_device())
 
         self._state = MdpRuntimeState.EMPTY
@@ -118,12 +115,8 @@ class MdpRuntime:
         self._eval_outputs: Sequence = ()
         self._chunk_layouts: Sequence = ()
         self._chunk_of_item: dict = {}
-        # Decoder CP > 1: per vision microbatch, the leaf rows of every CP shard
-        # (on PP0 ranks), and the rows this rank's own shard holds.
-        self._cp_shards: dict = {}
-        # Endpoint-only CUDA events around the CP shard scatter (P3) and gather (P5).
-        self._cp_scatter_events: Optional[tuple] = None
-        self._cp_gather_events: Optional[tuple] = None
+        # This producer's routed slices per item (one per item without decoder CP).
+        self._routes_of_item: dict = {}
         self._captured_num_tokens: Optional[torch.Tensor] = None
         self._token_capture_count = 0
         self._token_consumed = False
@@ -263,6 +256,9 @@ class MdpRuntime:
         )
         self._chunk_layouts = chunk_layouts if my_layout.segments else ()
         self._chunk_of_item = {}
+        self._routes_of_item = {}
+        for route in plan.routes_for_producer(self.rank_view.my_worker_id):
+            self._routes_of_item.setdefault(route.global_item_id, []).append(route)
         chunk_payloads = []
         pixel_dest = {}
         with nvtx_phase("p2_pack_payload"):
@@ -366,20 +362,20 @@ class MdpRuntime:
             self._eval_outputs = tuple(chunk_outputs)
             detached = tuple(output.detach() for output in chunk_outputs)
 
-        # P3: embedding exchange straight into the endpoint leaves. Under decoder
-        # TP the endpoint's TP peers allocate the same leaves (the plan is identical
-        # on every group member) and receive them by broadcast below. Under decoder
-        # CP the endpoint's leaves are full-microbatch staging buffers: they are cut
-        # into per-CP-rank shards, and each shard owner then holds (and
-        # TP-broadcasts) only the rows of its own CP slice.
+        # P3: embedding exchange straight into the leaves of the ranks that
+        # consume them. Without decoder CP that is the group endpoint; under
+        # decoder CP every slice goes directly to the PP0 TP source of the CP rank
+        # owning its decoder rows, so no rank ever stages another rank's rows.
+        # A shard owner's TP peers allocate the same leaves (the plan is identical
+        # on every group member) and receive them by broadcast below.
         view = self.rank_view
-        is_endpoint = view.lane_id is not None
-        cp_sharded = self.rank_map.spec.cp > 1
+        source = self._leaf_source()
+        is_owner = view.is_shard_owner
         emb_dest = {}
         leaves = []  # (microbatch_id, valid leaf view)
-        if is_endpoint or (view.is_leaf_peer and not cp_sharded):
+        if source is not None:
             with nvtx_phase("p3_leaf_assembly"):
-                for layout in plan.layouts:
+                for layout in plan.layouts_for_endpoint(source):
                     if layout.text_only:
                         continue
                     leaf = self.allocator.acquire(
@@ -389,9 +385,10 @@ class MdpRuntime:
                         device=self.device,
                         tag="leaf",
                     )
-                    if is_endpoint:
+                    if is_owner:
                         for segment in layout.segments:
-                            emb_dest[BridgeBufferKey(segment.global_item_id)] = leaf[
+                            key = BridgeBufferKey(segment.global_item_id, segment.slice_id)
+                            emb_dest[key] = leaf[
                                 segment.leaf_row_start : segment.leaf_row_start
                                 + segment.output_rows
                             ]
@@ -399,10 +396,12 @@ class MdpRuntime:
         with nvtx_phase("p3_embedding_exchange"):
             emb_specs = self._iter_specs[BridgePhase.EMBEDDING]
             emb_local = {}
-            for item_id, (chunk_index, segment) in self._chunk_of_item.items():
-                emb_local[BridgeBufferKey(item_id)] = detached[chunk_index][
-                    segment.output_row_start : segment.output_row_start + segment.output_rows
-                ]
+            for route in plan.routes_for_producer(view.my_worker_id):
+                chunk_index, segment = self._chunk_of_item[route.global_item_id]
+                start, rows = self._slice_rows(route, segment)
+                emb_local[BridgeBufferKey(route.global_item_id, route.slice_id)] = detached[
+                    chunk_index
+                ][segment.output_row_start + start : segment.output_row_start + start + rows]
             # One alltoall instead of batched P2P: same ledger and payload,
             # but no per-edge kernel pairs and no torch.cuda.synchronize
             # workaround (all_to_all_single stream-orders its receive buffer).
@@ -417,9 +416,6 @@ class MdpRuntime:
                 device=self.device,
                 dest_views=emb_dest,
             )
-        if cp_sharded and (view.is_shard_owner or view.is_leaf_peer):
-            with nvtx_phase("p3_cp_shard_scatter"):
-                leaves = self._scatter_cp_shards(plan, leaves if is_endpoint else ())
         leaf_tp_group = self.process_groups.leaf_tp_group
         if leaf_tp_group is not None and leaves:
             # Every first-stage TP rank runs the decoder input layer, so every one
@@ -435,12 +431,11 @@ class MdpRuntime:
         # on every TP rank (the first column-parallel layer all-reduces it, or the
         # SP scatter's backward all-gathers it), so one copy goes back to the
         # encoder and a peer returning its own would scale encoder grads by TP.
-        # CP shards are disjoint, so they need no reduction either.
-        owner = view.is_shard_owner
+        # CP slices are disjoint, so they need no reduction either.
         for microbatch_id, leaf_valid in leaves:
-            if owner:
+            if is_owner:
                 leaf_valid.requires_grad_(True)
-            self.storage.put_leaf(microbatch_id, leaf_valid, trainable=owner)
+            self.storage.put_leaf(microbatch_id, leaf_valid, trainable=is_owner)
         if forward_only and self._eval_outputs:
             # Evaluation releases producer outputs once the bridge completed.
             self._eval_outputs = ()
@@ -513,10 +508,11 @@ class MdpRuntime:
                             tag="grad_regroup",
                         )
                         for segment in chunk.segments:
-                            grad_dest[BridgeBufferKey(segment.global_item_id)] = grad_buffer[
-                                segment.output_row_start : segment.output_row_start
-                                + segment.output_rows
-                            ]
+                            for route in self._routes_of_item[segment.global_item_id]:
+                                start, rows = self._slice_rows(route, segment)
+                                offset = segment.output_row_start + start
+                                key = BridgeBufferKey(route.global_item_id, route.slice_id)
+                                grad_dest[key] = grad_buffer[offset : offset + rows]
                         chunk_grads.append(grad_buffer[: chunk.total_output_rows])
                     # Drop only the loop-local base-tensor reference; this does not
                     # release its storage. The grad_dest and chunk_grads views
@@ -530,21 +526,17 @@ class MdpRuntime:
                     # TP peers hold untrainable copies; release them, send nothing.
                     for layout in plan.layouts:
                         self.storage.release(layout.microbatch_id)
-                full_grads = None
-                if self.rank_map.spec.cp > 1 and self.rank_view.is_shard_owner:
-                    with nvtx_phase("p5_cp_shard_gather"):
-                        full_grads = self._gather_cp_shard_grads(plan)
-                if self.rank_view.lane_id is not None:
-                    for layout in plan.layouts:
+                if self.rank_view.is_shard_owner:
+                    # Each owner returns its own slices' gradients straight to
+                    # their producers: complete per row (CP attention backward
+                    # delivers them), disjoint across owners, no reduction.
+                    for layout in plan.layouts_for_endpoint(self._leaf_source()):
                         if layout.text_only:
                             continue
-                        grad = (
-                            full_grads[layout.microbatch_id]
-                            if full_grads is not None
-                            else self.storage.pop_grad(layout.microbatch_id)
-                        )
+                        grad = self.storage.pop_grad(layout.microbatch_id)
                         for segment in layout.segments:
-                            grad_local[BridgeBufferKey(segment.global_item_id)] = grad[
+                            key = BridgeBufferKey(segment.global_item_id, segment.slice_id)
+                            grad_local[key] = grad[
                                 segment.leaf_row_start : segment.leaf_row_start
                                 + segment.output_rows
                             ]
@@ -606,8 +598,7 @@ class MdpRuntime:
         self._eval_outputs = ()
         self._chunk_layouts = ()
         self._chunk_of_item = {}
-        self._log_cp_shard_timing()
-        self._cp_shards = {}
+        self._routes_of_item = {}
         self._captured_num_tokens = None
         self._iteration += 1
         self._state = MdpRuntimeState.EMPTY
@@ -615,209 +606,31 @@ class MdpRuntime:
     def expects_leaf(self, microbatch_id: int) -> bool:
         """Whether this first-stage rank holds vision rows for ``microbatch_id``.
 
-        At CP == 1 that is every vision-bearing microbatch. Under decoder CP it
-        is a per-(microbatch, cp_rank) fact: a CP slice may contain no image
-        token even when the microbatch carries images, and then no leaf exists.
+        Without decoder CP that is every vision-bearing microbatch. Under decoder
+        CP it is a per-(microbatch, cp_rank) fact: a CP slice may contain no image
+        token even when the microbatch carries images, and then the plan has no
+        layout for it at this rank's shard owner.
         """
-        if self.rank_map.spec.cp == 1:
-            layout = self._plan.layout_for_microbatch(microbatch_id)
-            return not layout.text_only
-        shards = self._cp_shards.get(microbatch_id)
-        return bool(shards) and bool(shards[self._my_cp_shard_index()])
+        source = self._leaf_source()
+        if source is None:
+            return False
+        for layout in self._plan.layouts_for_endpoint(source):
+            if layout.microbatch_id == microbatch_id:
+                return not layout.text_only
+        return False
 
-    def _my_cp_shard_index(self) -> int:
+    def _leaf_source(self) -> Optional[int]:
+        """The shard owner whose leaves this rank holds (itself or its TP source)."""
         view = self.rank_view
-        source = view.global_rank if view.is_shard_owner else view.leaf_tp_source
-        return view.shard_owners.index(source)
+        if view.is_shard_owner:
+            return view.global_rank
+        return view.leaf_tp_source if view.is_leaf_peer else None
 
-    def _cp_shard_table(self, plan: MdpBatchPlan) -> dict:
-        """Leaf rows of every CP shard, per vision microbatch (host integers).
-
-        Every first-stage rank derives the same table from its own replay
-        records, so shard sizes need no metadata exchange. Leaf rows follow the
-        plan's ``(sample_id, image_ordinal)`` order, which is ascending decoder
-        position; ``cp_shard_rows`` checks that.
-        """
-        records = {record.microbatch_id: record for record in self._window.records()}
-        vision = [layout for layout in plan.layouts if not layout.text_only]
-        params = [records[layout.microbatch_id].decoder_packed_seq_params for layout in vision]
-        # One D2H copy for every microbatch's padded boundaries.
-        cu_host = []
-        if params:
-            cu_all = torch.cat([p.cu_seqlens_q_padded.reshape(-1) for p in params]).tolist()
-            offset = 0
-            for p in params:
-                n = p.cu_seqlens_q_padded.numel()
-                cu_host.append(cu_all[offset : offset + n])
-                offset += n
-        table = {}
-        for layout, cu in zip(vision, cu_host):
-            items = sorted(
-                records[layout.microbatch_id].vision_items,
-                key=lambda item: (item.sample_id, item.image_ordinal),
-            )
-            positions = [pos for item in items for pos in item.decoder_positions]
-            if len(positions) != layout.total_output_rows:
-                raise MdpStateError(
-                    f"MDP: microbatch {layout.microbatch_id} violates: one decoder "
-                    f"position per leaf row ({len(positions)} != "
-                    f"{layout.total_output_rows})."
-                )
-            table[layout.microbatch_id] = cp_shard_rows(
-                positions,
-                cu_seqlens_padded=cu,
-                total_rows=cu[-1],
-                cp_size=self.rank_map.spec.cp,
-                mode=self.cp_partition_mode,
-            )
-        return table
-
-    def _scatter_cp_shards(self, plan: MdpBatchPlan, full_leaves) -> list:
-        """P3 under decoder CP: cut the endpoint's full leaves into CP shards.
-
-        The endpoint keeps shard 0 and sends shard ``k`` to the PP0 TP source of
-        cp_rank ``k`` over the decoder CP group; TP peers only allocate their
-        shard (the TP broadcast fills it). Empty shards are skipped on both
-        sides. Returns this rank's ``(microbatch_id, shard leaf)`` list.
-        """
-        view = self.rank_view
-        self._cp_shards = self._cp_shard_table(plan)
-        my_index = self._my_cp_shard_index()
-        owners = view.shard_owners
-        is_endpoint = view.lane_id is not None
-        full_by_mb = dict(full_leaves)
-        group = self.process_groups.leaf_cp_group
-        start = torch.cuda.Event(enable_timing=True) if is_endpoint else None
-        if start is not None:
-            start.record()
-        ops, keep_alive, leaves = [], [], []
-        for layout in plan.layouts:
-            if layout.text_only:
-                continue
-            shards = self._cp_shards[layout.microbatch_id]
-            rows = len(shards[my_index])
-            leaf = None
-            if rows:
-                leaf = self.allocator.acquire(
-                    rows=plan.capacity_policy.capacity_of(rows),
-                    width=self.output_hidden_size,
-                    dtype=self.params_dtype,
-                    device=self.device,
-                    tag="leaf",
-                )[:rows]
-                leaves.append((layout.microbatch_id, leaf))
-            if is_endpoint:
-                full = full_by_mb[layout.microbatch_id]
-                for k, shard in enumerate(shards):
-                    if not shard:
-                        continue
-                    index = torch.tensor(shard, dtype=torch.long, device=self.device)
-                    if k == my_index:
-                        torch.index_select(full, 0, index, out=leaf)
-                    else:
-                        buf = full.index_select(0, index)
-                        keep_alive.append(buf)
-                        ops.append(torch.distributed.P2POp(
-                            torch.distributed.isend, buf, owners[k], group
-                        ))
-            elif view.is_shard_owner and leaf is not None:
-                ops.append(torch.distributed.P2POp(
-                    torch.distributed.irecv, leaf, view.endpoint_rank, group
-                ))
-        if ops:
-            for request in torch.distributed.batch_isend_irecv(ops):
-                request.wait()
-        if is_endpoint:
-            # The staging leaves are dead once every shard is cut from them.
-            for full in full_by_mb.values():
-                self.allocator.release(full)
-            self._cp_scatter_events = (start, torch.cuda.Event(enable_timing=True))
-            self._cp_scatter_events[1].record()
-        del keep_alive
-        return leaves
-
-    def _gather_cp_shard_grads(self, plan: MdpBatchPlan) -> Optional[dict]:
-        """P5 under decoder CP: return every shard's leaf gradient to the endpoint.
-
-        Shards are disjoint and each row's gradient is complete on its owner
-        (CP attention backward delivers it), so the endpoint only places the
-        rows back into full-microbatch gradients -- no reduction. Returns those
-        gradients on the endpoint, ``None`` on the other shard owners.
-        """
-        view = self.rank_view
-        my_index = self._my_cp_shard_index()
-        owners = view.shard_owners
-        is_endpoint = view.lane_id is not None
-        group = self.process_groups.leaf_cp_group
-        start = torch.cuda.Event(enable_timing=True) if is_endpoint else None
-        if start is not None:
-            start.record()
-        ops, received, full_grads = [], [], {}
-        for layout in plan.layouts:
-            if layout.text_only:
-                continue
-            shards = self._cp_shards[layout.microbatch_id]
-            own = (
-                self.storage.pop_grad(layout.microbatch_id) if shards[my_index] else None
-            )
-            if not is_endpoint:
-                if own is not None:
-                    ops.append(torch.distributed.P2POp(
-                        torch.distributed.isend, own.contiguous(), view.endpoint_rank, group
-                    ))
-                continue
-            full = torch.empty(
-                (layout.total_output_rows, self.output_hidden_size),
-                dtype=self.params_dtype,
-                device=self.device,
-            )
-            full_grads[layout.microbatch_id] = full
-            for k, shard in enumerate(shards):
-                if not shard:
-                    continue
-                index = torch.tensor(shard, dtype=torch.long, device=self.device)
-                if k == my_index:
-                    full.index_copy_(0, index, own.to(full.dtype))
-                else:
-                    buf = torch.empty(
-                        (len(shard), self.output_hidden_size),
-                        dtype=self.params_dtype,
-                        device=self.device,
-                    )
-                    ops.append(torch.distributed.P2POp(
-                        torch.distributed.irecv, buf, owners[k], group
-                    ))
-                    received.append((full, index, buf))
-        if ops:
-            for request in torch.distributed.batch_isend_irecv(ops):
-                request.wait()
-        for full, index, buf in received:
-            full.index_copy_(0, index, buf)
-        if not is_endpoint:
-            return None
-        end = torch.cuda.Event(enable_timing=True)
-        end.record()
-        self._cp_gather_events = (start, end)
-        return full_grads
-
-    def _log_cp_shard_timing(self) -> None:
-        """Endpoint-only, periodic: GPU time of the CP shard scatter and gather."""
-        scatter, gather = self._cp_scatter_events, self._cp_gather_events
-        self._cp_scatter_events = self._cp_gather_events = None
-        if scatter is None or gather is None:
-            return
-        if not (self._iteration < 3 or self._iteration % 10 == 0):
-            return
-        gather[1].synchronize()
-        logger.info(
-            "MDP CP shard redistribution (iteration %d, endpoint %d): scatter %.2f ms, "
-            "gather %.2f ms over %d vision microbatches",
-            self._iteration,
-            self.rank_view.global_rank,
-            scatter[0].elapsed_time(scatter[1]),
-            gather[0].elapsed_time(gather[1]),
-            len(self._cp_shards),
-        )
+    @staticmethod
+    def _slice_rows(route, segment) -> tuple:
+        """``(item_row_start, rows)`` of one routed slice of an encoder segment."""
+        rows = segment.output_rows if route.item_rows is None else route.item_rows
+        return route.item_row_start, rows
 
     def last_iteration_metrics(self) -> Optional[MdpIterationMetrics]:
         """Metrics of the most recently completed iteration."""
@@ -1024,12 +837,16 @@ class MdpRuntime:
             )
 
     def _tensor_specs(self, plan: MdpBatchPlan, *, pixels: bool) -> dict:
+        """PIXEL specs per item; EMBEDDING/GRADIENT specs per routed slice."""
         specs = {}
         for route in plan.routes:
+            if pixels and route.slice_id != 0:
+                continue
             segment = plan.segment_for_item(route.global_item_id)
-            valid = segment.payload_rows if pixels else segment.output_rows
+            valid = segment.payload_rows if pixels else self._slice_rows(route, segment)[1]
             width = self.adapter.payload_width if pixels else self.output_hidden_size
-            specs[BridgeBufferKey(route.global_item_id)] = BridgeTensorSpec(
+            key = BridgeBufferKey(route.global_item_id, 0 if pixels else route.slice_id)
+            specs[key] = BridgeTensorSpec(
                 valid_rows=valid,
                 capacity_rows=plan.capacity_policy.capacity_of(valid),
                 width=width,

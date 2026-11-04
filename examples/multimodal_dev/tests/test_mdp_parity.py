@@ -28,8 +28,9 @@ returning their (identical) gradients would cause and must be caught.
 
 The CP variants (CP2, TP2xCP2, TP2xCP2 with SP; zigzag THD) run both paths with
 a context-parallel decoder: every first-stage rank consumes only its CP shard of
-the vision rows. The endpoint cuts its leaf into shards, owners return their
-shard gradients, and the endpoint reassembles them; per-rank losses and decoder
+the vision rows. The planner cuts every item into per-CP-rank slices that the
+producers send straight to their owners, and owners return their slices'
+gradients straight to the producers; per-rank losses and decoder
 gradients must match bitwise and the encoder gradient to the same tolerance.
 Twins drop one shard's gradient or duplicate every shard cp times and must be
 caught. A native-only test checks the split-before-embed model path at CP2
@@ -412,7 +413,7 @@ def _build_runtime(vision_config, microbatches, *, mdp_config=None, tp=1, cp=1):
         ),
         planner=MdpPlanner(
             view, locality_slack_permille=10, capacity_policy=RowCapacityPolicy(),
-            shape_key_width=3,
+            shape_key_width=3, cp_size=cp, cp_partition_mode="zigzag",
         ),
         bridge=ModalityBridge(allocator),
         storage=MdpEmbeddingStorage(allocator),
@@ -420,7 +421,6 @@ def _build_runtime(vision_config, microbatches, *, mdp_config=None, tp=1, cp=1):
         output_hidden_size=HIDDEN,
         params_dtype=DTYPE,
         num_vpp_chunks=1,
-        cp_partition_mode="zigzag",
     )
     return runtime, encoder_ddp
 
@@ -728,9 +728,9 @@ _CP_IDS = ["cp2", "tp2-cp2", "tp2-cp2-sp"]
 )
 def test_g1_cp_mdp_matches_native_pixel_path(_tp_cp_parallel, sequence_parallel):
     # Decoder CP (zigzag THD): every PP0 rank consumes its own CP shard of the
-    # vision rows. The endpoint cuts its full leaf into shards and gathers their
-    # gradients back; both paths then run the identical rank-local scatter, so
-    # the per-rank loss and decoder gradients match bitwise.
+    # vision rows. Producers send each slice straight to its owner and owners
+    # return their gradients directly; both paths run the identical rank-local
+    # scatter, so the per-rank loss and decoder gradients match bitwise.
     tp, cp = _tp_cp_parallel
     batch = _make_batch()
     native_model, native_loss = _seeded(

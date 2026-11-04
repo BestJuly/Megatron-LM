@@ -256,10 +256,10 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "TP >= 1",
             "Tensor parallel size must be positive.",
         )
-    # Decoder CP > 1 is supported in both CP input layouts: the plan stays
-    # CP-agnostic, the endpoint cuts each leaf into per-CP-rank shards with the
-    # decoder's own partition (megatron.core.mdp.cp_partition) and scatters them
-    # over its CP group. The encoder stays CP-unaware (encoder_cp == 1).
+    # Decoder CP > 1 is supported in both CP input layouts: the planner cuts each
+    # vision item into the runs each CP rank owns under the decoder's own
+    # partition (megatron.core.mdp.cp_partition) and routes them straight to
+    # their owners. The encoder stays CP-unaware (encoder_cp == 1).
     if options.context_parallel_size < 1:
         _reject(
             "context_parallel_size",
