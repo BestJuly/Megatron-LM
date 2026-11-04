@@ -299,6 +299,21 @@ def add_multimodal_args(parser):
         ),
     )
     group.add_argument(
+        "--mdp-mock-vision-config-json",
+        type=str,
+        default=None,
+        help=(
+            "Vision content of the MDP mock dataset, as JSON or a path to a JSON "
+            "file; keys of examples/multimodal_dev/data/mdp_scenarios.py "
+            "VISION_CONFIG_DEFAULTS, e.g. "
+            '\'{"vision_fraction":[0.1,0.2],"item_tokens":[256,4096],'
+            '"text_only_every":0}\'. Every multimodal sample then carries a '
+            "per-sample vision share instead of the built-in 100-500 image "
+            "tokens, which long (32K-64K) samples need. Unset keeps the pool "
+            "byte-identical."
+        ),
+    )
+    group.add_argument(
         "--mdp-debug-plan-payload-check",
         action="store_true",
         default=False,

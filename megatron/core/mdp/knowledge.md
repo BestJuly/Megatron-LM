@@ -455,6 +455,7 @@ Primary flags:
 - `--mdp-greedy-packing`
 - `--mdp-greedy-packing-approximate-resume`
 - `--mdp-mock-dataset-config-json`
+- `--mdp-mock-vision-config-json`
 
 Packing flags MDP consumes from the core config (all optional, all off by
 default):
@@ -518,6 +519,22 @@ about `token_budget / mean_sample_len` samples per bin, so
 `token_budget / MBS`. The mock provider scales its dataset accordingly
 (`mdp_mock._greedy_sample_scale`); a real dataset must be sized by the
 operator.
+
+The mock pool's built-in vision budget (100-500 image slots, at most 3 items,
+every fifth sample text-only) suits 1K-8K samples; a 64K sample drawn from
+`--mdp-mock-dataset-config-json` would be under 1% vision.
+`--mdp-mock-vision-config-json` (keys of
+`mdp_scenarios.VISION_CONFIG_DEFAULTS`) replaces it with a per-sample share:
+`vision_fraction` is drawn uniformly per sample, items of `item_tokens`
+decoder slots (merged side up to `max_merged_side`, `video_fraction` of them
+`video_frames`-frame video) are drawn until the share is used, text fills
+the remainder exactly, and `text_only_every` sets the text-only cadence
+(0 = none). Unset, every existing pool is byte-identical. The Kimi-K3 provider
+counts MoonViT's pooled frames (`frames_pooled`) and draws `t in {2, 4}`, so a
+fixed-length config (lognormal with `min = max = mean`) yields samples of
+exactly that length. Example, one 64K sequence per microbatch with 10-20%
+vision: `{"vision_fraction":[0.1,0.2],"item_tokens":[256,4096],"text_only_every":0}`
+(about 6 items, 56K pixel rows per sample on average).
 
 The typed encoder recompute arguments are shared by native `multimodal_dev` and
 MDP training. Native training supports no recompute, `selective`, and `full`;

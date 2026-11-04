@@ -24,7 +24,11 @@ from typing import Dict, List, Optional
 import torch
 from torch.utils.data import Dataset
 
-from examples.multimodal_dev.data.mdp_mock import MdpThdMockDataset, _greedy_sample_scale
+from examples.multimodal_dev.data.mdp_mock import (
+    MdpThdMockDataset,
+    _greedy_sample_scale,
+    mock_configs,
+)
 from examples.multimodal_dev.data.mdp_scenarios import build_scenarios
 from examples.multimodal_dev.models.kimi_k3_vl.configuration import (
     KIMI_K3_IMAGE_TOKEN_ID,
@@ -58,6 +62,19 @@ def kimi_scenarios(scenarios):
         grids = tuple((4 if t == 3 else t, h, w) for t, h, w in grids)
         out.append((grids, text_chunks))
     return tuple(out)
+
+
+def kimi_vision_config(vision_config):
+    """A ``--mdp-mock-vision-config-json`` payload with MoonViT's frame geometry.
+
+    MoonViT pools frames away (an item fills ``(h/2)*(w/2)`` slots for any
+    ``t``) and takes up to ``pos_emb_time`` frames, so the pool counts slots with
+    pooled frames and draws ``t in {2, 4}`` directly; ``kimi_scenarios`` is then
+    a no-op and every sample's length equals its drawn total.
+    """
+    if vision_config is None:
+        return None
+    return {"frames_pooled": True, "video_frames": (2, 4), **vision_config}
 
 
 class KimiMdpMockDataset(MdpThdMockDataset):
@@ -281,18 +298,20 @@ def mdp_mock_provider(train_val_test_num_samples):
     from megatron.training import get_args
 
     args = get_args()
-    length_config = getattr(args, "mdp_mock_dataset_config_json", None)
-    if length_config is not None:
-        from megatron.training.datasets.utils import load_json_arg
-
-        length_config = load_json_arg(length_config)
-    scenarios = kimi_scenarios(build_scenarios(length_config=length_config))
+    length_config, vision_config = mock_configs(args)
+    scenarios = kimi_scenarios(
+        build_scenarios(
+            length_config=length_config, vision_config=kimi_vision_config(vision_config)
+        )
+    )
     kwargs = dict(
         vocab_size=getattr(args, "padded_vocab_size", 1024),
         image_token_id=resolve_image_token_id(args),
         scenarios=scenarios,
     )
-    scale = _greedy_sample_scale(args, scenarios)
+    # With a vision config the pool counts MoonViT's pooled frames, so its
+    # totals are the sample lengths the dataset emits.
+    scale = _greedy_sample_scale(args, scenarios, frames_pooled=vision_config is not None)
     return tuple(
         KimiMdpMockDataset(num_samples=math.ceil(n * scale), seed=1234 + split, **kwargs)
         for split, n in enumerate(train_val_test_num_samples)

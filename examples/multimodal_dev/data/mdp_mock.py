@@ -185,7 +185,7 @@ class MdpThdMockDataset(Dataset):
 GREEDY_SAMPLE_SAFETY = 1.5
 
 
-def _greedy_sample_scale(args, scenarios):
+def _greedy_sample_scale(args, scenarios, frames_pooled=False):
     """Scale factor for the synthetic dataset length under greedy packing.
 
     Megatron sizes the dataset as ``train_iters * global_batch_size`` samples.
@@ -202,11 +202,24 @@ def _greedy_sample_scale(args, scenarios):
         return 1.0
     budget = int(args.max_seqlen_per_dp_cp_rank) * int(args.context_parallel_size)
     cap = getattr(args, "thd_max_packed_sequences", None)
-    mean_len = sum(scenario_totals(s)[0] for s in scenarios) / len(scenarios)
+    mean_len = sum(scenario_totals(s, frames_pooled=frames_pooled)[0] for s in scenarios) / len(
+        scenarios
+    )
     samples_per_bin = budget / mean_len
     if cap:
         samples_per_bin = min(samples_per_bin, float(cap))
     return max(1.0, samples_per_bin / int(args.micro_batch_size)) * GREEDY_SAMPLE_SAFETY
+
+
+def mock_configs(args):
+    """``(length_config, vision_config)`` parsed from the MDP mock JSON flags."""
+    from megatron.training.datasets.utils import load_json_arg
+
+    configs = []
+    for name in ("mdp_mock_dataset_config_json", "mdp_mock_vision_config_json"):
+        value = getattr(args, name, None)
+        configs.append(None if value is None else load_json_arg(value))
+    return tuple(configs)
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):
@@ -214,14 +227,10 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     from megatron.training import get_args
 
     args = get_args()
-    length_config = getattr(args, "mdp_mock_dataset_config_json", None)
-    if length_config is not None:
-        from megatron.training.datasets.utils import load_json_arg
-
-        length_config = load_json_arg(length_config)
+    length_config, vision_config = mock_configs(args)
     # Built once and shared: the pool is a deterministic function of the length
     # config, and drawing it re-samples a million lognormal lengths.
-    scenarios = build_scenarios(length_config=length_config)
+    scenarios = build_scenarios(length_config=length_config, vision_config=vision_config)
     kwargs = dict(
         vocab_size=getattr(args, "padded_vocab_size", 1024),
         image_token_id=resolve_image_token_id(args),

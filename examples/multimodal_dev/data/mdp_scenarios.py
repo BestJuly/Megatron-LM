@@ -79,9 +79,9 @@ def draw_total_token_lengths(length_config, count, seed=GENERATOR_SEED):
     ]
 
 
-def _item_tokens(grid, merge=SPATIAL_MERGE_SIZE):
+def _item_tokens(grid, merge=SPATIAL_MERGE_SIZE, frames_pooled=False):
     t, h, w = grid
-    return t * (h // merge) * (w // merge)
+    return (1 if frames_pooled else t) * (h // merge) * (w // merge)
 
 
 def _random_grid(rng, max_tokens):
@@ -161,19 +161,123 @@ def _multimodal_scenario(rng, total_target):
     return (tuple(grids), text_chunks)
 
 
+#: ``--mdp-mock-vision-config-json`` keys and their defaults. Unset, the pool is
+#: built exactly as before; set, every multimodal sample gets a vision share drawn
+#: per sample instead of the fixed ``IMAGE_TOKENS_RANGE`` budget, so long samples
+#: (32K-64K) carry a realistic amount of vision.
+VISION_CONFIG_DEFAULTS = {
+    # Decoder slots of vision items over the sample's total, uniform per sample.
+    "vision_fraction": (0.10, 0.20),
+    # Decoder slots per item (per frame unless frames are pooled).
+    "item_tokens": (256, 4096),
+    "max_items": 64,
+    # Largest merged grid side (patches / merge); MoonViT allows 256.
+    "max_merged_side": 64,
+    "video_fraction": 0.25,
+    "video_frames": (2, 3),
+    # The encoder pools frames away, so a video item fills one frame's slots.
+    "frames_pooled": False,
+    # Every n-th scenario is text-only; 0 = none.
+    "text_only_every": 0,
+}
+
+
+def normalize_vision_config(vision_config):
+    """``vision_config`` merged over ``VISION_CONFIG_DEFAULTS`` and validated."""
+    unknown = set(vision_config) - set(VISION_CONFIG_DEFAULTS)
+    if unknown:
+        raise ValueError(f"unknown vision config keys {sorted(unknown)}")
+    config = {**VISION_CONFIG_DEFAULTS, **vision_config}
+    lo, hi = config["vision_fraction"]
+    if not 0.0 < lo <= hi < 1.0:
+        raise ValueError(
+            f"vision_fraction {config['vision_fraction']} must satisfy 0 < lo <= hi < 1"
+        )
+    low, high = config["item_tokens"]
+    side = config["max_merged_side"]
+    if not 4 <= low <= high or high > side * side:
+        raise ValueError(
+            f"item_tokens {config['item_tokens']} must satisfy 4 <= lo <= hi <= max_merged_side^2"
+        )
+    if config["max_items"] < 1 or config["text_only_every"] < 0:
+        raise ValueError("max_items must be >= 1 and text_only_every >= 0")
+    if not 0.0 <= config["video_fraction"] <= 1.0 or min(config["video_frames"]) < 2:
+        raise ValueError("video_fraction must be in [0, 1] and video_frames >= 2")
+    config["vision_fraction"] = (float(lo), float(hi))
+    config["item_tokens"] = (int(low), int(high))
+    config["video_frames"] = tuple(int(t) for t in config["video_frames"])
+    return config
+
+
+def _sized_grid(rng, tokens, t, config):
+    """A (t, h, w) grid whose per-frame merged area is close to, never above, ``tokens``."""
+    side = config["max_merged_side"]
+    mh = rng.randint(max(2, -(-tokens // side)), min(side, tokens // 2))
+    mw = min(side, tokens // mh)
+    return (t, mh * SPATIAL_MERGE_SIZE, mw * SPATIAL_MERGE_SIZE)
+
+
+def _vision_share_scenario(rng, total_target, config):
+    """Multimodal sample with a ``vision_fraction`` share of decoder slots.
+
+    Items are drawn until the drawn vision budget is used up; the share is
+    re-drawn when grid factorization lands outside the fraction window. Text
+    fills the remainder, so the total is exact.
+    """
+    lo, hi = config["vision_fraction"]
+    item_lo, item_hi = config["item_tokens"]
+    pooled = config["frames_pooled"]
+    floor, ceiling = int(lo * total_target + 0.999999), int(hi * total_target)
+    if ceiling < item_lo:
+        raise ValueError(
+            f"a {total_target}-token sample cannot hold a {item_lo}-slot item at "
+            f"vision_fraction {config['vision_fraction']}"
+        )
+    for _ in range(MAX_GRID_DRAWS):
+        budget = rng.randint(max(floor, item_lo), ceiling)
+        grids, used = [], 0
+        while len(grids) < config["max_items"] and budget - used >= item_lo:
+            t = rng.choice(config["video_frames"]) if rng.random() < config["video_fraction"] else 1
+            per_item = rng.randint(item_lo, min(item_hi, budget - used))
+            per_frame = per_item if pooled else per_item // t
+            if per_frame < item_lo and not pooled:
+                t, per_frame = 1, per_item
+            grids.append(_sized_grid(rng, per_frame, t, config))
+            used += _item_tokens(grids[-1], frames_pooled=pooled)
+        if floor <= used <= ceiling:
+            break
+    else:
+        raise ValueError(f"no grid draw reached vision_fraction for a {total_target}-token sample")
+    text_total = total_target - used - len(grids)
+    if text_total < len(grids) + 1:
+        raise ValueError(
+            f"{total_target}-token sample has no room for text around {len(grids)} items"
+        )
+    cuts = sorted(rng.sample(range(1, text_total), len(grids)))
+    bounds = [0] + cuts + [text_total]
+    text_chunks = tuple(bounds[i + 1] - bounds[i] for i in range(len(grids) + 1))
+    return (tuple(grids), text_chunks)
+
+
 def _text_only_scenario(rng, total_target):
     return ((), (total_target,))
 
 
-def scenario_totals(scenario, merge=SPATIAL_MERGE_SIZE):
-    """(total_tokens, image_tokens) of one scenario as the dataset builds it."""
+def scenario_totals(scenario, merge=SPATIAL_MERGE_SIZE, frames_pooled=False):
+    """(total_tokens, image_tokens) of one scenario as the dataset builds it.
+
+    ``frames_pooled`` counts a video item's decoder slots once, not per frame,
+    for encoders that pool frames away (MoonViT).
+    """
     grids, text_chunks = scenario
-    image_tokens = sum(_item_tokens(g, merge) for g in grids)
+    image_tokens = sum(_item_tokens(g, merge, frames_pooled) for g in grids)
     total = sum(text_chunks) + image_tokens + len(grids)
     return total, image_tokens
 
 
-def build_scenarios(pool_size=POOL_SIZE, seed=GENERATOR_SEED, length_config=None):
+def build_scenarios(
+    pool_size=POOL_SIZE, seed=GENERATOR_SEED, length_config=None, vision_config=None
+):
     """Deterministic pool of ``pool_size`` scenarios.
 
     The first five entries deliberately cover every structural case the
@@ -190,7 +294,16 @@ def build_scenarios(pool_size=POOL_SIZE, seed=GENERATOR_SEED, length_config=None
             distribution and the vision/text split is fitted to it; when
             ``None``, totals are drawn uniformly from ``TOTAL_TOKENS_RANGE`` as
             before (the default pool is unchanged).
+        vision_config: Optional ``--mdp-mock-vision-config-json`` payload (keys
+            of ``VISION_CONFIG_DEFAULTS``). When given, multimodal samples carry
+            a per-sample ``vision_fraction`` share of decoder slots and the
+            text-only cadence is ``text_only_every``; when ``None`` the pool is
+            byte-identical to the one built without it.
     """
+    if vision_config is not None:
+        return _build_vision_share_scenarios(
+            pool_size, seed, length_config, normalize_vision_config(vision_config)
+        )
     rng = random.Random(seed)
     totals = (
         None
@@ -219,6 +332,26 @@ def build_scenarios(pool_size=POOL_SIZE, seed=GENERATOR_SEED, length_config=None
                 assert h % SPATIAL_MERGE_SIZE == 0 and w % SPATIAL_MERGE_SIZE == 0
         else:
             assert image_tokens == 0
+        pool.append(scenario)
+    return tuple(pool)
+
+
+def _build_vision_share_scenarios(pool_size, seed, length_config, config):
+    rng = random.Random(seed)
+    totals = (
+        [rng.randint(*TOTAL_TOKENS_RANGE) for _ in range(pool_size)]
+        if length_config is None
+        else draw_total_token_lengths(length_config, pool_size, seed=seed)
+    )
+    every = config["text_only_every"]
+    pool = []
+    for i, total_target in enumerate(totals):
+        if every and i % every == every - 1:
+            scenario = _text_only_scenario(rng, total_target)
+        else:
+            scenario = _vision_share_scenario(rng, total_target, config)
+        total, _ = scenario_totals(scenario, frames_pooled=config["frames_pooled"])
+        assert total == total_target, f"scenario {i}: total {total} != target {total_target}"
         pool.append(scenario)
     return tuple(pool)
 
