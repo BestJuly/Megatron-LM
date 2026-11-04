@@ -21,7 +21,7 @@ from megatron.core.mdp.rank_mapping import MdpRankMap
 # model's ``shape_key`` is appended after them, so a record is
 # ``DESCRIPTOR_FIXED_SLOTS + adapter.shape_key_width`` slots wide and the fixed
 # fields keep stable indices for every model.
-DESCRIPTOR_FIXED_SLOTS = 9
+DESCRIPTOR_FIXED_SLOTS = 13
 
 
 def descriptor_slots(shape_key_width: int) -> int:
@@ -205,6 +205,10 @@ def descriptors_to_records(
                 d.payload_rows,
                 d.output_rows,
                 d.owner_worker_id,
+                d.decoder_start,
+                d.sample_padded_start,
+                d.sample_padded_len,
+                d.microbatch_rows,
                 *(int(value) for value in d.shape_key),
             ]
         )
@@ -230,6 +234,10 @@ def records_to_descriptors(records, *, shape_key_width: int) -> tuple:
             payload_rows,
             output_rows,
             owner_worker_id,
+            decoder_start,
+            sample_padded_start,
+            sample_padded_len,
+            microbatch_rows,
         ) = (int(v) for v in row[:DESCRIPTOR_FIXED_SLOTS])
         descriptors.append(
             VisionDescriptor(
@@ -243,6 +251,10 @@ def records_to_descriptors(records, *, shape_key_width: int) -> tuple:
                 output_rows=output_rows,
                 shape_key=tuple(int(v) for v in row[DESCRIPTOR_FIXED_SLOTS:]),
                 owner_worker_id=owner_worker_id,
+                decoder_start=decoder_start,
+                sample_padded_start=sample_padded_start,
+                sample_padded_len=sample_padded_len,
+                microbatch_rows=microbatch_rows,
             )
         )
     return tuple(descriptors)

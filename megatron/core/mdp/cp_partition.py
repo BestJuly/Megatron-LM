@@ -4,10 +4,10 @@
 
 Under decoder CP the packed THD sequence is split across the CP ranks of the
 first pipeline stage before the decoder runs, and every CP rank scatters only
-the vision rows whose image-token slot it owns. MDP still assembles one full
-leaf per microbatch on the endpoint (the plan is CP-agnostic); this module
-answers, in pure host integer arithmetic, how that leaf is cut into per-CP-rank
-shards.
+the vision rows whose image-token slot it owns. The MDP planner cuts each vision
+item into the runs of rows each rank owns (:func:`cp_item_runs`) and routes
+every run straight to its owner; :func:`cp_shard_rows` gives the same answer per
+leaf row and serves as the row-level reference. Pure host integer arithmetic.
 
 The split mirrors the decoder input layout exactly:
 
@@ -111,3 +111,80 @@ def cp_shard_rows(
         )
         shards[owner].append(row)
     return shards
+
+
+def cp_item_runs(
+    decoder_start: int,
+    rows: int,
+    *,
+    sample_padded_start: int,
+    sample_padded_len: int,
+    total_rows: int,
+    cp_size: int,
+    mode: str,
+) -> List[tuple]:
+    """Cut one vision item's decoder span into per-CP-rank runs.
+
+    An item's image-token slots are one contiguous position range
+    ``[decoder_start, decoder_start + rows)`` inside its sample. Every CP rank
+    owns a union of position intervals (``zigzag``: chunks ``r`` and
+    ``2 * cp - 1 - r`` of each padded sequence; ``contiguous``: one interval of
+    the whole pack), so the item splits into contiguous runs of its rows, each
+    owned by one rank.
+
+    Returns ``(cp_rank, item_row_start, item_rows, decoder_position)`` tuples in
+    ascending ``decoder_position`` -- which is also each rank's local order -- so
+    a rank's leaf is its runs in this order. ``cp_size == 1`` yields the whole
+    item as one run on rank 0.
+    """
+    if rows <= 0:
+        raise MdpStateError(f"MDP: item rows {rows} violate: rows > 0.")
+    end = decoder_start + rows
+    if cp_size == 1:
+        return [(0, 0, rows, decoder_start)]
+    if mode == "contiguous":
+        if total_rows <= 0 or total_rows % cp_size != 0:
+            raise MdpStateError(
+                f"MDP: packed rows {total_rows} violate: positive and divisible by "
+                f"cp_size={cp_size} under the contiguous CP layout."
+            )
+        if decoder_start < 0 or end > total_rows:
+            raise MdpStateError(
+                f"MDP: item span [{decoder_start}, {end}) violates: inside the pack of "
+                f"{total_rows} rows."
+            )
+        local = total_rows // cp_size
+        bounds = [(r, r * local, (r + 1) * local) for r in range(cp_size)]
+    elif mode == "zigzag":
+        chunk = sample_padded_len // (2 * cp_size) if sample_padded_len > 0 else 0
+        if chunk == 0 or sample_padded_len % (2 * cp_size) != 0:
+            raise MdpStateError(
+                f"MDP: padded sequence length {sample_padded_len} violates: positive and "
+                f"divisible by 2 * cp_size = {2 * cp_size} under the zigzag CP layout."
+            )
+        if decoder_start < sample_padded_start or end > sample_padded_start + sample_padded_len:
+            raise MdpStateError(
+                f"MDP: item span [{decoder_start}, {end}) violates: inside its padded "
+                f"sequence [{sample_padded_start}, {sample_padded_start + sample_padded_len})."
+            )
+        bounds = []
+        for c in range(2 * cp_size):
+            owner = c if c < cp_size else 2 * cp_size - 1 - c
+            lo = sample_padded_start + c * chunk
+            bounds.append((owner, lo, lo + chunk))
+    else:
+        raise MdpStateError(
+            f"MDP: cp_partition_mode={mode!r} violates: one of {CP_PARTITION_MODES}."
+        )
+    runs = []
+    for owner, lo, hi in bounds:
+        a, b = max(lo, decoder_start), min(hi, end)
+        if a < b:
+            runs.append((owner, a - decoder_start, b - a, a))
+    runs.sort(key=lambda run: run[3])
+    if sum(run[2] for run in runs) != rows:
+        raise MdpStateError(
+            f"MDP: item span [{decoder_start}, {end}) violates: CP runs tile the item "
+            f"({runs})."
+        )
+    return runs

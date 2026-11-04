@@ -143,3 +143,47 @@ def test_owner_of_position_zigzag_cp4():
 def test_invalid_inputs_fail_loudly(kwargs, match):
     with pytest.raises(MdpStateError, match=match):
         cp_shard_rows(**kwargs)
+
+
+@pytest.mark.parametrize("mode", ["zigzag", "contiguous"])
+@pytest.mark.parametrize("cp", [1, 2, 4])
+def test_item_runs_tile_the_item_by_owner(mode, cp):
+    from megatron.core.mdp.cp_partition import cp_item_runs
+
+    rng = random.Random(31 * cp + len(mode))
+    for _ in range(200):
+        positions, cu, total = _random_pack(rng, cp, rng.randint(1, 4), 2 * cp)
+        seq = rng.randrange(len(cu) - 1)
+        start, end = cu[seq], cu[seq + 1]
+        first = rng.randrange(start, end)
+        rows = rng.randint(1, end - first)
+        runs = cp_item_runs(
+            first,
+            rows,
+            sample_padded_start=start,
+            sample_padded_len=end - start,
+            total_rows=total,
+            cp_size=cp,
+            mode=mode,
+        )
+        covered = []
+        for owner, row_start, run_rows, position in runs:
+            assert position == first + row_start
+            for k in range(run_rows):
+                pos = first + row_start + k
+                assert owner == cp_owner_of_position(
+                    pos, cu_seqlens_padded=cu, total_rows=total, cp_size=cp, mode=mode
+                ) or cp == 1
+                covered.append(row_start + k)
+        assert covered == list(range(rows))  # contiguous runs, ascending, tiling
+
+
+def test_item_runs_reject_a_span_outside_its_sequence():
+    from megatron.core.mdp.cp_partition import cp_item_runs
+
+    with pytest.raises(MdpStateError, match="inside"):
+        cp_item_runs(14, 4, sample_padded_start=0, sample_padded_len=16, total_rows=16,
+                      cp_size=2, mode="zigzag")
+    with pytest.raises(MdpStateError, match="inside"):
+        cp_item_runs(14, 4, sample_padded_start=0, sample_padded_len=16, total_rows=16,
+                      cp_size=2, mode="contiguous")

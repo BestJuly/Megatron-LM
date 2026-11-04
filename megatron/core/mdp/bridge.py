@@ -36,8 +36,8 @@ class BridgePhase(Enum):
 
 @dataclass(frozen=True)
 class BridgeBufferKey:
-    """Identifies one transported buffer. ``slice_id`` is always 0 in v1 and
-    distinguishes multiple slices of one item once decoder CP lands."""
+    """Identifies one transported buffer: an item (PIXEL, ``slice_id`` 0) or one
+    of its decoder-CP slices (EMBEDDING/GRADIENT; 0 when the item is unsplit)."""
 
     global_item_id: int
     slice_id: int = 0
@@ -128,6 +128,10 @@ class ModalityBridge:
         """
         entries = []
         for route in plan.routes:
+            # Pixels are per item and CP-invariant: slice 0 stands for the item,
+            # so a split item never multiplies pixel traffic.
+            if phase is BridgePhase.PIXEL and route.slice_id != 0:
+                continue
             producer_ranks = rank_map.worker_ranks(plan.outer_dp_rank, route.producer_worker_id)
             if len(producer_ranks) != 1:
                 raise MdpBridgeError(
@@ -152,7 +156,10 @@ class ModalityBridge:
                 src, dst = owner_rank, producer_rank
             else:  # GRADIENT flows owner endpoint -> producer
                 src, dst = route.endpoint_rank, producer_rank
-            key = BridgeBufferKey(global_item_id=route.global_item_id)
+            key = BridgeBufferKey(
+                global_item_id=route.global_item_id,
+                slice_id=0 if phase is BridgePhase.PIXEL else route.slice_id,
+            )
             spec = tensor_specs.get(key)
             if spec is None:
                 raise MdpBridgeError(

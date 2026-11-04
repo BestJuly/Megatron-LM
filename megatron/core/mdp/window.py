@@ -180,6 +180,15 @@ class MdpIterationWindow:
                 expect_pixels=owns_pixels,
             )
             vision_records = []
+            # Host copy of the padded boundaries, read once per microbatch on the
+            # descriptor source only: the decoder span every rank needs to cut an
+            # item into per-CP-rank slices travels in the descriptor.
+            cu_padded = None
+            if lane_id is not None and captured.vision_items:
+                params = captured.decoder_packed_seq_params
+                cu_tensor = getattr(params, "cu_seqlens_q_padded", None)
+                if cu_tensor is not None:
+                    cu_padded = [int(v) for v in cu_tensor.tolist()]
             for item in captured.vision_items:
                 output_rows = item.output_rows
                 item_id = next_item_id
@@ -214,6 +223,7 @@ class MdpIterationWindow:
                             output_rows=output_rows,
                             shape_key=item.shape_key,
                             owner_worker_id=owner_worker_id,
+                            **_decoder_span(item, cu_padded),
                         )
                     )
                 if owns_pixels:
@@ -335,3 +345,24 @@ def _validate_captured(
                 f"MDP: item {key} in microbatch {microbatch_id} violates: payload rows "
                 f"[{item.payload_row_start}, {end}) lie inside flat_pixel_payload."
             )
+
+
+def _decoder_span(item, cu_padded) -> dict:
+    """The decoder-span descriptor fields of one captured item.
+
+    ``decoder_start`` is ``-1`` when the item's image-token slots are not one
+    contiguous run (the planner rejects such an item only under decoder CP);
+    all fields stay zero without packed decoder metadata.
+    """
+    if cu_padded is None:
+        return {}
+    positions = item.decoder_positions
+    contiguous = positions[-1] - positions[0] + 1 == len(positions)
+    sample = item.sample_id
+    return dict(
+        decoder_start=positions[0] if contiguous else -1,
+        sample_padded_start=cu_padded[sample],
+        sample_padded_len=cu_padded[sample + 1] - cu_padded[sample],
+        microbatch_rows=cu_padded[-1],
+    )
+

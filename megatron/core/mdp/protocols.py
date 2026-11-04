@@ -92,6 +92,14 @@ class VisionDescriptor:
 
     ``owner_worker_id`` is the logical worker holding this item's pixels at
     dispatch time: ``microbatch_id % num_workers``.
+
+    The decoder-span fields let every group member split an item across the
+    decoder's context-parallel ranks identically from the broadcast alone:
+    ``decoder_start`` is the item's first image-token position in its packed
+    microbatch (its slots are one contiguous run of ``output_rows``),
+    ``sample_padded_start``/``sample_padded_len`` its sample's padded span, and
+    ``microbatch_rows`` the packed microbatch's padded row count. Zero when the
+    capture has no packed decoder metadata (decoder CP needs it).
     """
 
     global_item_id: int
@@ -104,6 +112,10 @@ class VisionDescriptor:
     output_rows: int
     shape_key: tuple
     owner_worker_id: int
+    decoder_start: int = 0
+    sample_padded_start: int = 0
+    sample_padded_len: int = 0
+    microbatch_rows: int = 0
 
 
 class MdpModelAdapter(Protocol):

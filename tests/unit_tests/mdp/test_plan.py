@@ -110,9 +110,25 @@ def test_split_rejects_nonpositive_cap():
 # ------------------------- digest -------------------------
 
 
-def _entry(item_id, worker=0, order=0, endpoint=0, grid=(1, 4, 4)):
+def _entry(
+    item_id, worker=0, order=0, endpoint=0, grid=(1, 4, 4), slice_id=0, row_start=0, rows=None
+):
     t, h, w = grid
-    return (item_id, worker, order, endpoint, t * h * w, t * (h // 2) * (w // 2), t, h, w)
+    output_rows = t * (h // 2) * (w // 2)
+    return (
+        item_id,
+        slice_id,
+        worker,
+        order,
+        endpoint,
+        row_start,
+        output_rows if rows is None else rows,
+        t * h * w,
+        output_rows,
+        t,
+        h,
+        w,
+    )
 
 
 def test_digest_is_deterministic_and_16_bytes():
@@ -134,7 +150,7 @@ def test_digest_covers_the_minimal_sufficient_set():
     )
     # Same row counts, different shape key -> the producer would build different
     # encoder metadata -> the digest must change (design doc 7.4).
-    same_rows_other_shape = (0, 0, 0, 0, 16, 4, 1, 2, 8)
+    same_rows_other_shape = (0, 0, 0, 0, 0, 0, 4, 16, 4, 1, 2, 8)
     assert compute_plan_digest(
         PLAN_SCHEMA_VERSION, policy, [same_rows_other_shape], shape_key_width=3
     ) != base
@@ -152,6 +168,28 @@ def test_digest_covers_the_minimal_sufficient_set():
     assert compute_plan_digest(
         PLAN_SCHEMA_VERSION + 1, policy, [_entry(0)], shape_key_width=3
     ) != base
+    # Decoder CP: the slice split, the receiving endpoint, the CP size and the
+    # layout each change the digest -- every rank derives the split locally, so a
+    # divergence must fail the digest check rather than hang the bridge.
+    split = [_entry(0, endpoint=0, rows=2), _entry(0, endpoint=2, slice_id=1, row_start=2, rows=2)]
+    split_base = compute_plan_digest(
+        PLAN_SCHEMA_VERSION, policy, split, shape_key_width=3, cp_size=2
+    )
+    assert split_base != base
+    moved = [_entry(0, endpoint=0, rows=3), _entry(0, endpoint=2, slice_id=1, row_start=3, rows=1)]
+    assert compute_plan_digest(
+        PLAN_SCHEMA_VERSION, policy, moved, shape_key_width=3, cp_size=2
+    ) != split_base
+    rerouted = [_entry(0, endpoint=0, rows=2), _entry(0, endpoint=4, slice_id=1, row_start=2, rows=2)]
+    assert compute_plan_digest(
+        PLAN_SCHEMA_VERSION, policy, rerouted, shape_key_width=3, cp_size=2
+    ) != split_base
+    assert compute_plan_digest(
+        PLAN_SCHEMA_VERSION, policy, split, shape_key_width=3, cp_size=4
+    ) != split_base
+    assert compute_plan_digest(
+        PLAN_SCHEMA_VERSION, policy, split, shape_key_width=3, cp_size=2, cp_layout_code=1
+    ) != split_base
 
 
 def test_digest_is_shape_key_width_aware():
@@ -162,8 +200,8 @@ def test_digest_is_shape_key_width_aware():
     plan mismatch into a clean error would then miss it.
     """
     policy = RowCapacityPolicy()
-    narrow = (0, 0, 0, 0, 16, 4, 4, 4)
-    wide = (0, 0, 0, 0, 16, 4, 4, 4, 0)
+    narrow = (0, 0, 0, 0, 0, 0, 4, 16, 4, 4, 4)
+    wide = (0, 0, 0, 0, 0, 0, 4, 16, 4, 4, 4, 0)
     assert compute_plan_digest(
         PLAN_SCHEMA_VERSION, policy, [narrow], shape_key_width=2
     ) != compute_plan_digest(

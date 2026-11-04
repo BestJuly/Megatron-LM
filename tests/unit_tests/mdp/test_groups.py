@@ -46,6 +46,16 @@ def test_record_round_trip_is_lossless():
     descriptors = (
         _descriptor(0, grid=(2, 6, 8)),
         _descriptor(1, mb=1, sample=3, ordinal=2, cost=123, grid=(1, 4, 4)),
+        VisionDescriptor(
+            **{
+                **_descriptor(2, grid=(1, 4, 4)).__dict__,
+                "decoder_start": 37,
+                "sample_padded_start": 32,
+                "sample_padded_len": 64,
+                "microbatch_rows": 4096,
+            }
+        ),
+        VisionDescriptor(**{**_descriptor(3, grid=(1, 4, 4)).__dict__, "decoder_start": -1}),
     )
     assert (
         records_to_descriptors(
