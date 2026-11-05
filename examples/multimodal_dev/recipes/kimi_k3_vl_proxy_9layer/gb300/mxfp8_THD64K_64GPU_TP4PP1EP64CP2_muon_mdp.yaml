@@ -1,0 +1,217 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Kimi-K3 VL 9-layer proxy: the Kimi-K3 9L proxy decoder
+# (../../../../moe_recipes/kimi_k3_proxy_9layer/gb300/mxfp8_THD64K_64GPU_TP4PP1EP64CP2_muon.yaml)
+# plus a 3-layer MoonViT, trained through MDP on one 65536-token multimodal sequence per
+# microbatch (10-20% vision per sample, no text-only samples). 64 GB300 GPUs, TP4 + sequence
+# parallel, EP64, CP2, dense DP8. These are the arguments of the recorded run; results are in
+# ../../../README.md (Kimi-K3 VL section).
+# Entry point: examples/multimodal_dev/pretrain_multimodal.py, run from the repository root.
+# The 16 nodes must share one NVLink domain: EP64 spans every GPU and HybridEP sizes its
+# domain from the ranks it can reach (on Slurm block topologies, e.g. --segment=16).
+#
+# Differences from the text proxy recipe:
+# - Data: mdp_mock, fixed 65536-token samples with a per-sample vision share, instead of
+#   LongAlign-10k packed by sequence_packing_scheduler; MDP rejects MCore's packing schedulers
+#   (they drop the pixel payload) and packs with static THD padding instead.
+# - fine_grained_activation_offloading is off: MDP rejects activation offload. The recompute
+#   set (gdn, moe, mlp) is unchanged.
+# - chunked_optimizer_state_offload is off (memory only; peak device use is 166 GB).
+# - The container additionally pins flash-attn-4 4.0.0b11 with the nvidia-cutlass-dsl 4.5.x
+#   family it imports (mla_latent_cp requires b11).
+DEPENDENCIES:
+  pytorch_base_image: nvcr.io/nvidia/pytorch:26.04-py3
+  dockerfile_path: examples/moe_recipes/kimi_k3/Dockerfile
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: '1'
+  TORCH_NCCL_AVOID_RECORD_STREAMS: '0'
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  NCCL_NVLS_ENABLE: '0'
+  NCCL_GRAPH_REGISTER: '0'
+  NCCL_DEBUG: VERSION
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: '1'
+  NVTE_NORM_FWD_USE_CUDNN: '1'
+  NVTE_NORM_BWD_USE_CUDNN: '1'
+  PYTHONWARNINGS: ignore
+  DYNAMO_CACHE_SIZE_LIMIT: '64'
+  NUM_OF_TOKENS_PER_CHUNK_DISPATCH_API: '128'
+  NUM_OF_TOKENS_PER_CHUNK_COMBINE_API: '128'
+  NUM_OF_TOKENS_PER_CHUNK_PREPROCESSING_API: '128'
+  NCCL_LL128_BUFFSIZE: '1048576'
+  NCCL_PROTO: ^LL128
+  NCCL_BUFFSIZE: '1048576'
+ARGS:
+  # Multimodal model: Kimi-K3 VL with a 3-layer MoonViT (9/93 of the full model's 27 layers,
+  # rounded up).
+  model_arch: kimi_k3_vl
+  model_variant: proxy
+  vision_num_layers: 3
+  tokenizer_type: NullTokenizer
+  vocab_size: 163840
+  make_vocab_size_divisible_by: 1280
+  spec:
+  - megatron.core.models.hybrid.hybrid_layer_specs
+  - hybrid_stack_spec
+  enable_experimental: true
+  num_layers: 18
+  # K=KDA, +=MLA, -=dense MLP, E=LatentMoE; /+E adds one MTP depth.
+  hybrid_layer_pattern: K-KEKE+EKEKEKE+EKE/+E
+  experimental_attention_variant: kda
+  hidden_size: 7168
+  ffn_hidden_size: 33792
+  num_attention_heads: 96
+  kv_channels: 64
+  max_position_embeddings: 1048576
+  init_method_std: 0.02
+  linear_conv_kernel_dim: 4
+  linear_key_head_dim: 128
+  linear_value_head_dim: 128
+  linear_num_key_heads: 96
+  linear_num_value_heads: 96
+  kda_f_lora_rank: 128
+  kda_safe_gate: true
+  kda_lower_bound: -5.0
+  multi_latent_attention: true
+  q_lora_rank: 1536
+  kv_lora_rank: 512
+  qk_head_dim: 128
+  qk_pos_emb_head_dim: 64
+  v_head_dim: 128
+  qk_layernorm: true
+  attention_latent_norm_epsilon: 1.0e-06
+  attention_output_gate: true
+  gated_attention_proj_granularity: elementwise
+  no_rope_freq: 1
+  position_embedding_type: none
+  enable_attention_residuals: true
+  attn_res_block_layers: 2
+  normalization: RMSNorm
+  norm_epsilon: 1.0e-05
+  situ_glu: true
+  situ_glu_beta1: 4.0
+  situ_glu_beta2: 25.0
+  disable_bias_linear: true
+  untie_embeddings_and_output_weights: true
+  num_experts: 896
+  moe_ffn_hidden_size: 3072
+  moe_latent_size: 3584
+  moe_latent_up_projection_rmsnorm: true
+  moe_shared_expert_intermediate_size: 6144
+  moe_router_topk: 16
+  moe_router_score_function: sigmoid
+  moe_router_dtype: fp32
+  moe_router_topk_scaling_factor: 1.0
+  moe_router_load_balancing_type: quantile_balancing
+  moe_aux_loss_coeff: 0.0
+  moe_router_quantile_balancing_estimation_scope: global_batch
+  moe_router_qb_num_bins: 1000
+  # Mock data: force balanced routing.
+  moe_router_force_load_balancing: true
+  mtp_num_layers: 1
+  mtp_loss_scaling_factor: 0.1
+  attention_dropout: 0.0
+  hidden_dropout: 0.0
+  # MDP data path: one fixed 65536-token sample per microbatch; each sample draws its vision
+  # share from [0.10, 0.20], filled with 256-4096-slot items (a quarter of them video).
+  mdp_enable: true
+  dataset_provider: mdp_mock
+  use_packed_sequence: true
+  use_vanilla_collate_fn: true
+  mdp_mock_dataset_config_json:
+    mode: distribution
+    type: lognormal
+    format: thd
+    min_seq_len: 65536
+    max_seq_len: 65536
+    mean_seq_len: 65536
+    lognormal_sigma: 1.1
+  mdp_mock_vision_config_json:
+    vision_fraction: [0.1, 0.2]
+    item_tokens: [256, 4096]
+    text_only_every: 0
+  seq_length: 65536
+  # Per-CP-rank budget 2 x 32768, static THD shape (contiguous CP needs fixed shapes).
+  max_seqlen_per_dp_cp_rank: 32768
+  thd_static_packing: true
+  thd_max_packed_sequences: 2
+  pad_packed_seq_alignment: max
+  calculate_per_token_loss: true
+  moe_hybridep_pad_variable_tokens: false
+  bf16: true
+  transformer_impl: transformer_engine
+  attention_backend: flash
+  distributed_timeout_minutes: 60
+  tensor_model_parallel_size: 4
+  sequence_parallel: true
+  pipeline_model_parallel_size: 1
+  expert_model_parallel_size: 64
+  expert_tensor_parallel_size: 1
+  context_parallel_size: 2
+  cp_partition_mode: contiguous
+  linear_cp_mode: chunkwise
+  mla_latent_cp: true
+  cp_comm_type: a2a
+  attn_res_impl: fla
+  attn_res_norm_fusion: true
+  gdn_pre_gated_delta_rule_fusion: true
+  gdn_gated_output_norm_fusion: true
+  strict_runtime_validation_frequency: once_per_microbatch
+  moe_token_dispatcher_type: flex
+  moe_flex_dispatcher_backend: hybridep
+  moe_hybridep_num_sms: 32
+  moe_grouped_gemm: true
+  moe_permute_fusion: true
+  moe_megakernel_backend: mok
+  moe_megakernel_backend_config:
+    shared_expert_mode: native
+  fp8_format: e4m3
+  fp8_recipe: mxfp8
+  fp8_param_gather: true
+  reuse_grad_buf_for_mxfp8_param_ag: true
+  moe_router_padding_for_quantization: true
+  micro_batch_size: 1
+  # Dense DP=8: 32 microbatches per DP rank, 16.8M tokens per step.
+  global_batch_size: 256
+  train_iters: 50
+  seed: 1234
+  recompute_granularity: selective
+  recompute_modules:
+  - gdn
+  - moe
+  - mlp
+  nccl_communicator_config_path: examples/moe_recipes/kimi_k3/nccl/tp_dp_cp_max_ctas16.yaml
+  cross_entropy_loss_fusion: true
+  cross_entropy_fusion_impl: native
+  # Decoder: Muon with the Kimi-K3 release flags (layer-wise distributed optimizer).
+  # The MoonViT encoder trains with Adam ZeRO-1 under MDP.
+  optimizer: muon
+  use_distributed_optimizer: true
+  use_precision_aware_optimizer: false
+  muon_momentum: 0.95
+  muon_scale_mode: spectral
+  muon_extra_scale_factor: 1.0
+  muon_num_ns_steps: 5
+  muon_coefficient_type: quintic
+  muon_split_qkv_per_head: true
+  muon_tp_mode: duplicated
+  muon_fp32_matmul_prec: medium
+  muon_nesterov: false
+  overlap_grad_reduce: true
+  overlap_param_gather: true
+  no_create_attention_mask_in_dataloader: true
+  lr: 1.0e-04
+  min_lr: 1.0e-05
+  lr_decay_style: cosine
+  lr_decay_iters: 50
+  lr_warmup_iters: 5
+  weight_decay: 0.1
+  clip_grad: 1.0
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  manual_gc: true
+  manual_gc_interval: 10
+  eval_iters: 0
+  eval_interval: 1000
+  log_throughput: true
+  log_interval: 1
+  log_memory_interval: 1
+  log_device_memory_used: true

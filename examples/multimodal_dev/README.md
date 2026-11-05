@@ -26,6 +26,7 @@ multimodal_dev/
 │       ├── specs.py         # Vision layer spec builders
 │       ├── mrope.py         # 3D MRoPE position ID computation
 │       └── vision_encoder.py# ViT encoder (patch embed, merger, RoPE)
+├── recipes/                 # Recorded multi-node recipes (Kimi-K3 VL 9L proxy)
 └── scripts/                 # Launch scripts (torchrun, Slurm)
 ```
 
@@ -208,6 +209,27 @@ Tests: `tests/test_kimi_k3_vl_vision_parity.py`, `test_kimi_k3_vl_crosscheck.py`
 (full model through the mapping, plus a bitwise HF -> MCore -> HF round trip),
 `test_kimi_k3_vl_preprocessing.py`, `test_kimi_k3_vl_data.py`. The HF-reference
 tests need transformers 4.56 - 5.0 (see `tests/_kimi_hf.py`).
+
+### Kimi-K3 VL 9L proxy, packed THD 64K on 64 GB300
+
+[`recipes/kimi_k3_vl_proxy_9layer/gb300/mxfp8_THD64K_64GPU_TP4PP1EP64CP2_muon_mdp.yaml`](recipes/kimi_k3_vl_proxy_9layer/gb300/mxfp8_THD64K_64GPU_TP4PP1EP64CP2_muon_mdp.yaml)
+is the multimodal counterpart of the Kimi-K3 9L proxy 64K recipe
+(`examples/moe_recipes/kimi_k3_proxy_9layer/`), trained through MDP.
+
+| | |
+|---|---|
+| Model | 9 decoder blocks (7 KDA + 2 MLA; 1 dense + 8 LatentMoE, 896 experts top-16) + 1 MTP depth, full Kimi-K3 widths; 3-layer MoonViT (9/93 of 27, rounded up) |
+| Input | one 65536-token sample per microbatch, GBS 256 (16.8M tokens per step); per-sample vision share 10-20 %, items of 256-4096 slots, a quarter of them video; no text-only samples (`mdp_mock`) |
+| Parallelism | TP4+SP / PP1 / EP64 / ETP1 / CP2 (contiguous) / DP8 / MBS 1 |
+| Features | FA4 4.0.0b11 MLA latent CP (a2a), KDA chunkwise CP, MXFP8 with FP8 parameter gather, HybridEP, MoK, fused AttnRes / GDN / cross entropy, grad-reduce and param-gather overlap, Muon (release flags) |
+
+Recorded run (50 iterations, 2026-11-04): 816 TFLOP/s/GPU mean over iterations
+3-50 (820.9 at iteration 50), peak 143.7 GB allocated and 166.2 GB device memory
+used per GPU, no NaN or skipped iterations, lm loss 13.44 -> 12.01. Compared
+with the text recipe, MDP rejects the dp_balanced packing scheduler and
+fine-grained activation offload, and chunked optimizer-state offload is left
+off. The 16 nodes must share one NVLink domain (EP64 spans every GPU and
+HybridEP sizes its domain from the ranks it can reach).
 
 ## Architecture
 
