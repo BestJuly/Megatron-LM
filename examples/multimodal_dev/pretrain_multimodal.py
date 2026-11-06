@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Standalone entry point for multimodal_dev model training (FSDP + EP).
 
@@ -32,7 +32,10 @@ sys.path.insert(
     os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")),
 )
 
-from examples.multimodal_dev.arguments import add_multimodal_args
+from examples.multimodal_dev.arguments import (
+    add_multimodal_args,
+    validate_encoder_recompute_args,
+)
 from examples.multimodal_dev.forward_step import forward_step
 from megatron.core.enums import ModelType
 from megatron.training import get_args, pretrain
@@ -72,6 +75,11 @@ def model_provider(
     if post_language_config_fn is not None:
         post_language_config_fn(language_config, args)
 
+    # Variable-length THD packs change the P2P tensor shape between
+    # microbatches; the pipeline schedule must negotiate shapes per send.
+    if getattr(args, "use_packed_sequence", False) and args.pipeline_model_parallel_size > 1:
+        language_config.variable_seq_lengths = True
+
     # --- vision config ---
     vision_config = registry["vision_config_fn"](
         num_layers_override=getattr(args, "vision_num_layers", None),
@@ -96,6 +104,8 @@ def model_provider(
         args=args,
         language_config=language_config,
         vision_config=vision_config,
+        pre_process=pre_process,
+        post_process=post_process,
         **kwargs,
     )
 
@@ -112,12 +122,15 @@ def _resolve_provider_fn(provider_fn):
     return provider_fn
 
 
-def datasets_provider(train_val_test_num_samples):
+def datasets_provider(train_val_test_num_samples, vp_stage=None):
     """Dataset provider dispatcher.
 
     Routes to the dataset factory registered for the current
-    ``(--model-arch, --dataset-provider)`` combination.
+    ``(--model-arch, --dataset-provider)`` combination. ``vp_stage`` is
+    accepted for the virtual-pipeline contract in ``pretrain()``; the
+    registered providers build stage-independent datasets and ignore it.
     """
+    del vp_stage
     args = get_args()
     model_arch = getattr(args, "model_arch", "qwen35_vl")
     provider = getattr(args, "dataset_provider", "mock")
@@ -143,6 +156,61 @@ def datasets_provider(train_val_test_num_samples):
     return provider_fn(train_val_test_num_samples)
 
 
+def _mdp_adapter_builder(args):
+    """Build the Qwen3.5-VL MDP adapter plus its vision TransformerConfig.
+
+    Mirrors model_provider's vision-config assembly so the MDP encoder is
+    built from exactly the same configuration as the native path.
+    """
+    from examples.multimodal_dev.mdp_adapter import build_mdp_adapter
+    from examples.multimodal_dev.models import MODEL_REGISTRY
+
+    registry = MODEL_REGISTRY[getattr(args, "model_arch", "qwen35_vl")]
+    language_config = core_transformer_config_from_args(args)
+    post_language_config_fn = registry.get("post_language_config_fn")
+    if post_language_config_fn is not None:
+        post_language_config_fn(language_config, args)
+    vision_config = registry["vision_config_fn"](
+        num_layers_override=getattr(args, "vision_num_layers", None),
+        variant=getattr(args, "model_variant", None),
+    )
+    vision_config.bf16 = language_config.bf16
+    vision_config.fp16 = language_config.fp16
+    vision_config.apply_rope_fusion = language_config.apply_rope_fusion
+    vision_config.params_dtype = language_config.params_dtype
+    # The encoder DDP derives its gradient prescale from this flag; MDP
+    # requires prescale 1 (WORLD sum, normalized once by 1/T_global).
+    vision_config.calculate_per_token_loss = language_config.calculate_per_token_loss
+    return build_mdp_adapter(args, language_config), vision_config
+
+
+def _setup_mdp(args):
+    """Validate the MDP configuration and register the adapter builder."""
+    from megatron.core.mdp import integration as mdp_integration
+
+    if not getattr(args, "use_packed_sequence", False):
+        raise RuntimeError(
+            "--mdp-enable requires --use-packed-sequence: the dual-THD contract "
+            "packs decoder samples into [1, T]"
+        )
+    if not getattr(args, "use_vanilla_collate_fn", False):
+        raise RuntimeError(
+            "--mdp-enable requires --use-vanilla-collate-fn: pack_or_pad_batch "
+            "consumes the per-sample dict list only the identity collate produces"
+        )
+    if getattr(args, "recompute_vision", False):
+        raise RuntimeError(
+            "--recompute-vision is the native-path switch and is not supported "
+            "with --mdp-enable; use --encoder-recompute-granularity "
+            "{selective,full,whole} for the MDP encoder"
+        )
+    mdp_integration.validate_from_args(args)
+    from megatron.core.mdp.checkpoint import assert_supported_checkpoint_config
+
+    assert_supported_checkpoint_config(args)
+    mdp_integration.set_adapter_builder(_mdp_adapter_builder)
+
+
 if __name__ == "__main__":
     datasets_provider.is_distributed = True
 
@@ -150,16 +218,9 @@ if __name__ == "__main__":
         extra_args_provider=add_multimodal_args,
         args_defaults={},
     )
-    # multimodal_dev's model_provider builds the full model on every rank and
-    # does not honor pre_process / post_process pipeline-stage flags. PP>1
-    # would silently violate Megatron's pipeline-parallel contract.
-    if args.pipeline_model_parallel_size > 1:
-        raise ValueError(
-            "multimodal_dev does not support pipeline_model_parallel_size > 1 "
-            f"(got {args.pipeline_model_parallel_size}). The model provider "
-            "builds the full model on every rank; pipeline-stage splitting is "
-            "not wired through. Run with --pipeline-model-parallel-size 1."
-        )
+    validate_encoder_recompute_args(args)
+    if getattr(args, "mdp_enable", False):
+        _setup_mdp(args)
     full_config = pretrain_cfg_container_from_args(args)
     # training.py enables allocator history only on the config-container MODEL
     # flow; this entry uses model_provider, so it enables recording itself, and

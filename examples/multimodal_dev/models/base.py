@@ -1,11 +1,11 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Base multimodal model for FSDP + EP training.
+"""Base multimodal model for FSDP + EP and PP training.
 
-Composes a vision encoder and a ``GPTModel`` language decoder.  Designed
-for FSDP + EP: always builds the **full** model on every rank (no PP
-flags).  PP support is only available through the MIMO ``MimoModel``
-assembly path.
+Composes a vision encoder and a ``GPTModel`` language decoder.  The
+vision encoder is built only on the first PP stage; the language
+decoder spans all PP stages following standard Megatron PP layout
+flags.
 
 Subclasses override ``compute_position_ids()`` for model-specific
 position encoding (e.g. MRoPE for Qwen3.5-VL).
@@ -17,6 +17,7 @@ from typing import Optional
 import torch
 from torch import Tensor
 
+from examples.multimodal_dev.observability import nvtx_phase
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.models.gpt import GPTModel
 from megatron.core.transformer.module import MegatronModule
@@ -83,13 +84,15 @@ class MultimodalModel(MegatronModule):
     """Base class for multimodal vision-language models.
 
     Composes a pre-constructed vision encoder and a ``GPTModel`` language
-    decoder.  Designed for FSDP + EP; always builds the full model on
-    every rank.
+    decoder.  Supports pipeline parallelism: the vision encoder is built
+    only on the first PP stage, while the language decoder spans all PP
+    stages following standard Megatron PP layout flags.
 
     Args:
         language_config: ``TransformerConfig`` for the language decoder.
         language_spec: ``ModuleSpec`` for decoder transformer layers.
-        vision_encoder: Pre-constructed vision encoder module.
+        vision_encoder: Pre-constructed vision encoder module (or ``None``
+            on non-first PP stages).
         vocab_size: Language model vocabulary size.
         max_sequence_length: Maximum sequence length.
         image_token_id: Token ID for image placeholder tokens.
@@ -100,13 +103,18 @@ class MultimodalModel(MegatronModule):
         mtp_block_spec: Optional MTP block spec.
         parallel_output: Keep outputs split across TP ranks.
         share_embeddings_and_output_weights: Tie input/output embeddings.
+        pre_process: First PP stage flag — when True, build embedding +
+            run vision encoder + scatter image embeddings.
+        post_process: Last PP stage flag — when True, build output layer +
+            compute loss inside ``GPTModel``.
+        vp_stage: Virtual pipeline stage (forwarded to ``GPTModel``).
     """
 
     def __init__(
         self,
         language_config: TransformerConfig,
         language_spec: ModuleSpec,
-        vision_encoder: MegatronModule,
+        vision_encoder: Optional[MegatronModule],
         vocab_size: int,
         max_sequence_length: int,
         image_token_id: int,
@@ -117,19 +125,31 @@ class MultimodalModel(MegatronModule):
         mtp_block_spec: Optional[ModuleSpec] = None,
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
+        pre_process: bool = True,
+        post_process: bool = True,
+        vp_stage: Optional[int] = None,
     ):
         super().__init__(config=language_config)
 
         self.image_token_id = image_token_id
+        self.pre_process = pre_process
+        self.post_process = post_process
+        self.vp_stage = vp_stage
+        # Surfaced for ``finalize_model_grads._allreduce_word_embedding_grads``
+        # which inspects the outer module (not the wrapped GPTModel) when
+        # PP > 1 and either tied embeddings or MTP layers are in use.
+        self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
 
-        self.vision_model = vision_encoder
+        # Vision encoder lives only on the first PP stage.
+        self.vision_model = vision_encoder if pre_process else None
         self.language_model = GPTModel(
             config=language_config,
             transformer_layer_spec=language_spec,
             vocab_size=vocab_size,
             max_sequence_length=max_sequence_length,
-            pre_process=True,
-            post_process=True,
+            pre_process=pre_process,
+            post_process=post_process,
+            vp_stage=vp_stage,
             parallel_output=parallel_output,
             share_embeddings_and_output_weights=(share_embeddings_and_output_weights),
             position_embedding_type=position_embedding_type,
@@ -138,12 +158,178 @@ class MultimodalModel(MegatronModule):
             mtp_block_spec=mtp_block_spec,
         )
 
+    # ------------------------------------------------------------------
+    # Attributes surfaced for per-layer CUDA graph capture.
+    #
+    # ``TECudaGraphHelper._discover_layers`` resolves the graphable layers with
+    # ``get_attr_wrapped_model(chunk, 'decoder')``, which only unwraps through
+    # ``.module`` (DDP -> Float16Module -> this class). It then reads ``decoder``,
+    # ``mtp``, ``rotary_pos_emb``, and ``position_embedding_type`` off the object it
+    # stopped at. Without these forwards the helper raises, catches its own
+    # RuntimeError, and silently captures zero layers. Same pattern as
+    # ``shared_embedding_or_output_weight`` below.
+    # ------------------------------------------------------------------
+
+    @property
+    def decoder(self):
+        """The language model's transformer block."""
+        return self.language_model.decoder
+
+    @property
+    def mtp(self):
+        """The language model's MTP block.
+
+        Raises ``AttributeError`` when MTP is off, so ``hasattr(chunk, 'mtp')``
+        keeps reporting False exactly as it does for a bare ``GPTModel``.
+        """
+        return self.language_model.mtp
+
+    @property
+    def rotary_pos_emb(self):
+        """The language model's rotary embedding module."""
+        return self.language_model.rotary_pos_emb
+
+    @property
+    def position_embedding_type(self):
+        """The language model's position embedding type."""
+        return self.language_model.position_embedding_type
+
+    def shared_embedding_or_output_weight(self):
+        """Surface the wrapped language model's shared embedding / output
+        weight to the PP grad-finalize step (mirrors the LLaVA wrapper).
+        Needed when PP>1 and embeddings are tied or MTP is enabled.
+        """
+        return self.language_model.shared_embedding_or_output_weight()
+
     def set_input_tensor(self, input_tensor):
-        """Route input tensors (simplified, no PP routing)."""
+        """Forward the activation from the previous PP stage into
+        ``GPTModel``.  No PP-specific routing is needed here:
+        ``GPTModel.set_input_tensor`` already handles the case based on
+        its own ``pre_process`` flag.
+        """
         if not isinstance(input_tensor, list):
             input_tensor = [input_tensor]
         assert len(input_tensor) == 1
         self.language_model.set_input_tensor(input_tensor[0])
+
+    def _prepare_decoder_inputs(
+        self,
+        *,
+        input_ids: Tensor,
+        position_ids: Tensor = None,
+        attention_mask: Tensor = None,
+        labels: Tensor = None,
+        loss_mask: Tensor = None,
+        padding_mask: Tensor = None,
+        pixel_values: Tensor = None,
+        image_grid_thw: Tensor = None,
+        decoder_input: Tensor = None,
+        packed_seq_params=None,
+        vision_embeddings: Tensor = None,
+    ):
+        """Prepare the rank-local inputs shared by eager and scheduled decoder execution.
+
+        The native path runs the vision encoder here, while MDP supplies its
+        detached endpoint leaf through ``vision_embeddings`` after P2/P3.
+        Vision work and embedding scatter intentionally stay outside the
+        decoder's fine-grained schedule.
+        """
+        if position_ids is None:
+            with nvtx_phase("compute_position_ids"):
+                position_ids = self.compute_position_ids(
+                    input_ids=input_ids,
+                    image_grid_thw=image_grid_thw,
+                    packed_seq_params=packed_seq_params,
+                )
+
+        if self.pre_process:
+            # An MDP endpoint supplies the pre-encoded leaf. The native path
+            # encodes pixels here; both feed the same scatter below.
+            if vision_embeddings is None:
+                if self.vision_model is not None and pixel_values is not None:
+                    with nvtx_phase("native_vision_encoder_forward"):
+                        vision_embeddings = self.vision_model(pixel_values, image_grid_thw)
+
+            if decoder_input is None:
+                with nvtx_phase("text_embedding"):
+                    text_embeddings = self.language_model.embedding(
+                        input_ids=input_ids, position_ids=None
+                    )
+
+                if vision_embeddings is not None:
+                    with nvtx_phase("scatter_vision_embeddings"):
+                        decoder_input = self._scatter_vision_embeddings(
+                            input_ids, text_embeddings, vision_embeddings
+                        )
+                else:
+                    if bool((input_ids == self.image_token_id).any()):
+                        raise RuntimeError(
+                            "input_ids contain image-token slots but no vision "
+                            "source was provided (neither pixel_values nor "
+                            "vision_embeddings); the text path would silently "
+                            "train on placeholder embeddings"
+                        )
+                    decoder_input = text_embeddings
+        else:
+            # Intermediate PP/VPP chunks receive their activation through
+            # GPTModel.set_input_tensor during scheduled or eager execution.
+            decoder_input = None
+
+        (
+            decoder_input, input_ids, labels, loss_mask,
+            attention_mask, position_ids, padding_mask,
+        ) = self._cp_split_for_forward(
+            decoder_input=decoder_input,
+            input_ids=input_ids,
+            labels=labels,
+            loss_mask=loss_mask,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
+        )
+
+        return dict(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            decoder_input=decoder_input,
+            labels=labels,
+            loss_mask=loss_mask,
+            padding_mask=padding_mask,
+            packed_seq_params=packed_seq_params,
+        )
+
+    def build_schedule_plan(
+        self,
+        input_ids: Tensor,
+        position_ids: Tensor = None,
+        attention_mask: Tensor = None,
+        labels: Tensor = None,
+        loss_mask: Tensor = None,
+        padding_mask: Tensor = None,
+        pixel_values: Tensor = None,
+        image_grid_thw: Tensor = None,
+        decoder_input: Tensor = None,
+        packed_seq_params=None,
+        vision_embeddings: Tensor = None,
+        **kwargs,
+    ):
+        """Build the native fine-grained schedule for the decoder only."""
+        decoder_inputs = self._prepare_decoder_inputs(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            loss_mask=loss_mask,
+            padding_mask=padding_mask,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            decoder_input=decoder_input,
+            packed_seq_params=packed_seq_params,
+            vision_embeddings=vision_embeddings,
+        )
+        return self.language_model.build_schedule_plan(**decoder_inputs)
 
     def _scatter_vision_embeddings(
         self, input_ids: Tensor, text_embeddings: Tensor, vision_embeddings: Tensor
@@ -172,8 +358,17 @@ class MultimodalModel(MegatronModule):
 
         combined = text_embeddings.transpose(0, 1).contiguous()
         image_mask = input_ids == self.image_token_id
+        num_slots = int(image_mask.sum())
+        if num_slots != vision_embeddings.shape[0]:
+            raise RuntimeError(
+                f"image-token slot count {num_slots} != vision embedding rows "
+                f"{vision_embeddings.shape[0]}; masked_scatter would silently "
+                "mis-fill the sequence"
+            )
         mask_expanded = image_mask.unsqueeze(-1).expand_as(combined)
-        combined = combined.masked_scatter(mask_expanded, vision_embeddings)
+        combined = combined.masked_scatter(
+            mask_expanded, vision_embeddings.to(combined.dtype)
+        )
         combined = combined.transpose(0, 1).contiguous()
 
         if sp:
@@ -316,6 +511,7 @@ class MultimodalModel(MegatronModule):
         image_grid_thw: Tensor = None,
         decoder_input: Tensor = None,
         packed_seq_params=None,
+        vision_embeddings: Tensor = None,
         **kwargs,
     ):
         """Forward pass.
@@ -340,31 +536,7 @@ class MultimodalModel(MegatronModule):
         Returns:
             Loss tensor (post_process=True) or hidden states.
         """
-        if position_ids is None:
-            position_ids = self.compute_position_ids(
-                input_ids=input_ids,
-                image_grid_thw=image_grid_thw,
-                packed_seq_params=packed_seq_params,
-            )
-
-        vision_embeddings = None
-        if self.vision_model is not None and pixel_values is not None:
-            vision_embeddings = self.vision_model(pixel_values, image_grid_thw)
-
-        if decoder_input is None and self.language_model is not None:
-            text_embeddings = self.language_model.embedding(input_ids=input_ids, position_ids=None)
-
-            if vision_embeddings is not None:
-                decoder_input = self._scatter_vision_embeddings(
-                    input_ids, text_embeddings, vision_embeddings
-                )
-            else:
-                decoder_input = text_embeddings
-
-        (
-            decoder_input, input_ids, labels, loss_mask,
-            attention_mask, position_ids, padding_mask,
-        ) = self._cp_split_for_forward(
+        decoder_inputs = self._prepare_decoder_inputs(
             decoder_input=decoder_input,
             input_ids=input_ids,
             labels=labels,
@@ -373,16 +545,12 @@ class MultimodalModel(MegatronModule):
             position_ids=position_ids,
             packed_seq_params=packed_seq_params,
             padding_mask=padding_mask,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            vision_embeddings=vision_embeddings,
         )
 
-        with self._thd_mrope_no_cp_override(packed_seq_params):
-            return self.language_model(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                decoder_input=decoder_input,
-                labels=labels,
-                loss_mask=loss_mask,
-                padding_mask=padding_mask,
-                packed_seq_params=packed_seq_params,
-            )
+        with self._thd_mrope_no_cp_override(packed_seq_params), nvtx_phase(
+            "decoder_forward"
+        ):
+            return self.language_model(**decoder_inputs)
