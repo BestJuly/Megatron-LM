@@ -67,6 +67,26 @@ def test_fully_parallel_modes_are_rejected():
         assert_supported_checkpoint_config(fully_parallel_load)
 
 
+@pytest.mark.parametrize(
+    "overrides, match",
+    [
+        ({"ckpt_fully_parallel_load": True}, "fully-parallel-load"),
+        ({"async_save": True}, "async-save"),
+        ({"non_persistent_ckpt_type": "global"}, "non-persistent"),
+        ({"ckpt_assume_constant_structure": True}, "constant-structure"),
+    ],
+)
+def test_pretrained_checkpoint_obeys_execution_mode_guards(overrides, match):
+    args = SimpleNamespace(
+        save=None, load=None, pretrained_checkpoint="/tmp/pretrained", ckpt_fully_parallel_save=True
+    )
+    assert_supported_checkpoint_config(args)
+    for name, value in overrides.items():
+        setattr(args, name, value)
+    with pytest.raises(MdpCheckpointError, match=match):
+        assert_supported_checkpoint_config(args)
+
+
 def test_unsupported_checkpoint_execution_modes_rejected():
     # Design doc section 12: asynchronous, non-persistent, and constant-
     # structure caching modes must fail at startup when a save/load is
