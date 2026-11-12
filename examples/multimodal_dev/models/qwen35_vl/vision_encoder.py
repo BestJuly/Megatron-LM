@@ -48,6 +48,7 @@ from megatron.core.models.common.vision_module.vision_module import (
     VisionModule,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -227,6 +228,7 @@ class Qwen35VLPatchMerger(MegatronModule):
         hidden_size: int = 1152,
         out_hidden_size: int = 3584,
         spatial_merge_size: int = 2,
+        tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super().__init__(config=config)
         self.spatial_merge_size = spatial_merge_size
@@ -242,6 +244,7 @@ class Qwen35VLPatchMerger(MegatronModule):
             init_method=config.init_method,
             bias=True,
             gather_output=False,
+            tp_group=tp_group,
         )
         self.linear_fc2 = build_module(
             RowParallelLinear,
@@ -252,6 +255,7 @@ class Qwen35VLPatchMerger(MegatronModule):
             bias=True,
             input_is_parallel=True,
             skip_bias_add=False,
+            tp_group=tp_group,
         )
 
     def forward(self, hidden_states: Tensor) -> Tensor:
@@ -311,6 +315,7 @@ class Qwen35VLVisionEncoder(VisionModule):
         spatial_merge_size: int = 2,
         out_hidden_size: int = 3584,
         max_num_positions: int = 2304,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         super().__init__(config=config)
 
@@ -351,6 +356,7 @@ class Qwen35VLVisionEncoder(VisionModule):
             pre_process=True,
             post_process=True,
             post_layer_norm=False,
+            pg_collection=pg_collection,
         )
 
         # --- Patch merger ---
@@ -359,6 +365,7 @@ class Qwen35VLVisionEncoder(VisionModule):
             hidden_size=config.hidden_size,
             out_hidden_size=out_hidden_size,
             spatial_merge_size=spatial_merge_size,
+            tp_group=pg_collection.tp if pg_collection is not None else None,
         )
 
         # Grid-keyed cache of position indices/weights, merge permutations,

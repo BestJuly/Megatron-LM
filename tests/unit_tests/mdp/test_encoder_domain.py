@@ -54,15 +54,33 @@ class _TinyEncoder(torch.nn.Module):
         return self.proj(x)
 
 
+class _RankSeededEncoder(torch.nn.Module):
+    """Initializes differently on every rank, like a ViT whose plain-torch
+    layers draw from Megatron's per-pipeline-stage seed and whose linears draw
+    from the per-TP-rank model-parallel RNG."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        torch.manual_seed(1000 + torch.distributed.get_rank())
+        self.proj = torch.nn.Linear(8, 8, bias=False)
+
+    def forward(self, x):
+        return self.proj(x)
+
+
 class _TinyAdapter:
     payload_width = 8
     spatial_merge_size = 2
 
+    def __init__(self, encoder_cls=_TinyEncoder):
+        self._encoder_cls = encoder_cls
+
     def build_encoder(self, model_config, *, pg_collection):
-        return _TinyEncoder(model_config)
+        return self._encoder_cls(model_config)
 
 
-def _build_domain(*, decoder_overlap=False):
+def _build_domain(*, decoder_overlap=False, encoder_cls=_TinyEncoder):
     world = torch.distributed.get_world_size()
     rank_map = build_rank_map(
         MdpRankSpec(world_size=world, tp=1, pp=2, cp=1, ep=1, encoder_cp=1)
@@ -88,7 +106,7 @@ def _build_domain(*, decoder_overlap=False):
         optimizer="adam", lr=1e-3, use_distributed_optimizer=True, clip_grad=1.0
     )
     domain = build_encoder_domain(
-        adapter=_TinyAdapter(),
+        adapter=_TinyAdapter(encoder_cls),
         model_config=model_config,
         mdp_config=MdpConfig(enable=True),
         ddp_config=ddp_config,
@@ -97,6 +115,29 @@ def _build_domain(*, decoder_overlap=False):
         wrap_mixed_precision=False,
     )
     return domain
+
+
+def test_replicated_encoder_starts_identical_on_every_rank():
+    # build_encoder_domain broadcasts the encoder from WORLD rank 0 before the
+    # optimizer copies its main parameters; otherwise per-rank initialization
+    # would leave every replica (and every ZeRO-1 shard) different.
+    domain = _build_domain(encoder_cls=_RankSeededEncoder)
+    weight = domain.encoder_ddp.module.proj.weight.detach().clone()
+    reference = weight.clone()
+    torch.distributed.broadcast(reference, src=0)
+    assert torch.equal(weight, reference)
+
+
+def test_encoder_pg_collection_has_singleton_cp():
+    # The encoder modules are built from this collection; attention reads cp.
+    world = torch.distributed.get_world_size()
+    rank_map = build_rank_map(
+        MdpRankSpec(world_size=world, tp=1, pp=2, cp=1, ep=1, encoder_cp=1)
+    )
+    groups = install_mdp_process_groups(rank_map, group_registry=MdpGroupRegistry())
+    encoder_pgs = build_encoder_pg_collection(rank_map, encoder_cp=1, process_groups=groups)
+    assert torch.distributed.get_world_size(encoder_pgs.cp) == 1
+    assert torch.distributed.get_world_size(encoder_pgs.tp) == 1
 
 
 def test_decoder_overlap_is_isolated_from_encoder_domain():
