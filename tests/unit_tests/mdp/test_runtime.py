@@ -13,6 +13,7 @@ from types import MappingProxyType, SimpleNamespace
 import pytest
 import torch
 
+from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.mdp.allocator import DirectBufferAllocator
 from megatron.core.mdp.bridge import ModalityBridge
@@ -43,6 +44,18 @@ if _DISTRIBUTED:
         )
         yield
         Utils.destroy_model_parallel()
+
+    @pytest.fixture
+    def _tp2_parallel():
+        if torch.distributed.get_world_size() % 4 != 0:
+            pytest.skip("needs a world divisible by TP * PP = 4")
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=2, pipeline_model_parallel_size=2
+        )
+        yield
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=2
+        )
 
 
 WIDTH = 8  # payload width == hidden size, identity encoder
@@ -133,14 +146,18 @@ class _StubAdapter:
         return torch.cat(pieces) if pieces else payload[:0]
 
 
-def _build_runtime():
+def _build_runtime(tp=1):
     world = torch.distributed.get_world_size()
     rank = torch.distributed.get_rank()
     rank_map = build_rank_map(
-        MdpRankSpec(world_size=world, tp=1, pp=2, cp=1, ep=1, encoder_cp=1)
+        MdpRankSpec(world_size=world, tp=tp, pp=2, cp=1, ep=1, encoder_cp=1)
     )
     view = rank_map.view(rank)
-    groups = install_mdp_process_groups(rank_map, group_registry=MdpGroupRegistry())
+    groups = install_mdp_process_groups(
+        rank_map,
+        group_registry=MdpGroupRegistry(),
+        decoder_tp_group=parallel_state.get_tensor_model_parallel_group() if tp > 1 else None,
+    )
     encoder_pgs = build_encoder_pg_collection(rank_map, encoder_cp=1, process_groups=groups)
     adapter = _StubAdapter(view.outer_dp_rank)
     model_config = TransformerConfig(
@@ -193,9 +210,12 @@ def _drive_decoder(runtime, view, replay_iters, *, backward):
     """Consume the replay iterator like the native schedule would."""
     records = [next(replay_iters[0]) for _ in range(2)]
     assert [r.model_payload["microbatch"] for r in records] == [0, 1]
-    if view.lane_id is not None:
+    if view.lane_id is not None or view.is_leaf_peer:
+        # The endpoint holds the trainable leaf; under decoder TP its TP peers
+        # hold an untrainable copy filled by broadcast.
         leaf = runtime.storage.get_leaf(0)
         assert leaf is not None
+        assert leaf.requires_grad == (view.lane_id is not None)
         assert runtime.storage.get_leaf(1) is None  # text-only
         # Forward routing correctness: every leaf row carries its item's
         # sentinel (identity encoder, sentinel pixels).
@@ -206,8 +226,11 @@ def _drive_decoder(runtime, view, replay_iters, *, backward):
             block = leaf[offset : offset + rows]
             assert (block == _sentinel(view.outer_dp_rank, index)).all(), index
             offset += rows
-        if backward:
+        if backward and view.lane_id is not None:
             (leaf * 2.0).sum().backward()
+    else:
+        # Later pipeline stages never hold a leaf.
+        assert runtime.storage.get_leaf(0) is None
     return records
 
 
@@ -305,3 +328,54 @@ def test_iteration_metrics_are_populated():
     assert set(metrics.bridge_stats) == {"pixel", "embedding", "gradient"}
     assert metrics.bridge_stats["pixel"].total_bytes > 0
     assert all(count == 0 for count in metrics.allocator_reuse.values())
+
+
+def test_tp2_training_iteration_broadcasts_leaves_to_tp_peers(_tp2_parallel):
+    runtime, view = _build_runtime(tp=2)
+    # Every rank of the planning group is an encoder worker, but only the
+    # workers on TP-source ranks own pixels.
+    assert len(view.worker_ids) == 4
+    assert view.pixel_owners == (0, 2)
+    replay = runtime.begin_iteration(iter(range(10)), num_microbatches=2, forward_only=False)
+    # Checks the sentinels on the endpoint and on its TP peer, and that only
+    # the endpoint's copy is trainable; only the endpoint runs backward.
+    _drive_decoder(runtime, view, replay, backward=True)
+    if view.lane_id is not None or view.is_leaf_peer:
+        leaf = runtime.storage.get_leaf(0).detach()
+        copies = [torch.empty_like(leaf) for _ in range(2)]
+        torch.distributed.all_gather(
+            copies, leaf, group=parallel_state.get_tensor_model_parallel_group()
+        )
+        assert torch.equal(copies[0], copies[1])
+
+    runtime.capture_global_num_tokens(torch.tensor(20.0, device="cuda"))
+    runtime.mark_decoder_complete()
+    # The peer has no gradient to return: P5 must release its copy instead of
+    # reading leaf.grad.
+    runtime.end_iteration()
+    assert runtime.state is MdpRuntimeState.EMPTY
+    runtime.storage.assert_empty()
+
+    # ZeRO-1 leaves each rank only its reduced shard, and a worker that encoded
+    # nothing has no local gradient, so check the gradient over WORLD.
+    param = next(runtime.encoder_domain.encoder_ddp.module.parameters())
+    grad_mass = param.main_grad.abs().sum().reshape(1)
+    torch.distributed.all_reduce(grad_mass)
+    assert grad_mass.item() > 0
+    success, _, _ = runtime.encoder_domain.encoder_optimizer.step()
+    assert success
+    gathered = [torch.empty_like(param.data) for _ in range(torch.distributed.get_world_size())]
+    torch.distributed.all_gather(gathered, param.data)
+    for other in gathered[1:]:
+        assert torch.equal(other, gathered[0])
+    assert not torch.equal(param.data, torch.eye(WIDTH, device=param.device))
+
+
+def test_tp2_forward_only_iteration_releases_peer_leaves(_tp2_parallel):
+    runtime, view = _build_runtime(tp=2)
+    replay = runtime.begin_iteration(iter(range(10)), num_microbatches=2, forward_only=True)
+    _drive_decoder(runtime, view, replay, backward=False)
+    runtime.mark_decoder_complete()
+    runtime.end_iteration()
+    assert runtime.state is MdpRuntimeState.EMPTY
+    runtime.storage.assert_empty()

@@ -4,6 +4,10 @@
 
 Text-only microbatches have no storage key; reads return ``None``. Endpoint
 storage must return to zero every iteration (``assert_empty``).
+
+Under decoder TP the endpoint's TP peers hold copies of the same leaves (filled
+by broadcast). Their copies are not trainable: the leaf gradient is identical on
+every TP rank, and only the endpoint's copy is routed back to the encoder.
 """
 
 from typing import Optional
@@ -21,18 +25,21 @@ class MdpEmbeddingStorage:
         self._allocator = allocator
         self._leaves: dict = {}
 
-    def put_leaf(self, mb_id: int, leaf: Tensor) -> None:
-        """Store one detached leaf; duplicate insertion for the same id fails."""
+    def put_leaf(self, mb_id: int, leaf: Tensor, *, trainable: bool = True) -> None:
+        """Store one detached leaf; duplicate insertion for the same id fails.
+
+        ``trainable=False`` stores a TP peer's copy, which must not require grad.
+        """
         if mb_id in self._leaves:
             raise MdpStateError(
                 f"MDP: microbatch_id={mb_id} violates: one leaf per microbatch per "
                 "iteration."
             )
-        if not leaf.is_leaf or not leaf.requires_grad or leaf.grad_fn is not None:
+        if not leaf.is_leaf or leaf.requires_grad != trainable or leaf.grad_fn is not None:
             raise MdpStateError(
-                f"MDP: leaf for microbatch_id={mb_id} violates: is_leaf and "
-                "requires_grad with no grad_fn. Only detached leaves cross into the "
-                "decoder domain."
+                f"MDP: leaf for microbatch_id={mb_id} violates: is_leaf with no "
+                f"grad_fn and requires_grad == {trainable}. Only detached leaves cross "
+                "into the decoder domain, and only the endpoint's copy is trainable."
             )
         self._leaves[mb_id] = leaf
 

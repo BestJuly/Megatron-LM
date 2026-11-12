@@ -90,6 +90,9 @@ def build_encoder_pg_collection(
     pgs.intra_dp_cp = world
     pgs.intra_dist_opt = world
     pgs.tp = mine
+    # The encoder modules are built with this collection, and attention reads
+    # its CP group; the encoder has no CP (encoder_cp=1).
+    pgs.cp = mine
     pgs.pp = mine
     pgs.ep = mine
     pgs.mp = None
@@ -160,6 +163,11 @@ def build_encoder_domain(
         pg_collection=encoder_pgs,
     )
     assert_encoder_prescale_is_one(encoder_ddp)
+    # Replicated weights must start identical on every rank, and nothing else
+    # guarantees it: Megatron seeds each pipeline stage differently, and under
+    # decoder TP the model-parallel RNG tracker differs per TP rank. Broadcast
+    # from WORLD rank 0 before the optimizer copies the main parameters.
+    encoder_ddp.broadcast_params()
 
     from megatron.core.mdp.optimizer import build_encoder_optimizer_config
     from megatron.core.optimizer import get_megatron_optimizer

@@ -238,13 +238,16 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "has not been validated against other orders.",
             SUPPORTED_RANK_ORDER,
         )
-    if options.tensor_parallel_size != 1:
+    # Decoder TP > 1 (with or without SP) is supported: the encoder stays
+    # replicated and TP-unaware, the endpoint broadcasts each embedding leaf to
+    # its decoder-TP peers, and only the endpoint returns gradients. The window
+    # capture overlap above is still rejected with TP > 1.
+    if options.tensor_parallel_size < 1:
         _reject(
             "tensor_parallel_size",
             options.tensor_parallel_size,
-            "TP == 1",
-            "The current MDP support matrix requires TP=1.",
-            "1",
+            "TP >= 1",
+            "Tensor parallel size must be positive.",
         )
     if options.context_parallel_size != 1:
         _reject(
@@ -621,4 +624,26 @@ def validate_effective_vision_config(
             "interaction with encoder replay are validated in the follow-up that "
             "wires encoder FP8; only the decoder's --fp8 flags are supported here.",
             "None",
+        )
+    # The encoder is replicated and TP-unaware under every decoder TP size: its
+    # process groups are rank-local singletons, so a vision config that inherited
+    # the decoder's tensor/sequence parallelism would build mis-sharded layers.
+    vision_tp = getattr(effective_config, "tensor_model_parallel_size", 1)
+    if vision_tp != 1:
+        _reject(
+            "effective vision tensor_model_parallel_size",
+            vision_tp,
+            "1",
+            "The MDP encoder is fully replicated; decoder TP must not leak into the "
+            "vision TransformerConfig.",
+            "1",
+        )
+    if getattr(effective_config, "sequence_parallel", False):
+        _reject(
+            "effective vision sequence_parallel",
+            True,
+            "False",
+            "The MDP encoder is fully replicated; decoder sequence parallelism must not "
+            "leak into the vision TransformerConfig.",
+            "False",
         )

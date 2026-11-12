@@ -118,8 +118,11 @@ class Qwen35VLMdpAdapter:
     # ------------------------------------------------------------------
 
     def build_encoder(self, model_config, *, pg_collection) -> torch.nn.Module:
-        """Same factory as the non-MDP path (models/qwen35_vl/model.py)."""
-        del pg_collection  # the encoder has no model parallelism in v1
+        """Same factory as the non-MDP path (models/qwen35_vl/model.py).
+
+        The encoder is built on MDP's rank-local process groups: without them its
+        layers would shard over the decoder's TP group when TP > 1.
+        """
         kwargs = self._vision_kwargs
         return Qwen35VLVisionEncoder(
             config=model_config,
@@ -130,6 +133,7 @@ class Qwen35VLMdpAdapter:
             spatial_merge_size=kwargs["spatial_merge_size"],
             out_hidden_size=kwargs["out_hidden_size"],
             max_num_positions=kwargs["max_num_positions"],
+            pg_collection=pg_collection,
         )
 
     def encode(self, encoder: torch.nn.Module, payload: torch.Tensor, layout) -> torch.Tensor:

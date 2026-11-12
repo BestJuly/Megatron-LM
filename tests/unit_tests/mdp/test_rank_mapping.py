@@ -88,6 +88,50 @@ def test_extension_hook_encoder_cp2():
     assert seen == set(range(16))
 
 
+def test_tp2_pp1_every_rank_is_a_worker_and_peers_hold_leaves():
+    # W=8, TP=2, PP=1 -> DP=4; rank = tp + 2 * dp, so each planning group is one
+    # decoder TP group and the endpoint is its tp=0 rank.
+    rank_map = build_rank_map(_spec(world_size=8, tp=2, pp=1))
+    assert rank_map.planning_groups() == ((0, 1), (2, 3), (4, 5), (6, 7))
+    assert rank_map.num_workers_per_group == 2
+    endpoint = rank_map.view(2)
+    peer = rank_map.view(3)
+    assert endpoint.lane_id == 1 and endpoint.is_endpoint and not endpoint.is_leaf_peer
+    assert peer.lane_id is None and peer.is_leaf_peer and not peer.is_endpoint
+    assert endpoint.endpoint_tp_ranks == peer.endpoint_tp_ranks == (2, 3)
+    assert (endpoint.my_worker_id, peer.my_worker_id) == (0, 1)
+    # Only the TP source loads data, so only its worker owns pixels.
+    assert endpoint.pixel_owners == peer.pixel_owners == (0,)
+    assert endpoint.worker_ids == (0, 1)
+
+
+def test_tp2_pp2_groups_workers_and_pixel_owners():
+    # W=8, TP=2, PP=2 -> DP=2; rank = tp + 2 * dp + 4 * pp.
+    rank_map = build_rank_map(_spec(world_size=8, tp=2, pp=2))
+    assert rank_map.planning_groups() == ((0, 1, 4, 5), (2, 3, 6, 7))
+    assert rank_map.num_workers_per_group == 4
+    for outer_dp_rank, group in enumerate(rank_map.planning_groups()):
+        resolved = [rank_map.worker_ranks(outer_dp_rank, w) for w in range(4)]
+        assert [ranks[0] for ranks in resolved] == list(group)
+        for rank in group:
+            view = rank_map.view(rank)
+            assert view.endpoint_tp_ranks == group[:2]
+            # The TP sources are the PP0 and PP1 tp=0 ranks: indices 0 and 2.
+            assert view.pixel_owners == (0, 2)
+            assert view.is_leaf_peer == (rank == group[1])
+            assert rank_map.worker_ranks(outer_dp_rank, view.my_worker_id) == (rank,)
+    # PP1's TP pair is not part of the leaf broadcast: PP1 never reads leaves.
+    assert not rank_map.view(5).is_leaf_peer and not rank_map.view(4).is_endpoint
+
+
+def test_tp1_view_keeps_every_worker_as_pixel_owner():
+    rank_map = build_rank_map(_spec())
+    view = rank_map.view(4)
+    assert view.pixel_owners == view.worker_ids == (0, 1)
+    assert view.endpoint_tp_ranks == (0,)
+    assert not view.is_leaf_peer
+
+
 def test_local_view_has_no_global_lists():
     # O(W^2) guard: a view carries only its own group, not all groups.
     rank_map = build_rank_map(_spec(world_size=8, pp=2))
@@ -98,7 +142,7 @@ def test_local_view_has_no_global_lists():
 @pytest.mark.parametrize(
     "kwargs, match",
     [
-        (dict(tp=2, world_size=16), "tp"),
+        (dict(tp=0), "tp"),
         (dict(world_size=6, pp=4), "world_size"),
         (dict(encoder_cp=3, world_size=16, cp=2), "encoder_cp"),
         (dict(rank_order="tp-ep-dp-pp-cp"), "rank_order"),

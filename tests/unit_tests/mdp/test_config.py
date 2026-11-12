@@ -55,6 +55,23 @@ def test_valid_configuration_passes():
     validate_mdp_config(MdpConfig(enable=True), _options())
 
 
+@pytest.mark.parametrize("sequence_parallel", [False, True])
+def test_decoder_tensor_parallel_configuration_passes(sequence_parallel):
+    validate_mdp_config(
+        MdpConfig(enable=True),
+        _options(world_size=8, tensor_parallel_size=2, sequence_parallel=sequence_parallel),
+    )
+
+
+def test_window_capture_overlap_still_requires_tp1():
+    validate_mdp_config(MdpConfig(enable=True, overlap_window_capture=True), _options())
+    with pytest.raises(MdpConfigurationError, match="overlap_window_capture"):
+        validate_mdp_config(
+            MdpConfig(enable=True, overlap_window_capture=True),
+            _options(tensor_parallel_size=2),
+        )
+
+
 def test_decoder_ep_overlap_configuration_passes_with_vpp():
     validate_mdp_config(
         MdpConfig(enable=True),
@@ -141,7 +158,7 @@ def test_invalid_mdp_config_fields_rejected(config_kwargs, match):
     "option_kwargs, match",
     [
         (dict(rank_order="tp-ep-dp-pp-cp"), "rank_order"),
-        (dict(tensor_parallel_size=2), "tensor_parallel_size"),
+        (dict(tensor_parallel_size=0), "tensor_parallel_size"),
         (dict(context_parallel_size=2), "context_parallel_size"),
         (dict(world_size=6, pipeline_parallel_size=4), "world_size"),
         (dict(calculate_per_token_loss=False), "calculate_per_token_loss"),
@@ -222,6 +239,8 @@ class _FakeTransformerConfig:
     recompute_modules: object = None
     hidden_size: int = 64
     fp8: object = None
+    tensor_model_parallel_size: int = 1
+    sequence_parallel: bool = False
 
     def __post_init__(self):
         if self.recompute_granularity not in (None, "selective", "full"):
@@ -664,6 +683,21 @@ def test_effective_vision_config_with_fp8_is_rejected():
     with pytest.raises(MdpConfigurationError, match="effective vision fp8"):
         validate_effective_vision_config(
             MdpConfig(enable=True), _FakeTransformerConfig(fp8="hybrid")
+        )
+
+
+@pytest.mark.parametrize(
+    "fields, match",
+    [
+        (dict(tensor_model_parallel_size=2), "effective vision tensor_model_parallel_size"),
+        (dict(sequence_parallel=True), "effective vision sequence_parallel"),
+    ],
+)
+def test_effective_vision_config_must_stay_replicated(fields, match):
+    # Decoder TP/SP must never leak into the replicated MDP encoder's config.
+    with pytest.raises(MdpConfigurationError, match=match):
+        validate_effective_vision_config(
+            MdpConfig(enable=True), _FakeTransformerConfig(**fields)
         )
 
 

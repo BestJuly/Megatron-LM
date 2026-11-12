@@ -41,16 +41,43 @@ class MdpRankView:
     endpoint_rank: int
     planning_group_ranks: tuple
     worker_ids: tuple
+    # The endpoint's decoder tensor-parallel group (the PP0 ranks of this
+    # planning group). Every member runs the first decoder stage, so every member
+    # needs the vision-embedding leaves; only the endpoint itself routes them.
+    # Empty means "just the endpoint" (TP=1, and hand-built views in tests).
+    endpoint_tp_ranks: tuple = ()
+    # Logical workers that may own (materialize and send) pixels. Under TP only
+    # the TP source rank of each TP group loads data, so ownership is restricted
+    # to the workers hosting those ranks. ``None`` means every worker.
+    pixel_owner_worker_ids: Optional[tuple] = None
+
+    @property
+    def is_endpoint(self) -> bool:
+        """This rank routes the group's embeddings and gradients (``lane_id``)."""
+        return self.global_rank == self.endpoint_rank
+
+    @property
+    def is_leaf_peer(self) -> bool:
+        """A decoder-TP peer of the endpoint: it receives the leaves by broadcast,
+        never routes embeddings and never returns gradients."""
+        return not self.is_endpoint and self.global_rank in self.endpoint_tp_ranks
+
+    @property
+    def pixel_owners(self) -> tuple:
+        """The workers that own pixels, in the order microbatches are dealt to them."""
+        if self.pixel_owner_worker_ids is None:
+            return tuple(self.worker_ids)
+        return tuple(self.pixel_owner_worker_ids)
 
 
 class MdpRankMap:
     """Outer-DP planning groups and logical-worker resolution, built once and shared.
 
     A planning group is one outer-DP group: all model-parallel ranks with one fixed
-    decoder ``dp_rank``. Inside a group, the ``CP x PP`` encoder ranks form
-    ``inner_dp / encoder_cp`` logical workers with stable ids ``0..num_workers-1``;
-    ``worker_ranks()`` is the only resolution point from logical workers to
-    physical ranks.
+    decoder ``dp_rank``. Inside a group, all ``TP x CP x PP`` ranks run the
+    replicated encoder and form ``group_size / encoder_cp`` logical workers with
+    stable ids ``0..num_workers-1``; ``worker_ranks()`` is the only resolution
+    point from logical workers to physical ranks.
     """
 
     def __init__(self, spec: MdpRankSpec, planning_groups: Sequence[tuple]):
@@ -80,8 +107,8 @@ class MdpRankMap:
     @property
     def num_workers_per_group(self) -> int:
         """Logical encoder workers per planning group."""
-        inner_dp = self._spec.cp * self._spec.pp
-        return inner_dp // self._spec.encoder_cp
+        group_size = self._spec.tp * self._spec.cp * self._spec.pp
+        return group_size // self._spec.encoder_cp
 
     def planning_groups(self) -> Sequence[tuple]:
         """All outer-DP planning groups in ascending ``outer_dp_rank`` order."""
@@ -117,6 +144,10 @@ class MdpRankMap:
         outer_dp_rank, index_in_group = self._rank_to_coord[global_rank]
         group = self._groups[outer_dp_rank]
         endpoint = group[0]
+        tp = self._spec.tp
+        encoder_cp = self._spec.encoder_cp
+        # Group order is 'tp-cp-pp' with tp fastest: indices 0..tp-1 are the
+        # endpoint's TP group, and every index divisible by tp is a TP source.
         return MdpRankView(
             global_rank=global_rank,
             outer_dp_rank=outer_dp_rank,
@@ -125,6 +156,10 @@ class MdpRankMap:
             endpoint_rank=endpoint,
             planning_group_ranks=group,
             worker_ids=tuple(range(self.num_workers_per_group)),
+            endpoint_tp_ranks=tuple(group[:tp]),
+            pixel_owner_worker_ids=tuple(
+                sorted({index // encoder_cp for index in range(0, len(group), tp)})
+            ),
         )
 
 
@@ -144,19 +179,15 @@ def build_rank_map(spec: MdpRankSpec) -> MdpRankMap:
     Planning groups come from ``RankGenerator.get_ranks('tp-cp-pp')``: each group
     holds the ranks that share one decoder ``dp_rank``, ordered with earlier
     dimensions in the rank order changing faster (tp fastest, then cp, then pp),
-    so index 0 in each group is the ``(tp=0, cp=0, pp=0)`` PP0 endpoint.
+    so index 0 in each group is the ``(tp=0, cp=0, pp=0)`` PP0 endpoint and
+    indices ``0..tp-1`` are its decoder TP group.
     """
     if spec.rank_order != SUPPORTED_RANK_ORDER:
         raise MdpConfigurationError(
             f"MDP: rank_order={spec.rank_order!r} violates: rank_order == "
             f"'{SUPPORTED_RANK_ORDER}'. Other orders are not validated."
         )
-    if spec.tp != 1:
-        raise MdpConfigurationError(
-            f"MDP: tp={spec.tp} violates: TP == 1. The logical worker partition is "
-            "defined over the CP x PP ranks of each outer-DP group."
-        )
-    for name in ("world_size", "pp", "cp", "ep", "encoder_cp"):
+    for name in ("world_size", "tp", "pp", "cp", "ep", "encoder_cp"):
         value = getattr(spec, name)
         if value < 1:
             raise MdpConfigurationError(
@@ -168,11 +199,11 @@ def build_rank_map(spec: MdpRankSpec) -> MdpRankMap:
             f"MDP: world_size={spec.world_size} violates: world_size % "
             f"(TP * PP * CP) == 0 with TP * PP * CP = {model_parallel}."
         )
-    inner_dp = spec.cp * spec.pp
-    if inner_dp % spec.encoder_cp != 0:
+    group_size = spec.tp * spec.cp * spec.pp
+    if group_size % spec.encoder_cp != 0:
         raise MdpConfigurationError(
             f"MDP: encoder_cp={spec.encoder_cp} violates: encoder_cp divides "
-            f"inner_dp = CP * PP = {inner_dp}."
+            f"the planning-group size TP * CP * PP = {group_size}."
         )
 
     decoder_dp = spec.world_size // model_parallel

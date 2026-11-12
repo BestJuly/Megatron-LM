@@ -14,7 +14,8 @@ import os
 import pytest
 import torch
 
-from megatron.core.mdp.errors import MdpBridgeError
+from megatron.core import parallel_state
+from megatron.core.mdp.errors import MdpBridgeError, MdpConfigurationError
 from megatron.core.mdp.groups import (
     MdpGroupRegistry,
     broadcast_descriptors,
@@ -62,6 +63,16 @@ if _DISTRIBUTED:
         )
         yield
         Utils.destroy_model_parallel()
+
+    @pytest.fixture
+    def _tp2_parallel():
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=2, pipeline_model_parallel_size=2
+        )
+        yield
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=2
+        )
 
 
 @pytest.mark.skipif(not _DISTRIBUTED, reason="needs torchrun world")
@@ -147,3 +158,49 @@ def test_broadcast_rejects_misordered_descriptors():
             )
     # Non-endpoint ranks skip; a real run would abort collectively before
     # reaching the broadcast.
+
+
+@pytest.mark.skipif(not _DISTRIBUTED, reason="needs torchrun world")
+def test_install_process_groups_reuses_decoder_tp_group(_tp2_parallel):
+    world = torch.distributed.get_world_size()
+    if world % 4 != 0:
+        pytest.skip("needs a world divisible by TP * PP = 4")
+    rank_map = build_rank_map(
+        MdpRankSpec(world_size=world, tp=2, pp=2, cp=1, ep=1, encoder_cp=1)
+    )
+    registry = MdpGroupRegistry()
+    decoder_tp_group = parallel_state.get_tensor_model_parallel_group()
+    groups = install_mdp_process_groups(
+        rank_map, group_registry=registry, decoder_tp_group=decoder_tp_group
+    )
+    my_rank = torch.distributed.get_rank()
+    view = rank_map.view(my_rank)
+    if my_rank in view.endpoint_tp_ranks:
+        # The endpoint and its TP peer broadcast leaves over the decoder's own
+        # TP group; MDP creates no TP group.
+        assert groups.leaf_tp_group is decoder_tp_group
+        assert (
+            tuple(torch.distributed.get_process_group_ranks(groups.leaf_tp_group))
+            == view.endpoint_tp_ranks
+        )
+    else:
+        # Later pipeline stages never hold a leaf.
+        assert groups.leaf_tp_group is None
+    registry.assert_no_leak()
+
+    if my_rank in view.endpoint_tp_ranks:
+        with pytest.raises(MdpConfigurationError, match="decoder TP group is passed"):
+            install_mdp_process_groups(rank_map, group_registry=registry)
+        # A group whose membership is not the endpoint TP group is rejected.
+        with pytest.raises(MdpConfigurationError, match="disagree about the rank order"):
+            install_mdp_process_groups(
+                rank_map,
+                group_registry=registry,
+                decoder_tp_group=torch.distributed.group.WORLD,
+            )
+    else:
+        # Ranks outside the endpoint TP group ignore the argument.
+        assert (
+            install_mdp_process_groups(rank_map, group_registry=registry).leaf_tp_group
+            is None
+        )
