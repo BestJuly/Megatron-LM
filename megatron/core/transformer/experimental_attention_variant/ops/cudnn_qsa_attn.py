@@ -28,6 +28,12 @@ Batches (BSHD, ``B > 1``) are packed into one ``T = B * S`` sequence space with 
 its own sequence, so a ``[T, NB]`` bitmap grows as ``B**2``; Qwen4 trains with micro-batch 1.
 The bitmap and cuDNN's compact-index scratch are ``O(T * NB)``: at ``T = 131072`` the cuDNN
 scratch alone is 16 GiB.
+
+A cuDNN Frontend with the index-list entry points (``cudnn.ops.qsa_forward_ids`` /
+``qsa_backward_ids``) is used when present: the selection goes in as the per-query ascending
+block lists that ``qsa_forward`` compacts its bitmap into (bitwise the same results, ``O(T * K)``
+memory), and the queries may be a context-parallel rank's local tokens against the gathered
+keys (``Tq != Tk``, ``qsa_api`` backward).
 """
 
 from typing import List, NamedTuple, Optional, Sequence, Tuple
@@ -165,6 +171,102 @@ def build_miles_metadata(
     )
 
 
+class QSAIndexLists(NamedTuple):
+    """Selection for ``cudnn.ops.qsa_forward_ids`` / ``qsa_backward_ids``: per-query block id lists."""
+
+    block_ids: torch.Tensor  # [Tq, K] int32, the first block_counts[t] entries valid, ascending
+    block_counts: torch.Tensor  # [Tq] int32
+    lo: torch.Tensor  # [Tq] int32, first visible key token (key-token space)
+    hi: torch.Tensor  # [Tq] int32, query position (key-token space)
+    block_first: torch.Tensor  # [NB] int32
+    block_last: torch.Tensor  # [NB] int32
+
+
+def build_index_lists(
+    block_indices: torch.Tensor,
+    block_counts: torch.Tensor,
+    block_bases: torch.Tensor,
+    block_ends: torch.Tensor,
+    key_len: int,
+    q_positions: Optional[torch.Tensor],
+    token_offsets: Optional[torch.Tensor],
+) -> QSAIndexLists:
+    """Translate a QSA selection to per-query block id lists. Device-only, ``O(Tq * K)`` memory.
+
+    The lists are exactly what ``cudnn.ops.qsa_forward`` compacts its ``[T, NB]`` bitmap into
+    (ascending ids whose token span meets the query's ``[lo, hi]``), so the results match the
+    bitmap entry point bitwise, without its ``O(T * NB)`` bitmap and compaction scratch.
+
+    Args:
+        block_indices: ``[B, S, K]`` global block ids (in the key blocks of each row).
+        block_counts: ``[B, S]`` valid leading slots.
+        block_bases / block_ends: ``[NBr]`` first / one-past-last key token of each block.
+        key_len: key tokens per row (``S`` without context parallelism, the gathered length with).
+        q_positions: ``[S]`` key-token position of each query row (None: ``arange(S)``).
+        token_offsets: ``[S]`` first key token of each query's document (None: 0).
+    """
+    B, S, K = block_indices.shape
+    device = block_indices.device
+    nbr = block_bases.shape[0]
+    Tq, NB = B * S, B * nbr
+    row = torch.arange(B, device=device, dtype=torch.int64)
+    pos = (
+        torch.arange(S, device=device, dtype=torch.int64)
+        if q_positions is None
+        else q_positions.to(torch.int64)
+    )
+    tok0 = (
+        torch.zeros(S, dtype=torch.int64, device=device)
+        if token_offsets is None
+        else token_offsets.to(torch.int64)
+    )
+    hi = (row[:, None] * key_len + pos[None, :]).reshape(Tq)
+    lo = (row[:, None] * key_len + tok0[None, :]).reshape(Tq)
+    bases = block_bases.to(torch.int64)
+    ends = block_ends.to(torch.int64)
+    block_first = (row[:, None] * key_len + bases[None, :]).reshape(NB)
+    block_last = (row[:, None] * key_len + ends[None, :] - 1).reshape(NB)
+    ids = block_indices.to(torch.int64).clamp(0, nbr - 1)
+    slot = torch.arange(K, device=device)
+    # The bitmap path's slot validity (a leading slot whose block starts at or before the query)
+    # and the compaction's span test (the block's tokens meet [lo, hi]).
+    b0 = bases.index_select(0, ids.reshape(-1)).view(B, S, K)
+    b1 = ends.index_select(0, ids.reshape(-1)).view(B, S, K) - 1
+    keep = (
+        (slot[None, None, :] < block_counts[..., None])
+        & (b0 <= pos[None, :, None])
+        & (b1 >= tok0[None, :, None])
+        & (tok0 <= pos)[None, :, None]
+    )
+    gid = (ids + row[:, None, None] * nbr).reshape(Tq, K)
+    keep = keep.reshape(Tq, K)
+    # Ascending ids first (each query selects a block at most once), invalid slots pushed last.
+    # int32 keys (NB < 2**31, checked by the kernels): the int64 sort costs ~2x at 128K tokens.
+    key = torch.where(keep, gid, NB).to(torch.int32)
+    block_ids = torch.sort(key, dim=1).values
+    counts = keep.sum(1)
+    i32 = lambda t: t.to(torch.int32).contiguous()  # noqa: E731
+    return QSAIndexLists(
+        block_ids=torch.where(block_ids < NB, block_ids, 0).contiguous(),
+        block_counts=i32(counts),
+        lo=i32(lo),
+        hi=i32(hi),
+        block_first=i32(block_first),
+        block_last=i32(block_last),
+    )
+
+
+def has_index_list_kernels() -> bool:
+    """Whether the installed cuDNN Frontend has the index-list (and Tq != Tk) QSA entry points."""
+    try:
+        import cudnn.ops as cudnn_ops
+
+        cudnn_ops.qsa_forward_ids, cudnn_ops.qsa_backward_ids  # pylint: disable=pointless-statement
+        return True
+    except (ImportError, AttributeError):
+        return False
+
+
 def build_sparse_gqa_index_lists(
     block_indices: torch.Tensor,
     block_counts: torch.Tensor,
@@ -293,6 +395,47 @@ class CudnnQSAAttnFunction(torch.autograd.Function):
         return dq, dk, dv, None, None, None, None, None
 
 
+class CudnnQSAIdsAttnFunction(torch.autograd.Function):
+    """cuDNN FE QSA through the index-list entry points (no ``[T, NB]`` bitmap); ``Tq`` queries
+    against ``Tk`` keys. Backward: ``qsa_backward_ids`` or, without context parallelism,
+    the ``sparse_gqa`` backward."""
+
+    @staticmethod
+    def forward(ctx, q, k, v, lists: QSAIndexLists, scale, bwd_impl, index_list_args, spans):
+        """Run ``cudnn.ops.qsa_forward_ids`` and save what the chosen backward consumes."""
+        from cudnn.ops import qsa_forward_ids
+
+        out, out_fp32, lse = qsa_forward_ids(q, k, v, *lists, scale=scale, block_size=4)
+        ctx.scale = scale
+        ctx.bwd_impl = bwd_impl
+        if bwd_impl == "qsa_api":
+            ctx.save_for_backward(q, k, v, out_fp32, lse, *lists)
+        else:
+            ctx.index_list_args = index_list_args
+            ctx.spans = spans
+            ctx.save_for_backward(q, k, v, out, lse.t().contiguous())
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        """dq, dk, dv through the configured cuDNN QSA backward."""
+        dout = dout.contiguous()
+        if ctx.bwd_impl == "qsa_api":
+            from cudnn.ops import qsa_backward_ids
+
+            q, k, v, out_fp32, lse, *lists = ctx.saved_tensors
+            dq, dk, dv = qsa_backward_ids(
+                dout, q, k, v, out_fp32, lse, *lists, scale=ctx.scale, block_size=4
+            )
+        else:
+            q, k, v, out, lse_t = ctx.saved_tensors
+            topk_idxs = build_sparse_gqa_index_lists(*ctx.index_list_args)
+            dq, dk, dv = _sparse_gqa_backward(
+                q, k, v, out, dout, lse_t, topk_idxs, ctx.spans, ctx.scale
+            )
+        return dq, dk, dv, None, None, None, None, None
+
+
 def cudnn_qsa_sparse_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -306,17 +449,67 @@ def cudnn_qsa_sparse_attention(
     cu_seqlens: Optional[torch.Tensor] = None,
     scale: Optional[float] = None,
     bwd_impl: str = "sparse_gqa",
+    q_positions: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Sparse GQA attention over per-query selected 4-token blocks, on cuDNN Frontend.
 
     Takes the selection of :func:`~.cute_qsa_attn.qsa_sparse_attention` (``q`` ``[B, S, HQ, D]``,
     ``k``/``v`` ``[B, S, H, D]``, global ``block_indices`` ``[B, S, K]`` with slot 0 the own
     block, ``block_counts`` ``[B, S]``, per-block token ranges) plus each query's document
-    block offset and first token. Queries and keys share one token space: no context
-    parallelism. ``cu_seqlens`` (packed THD) is only read by the ``sparse_gqa`` backward.
-    Returns ``[B, S, HQ, D]``.
+    block offset and first token. ``cu_seqlens`` (packed THD) is only read by the ``sparse_gqa``
+    backward. Returns ``[B, S, HQ, D]``.
+
+    With a cuDNN Frontend that has the index-list entry points (``qsa_forward_ids``), the
+    selection is passed as per-query block lists (``O(T * K)`` memory instead of the bitmap's
+    ``O(T * NB)``) and ``k``/``v`` may be the gathered keys of context parallelism
+    (``[B, Sk, H, D]`` with ``q_positions`` the queries' key-token positions; ``qsa_api``
+    backward only).
     """
     B, S, HQ, D = q.shape
+    Sk = k.shape[1]
+    use_ids = has_index_list_kernels()
+    if Sk != S or q_positions is not None:
+        assert use_ids, (
+            "context-parallel cuDNN QSA needs a cuDNN Frontend with cudnn.ops.qsa_forward_ids"
+        )
+        assert bwd_impl == "qsa_api", (
+            "context-parallel cuDNN QSA (queries against gathered keys) needs "
+            "qsa_cudnn_bwd_impl='qsa_api': the sparse_gqa backward runs per sequence."
+        )
+    if scale is None:
+        scale = D**-0.5
+    if (
+        bwd_impl == "sparse_gqa"
+        and cu_seqlens is not None
+        and torch.cuda.is_current_stream_capturing()
+    ):
+        raise RuntimeError(
+            "qsa_cudnn_bwd_impl='sparse_gqa' runs one backward per packed document and needs the "
+            "document boundaries on the host, so it cannot be captured into a CUDA graph with "
+            "packed (THD) inputs. Use qsa_cudnn_bwd_impl='qsa_api'."
+        )
+    index_list_args = spans = None
+    if bwd_impl == "sparse_gqa":
+        index_list_args = (block_indices, block_counts, block_offsets, token_offsets)
+        spans = sequence_spans(B, S, cu_seqlens)
+    packed = lambda t: t.reshape(-1, *t.shape[2:]).contiguous()  # noqa: E731
+    if use_ids:
+        fn = CudnnQSAIdsAttnFunction
+        sel = build_index_lists(
+            block_indices, block_counts, block_bases, block_ends, Sk, q_positions, token_offsets
+        )
+    else:
+        fn = CudnnQSAAttnFunction
+        sel = build_miles_metadata(
+            block_indices, block_counts, block_bases, block_ends, block_offsets, token_offsets
+        )
+    out = fn.apply(
+        packed(q), packed(k), packed(v), sel, float(scale), bwd_impl, index_list_args, spans
+    )
+    return out.view(B, S, HQ, out.shape[-1])
+    assert Sk == S and q_positions is None, (
+        "context-parallel cuDNN QSA needs a cuDNN Frontend with cudnn.ops.qsa_forward_ids"
+    )
     if scale is None:
         scale = D**-0.5
     if (

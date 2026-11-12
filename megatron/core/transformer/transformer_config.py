@@ -546,7 +546,8 @@ class TransformerConfig(ModelParallelConfig):
     in-tree CuTe DSL sparse kernels (``qsa_use_sparse_attention=True``). ``cudnn``: the same
     sparse path with cuDNN Frontend's QSA kernels (``cudnn.ops.qsa_forward``; backward chosen by
     ``qsa_cudnn_bwd_impl``); bf16, head dim 256, 24 query / 2 KV or 12 / 1 heads per rank,
-    4-token blocks, SM100/SM103, no context parallelism. None (default) follows
+    4-token blocks, SM100/SM103; allgather context parallelism needs a cuDNN Frontend with the
+    index-list entry points and ``qsa_cudnn_bwd_impl='qsa_api'``. None (default) follows
     ``qsa_use_sparse_attention``; any other value sets it (``dense`` -> False, else True)."""
 
     qsa_dense_when_fits: bool = False
@@ -2368,12 +2369,11 @@ class TransformerConfig(ModelParallelConfig):
                     f"{self.qsa_cudnn_bwd_impl!r}."
                 )
             if self.qsa_attn_backend == "cudnn":
-                if self.context_parallel_size > 1:
+                if self.context_parallel_size > 1 and self.qsa_cudnn_bwd_impl != "qsa_api":
                     raise ValueError(
-                        "qsa_attn_backend='cudnn' does not support context parallelism: "
-                        "cudnn.ops.qsa_forward takes queries and keys in one token space, while "
-                        "QSA CP runs local queries against all-gathered keys. Use "
-                        "qsa_attn_backend='cute'."
+                        "qsa_attn_backend='cudnn' with context parallelism needs "
+                        "qsa_cudnn_bwd_impl='qsa_api': the sparse_gqa backward runs per "
+                        "sequence and cannot take local queries against all-gathered keys."
                     )
             if self.qsa_cp_packing_layout not in ("per_document", "per_sequence"):
                 raise ValueError(

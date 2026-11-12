@@ -3,13 +3,16 @@
 """QSA on cuDNN Frontend (``qsa_attn_backend='cudnn'``, :mod:`ops.cudnn_qsa_attn`).
 
 * The selection translations, exactly and on CPU: the Miles ``[T, NB]`` bitmap metadata
-  admits exactly the keys of the gold mask, and the ``sparse_gqa`` index lists list exactly
-  those keys in the kernel's layout.
+  admits exactly the keys of the gold mask, the per-query block lists of the index-list entry
+  points are exactly cuDNN's compaction of that bitmap (also for a context-parallel subset of
+  the queries), and the ``sparse_gqa`` index lists list exactly those keys in the kernel's
+  layout.
 * Build-time validation: unsupported geometries and combinations fail with their cause.
 * On a Blackwell GPU with a cuDNN Frontend that has the QSA training kernels: the output and
   the q / k / v gradients of both backward implementations against the fp64 gold reference
   of ``test_qsa_cute_attn.py`` and against the in-tree CuTe DSL kernels, and the
-  ``QSASelfAttention`` module against the dense-mask bridge.
+  ``QSASelfAttention`` module against the dense-mask bridge; with the index-list entry points
+  also under allgather context parallelism (CP2 / CP4) against the CuTe DSL backend.
 """
 
 import pytest
@@ -17,6 +20,7 @@ import torch
 
 from megatron.core.transformer.experimental_attention_variant.ops.cudnn_qsa_attn import (
     SPARSE_GQA_WIDTH,
+    build_index_lists,
     build_miles_metadata,
     build_sparse_gqa_index_lists,
     cudnn_qsa_support_error,
@@ -148,6 +152,48 @@ class TestSelectionTranslation:
             assert t.dtype == torch.int32 and t.is_contiguous()
 
     @pytest.mark.parametrize("case", list(CPU_CASES))
+    def test_index_lists_are_the_compacted_bitmap(self, case):
+        c = _selection(**CPU_CASES[case])
+        meta = build_miles_metadata(
+            c["idx"], c["counts"], c["bases"], c["ends"], c["blk_off"], c["tok_off"]
+        )
+        S = c["counts"].shape[1]
+        lists = build_index_lists(
+            c["idx"], c["counts"], c["bases"], c["ends"], S, None, c["tok_off"]
+        )
+        # cudnn.ops.qsa_forward's compaction: ascending ids whose span meets [lo, hi].
+        lo, hi = meta.lo.long()[:, None], meta.hi.long()[:, None]
+        keep = (
+            (meta.sel_blocks != 0)
+            & (meta.block_last.long()[None, :] >= lo)
+            & (meta.block_first.long()[None, :] <= hi)
+            & (lo <= hi)
+        )
+        assert torch.equal(lists.block_counts.long(), keep.sum(1))
+        for t in range(keep.shape[0]):
+            n = int(lists.block_counts[t])
+            assert torch.equal(lists.block_ids[t, :n].long(), keep[t].nonzero().flatten()), t
+        for name in ("lo", "hi", "block_first", "block_last"):
+            assert torch.equal(getattr(lists, name), getattr(meta, name)), name
+        for t in lists:
+            assert t.dtype == torch.int32 and t.is_contiguous()
+
+    @pytest.mark.parametrize("case", ["one_doc", "thd_ragged"])
+    def test_index_lists_of_a_query_subset_are_its_rows(self, case):
+        """Context parallelism: a rank's queries (any subset, at their key positions) against
+        all keys get exactly the rows of the full lists."""
+        c = _selection(**CPU_CASES[case])
+        S = c["counts"].shape[1]
+        args = (c["bases"], c["ends"], S)
+        full = build_index_lists(c["idx"], c["counts"], *args, None, c["tok_off"])
+        rows = torch.randperm(S, generator=torch.Generator().manual_seed(3))[: S // 3]
+        tok_off = None if c["tok_off"] is None else c["tok_off"][rows]
+        part = build_index_lists(c["idx"][:, rows], c["counts"][:, rows], *args, rows, tok_off)
+        for name in ("block_ids", "block_counts", "lo", "hi"):
+            assert torch.equal(getattr(part, name), getattr(full, name)[rows]), name
+        assert torch.equal(part.block_first, full.block_first)
+
+    @pytest.mark.parametrize("case", list(CPU_CASES))
     def test_sparse_gqa_index_lists_list_exactly_the_selected_keys(self, case):
         c = _selection(**CPU_CASES[case])
         lists = build_sparse_gqa_index_lists(c["idx"], c["counts"], c["blk_off"], c["tok_off"])
@@ -266,9 +312,13 @@ class TestConfig:
         with pytest.raises(ValueError, match="qsa_cudnn_bwd_impl"):
             _qsa_config(qsa_attn_backend="cudnn", qsa_cudnn_bwd_impl="fa4")
 
-    def test_cudnn_rejects_context_parallelism(self):
-        with pytest.raises(ValueError, match="does not support context parallelism"):
+    def test_cudnn_context_parallelism_needs_qsa_api(self):
+        with pytest.raises(ValueError, match="needs qsa_cudnn_bwd_impl='qsa_api'"):
             _qsa_config(qsa_attn_backend="cudnn", context_parallel_size=2)
+        cfg = _qsa_config(
+            qsa_attn_backend="cudnn", qsa_cudnn_bwd_impl="qsa_api", context_parallel_size=2
+        )
+        assert cfg.context_parallel_size == 2
 
     def test_sparse_gqa_rejects_thd_cuda_graph_capture(self):
         with pytest.raises(ValueError, match="cannot be captured"):
@@ -473,3 +523,141 @@ class TestCudnnQSAModule:
             err = ((a.float() - b.float()).abs().max() / b.float().abs().max()).item()
             print(f"QSA_CUDNN_MODULE_ERR impl={bwd_impl} {name}={err:.3e}")
             assert err < 2e-2, f"{name}: cudnn vs bridge max rel err {err:.3e}"
+
+
+def _cudnn_qsa_ids_available():
+    if not _cudnn_qsa_available():
+        return False
+    from megatron.core.transformer.experimental_attention_variant.ops.cudnn_qsa_attn import (
+        has_index_list_kernels,
+    )
+
+    return has_index_list_kernels()
+
+
+@pytest.mark.skipif(
+    not _cudnn_qsa_ids_available(),
+    reason="needs an SM100/SM103 GPU and a cuDNN Frontend with cudnn.ops.qsa_forward_ids",
+)
+class TestCudnnQSAContextParallel:
+    """Allgather CP with ``qsa_attn_backend='cudnn'`` (index-list kernels, ``qsa_api``
+    backward): every rank's output and input gradient against the CuTe DSL backend on the
+    same shard and weights, and the output against the cuDNN single-rank run on the full
+    sequence."""
+
+    SEQ = 1024
+    BUDGET = 256  # 64 blocks: sparse at this length
+
+    def teardown_method(self, method):
+        from tests.unit_tests.test_utilities import Utils
+
+        Utils.destroy_model_parallel()
+
+    def _build(self, cp, layout):
+        import megatron.core.parallel_state as ps
+        from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+        from megatron.core.transformer.experimental_attention_variant.qsa_module_specs import (
+            get_qsa_module_spec_for_backend,
+        )
+        from megatron.core.transformer.spec_utils import build_module
+        from tests.unit_tests.test_utilities import Utils
+
+        Utils.initialize_model_parallel(1, 1, context_parallel_size=cp)
+        model_parallel_cuda_manual_seed(123)
+        config = _qsa_config(
+            qsa_attn_backend="cudnn",
+            qsa_cudnn_bwd_impl="qsa_api",
+            qsa_indexer_budget=self.BUDGET,
+            layernorm_epsilon=1e-6,
+            context_parallel_size=cp,
+            cp_comm_type="all_gather",
+            qsa_cp_packing_layout=layout,
+        )
+        attn = build_module(
+            get_qsa_module_spec_for_backend(config), config=config, layer_number=1
+        ).cuda()
+        return config, attn, ps.get_context_parallel_rank()
+
+    @staticmethod
+    def _fwd_bwd(config, attn, backend, shard, freqs, psp):
+        config.qsa_attn_backend = backend
+        attn.zero_grad(set_to_none=True)
+        x = shard.detach().clone().requires_grad_()
+        out, _ = attn(x, attention_mask=None, rotary_pos_emb=freqs, packed_seq_params=psp)
+        out.float().square().mean().backward()
+        return out.detach(), x.grad
+
+    @pytest.mark.parametrize("cp", [2, 4])
+    @pytest.mark.parametrize("case", ["bshd", "per_document", "per_sequence"])
+    def test_cp_matches_cute_and_single_rank(self, case, cp):
+        from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+        from megatron.core.packed_seq_params import PackedSeqParams
+        from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
+            build_packed_allgather_cp_local_positions,
+            build_zigzag_cp_local_positions,
+        )
+        from tests.unit_tests.test_utilities import Utils
+
+        if Utils.world_size < cp:
+            pytest.skip(f"cuDNN QSA CP{cp} needs at least {cp} distributed ranks")
+        layout = "per_document" if case == "bshd" else case
+        config, attn, cp_rank = self._build(cp, layout)
+        rope = RotaryEmbedding(kv_channels=256, rotary_percent=0.25, rotary_base=1e7)
+        g = torch.Generator().manual_seed(29)
+        full = torch.randn(self.SEQ, 1, 256, generator=g).cuda().bfloat16()
+        psp = None
+        if case == "bshd":
+            rows = build_zigzag_cp_local_positions(self.SEQ, cp, cp_rank, full.device)
+            freqs = rope(self.SEQ)
+        else:
+            # per_document: every document divisible by 2 * cp; per_sequence: only the pack.
+            cu_list = [0, 480, self.SEQ] if case == "per_document" else [0, 362, self.SEQ]
+            cu = torch.tensor(cu_list, dtype=torch.int32).cuda()
+            rows = build_packed_allgather_cp_local_positions(
+                cu, cp, cp_rank, full.device, cp_packing_layout=layout
+            )
+            max_len = max(b - a for a, b in zip(cu_list[:-1], cu_list[1:]))
+            psp = PackedSeqParams(
+                qkv_format='thd',
+                cu_seqlens_q=cu,
+                cu_seqlens_kv=cu,
+                max_seqlen_q=max_len,
+                max_seqlen_kv=max_len,
+            )
+            freqs = rope(max_len, packed_seq=True)
+        shard = full.index_select(0, rows).contiguous()
+
+        cudnn = self._fwd_bwd(config, attn, "cudnn", shard, freqs, psp)
+        cute = self._fwd_bwd(config, attn, "cute", shard, freqs, psp)
+        for name, a, b in zip(("out", "dgrad"), cudnn, cute):
+            assert torch.isfinite(a).all(), name
+            err = ((a.float() - b.float()).abs().max() / b.float().abs().max()).item()
+            print(f"QSA_CUDNN_CP_ERR cp={cp} case={case} {name} vs cute={err:.3e}")
+            assert err < 2e-2, f"{name}: cudnn CP{cp} vs cute CP{cp} max rel err {err:.3e}"
+
+        # The cuDNN single-rank run on the full sequence (a size-1 CP group per rank).
+        world = torch.distributed.get_world_size()
+        own = [torch.distributed.new_group([r]) for r in range(world)]
+        own = own[torch.distributed.get_rank()]
+        pg, old_cp = attn.pg_collection, attn.pg_collection.cp
+        config.qsa_attn_backend = "cudnn"
+        pg.cp = own
+        try:
+            with torch.no_grad():
+                ref, _ = attn(
+                    full,
+                    attention_mask=None,
+                    # Under CP the module's rotary table is the local shard's unless packed_seq.
+                    rotary_pos_emb=(
+                        freqs
+                        if psp is not None
+                        else rope(self.SEQ, packed_seq=True)[: self.SEQ].contiguous()
+                    ),
+                    packed_seq_params=psp,
+                )
+        finally:
+            pg.cp = old_cp
+        err = ((cudnn[0].float() - ref.index_select(0, rows).float()).abs().max()).item()
+        err /= ref.float().abs().max().item()
+        print(f"QSA_CUDNN_CP_ERR cp={cp} case={case} out vs single-rank={err:.3e}")
+        assert err < 2e-2, f"cudnn CP{cp} vs cudnn single rank max rel err {err:.3e}"

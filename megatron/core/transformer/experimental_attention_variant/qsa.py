@@ -1004,11 +1004,15 @@ def _require_qsa_cudnn_support(config: TransformerConfig, tp_size: int) -> None:
         cudnn_ops.qsa_forward, cudnn_ops.qsa_backward  # pylint: disable=pointless-statement
         if config.qsa_cudnn_bwd_impl == "sparse_gqa":
             from cudnn.sdpa.bwd import sparse_gqa_bwd_wrapper_sm100  # noqa: F401
+        if config.context_parallel_size > 1:
+            cudnn_ops.qsa_forward_ids, cudnn_ops.qsa_backward_ids  # pylint: disable=W0104
     except (ImportError, AttributeError) as e:
         raise RuntimeError(
             "qsa_attn_backend='cudnn' requires a cuDNN Frontend build with the QSA training "
-            "kernels (cudnn.ops.qsa_forward / qsa_backward, NVIDIA/cudnn-frontend PR #1765) "
-            "and, for qsa_cudnn_bwd_impl='sparse_gqa', cudnn.sdpa.bwd.sparse_gqa_bwd_wrapper_sm100."
+            "kernels (cudnn.ops.qsa_forward / qsa_backward, NVIDIA/cudnn-frontend PR #1765), "
+            "for qsa_cudnn_bwd_impl='sparse_gqa' cudnn.sdpa.bwd.sparse_gqa_bwd_wrapper_sm100, "
+            "and for context parallelism the index-list entry points "
+            "(cudnn.ops.qsa_forward_ids / qsa_backward_ids)."
         ) from e
     num_q_heads = config.num_attention_heads // tp_size
     num_kv_heads = max(1, config.num_query_groups // tp_size)
@@ -1444,6 +1448,7 @@ class QSASelfAttention(SelfAttention):
                 cu_seqlens=cu_seqlens,
                 scale=self.hidden_size_per_attention_head**-0.5,
                 bwd_impl=self.config.qsa_cudnn_bwd_impl,
+                q_positions=selection.q_positions,
             )  # [b, s, np, d_v]
         else:
             core_out = qsa_sparse_attention(
