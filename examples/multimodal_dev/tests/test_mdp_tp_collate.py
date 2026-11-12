@@ -16,7 +16,6 @@ Run with::
 
 import os
 import sys
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -27,7 +26,6 @@ if _REPO_ROOT not in sys.path:
 
 from examples.multimodal_dev.data.mdp_mock import MdpThdMockDataset
 from examples.multimodal_dev.forward_step import pack_or_pad_batch
-from examples.multimodal_dev.models.qwen35_vl.mdp_adapter import build_collate_spec
 from megatron.core import parallel_state
 from megatron.core.mdp import window as mdp_window
 from tests.unit_tests.test_utilities import Utils
@@ -37,8 +35,6 @@ pytestmark = pytest.mark.skipif(
     _WORLD < 2 or _WORLD % 2, reason="needs an even torchrun world for TP=2"
 )
 
-IMAGE_TOKEN_ID = 248056
-SPEC = build_collate_spec(SimpleNamespace(image_token_id=IMAGE_TOKEN_ID))
 SIDECAR_FIELDS = (
     "input_ids",
     "labels",
@@ -66,9 +62,7 @@ def _pack(owner_context=None):
     batch = _multimodal_batch() if is_src else None
     mdp_window._PIXEL_OWNERSHIP.value = owner_context
     try:
-        return pack_or_pad_batch(
-            batch, use_packed_sequence=True, with_vision_sidecar=True, vision_collate_spec=SPEC
-        )
+        return pack_or_pad_batch(batch, use_packed_sequence=True, with_vision_sidecar=True)
     finally:
         mdp_window._PIXEL_OWNERSHIP.value = None
 
