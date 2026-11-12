@@ -62,7 +62,7 @@ from megatron.core.mdp.rank_mapping import MdpRankSpec, build_rank_map
 from megatron.core.mdp.runtime import MdpRuntime
 from megatron.core.mdp.storage import MdpEmbeddingStorage
 from megatron.core.mdp.window import pixel_capture_suppressed
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     model_parallel_cuda_manual_seed,
@@ -97,6 +97,8 @@ if _DISTRIBUTED:
         model_parallel_cuda_manual_seed(1234)
 
 
+# Two decoder blocks: full attention ('*') followed by a dense MLP ('-').
+LAYER_PATTERN = "*-*-"
 HIDDEN = 128
 VOCAB = 128
 SEQ = 64
@@ -125,7 +127,7 @@ def _vision_config(dropout=0.0):
 
 def _language_config(tp=1, sp=False):
     return TransformerConfig(
-        num_layers=2,
+        num_layers=len(LAYER_PATTERN),
         hidden_size=HIDDEN,
         ffn_hidden_size=4 * HIDDEN,
         num_attention_heads=4,
@@ -210,7 +212,8 @@ def _build_language_model(with_encoder, vision_config, tp=1, sp=False):
     model_parallel_cuda_manual_seed(1234)
     model = MultimodalModel(
         language_config=_language_config(tp, sp),
-        language_spec=get_gpt_layer_with_transformer_engine_spec(),
+        hybrid_stack_spec=hybrid_stack_spec,
+        hybrid_layer_pattern=LAYER_PATTERN,
         vision_encoder=encoder,
         vocab_size=VOCAB,
         max_sequence_length=SEQ,
