@@ -226,7 +226,8 @@ def add_multimodal_args(parser):
             "thread and a dedicated side CUDA stream while the current "
             "iteration runs, hiding the serial P1 window-capture cost "
             "without inserting H2D copies into the main compute stream. "
-            "TP=1 only."
+            "TP=1 only (the capture's TP broadcast must not run on the "
+            "prefetch thread)."
         ),
     )
     group.add_argument(

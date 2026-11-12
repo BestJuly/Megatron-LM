@@ -2,7 +2,7 @@
 
 """MDP: co-located, phase-serialized multimodal training.
 
-MDP rebalances vision-encoder work across each decoder replica's ``CP x PP``
+MDP rebalances vision-encoder work across each decoder replica's ``TP x CP x PP``
 worker pool while leaving the native decoder schedule, data ownership, and
 training accounting untouched. See ``megatron/core/mdp/README.md``.
 """
