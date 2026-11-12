@@ -1155,9 +1155,7 @@ class QSASelfAttention(SelfAttention):
             )
 
         if train_indexer and selection is not None:
-            loss_cu_seqlens = (
-                packed_seq_params.cu_seqlens_q if packed_seq_params is not None else None
-            )
+            loss_cu_seqlens = _layout_cu_seqlens(packed_seq_params, "q")
             padding_mask = getattr(packed_seq_params, "padding_mask", None)
             if padding_mask is not None:
                 # Slots added by THD padding are not data: keep their rows out of the KL sum
@@ -1356,7 +1354,7 @@ class QSASelfAttention(SelfAttention):
         cu_seqlens = None
         if packed_seq_params is not None:
             assert packed_seq_params.qkv_format == 'thd', "QSA supports BSHD or packed THD"
-            cu_seqlens = packed_seq_params.cu_seqlens_q
+            cu_seqlens = _layout_cu_seqlens(packed_seq_params, "q")
             # QSA is self-attention only, so q and kv boundaries must coincide. A full
             # torch.equal would force a device sync per layer; check identity/shape and
             # rely on PackedSeqParams construction for element equality.

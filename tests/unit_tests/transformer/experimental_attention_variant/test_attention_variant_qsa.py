@@ -975,6 +975,57 @@ class TestQSAContextParallel:
         for name in base[2]:
             assert torch.equal(base[2][name], ovl[2][name]), f"overlap changed grad of {name}"
 
+    def test_cp2_thd_padded_boundaries_drive_the_layout(self):
+        """With per-document alignment padding the shards follow cu_seqlens_q_padded while
+        cu_seqlens_q holds the logical lengths; QSA must use the physical boundaries (the
+        logical ones mismatch the sharded token count and index past the rotary table)."""
+        if Utils.world_size < 2:
+            pytest.skip("QSA CP2 parity requires at least 2 distributed ranks")
+        from megatron.core.packed_seq_params import PackedSeqParams
+        from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
+            build_packed_allgather_cp_local_positions,
+        )
+
+        config, attn, cp_rank = self._build("per_document")
+        logical = [0, 117, 297]  # real document lengths 117 and 180
+        physical = [0, 120, 300]  # each padded to a multiple of 2 * cp
+        g = torch.Generator().manual_seed(31)
+        full = torch.randn(physical[-1], 1, HIDDEN, generator=g).cuda().bfloat16()
+        cu_p = torch.tensor(physical, dtype=torch.int32).cuda()
+        cu_l = torch.tensor(logical, dtype=torch.int32).cuda()
+        rows = build_packed_allgather_cp_local_positions(
+            cu_p, 2, cp_rank, full.device, cp_packing_layout="per_document"
+        )
+        shard = full.index_select(0, rows).contiguous()
+        rope = RotaryEmbedding(
+            kv_channels=SPARSE_HEAD_DIM, rotary_percent=ROTARY_PERCENT, rotary_base=ROPE_THETA
+        )
+        freqs = rope(180, packed_seq=True)
+        both = PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=cu_l,
+            cu_seqlens_kv=cu_l,
+            cu_seqlens_q_padded=cu_p,
+            cu_seqlens_kv_padded=cu_p,
+            max_seqlen_q=180,
+            max_seqlen_kv=180,
+        )
+        physical_only = PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=cu_p,
+            cu_seqlens_kv=cu_p,
+            max_seqlen_q=180,
+            max_seqlen_kv=180,
+        )
+        with torch.no_grad():
+            out_both, _ = attn(
+                shard, attention_mask=None, rotary_pos_emb=freqs, packed_seq_params=both
+            )
+            out_phys, _ = attn(
+                shard, attention_mask=None, rotary_pos_emb=freqs, packed_seq_params=physical_only
+            )
+        assert torch.equal(out_both, out_phys)
+
     def test_cp2_kl_trains_indexer(self):
         if Utils.world_size < 2:
             pytest.skip("QSA CP2 parity requires at least 2 distributed ranks")
