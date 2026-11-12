@@ -454,7 +454,10 @@ def qsa_select_topk_keys(
 # the entries. The outputs are bit-identical to the sort-based builders in triton_qsa.py.
 # ---------------------------------------------------------------------------
 
-_META_CH = 1024  # columns per compaction step
+_META_CH = 1024  # columns per count step
+# Columns per compaction step: empty chunks skip their stores, so a narrower chunk skips more of
+# a sparse row (and its stores are narrower) at the price of more loop iterations.
+_META_COMPACT_CH = 1024
 
 
 @triton.jit
@@ -463,6 +466,7 @@ def _qsa_meta_scatter_kernel(
     block_counts,  # [b, s]
     M,  # [b * n_tiles, ldm] uint8 (DO_SS)
     ss_counts,  # [b * n_tiles] int64 (DO_SS)
+    ss_hi,  # [b * n_tiles] int32 (DO_SS): one past the tile's largest selected block id
     P,  # [b * NT, s] int32 (DO_KV)
     s,
     S,
@@ -488,6 +492,7 @@ def _qsa_meta_scatter_kernel(
     tile = pid % n_tiles
     j = tl.arange(0, SP)
     mrow = M + lpid.to(tl.int64) * ldm
+    mx = tl.max(j, axis=0) * 0 - 1  # int32 scalar -1
     for qq in tl.static_range(BQ):
         t = tile * BQ + qq
         rv = t < s
@@ -499,6 +504,7 @@ def _qsa_meta_scatter_kernel(
             v = tl.load(mrow + ids, mask=m, other=0)
             tl.store(mrow + ids, (v | (1 << qq)).to(M.dtype.element_ty), mask=m)
             tl.debug_barrier()
+            mx = tl.maximum(mx, tl.max(tl.where(m, ids, -1), axis=0))
         if DO_KV:
             kt = (bi * NT + ids // KB).to(tl.int64)
             mk = m & (kt >= kt0) & (kt < kt1)
@@ -506,8 +512,12 @@ def _qsa_meta_scatter_kernel(
                 P + (kt - kt0) * s + t, (1 << (ids % KB)).to(tl.int32), mask=mk, sem="relaxed"
             )
     if DO_SS:
+        # Nothing is set past the largest selected id (causal selections stop at the tile's own
+        # block): count, and later compact, only [0, hi).
+        hi = tl.minimum(mx + 1, ncols)
+        tl.store(ss_hi + lpid, hi)
         acc = tl.zeros([CH], dtype=tl.int32)
-        for c0 in range(0, ncols, CH):
+        for c0 in range(0, hi, CH):
             c = c0 + tl.arange(0, CH)
             mv = tl.load(mrow + c, mask=c < ncols, other=0)
             acc += (mv != 0).to(tl.int32)
@@ -529,6 +539,7 @@ def _qsa_row_count_kernel(X, counts, ncols, ld, CH: tl.constexpr):
 @triton.jit
 def _qsa_ss_compact_kernel(
     M,
+    ss_hi,
     tile_offsets,
     block_bases,
     block_ends,
@@ -544,17 +555,28 @@ def _qsa_ss_compact_kernel(
     base = M + r.to(tl.int64) * ldm
     off = tl.load(tile_offsets + r)
     run = off * 0
-    for c0 in range(0, ncols, CH):
+    hi = tl.load(ss_hi + r)
+    for c0 in range(0, hi, CH):
         c = c0 + tl.arange(0, CH)
         v = tl.load(base + c, mask=c < ncols, other=0)
         nz = v != 0
         nz_i = nz.to(tl.int32)
-        pos = off + run + (tl.cumsum(nz_i, 0) - nz_i).to(tl.int64)
-        tl.store(entry_base + pos, tl.load(block_bases + c, mask=nz, other=0).to(tl.int32), mask=nz)
-        tl.store(entry_end + pos, tl.load(block_ends + c, mask=nz, other=0).to(tl.int32), mask=nz)
-        for qq in tl.static_range(BQ):
-            tl.store(membership + pos * BQ + qq, ((v >> qq) & 1).to(tl.uint8), mask=nz)
-        run += tl.sum(nz_i, axis=0).to(tl.int64)
+        n = tl.sum(nz_i, axis=0)
+        # Most chunks of the dense row are empty (a tile's union is a few thousand of up to
+        # hundreds of thousands of blocks): skip their 2 + BQ masked stores.
+        if n > 0:
+            pos = off + run + (tl.cumsum(nz_i, 0) - nz_i).to(tl.int64)
+            tl.store(
+                entry_base + pos, tl.load(block_bases + c, mask=nz, other=0).to(tl.int32), mask=nz
+            )
+            tl.store(
+                entry_end + pos, tl.load(block_ends + c, mask=nz, other=0).to(tl.int32), mask=nz
+            )
+            for qq in tl.static_range(BQ):
+                tl.store(membership + pos * BQ + qq, ((v >> qq) & 1).to(tl.uint8), mask=nz)
+            # leave the row clear for the next band (replaces a full memset per band)
+            tl.store(base + c, tl.zeros([CH], dtype=M.dtype.element_ty), mask=c < ncols)
+        run += n.to(tl.int64)
 
 
 @triton.jit
@@ -568,10 +590,12 @@ def _qsa_kv_compact_kernel(P, tile_offsets, entry_query, entry_bits, s, CH: tl.c
         v = tl.load(base + c, mask=c < s, other=0)
         nz = v != 0
         nz_i = nz.to(tl.int32)
-        pos = off + run + (tl.cumsum(nz_i, 0) - nz_i).to(tl.int64)
-        tl.store(entry_query + pos, c, mask=nz)
-        tl.store(entry_bits + pos, v, mask=nz)
-        run += tl.sum(nz_i, axis=0).to(tl.int64)
+        n = tl.sum(nz_i, axis=0)
+        if n > 0:  # skip the stores of empty chunks
+            pos = off + run + (tl.cumsum(nz_i, 0) - nz_i).to(tl.int64)
+            tl.store(entry_query + pos, c, mask=nz)
+            tl.store(entry_bits + pos, v, mask=nz)
+        run += n.to(tl.int64)
 
 
 # Scratch cap of the chunked builds: the dense [tiles, num_blocks] superset bitmask and the
@@ -608,8 +632,10 @@ def qsa_build_supersets_fused(
     assert BQ <= 30, "superset query bitmask is an int32"
     m_dtype = torch.uint8 if BQ <= 8 else torch.int32
     rows = _chunk_rows(n_flat, ldm * torch.empty((), dtype=m_dtype).element_size())
-    M = torch.empty(rows, ldm, dtype=m_dtype, device=device)
+    # Zeroed once: every band's compaction clears what the band's scatter set.
+    M = torch.zeros(rows, ldm, dtype=m_dtype, device=device)
     counts = torch.empty(rows, dtype=torch.long, device=device)
+    hi = torch.empty(rows, dtype=torch.int32, device=device)
     tile_offsets = torch.zeros(n_flat + 1, dtype=torch.long, device=device)
     entry_base = torch.zeros(e_cap, dtype=torch.int32, device=device)
     entry_end = torch.zeros(e_cap, dtype=torch.int32, device=device)
@@ -619,13 +645,13 @@ def qsa_build_supersets_fused(
     bases, ends = block_bases.contiguous(), block_ends.contiguous()
     for r0 in range(0, n_flat, rows):
         n = min(rows, n_flat - r0)
-        M[:n].zero_()
         _qsa_meta_scatter_kernel[(n,)](
             bi,
             bc,
             M,
             counts,
-            counts,
+            hi,
+            hi,
             s,
             S,
             n_tiles,
@@ -647,6 +673,7 @@ def qsa_build_supersets_fused(
         tile_offsets[r0 + 1 : r0 + n + 1] += tile_offsets[r0]
         _qsa_ss_compact_kernel[(n,)](
             M,
+            hi,
             tile_offsets[r0:],
             bases,
             ends,
@@ -656,7 +683,7 @@ def qsa_build_supersets_fused(
             num_blocks,
             ldm,
             BQ=BQ,
-            CH=_META_CH,
+            CH=_META_COMPACT_CH,
             num_warps=4,
         )
     return tile_offsets, entry_base, entry_end, membership, n_tiles, e_cap
@@ -692,6 +719,7 @@ def qsa_build_kv_tile_csr_fused(block_indices, block_counts, num_blocks, tile_bl
                 P,
                 P,
                 P,
+                P,
                 s,
                 S,
                 n_qt,
@@ -713,6 +741,6 @@ def qsa_build_kv_tile_csr_fused(block_indices, block_counts, num_blocks, tile_bl
         torch.cumsum(counts[:nr], 0, out=tile_offsets[r0 + 1 : r0 + nr + 1])
         tile_offsets[r0 + 1 : r0 + nr + 1] += tile_offsets[r0]
         _qsa_kv_compact_kernel[(nr,)](
-            P, tile_offsets[r0:], entry_query, entry_bits, s, CH=_META_CH, num_warps=4
+            P, tile_offsets[r0:], entry_query, entry_bits, s, CH=_META_COMPACT_CH, num_warps=4
         )
     return tile_offsets, entry_query, entry_bits, NT
