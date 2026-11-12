@@ -181,6 +181,41 @@ def qsa_cute_dq(q, k, v, o, do, lse, q_pos, ss: tq.QSASupersets, scale: float, t
     return dq, delta
 
 
+def _compiled_delta(dtype: torch.dtype, D: int):
+    key = ("delta", dtype, D)
+    fn = _COMPILED.get(key)
+    if fn is None:
+        import cutlass
+        import cutlass.cute as cute
+
+        from megatron.core.transformer.experimental_attention_variant.ops.cute_qsa_attn_kernels import (  # pylint: disable=line-too-long
+            QSADeltaSm100,
+        )
+
+        cdt = _cutlass_dtype(dtype)
+        kernel = QSADeltaSm100(D)
+        args = [
+            _fake(cdt, 4, D, 8, 16),  # o
+            _fake(cdt, 4, D, 8, 16),  # do
+            _fake(cutlass.Float32, 1),  # delta (out, flat)
+            cutlass.Int32(1),
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        ]
+        fn = cute.compile(kernel, *args, options="--enable-tvm-ffi")
+        _COMPILED[key] = fn
+    return fn
+
+
+def qsa_cute_delta(o, do):
+    """``delta = rowsum(o * do)`` (fp32 ``[B, TQ, HQ]``), bit-identical to the dq kernel's."""
+    B, TQ, HQ, D = o.shape
+    delta = torch.empty(B, TQ, HQ, dtype=torch.float32, device=o.device)
+    n_rows = B * TQ * HQ
+    if n_rows > 0:
+        _compiled_delta(o.dtype, D)(o, do, delta.view(-1), n_rows)
+    return delta
+
+
 def _compiled_dkv(dtype: torch.dtype, D: int, G: int):
     key = ("dkv", dtype, D, G)
     fn = _COMPILED.get(key)
@@ -311,6 +346,82 @@ class QSASparseAttnFunction(torch.autograd.Function):
         return dq, dk, dv, None, None, None, None, None, None, None
 
 
+def _to_rank_major(g, reorder):
+    """``[b, S, H, D]`` grads of the globally ordered keys -> ``[S, b, H, D]`` in the CP
+    gather's rank-major order: ``index_select(0, reorder)``'s backward (index_add into zeros)."""
+    g_sb = g.permute(1, 0, 2, 3)
+    return torch.zeros(g_sb.shape, dtype=g.dtype, device=g.device).index_add_(0, reorder, g_sb)
+
+
+class QSASparseAttnCPOverlapFunction(torch.autograd.Function):
+    """Allgather-CP sparse attention whose K/V reduce-scatter overlaps the dq kernel.
+
+    Inputs are this rank's (RoPE'd) ``k_local`` / ``v_local`` ``[s_local, b, H, D]``, which
+    receive the gradient, plus the already gathered, globally ordered ``k_full`` / ``v_full``
+    ``[b, S, H, D]`` (no grad; the caller overlapped their all-gather with the indexer). The
+    gradient path is the same arithmetic as ``gather -> index_select(reorder) -> permute ->
+    attention``: dk/dv of the global keys are scattered back to the rank-major gather order
+    (``index_add`` into zeros, as ``index_select``'s backward) and reduce-scattered over the CP
+    group. Only the order changes: delta is computed standalone (bit-identical to the dq
+    kernel's), dk/dv run first, their reduce-scatters are launched asynchronously, and the dq
+    kernel runs while they are in flight.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k_local,
+        v_local,
+        k_full,
+        v_full,
+        reorder,
+        cp_group,
+        q_pos,
+        ss,
+        kv_csr,
+        block_bases,
+        block_ends,
+        scale,
+        bq,
+    ):
+        """Sparse attention forward against the gathered K/V."""
+        o, lse = qsa_cute_fwd(q, k_full, v_full, q_pos, ss, scale, bq)
+        ctx.save_for_backward(q, k_full, v_full, o, lse, q_pos, block_bases, block_ends, reorder)
+        ctx.ss = ss
+        ctx.kv_csr = kv_csr
+        ctx.scale = scale
+        ctx.bq = bq
+        ctx.cp_group = cp_group
+        return o
+
+    @staticmethod
+    def backward(ctx, do):
+        """delta -> dk/dv -> async reduce-scatter(dk, dv) || dq -> wait."""
+        from megatron.core.tensor_parallel.mappings import async_reduce_scatter_along_first_dim
+
+        q, k, v, o, lse, q_pos, block_bases, block_ends, reorder = ctx.saved_tensors
+        do = do.contiguous()
+        delta = qsa_cute_delta(o, do)
+        dk, dv = qsa_cute_dkv(
+            q, k, v, lse, delta, do, q_pos, ctx.kv_csr, block_bases, block_ends, ctx.scale
+        )
+        handles = [
+            async_reduce_scatter_along_first_dim(
+                _to_rank_major(dk, reorder), group=ctx.cp_group
+            ),
+            None,
+        ]
+        del dk  # the handle holds the rank-major copy until the reduce-scatter completes
+        handles[1] = async_reduce_scatter_along_first_dim(
+            _to_rank_major(dv, reorder), group=ctx.cp_group
+        )
+        del dv
+        dq, _ = qsa_cute_dq(q, k, v, o, do, lse, q_pos, ctx.ss, ctx.scale, ctx.bq)
+        dk_local, dv_local = (h.wait() for h in handles)
+        return (dq, dk_local, dv_local) + (None,) * 11
+
+
 # The sort-free superset builder packs a tile's query bits into an int32 (tile_queries <= 30).
 _FUSED_SUPERSET_MAX_BQ = 30
 
@@ -336,6 +447,7 @@ def qsa_sparse_attention(
     scale: Optional[float] = None,
     q_positions: Optional[torch.Tensor] = None,
     static_shapes: bool = False,
+    cp_overlap: Optional[tuple] = None,
 ) -> torch.Tensor:
     """Sparse GQA attention over per-query selected 4-token blocks.
 
@@ -356,6 +468,12 @@ def qsa_sparse_attention(
         static_shapes: build the superset / CSR structures at shape-only upper bounds
             without host synchronization (CUDA-graph capturable). Results are
             bit-identical to the default builders.
+        cp_overlap: allgather-CP overlap mode, ``(k_local, v_local, reorder, cp_group)``.
+            ``k`` / ``v`` are then the already gathered global K/V (no grad) and the
+            gradient flows to ``k_local`` / ``v_local`` ``[s_local, b, H, D]`` through a
+            reduce-scatter that overlaps the dq kernel (see
+            :class:`QSASparseAttnCPOverlapFunction`). Bit-identical to gathering inside
+            autograd.
     """
     if scale is None:
         scale = k.shape[-1] ** -0.5
@@ -370,10 +488,35 @@ def qsa_sparse_attention(
     ss = _superset_builder(static_shapes, bq)(
         block_indices, block_counts, block_bases, block_ends, num_blocks, bq
     )
-    needs_grad = torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad)
+    if cp_overlap is not None:
+        k_local, v_local, reorder, cp_group = cp_overlap
+        needs_grad = torch.is_grad_enabled() and (
+            q.requires_grad or k_local.requires_grad or v_local.requires_grad
+        )
+    else:
+        needs_grad = torch.is_grad_enabled() and (
+            q.requires_grad or k.requires_grad or v.requires_grad
+        )
     kv_csr = None
     if needs_grad:
         kv_csr = tq.build_qsa_kv_tile_csr(block_indices, block_counts, num_blocks, DKV_TILE_BLOCKS)
+    if cp_overlap is not None:
+        return QSASparseAttnCPOverlapFunction.apply(
+            q.contiguous(),
+            k_local,
+            v_local,
+            k.contiguous(),
+            v.contiguous(),
+            reorder,
+            cp_group,
+            q_positions.contiguous(),
+            ss,
+            kv_csr,
+            block_bases.contiguous(),
+            block_ends.contiguous(),
+            scale,
+            bq,
+        )
     return QSASparseAttnFunction.apply(
         q.contiguous(),
         k.contiguous(),

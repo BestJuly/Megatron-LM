@@ -36,7 +36,10 @@ from torch import Tensor
 from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
+from megatron.core.tensor_parallel.mappings import (
+    async_gather_from_sequence_parallel_region,
+    gather_from_sequence_parallel_region,
+)
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.cuda_graph_config import cuda_graph_captures_attention
 from megatron.core.transformer.enums import AttnMaskType
@@ -120,6 +123,21 @@ class QSASelection(NamedTuple):
     # once per selection and reused by every K/V gather of the layer (attention and
     # the KL teacher).
     cp_key_reorder: Optional[Tensor] = None  # [s_global] int64
+
+
+class _CPSelectState(NamedTuple):
+    """In-flight allgather-CP selection between :meth:`QSAIndexer._select_cp_begin` and
+    :meth:`QSAIndexer._select_cp_finish`."""
+
+    q_all: Tensor
+    raw_keys: Tensor
+    rotary_pos_emb: Tensor
+    cu_seqlens: Optional[Tensor]
+    q_positions: Tensor
+    key_reorder: Tensor
+    gather: object  # gathered raw index keys (Tensor) or an async handle with wait()
+    doc_idx: Optional[Tensor]
+    token_offsets: Optional[Tensor]
 
 
 @dataclass
@@ -597,15 +615,63 @@ class QSAIndexer(MegatronModule):
         ``[S // r + n_docs]`` attention-block buffers, exactly like
         :meth:`_select_thd_static`, so the layer is CUDA-graph capturable under CP.
         """
+        return self._select_cp_finish(
+            self._select_cp_begin(hidden_states, rotary_pos_emb, cu_seqlens, async_gather=False)
+        )
+
+    def _select_cp_begin(
+        self,
+        hidden_states: Tensor,
+        rotary_pos_emb: Tensor,
+        cu_seqlens: Optional[Tensor] = None,
+        async_gather: bool = False,
+    ) -> "_CPSelectState":
+        """First half of :meth:`_select_cp`: project, build the CP layout and issue the
+        raw index-key all-gather (asynchronously when ``async_gather``, so the caller can
+        run independent work -- the main QKV projection -- while it is in flight).
+
+        The returned state also carries each local row's document start (packed THD), so
+        the main attention can apply RoPE before the selection exists."""
+        cp_group = self.pg_collection.cp
+        q_all, raw_keys = self._project(hidden_states, rotary_pos_emb)
+        s_loc = q_all.shape[0]
+        device = q_all.device
+
+        q_pos, reorder = self._cp_layout(s_loc, cu_seqlens, device)
+        if async_gather:
+            gather = async_gather_from_sequence_parallel_region(raw_keys, group=cp_group)
+        else:
+            gather = gather_from_sequence_parallel_region(raw_keys, group=cp_group)
+        doc_idx = doc_start = None
+        if cu_seqlens is not None:
+            cu = cu_seqlens.to(device=device, dtype=torch.int64)
+            # Positions restart per document; map each local row to its document.
+            doc_idx = torch.searchsorted(cu, q_pos, right=True) - 1
+            doc_start = cu[doc_idx]
+        return _CPSelectState(
+            q_all=q_all,
+            raw_keys=raw_keys,
+            rotary_pos_emb=rotary_pos_emb,
+            cu_seqlens=cu_seqlens,
+            q_positions=q_pos,
+            key_reorder=reorder,
+            gather=gather,
+            doc_idx=doc_idx,
+            token_offsets=doc_start,
+        )
+
+    def _select_cp_finish(self, state: "_CPSelectState") -> QSASelection:
+        """Second half of :meth:`_select_cp`: wait for the index keys, pool, score, top-k."""
         cp_group = self.pg_collection.cp
         cp_size = cp_group.size()
-        q_all, raw_keys = self._project(hidden_states, rotary_pos_emb)
+        q_all, raw_keys = state.q_all, state.raw_keys
+        rotary_pos_emb, cu_seqlens = state.rotary_pos_emb, state.cu_seqlens
         s_loc, b = q_all.shape[0], q_all.shape[1]
         r = self.compress_ratio
         device = q_all.device
 
-        q_pos, reorder = self._cp_layout(s_loc, cu_seqlens, device)
-        gathered = gather_from_sequence_parallel_region(raw_keys, group=cp_group)
+        q_pos, reorder = state.q_positions, state.key_reorder
+        gathered = state.gather if isinstance(state.gather, Tensor) else state.gather.wait()
         global_keys = gathered.index_select(0, reorder)  # [S_g, b, d] global order
 
         if cu_seqlens is None:
@@ -651,9 +717,7 @@ class QSAIndexer(MegatronModule):
         cu = cu_seqlens.to(device=device, dtype=torch.int64)
         n_docs = cu.numel() - 1
         lens = cu[1:] - cu[:-1]
-        # Positions restart per document; map each local row to its document.
-        doc_idx = torch.searchsorted(cu, q_pos, right=True) - 1
-        doc_start = cu[doc_idx]
+        doc_idx, doc_start = state.doc_idx, state.token_offsets
         pos_doc = q_pos - doc_start
         m_t = (pos_doc + 1) // r
         q_rot = self._rope_at_positions(q_all, rotary_pos_emb, pos_doc)
@@ -756,6 +820,12 @@ class QSAIndexer(MegatronModule):
 
     @torch.no_grad()
     @nvtx_decorator(message="QSA::indexer.topk")
+    def _autotune_sync_group(self):
+        """Ranks that must run identical score-kernel configs: the CP group (the next
+        collective after selection is the CP K/V all-gather), else None."""
+        cp = self.pg_collection.cp
+        return cp if cp is not None and cp.size() > 1 else None
+
     def _streaming_topk(
         self,
         q: Tensor,
@@ -812,6 +882,8 @@ class QSAIndexer(MegatronModule):
                         k,
                         m_lo=m_lo,
                         impl="auto",
+                        score_precision=self.config.qsa_indexer_score_precision,
+                        autotune_sync_group=self._autotune_sync_group(),
                     )
                     for bi in range(b)
                 ]
@@ -1105,6 +1177,16 @@ class QSASelfAttention(SelfAttention):
             )
         return output, bias
 
+    def _project_qkv(self, hidden_states):
+        """Main QKV projection -> ``(query, key, value, gate or None)``."""
+        qkv = self.get_query_key_value_tensors(
+            hidden_states, None, split_qkv=True, output_gate=self.config.attention_output_gate
+        )
+        if self.config.attention_output_gate:
+            return qkv
+        query, key, value = qkv
+        return query, key, value, None
+
     @nvtx_decorator(message="QSA::rope_qk")
     def _rope_qk(self, query, key, freqs, cu_seqlens):
         """Apply the main-attention partial RoPE to q/k ([s, b, h, d] layout).
@@ -1145,8 +1227,14 @@ class QSASelfAttention(SelfAttention):
         THD: ``freqs`` is a full table — index it at the per-document positions of
         this rank's rows. BSHD: ``freqs`` is already the rank's zigzag slice and
         applies to the local rows directly."""
-        if selection.token_offsets is not None:  # THD: positions restart per document
-            pos = selection.q_positions - selection.token_offsets
+        return self._rope_qk_cp_at(
+            query, key, freqs, selection.q_positions, selection.token_offsets
+        )
+
+    def _rope_qk_cp_at(self, query, key, freqs, q_positions, token_offsets):
+        """:meth:`_rope_qk_cp` from the layout alone (no selection needed)."""
+        if token_offsets is not None:  # THD: positions restart per document
+            pos = q_positions - token_offsets
             f = freqs.index_select(0, pos).contiguous()
         else:
             f = freqs[: query.shape[0]]
@@ -1279,25 +1367,51 @@ class QSASelfAttention(SelfAttention):
 
         # THD inputs arrive as [t, 1, h]; SelfAttention would squeeze them later, we
         # keep the [s, b, ...] convention throughout and reshape for the kernel.
-        selection = self.indexer.select(hidden_states, freqs, cu_seqlens=cu_seqlens)
-
-        qkv = self.get_query_key_value_tensors(
-            hidden_states, None, split_qkv=True, output_gate=self.config.attention_output_gate
-        )
-        if self.config.attention_output_gate:
-            query, key, value, gate = qkv
-        else:
-            query, key, value = qkv
-            gate = None
         cp_size = self.pg_collection.cp.size() if self.pg_collection.cp is not None else 1
-        if cp_size > 1:
-            # Allgather CP: RoPE locally at the shard's true positions, then gather
-            # K/V into global order. The gather is differentiable (backward =
-            # reduce-scatter), so dk/dv flow back to every rank's projections.
-            query, key = self._rope_qk_cp(query, key, freqs, selection)
-            key, value = self._cp_gather_kv([key, value], selection)
+        overlap = cp_size > 1 and self.config.qsa_cp_comm_overlap
+        cp_overlap = None
+        if overlap:
+            # Communication/compute overlap (same arithmetic, reordered issue):
+            #   index-key all-gather   || main QKV projection + RoPE
+            #   K/V all-gather          || indexer pooling, scoring and top-k
+            #   dk/dv reduce-scatter    || dq kernel (backward, in the attention function)
+            # All collectives use the CP group in issue order, so no second communicator.
+            cp_group = self.pg_collection.cp
+            state = self.indexer._select_cp_begin(
+                hidden_states, freqs, cu_seqlens=cu_seqlens, async_gather=True
+            )
+            query, key, value, gate = self._project_qkv(hidden_states)
+            query, key = self._rope_qk_cp_at(
+                query, key, freqs, state.q_positions, state.token_offsets
+            )
+            with torch.no_grad():
+                k_handle = async_gather_from_sequence_parallel_region(
+                    key.detach(), group=cp_group
+                )
+                v_handle = async_gather_from_sequence_parallel_region(
+                    value.detach(), group=cp_group
+                )
+            selection = self.indexer._select_cp_finish(state)
+            del state  # releases the rank-major index-key gather buffer
+            reorder = selection.cp_key_reorder
+            cp_overlap = (key, value, reorder, cp_group)
+            # Drop each rank-major gather buffer as soon as it is reordered (the handles
+            # would otherwise keep them alive through the attention kernels).
+            key = k_handle.wait().index_select(0, reorder)
+            del k_handle
+            value = v_handle.wait().index_select(0, reorder)
+            del v_handle
         else:
-            query, key = self._rope_qk(query, key, freqs, cu_seqlens)
+            selection = self.indexer.select(hidden_states, freqs, cu_seqlens=cu_seqlens)
+            query, key, value, gate = self._project_qkv(hidden_states)
+            if cp_size > 1:
+                # Allgather CP: RoPE locally at the shard's true positions, then gather
+                # K/V into global order. The gather is differentiable (backward =
+                # reduce-scatter), so dk/dv flow back to every rank's projections.
+                query, key = self._rope_qk_cp(query, key, freqs, selection)
+                key, value = self._cp_gather_kv([key, value], selection)
+            else:
+                query, key = self._rope_qk(query, key, freqs, cu_seqlens)
 
         s, b, np_local, d = query.shape
         q_bt = query.permute(1, 0, 2, 3)
@@ -1345,6 +1459,7 @@ class QSASelfAttention(SelfAttention):
                 scale=self.hidden_size_per_attention_head**-0.5,
                 q_positions=selection.q_positions,
                 static_shapes=self.indexer.static_shapes,
+                cp_overlap=cp_overlap,
             )  # [b, s, np, d_v]
         core_out = core_out.reshape(b, s, np_local * core_out.shape[-1]).permute(1, 0, 2)
 

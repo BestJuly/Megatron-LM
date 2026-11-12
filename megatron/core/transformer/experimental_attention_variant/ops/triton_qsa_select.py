@@ -101,7 +101,7 @@ _MAX_ID_CODE = (1 << ID_BITS) - 1
         for bkk in [8, 16, 32]
         for w in [4, 8]
     ],
-    key=['NH', 'DI', 'HAS_LO'],
+    key=['NH', 'DI', 'HAS_LO', 'PREC'],
 )
 @triton.jit
 def _qsa_select_score_kernel(
@@ -120,6 +120,7 @@ def _qsa_select_score_kernel(
     BN: tl.constexpr,
     BK: tl.constexpr,
     HAS_LO: tl.constexpr,
+    PREC: tl.constexpr = 0,  # 0: fp32 IEEE FMA (bit-exact reference), 1: TF32 tensor cores
 ):
     i_m, i_n = tl.program_id(0), tl.program_id(1)
     o_m = i_m * BM + tl.arange(0, BM)
@@ -152,7 +153,10 @@ def _qsa_select_score_kernel(
             b_k = tl.load(
                 bk + o_n[None, :] * DI + d0 + o_k[:, None], mask=m_n[None, :], other=0.0
             ).to(tl.float32)
-            b_s = tl.dot(b_q, b_k, b_s, input_precision="ieee")
+            if PREC == 1:
+                b_s = tl.dot(b_q, b_k, b_s, input_precision="tf32")
+            else:
+                b_s = tl.dot(b_q, b_k, b_s, input_precision="ieee")
         b_acc += tl.maximum(b_s, 0.0)
     score = b_acc * scale
     vis = (o_n[None, :] < mt[:, None]) & (o_n[None, :] >= lo[:, None]) & m_m[:, None]
@@ -310,6 +314,44 @@ def _cudnn_kth_bits(buf, n_vis, k):
     return vals.amin(dim=-1).view(torch.int32).contiguous()
 
 
+
+_AUTOTUNE_SYNCED = set()
+
+
+def _sync_autotune_choice(kernel, group) -> None:
+    """Make an autotuned kernel's cached choices identical across ``group``.
+
+    Triton autotunes independently on every rank; benchmark noise can pick different configs
+    per rank (measured on H100 CP8: rank 0's score kernel 1.43 s vs 1.08 s on the other ranks
+    for the same work), and the faster ranks then wait inside the next collective. After a
+    new tuning key appears, every rank adopts group rank 0's choice. All ranks of the group
+    reach a new key together (the key depends on static shapes only), so the one-time
+    broadcast is safe; already-synced keys cost nothing.
+    """
+    import torch.distributed as dist
+
+    if group is None or not dist.is_initialized() or dist.get_world_size(group) == 1:
+        return
+    cache = getattr(kernel, "cache", None)
+    configs = getattr(kernel, "configs", None)
+    if not cache or not configs:
+        return
+    gid = id(group)
+    for key, cfg in list(cache.items()):
+        if (gid, key) in _AUTOTUNE_SYNCED:
+            continue
+        idx = next(
+            (i for i, c in enumerate(configs) if c is cfg or c.all_kwargs() == cfg.all_kwargs()),
+            -1,
+        )
+        t = torch.tensor([idx], dtype=torch.int64, device="cuda")
+        dist.broadcast(t, src=dist.get_global_rank(group, 0), group=group)
+        src_idx = int(t.item())
+        if src_idx >= 0:
+            cache[key] = configs[src_idx]
+        _AUTOTUNE_SYNCED.add((gid, key))
+
+
 def qsa_select_topk_keys(
     q: torch.Tensor,  # [s, NH, DI] (one batch row)
     block_keys: torch.Tensor,  # [n_blocks, DI]
@@ -317,11 +359,19 @@ def qsa_select_topk_keys(
     k: int,
     m_lo=None,  # [s] or None
     impl: str = "auto",
+    score_precision: str = "fp32",
+    autotune_sync_group=None,
 ) -> torch.Tensor:
     """Top-k int64 keys ``[s, k]`` (descending), bit-identical to the opt2 chunked
     ``torch.topk`` merge (kept as the test oracle in ``qsa_reference.py``). ``impl``:
-    ``"triton"`` radix select, ``"cudnn"`` FE k-th value, or ``"auto"`` (by static width)."""
+    ``"triton"`` radix select, ``"cudnn"`` FE k-th value, or ``"auto"`` (by static width).
+
+    ``score_precision``: ``"fp32"`` (IEEE, bit-exact with the reference) or ``"tf32"``
+    (tensor cores). ``autotune_sync_group``: when given, the score kernel's autotune choice
+    is made identical on every rank of the group (rank 0's pick, broadcast once per tuning
+    key) so no rank runs a slower config and stalls the group's next collective."""
     assert impl in ("triton", "cudnn", "auto"), impl
+    prec = {"fp32": 0, "tf32": 1}[score_precision]
     s, NH, DI = q.shape
     nb = block_keys.shape[0]
     if impl == "auto":
@@ -360,7 +410,10 @@ def qsa_select_topk_keys(
             NH=NH,
             DI=DI,
             HAS_LO=has_lo,
+            PREC=prec,
         )
+        if r0 == 0 and autotune_sync_group is not None:
+            _sync_autotune_choice(_qsa_select_score_kernel, autotune_sync_group)
         if impl == "cudnn":
             nvis_buf[:n].copy_(nvis_all[r0:r1])
             if n < rc:

@@ -439,6 +439,28 @@ class TestQSASparseKernel:
             b, _ = self._fwd(sparse=True)
         assert torch.equal(a, b)
 
+    def test_tf32_indexer_score_selects_like_fp32(self):
+        """qsa_indexer_score_precision='tf32' runs the score kernel on tensor cores; only
+        near-tie selections may differ from the bit-exact fp32 path."""
+        self.config.qsa_use_sparse_attention = True
+        try:
+            with torch.no_grad():
+                self.config.qsa_indexer_score_precision = "fp32"
+                ref = self.attn.indexer.select(self.hidden, self.freqs)
+                self.config.qsa_indexer_score_precision = "tf32"
+                sel = self.attn.indexer.select(self.hidden, self.freqs)
+                out, _ = self._fwd(sparse=True)
+        finally:
+            self.config.qsa_indexer_score_precision = "fp32"
+        assert torch.equal(sel.picked, ref.picked)
+        a = torch.where(ref.picked, ref.order, -1).sort(-1).values
+        b = torch.where(sel.picked, sel.order, -1).sort(-1).values
+        idx = torch.searchsorted(b, a).clamp(max=b.shape[-1] - 1)
+        hit = (b.gather(-1, idx) == a) & (a >= 0)
+        recall = hit.sum().item() / max((a >= 0).sum().item(), 1)
+        assert recall > 0.98, f"tf32 top-k recall vs fp32 {recall:.4f}"
+        assert torch.isfinite(out).all()
+
     def test_kernel_slot_order_invariance(self):
         """``block_indices`` is a multiset contract: shuffling a query's selected
         slots must not change the kernel output or any gradient. The superset union
@@ -758,12 +780,12 @@ class TestQSAContextParallel:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def _build(self, layout="per_document", indexer_loss_coeff=None):
-        Utils.initialize_model_parallel(1, 1, context_parallel_size=2)
+    def _build(self, layout="per_document", indexer_loss_coeff=None, cp=2):
+        Utils.initialize_model_parallel(1, 1, context_parallel_size=cp)
         model_parallel_cuda_manual_seed(123)
         config = make_sparse_config()
         config.qsa_indexer_loss_coeff = indexer_loss_coeff
-        config.context_parallel_size = 2
+        config.context_parallel_size = cp
         config.cp_comm_type = "all_gather"
         config.qsa_cp_packing_layout = layout
         spec = get_qsa_module_spec_for_backend(config)
@@ -880,6 +902,78 @@ class TestQSAContextParallel:
             pytest.skip("QSA CP2 parity requires at least 2 distributed ranks")
         # doc len 90 is NOT divisible by 2 * cp — only the flattened pack is.
         self._thd_case("per_sequence", [0, 90, 300])
+
+    def _run_fwd_bwd(self, attn, shard, freqs, psp=None):
+        """Output, input grad and every parameter grad of one fwd + bwd."""
+        x = shard.detach().clone().requires_grad_()
+        out, _ = attn(x, attention_mask=None, rotary_pos_emb=freqs, packed_seq_params=psp)
+        out.float().square().mean().backward()
+        grads = {n: p.grad.clone() for n, p in attn.named_parameters() if p.grad is not None}
+        attn.zero_grad(set_to_none=True)
+        return out.detach().clone(), x.grad.clone(), grads
+
+    @pytest.mark.parametrize("cp", [2, 4])
+    @pytest.mark.parametrize("case", ["bshd", "per_document", "per_sequence"])
+    @pytest.mark.parametrize("indexer_loss_coeff", [None, 0.01])
+    def test_cp_comm_overlap_bitwise_matches_baseline(self, case, indexer_loss_coeff, cp):
+        """qsa_cp_comm_overlap only reorders issue (async index-key / K/V gathers, dk/dv
+        before dq with an async reduce-scatter): output and all grads are bitwise equal
+        (CP2 and CP4; BSHD and packed THD per_document / per_sequence)."""
+        if Utils.world_size < cp:
+            pytest.skip(f"QSA CP{cp} parity requires at least {cp} distributed ranks")
+        from megatron.core.packed_seq_params import PackedSeqParams
+        from megatron.core.transformer.experimental_attention_variant.dsa_layout import (
+            build_packed_allgather_cp_local_positions,
+            build_zigzag_cp_local_positions,
+        )
+
+        layout = "per_document" if case == "bshd" else case
+        config, attn, cp_rank = self._build(layout, indexer_loss_coeff=indexer_loss_coeff, cp=cp)
+        attn.train()
+        rope = RotaryEmbedding(
+            kv_channels=SPARSE_HEAD_DIM, rotary_percent=ROTARY_PERCENT, rotary_base=ROPE_THETA
+        )
+        g = torch.Generator().manual_seed(29)
+        psp = None
+        # Lengths divisible by 2 * cp: per_document needs every document, per_sequence and
+        # BSHD only the whole sequence.
+        if case == "bshd":
+            seq = SEQ if cp == 2 else 320
+            full = torch.randn(seq, BATCH, HIDDEN, generator=g).cuda().bfloat16()
+            rows = build_zigzag_cp_local_positions(seq, cp, cp_rank, full.device)
+            freqs = rope(seq)
+        else:
+            if cp == 2:
+                cu_list = [0, 120, 300] if case == "per_document" else [0, 90, 300]
+            else:
+                cu_list = [0, 120, 296] if case == "per_document" else [0, 90, 296]
+            full = torch.randn(cu_list[-1], 1, HIDDEN, generator=g).cuda().bfloat16()
+            cu = torch.tensor(cu_list, dtype=torch.int32).cuda()
+            rows = build_packed_allgather_cp_local_positions(
+                cu, cp, cp_rank, full.device, cp_packing_layout=layout
+            )
+            max_len = max(b - a for a, b in zip(cu_list[:-1], cu_list[1:]))
+            psp = PackedSeqParams(
+                qkv_format='thd',
+                cu_seqlens_q=cu,
+                cu_seqlens_kv=cu,
+                max_seqlen_q=max_len,
+                max_seqlen_kv=max_len,
+            )
+            freqs = rope(max_len, packed_seq=True)
+        shard = full.index_select(0, rows).contiguous()
+
+        config.qsa_cp_comm_overlap = False
+        base = self._run_fwd_bwd(attn, shard, freqs, psp)
+        config.qsa_cp_comm_overlap = True
+        ovl = self._run_fwd_bwd(attn, shard, freqs, psp)
+        config.qsa_cp_comm_overlap = False
+
+        assert torch.equal(base[0], ovl[0]), "overlap changed the forward output"
+        assert torch.equal(base[1], ovl[1]), "overlap changed the input gradient"
+        assert base[2].keys() == ovl[2].keys()
+        for name in base[2]:
+            assert torch.equal(base[2][name], ovl[2][name]), f"overlap changed grad of {name}"
 
     def test_cp2_kl_trains_indexer(self):
         if Utils.world_size < 2:

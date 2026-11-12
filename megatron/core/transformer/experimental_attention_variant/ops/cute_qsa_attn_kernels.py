@@ -1833,3 +1833,55 @@ class QSADkvSm100:
         if warp_idx == self.mma_warp:
             tmem.relinquish_alloc_permit()
         tmem.free(tmem_ptr)
+
+
+class QSADeltaSm100:
+    """``delta = rowsum(O * dO)`` (fp32) for every ``(b, t, hq)`` row, standalone.
+
+    The per-row arithmetic is the dq kernel's fused prologue verbatim (``D // 8`` chunks of 8
+    elements: load, widen to fp32, multiply, reduce, accumulate in chunk order), so the result is
+    bit-identical to the ``delta`` that :class:`QSADqSm100` emits. It lets the dk/dv kernel run
+    before dq (allgather-CP overlap: the dk/dv reduce-scatter then runs behind the dq kernel).
+    One thread per row; ``mO`` / ``mdO`` are contiguous ``[rows, D]`` (any leading shape) and
+    ``mDelta`` is the flat ``[rows]`` output.
+    """
+
+    def __init__(self, head_dim: int):
+        assert head_dim % 8 == 0
+        self.D = head_dim
+        self.num_threads = 128
+
+    @cute.jit
+    def __call__(
+        self,
+        mO: cute.Tensor,  # [B, TQ, HQ, D]
+        mdO: cute.Tensor,  # [B, TQ, HQ, D]
+        mDelta: cute.Tensor,  # [B * TQ * HQ] fp32
+        n_rows: Int32,
+        stream,
+    ):
+        self.dtype = mO.element_type
+        grid = ((n_rows + self.num_threads - 1) // self.num_threads, 1, 1)
+        self.kernel(mO, mdO, mDelta, n_rows).launch(
+            grid=grid, block=[self.num_threads, 1, 1], stream=stream
+        )
+
+    @cute.kernel
+    def kernel(  # pylint: disable=missing-function-docstring
+        self, mO: cute.Tensor, mdO: cute.Tensor, mDelta: cute.Tensor, n_rows: Int32
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        row = bidx * self.num_threads + tidx
+        if row < n_rows:
+            row_off = Int64(row) * self.D
+            dlt = Float32(0.0)
+            for ch in cutlass.range_constexpr(self.D // 8):
+                ro = cute.make_rmem_tensor((8,), self.dtype)
+                rd = cute.make_rmem_tensor((8,), self.dtype)
+                cute.autovec_copy(_row_vec(mO, row_off + ch * 8, 8), ro)
+                cute.autovec_copy(_row_vec(mdO, row_off + ch * 8, 8), rd)
+                fo = ro.load().to(Float32)
+                fd = rd.load().to(Float32)
+                dlt += (fo * fd).reduce(cute.ReductionOp.ADD, Float32(0.0), 0)
+            mDelta[row] = dlt

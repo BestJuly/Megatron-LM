@@ -580,6 +580,18 @@ class TransformerConfig(ModelParallelConfig):
     caller contract — both layouts are legal for the same cu_seqlens and cannot be
     inferred. Ignored for cp=1 and for BSHD inputs."""
 
+    qsa_cp_comm_overlap: bool = False
+    """Overlap QSA's allgather-CP communication with its computation (CP > 1, sparse ``cute``
+    backend; BSHD and packed THD). Forward: the shared index-key all-gather is issued before the
+    main QKV projection and the K/V all-gather before the indexer's scoring / top-k, so both run
+    behind compute. Backward: dk/dv are computed before dq and their reduce-scatter runs behind
+    the dq kernel. Numerically identical (bitwise) to the non-overlapped path."""
+
+    qsa_indexer_score_precision: Literal["fp32", "tf32"] = "fp32"
+    """Arithmetic of the QSA indexer score kernel (``relu(q @ k)`` summed over heads, fp32
+    accumulate). ``fp32``: IEEE FMA, bit-exact with the fp32 reference. ``tf32``: tensor-core
+    TF32 inputs (~2.7x faster at long context); top-k may differ from fp32 on near ties."""
+
     ####################
     # linear attention
     ####################
@@ -2367,6 +2379,16 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "qsa_cp_packing_layout must be 'per_document' or 'per_sequence', got "
                     f"{self.qsa_cp_packing_layout!r}."
+                )
+            if self.qsa_indexer_score_precision not in ("fp32", "tf32"):
+                raise ValueError(
+                    "qsa_indexer_score_precision must be 'fp32' or 'tf32', got "
+                    f"{self.qsa_indexer_score_precision!r}."
+                )
+            if self.qsa_cp_comm_overlap and self.qsa_attn_backend not in (None, "cute"):
+                raise ValueError(
+                    "qsa_cp_comm_overlap applies to the allgather-CP sparse path of "
+                    f"qsa_attn_backend='cute' only, got {self.qsa_attn_backend!r}."
                 )
             if self.context_parallel_size > 1:
                 # QSA CP is allgather-only: the indexer all-gathers the shared raw index
