@@ -356,8 +356,12 @@ def test_tp2_training_iteration_broadcasts_leaves_to_tp_peers(_tp2_parallel):
     assert runtime.state is MdpRuntimeState.EMPTY
     runtime.storage.assert_empty()
 
+    # ZeRO-1 leaves each rank only its reduced shard, and a worker that encoded
+    # nothing has no local gradient, so check the gradient over WORLD.
     param = next(runtime.encoder_domain.encoder_ddp.module.parameters())
-    assert param.main_grad.abs().sum() > 0
+    grad_mass = param.main_grad.abs().sum().reshape(1)
+    torch.distributed.all_reduce(grad_mass)
+    assert grad_mass.item() > 0
     success, _, _ = runtime.encoder_domain.encoder_optimizer.step()
     assert success
     gathered = [torch.empty_like(param.data) for _ in range(torch.distributed.get_world_size())]
