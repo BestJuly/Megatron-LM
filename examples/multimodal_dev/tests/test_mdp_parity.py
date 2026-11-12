@@ -648,7 +648,8 @@ def test_g1_fault_injection_detects_broken_reverse_routing():
     ],
     ids=["selective", "full"],
 )
-def test_g1_recompute_modes_match_reference(mdp_config):
+@pytest.mark.parametrize("tp", [1, 2], ids=["tp1", "tp2"])
+def test_g1_recompute_modes_match_reference(request, mdp_config, tp):
     """Stochastic encoder (dropout>0): every recompute mode must reproduce the
     no-recompute reference **bitwise** through the one shared P2/P5 path.
 
@@ -658,14 +659,16 @@ def test_g1_recompute_modes_match_reference(mdp_config):
     its dropout masks through MCore's RNG fork, so any custom RNG handling
     would break the bitwise match here.
     """
+    if tp > 1:
+        request.getfixturevalue("_tp2_parallel")
     batch = _make_batch()
     # Weight source: a native model provides the transplant weights for both
     # MDP runs, keeping them identical.
-    native_model, _ = _seeded(_run_native, _vision_config(dropout=0.0), batch)
+    native_model, _ = _seeded(_run_native, _vision_config(dropout=0.0), batch, tp=tp)
 
     reference_config = _vision_config(dropout=0.1)
     _, reference_loss, reference_ddp = _run_mdp(
-        reference_config, batch, native_model=native_model
+        reference_config, batch, native_model=native_model, tp=tp
     )
     reference_grads = {
         name: param.main_grad.float().clone()
@@ -676,7 +679,7 @@ def test_g1_recompute_modes_match_reference(mdp_config):
         _vision_config(dropout=0.1), mdp_config
     )
     _, mode_loss, mode_ddp = _run_mdp(
-        mode_config, batch, native_model=native_model, mdp_config=mdp_config
+        mode_config, batch, native_model=native_model, mdp_config=mdp_config, tp=tp
     )
     assert torch.equal(reference_loss, mode_loss), (
         float(reference_loss),
@@ -687,12 +690,12 @@ def test_g1_recompute_modes_match_reference(mdp_config):
 
 
 @pytest.mark.parametrize(
-    "overlap_window_capture,num_iterations",
-    [(False, 1), (True, 2)],
-    ids=["sync-window-capture", "overlap-window-capture"],
+    "overlap_window_capture,num_iterations,tp",
+    [(False, 1, 1), (True, 2, 1), (False, 2, 2)],
+    ids=["sync-window-capture", "overlap-window-capture", "sync-window-capture-tp2"],
 )
 def test_g1_whole_encoder_recompute_matches_reference(
-    overlap_window_capture, num_iterations
+    request, overlap_window_capture, num_iterations, tp
 ):
     """The Design-Doc P2-no-grad/P5-full-replay path must preserve stochastic
     encoder outputs and the ambient RNG stream bitwise.
@@ -707,8 +710,10 @@ def test_g1_whole_encoder_recompute_matches_reference(
     backward and release one chunk at a time, so weight-gradient accumulation
     order is intentionally different.
     """
+    if tp > 1:
+        request.getfixturevalue("_tp2_parallel")
     batch = _make_batch()
-    native_model, _ = _seeded(_run_native, _vision_config(dropout=0.0), batch)
+    native_model, _ = _seeded(_run_native, _vision_config(dropout=0.0), batch, tp=tp)
 
     reference_config = _vision_config(dropout=0.1)
     reference_mdp_config = MdpConfig(
@@ -722,6 +727,7 @@ def test_g1_whole_encoder_recompute_matches_reference(
         native_model=native_model,
         mdp_config=reference_mdp_config,
         num_iterations=num_iterations,
+        tp=tp,
     )
     reference_grads = {
         name: param.main_grad.float().clone()
@@ -739,6 +745,7 @@ def test_g1_whole_encoder_recompute_matches_reference(
             overlap_window_capture=overlap_window_capture,
         ),
         num_iterations=num_iterations,
+        tp=tp,
     )
     assert torch.equal(reference_loss, mode_loss), (
         float(reference_loss),
