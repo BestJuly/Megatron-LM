@@ -470,6 +470,9 @@ def _qsa_meta_scatter_kernel(
     NT,
     ldm,
     ncols,
+    pid0,
+    kt0,
+    kt1,
     BQ: tl.constexpr,
     SP: tl.constexpr,
     KB: tl.constexpr,
@@ -477,11 +480,14 @@ def _qsa_meta_scatter_kernel(
     DO_SS: tl.constexpr,
     DO_KV: tl.constexpr,
 ):
-    pid = tl.program_id(0)
+    # Chunked builds: this launch covers query tiles [pid0, pid0 + grid) (M / ss_counts hold
+    # just those rows) and, for the KV CSR, KV-tile rows [kt0, kt1) of P (P holds those rows).
+    lpid = tl.program_id(0)
+    pid = lpid + pid0
     bi = pid // n_tiles
     tile = pid % n_tiles
     j = tl.arange(0, SP)
-    mrow = M + pid.to(tl.int64) * ldm
+    mrow = M + lpid.to(tl.int64) * ldm
     for qq in tl.static_range(BQ):
         t = tile * BQ + qq
         rv = t < s
@@ -495,14 +501,17 @@ def _qsa_meta_scatter_kernel(
             tl.debug_barrier()
         if DO_KV:
             kt = (bi * NT + ids // KB).to(tl.int64)
-            tl.atomic_add(P + kt * s + t, (1 << (ids % KB)).to(tl.int32), mask=m, sem="relaxed")
+            mk = m & (kt >= kt0) & (kt < kt1)
+            tl.atomic_add(
+                P + (kt - kt0) * s + t, (1 << (ids % KB)).to(tl.int32), mask=mk, sem="relaxed"
+            )
     if DO_SS:
         acc = tl.zeros([CH], dtype=tl.int32)
         for c0 in range(0, ncols, CH):
             c = c0 + tl.arange(0, CH)
             mv = tl.load(mrow + c, mask=c < ncols, other=0)
             acc += (mv != 0).to(tl.int32)
-        tl.store(ss_counts + pid, tl.sum(acc, axis=0).to(tl.int64))
+        tl.store(ss_counts + lpid, tl.sum(acc, axis=0).to(tl.int64))
 
 
 @triton.jit
@@ -565,6 +574,17 @@ def _qsa_kv_compact_kernel(P, tile_offsets, entry_query, entry_bits, s, CH: tl.c
         run += tl.sum(nz_i, axis=0).to(tl.int64)
 
 
+# Scratch cap of the chunked builds: the dense [tiles, num_blocks] superset bitmask and the
+# [KV tiles, s] query bitmask are O(s^2) (13 GiB and 8.6 GB at 1M tokens / CP8); they are built
+# a band of rows at a time. Rows are compacted in order, so the CSR offsets advance on device
+# (no host sync, CUDA-graph capturable) and the results are bit-identical to one full build.
+_META_CHUNK_BYTES = 512 * 2**20
+
+
+def _chunk_rows(n_rows: int, row_bytes: int) -> int:
+    return max(1, min(n_rows, _META_CHUNK_BYTES // max(row_bytes, 1)))
+
+
 def _offsets(counts: torch.Tensor) -> torch.Tensor:
     out = torch.zeros(counts.numel() + 1, dtype=torch.long, device=counts.device)
     out[1:] = counts.cumsum(0)
@@ -587,12 +607,20 @@ def qsa_build_supersets_fused(
     # one bit per query of the tile (BQ <= 8 -> uint8, else int32)
     assert BQ <= 30, "superset query bitmask is an int32"
     m_dtype = torch.uint8 if BQ <= 8 else torch.int32
-    M = torch.zeros(n_flat, ldm, dtype=m_dtype, device=device)
-    counts = torch.empty(n_flat, dtype=torch.long, device=device)
+    rows = _chunk_rows(n_flat, ldm * torch.empty((), dtype=m_dtype).element_size())
+    M = torch.empty(rows, ldm, dtype=m_dtype, device=device)
+    counts = torch.empty(rows, dtype=torch.long, device=device)
+    tile_offsets = torch.zeros(n_flat + 1, dtype=torch.long, device=device)
+    entry_base = torch.zeros(e_cap, dtype=torch.int32, device=device)
+    entry_end = torch.zeros(e_cap, dtype=torch.int32, device=device)
+    membership = torch.zeros(e_cap, BQ, dtype=torch.uint8, device=device)
     bi = block_indices.contiguous()
     bc = block_counts.contiguous()
-    if n_flat > 0:
-        _qsa_meta_scatter_kernel[(n_flat,)](
+    bases, ends = block_bases.contiguous(), block_ends.contiguous()
+    for r0 in range(0, n_flat, rows):
+        n = min(rows, n_flat - r0)
+        M[:n].zero_()
+        _qsa_meta_scatter_kernel[(n,)](
             bi,
             bc,
             M,
@@ -604,6 +632,9 @@ def qsa_build_supersets_fused(
             1,
             ldm,
             num_blocks,
+            r0,
+            0,
+            1,
             BQ=BQ,
             SP=_pow2(S),
             KB=1,
@@ -612,16 +643,13 @@ def qsa_build_supersets_fused(
             DO_KV=False,
             num_warps=4,
         )
-    tile_offsets = _offsets(counts)
-    entry_base = torch.zeros(e_cap, dtype=torch.int32, device=device)
-    entry_end = torch.zeros(e_cap, dtype=torch.int32, device=device)
-    membership = torch.zeros(e_cap, BQ, dtype=torch.uint8, device=device)
-    if n_flat > 0:
-        _qsa_ss_compact_kernel[(n_flat,)](
+        torch.cumsum(counts[:n], 0, out=tile_offsets[r0 + 1 : r0 + n + 1])
+        tile_offsets[r0 + 1 : r0 + n + 1] += tile_offsets[r0]
+        _qsa_ss_compact_kernel[(n,)](
             M,
-            tile_offsets,
-            block_bases.contiguous(),
-            block_ends.contiguous(),
+            tile_offsets[r0:],
+            bases,
+            ends,
             entry_base,
             entry_end,
             membership,
@@ -642,36 +670,49 @@ def qsa_build_kv_tile_csr_fused(block_indices, block_counts, num_blocks, tile_bl
     device = block_indices.device
     NT = max(1, (num_blocks + tile_blocks - 1) // tile_blocks)
     n = b * s * S
-    P = torch.zeros(b * NT, max(s, 1), dtype=torch.int32, device=device)
     BQ = 4
     n_qt = (s + BQ - 1) // BQ
-    if b * n_qt > 0:
-        _qsa_meta_scatter_kernel[(b * n_qt,)](
-            block_indices.contiguous(),
-            block_counts.contiguous(),
-            P,
-            P,
-            P,
-            s,
-            S,
-            n_qt,
-            NT,
-            1,
-            1,
-            BQ=BQ,
-            SP=_pow2(S),
-            KB=tile_blocks,
-            CH=_META_CH,
-            DO_SS=False,
-            DO_KV=True,
-            num_warps=4,
-        )
-    counts = torch.empty(b * NT, dtype=torch.long, device=device)
-    _qsa_row_count_kernel[(b * NT,)](P, counts, s, max(s, 1), CH=_META_CH, num_warps=4)
-    tile_offsets = _offsets(counts)
+    ld = max(s, 1)
+    n_rows = b * NT
+    rows = _chunk_rows(n_rows, ld * 4)
+    P = torch.empty(rows, ld, dtype=torch.int32, device=device)
+    counts = torch.empty(rows, dtype=torch.long, device=device)
+    tile_offsets = torch.zeros(n_rows + 1, dtype=torch.long, device=device)
     entry_query = torch.zeros(n, dtype=torch.int32, device=device)
     entry_bits = torch.zeros(n, dtype=torch.int32, device=device)
-    _qsa_kv_compact_kernel[(b * NT,)](
-        P, tile_offsets, entry_query, entry_bits, s, CH=_META_CH, num_warps=4
-    )
+    bi = block_indices.contiguous()
+    bc = block_counts.contiguous()
+    for r0 in range(0, n_rows, rows):
+        nr = min(rows, n_rows - r0)
+        P[:nr].zero_()
+        if b * n_qt > 0:
+            _qsa_meta_scatter_kernel[(b * n_qt,)](
+                bi,
+                bc,
+                P,
+                P,
+                P,
+                s,
+                S,
+                n_qt,
+                NT,
+                1,
+                1,
+                0,
+                r0,
+                r0 + nr,
+                BQ=BQ,
+                SP=_pow2(S),
+                KB=tile_blocks,
+                CH=_META_CH,
+                DO_SS=False,
+                DO_KV=True,
+                num_warps=4,
+            )
+        _qsa_row_count_kernel[(nr,)](P, counts, s, ld, CH=_META_CH, num_warps=4)
+        torch.cumsum(counts[:nr], 0, out=tile_offsets[r0 + 1 : r0 + nr + 1])
+        tile_offsets[r0 + 1 : r0 + nr + 1] += tile_offsets[r0]
+        _qsa_kv_compact_kernel[(nr,)](
+            P, tile_offsets[r0:], entry_query, entry_bits, s, CH=_META_CH, num_warps=4
+        )
     return tile_offsets, entry_query, entry_bits, NT

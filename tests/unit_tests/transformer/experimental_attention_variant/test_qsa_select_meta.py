@@ -4,13 +4,15 @@
 
 The fused (dense bitmask + count + compaction) supersets and KV-tile CSR must equal the
 ``*_torch`` sort-based builders bit for bit, on the static (fixed-capacity) and the
-dynamic (exact-size) paths, and be CUDA-graph capturable.
+dynamic (exact-size) paths, and be CUDA-graph capturable -- also when the dense scratch is
+built a band of rows at a time (one row, and uneven bands).
 """
 
 import pytest
 import torch
 
 from megatron.core.transformer.experimental_attention_variant.ops import triton_qsa as tq
+from megatron.core.transformer.experimental_attention_variant.ops import triton_qsa_select
 from megatron.core.transformer.experimental_attention_variant.ops.triton_qsa_select import (
     qsa_build_kv_tile_csr_fused,
     qsa_build_supersets_fused,
@@ -59,6 +61,13 @@ CASES = [
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 class TestQSAFusedMetadata:
+    @pytest.fixture(autouse=True, params=["full", "row", "band"])
+    def chunking(self, request, monkeypatch):
+        """Scratch cap: one band (default at these sizes), one row per band, uneven bands."""
+        cap = {"full": None, "row": 1, "band": 777}[request.param]
+        if cap is not None:
+            monkeypatch.setattr(triton_qsa_select, "_META_CHUNK_BYTES", cap)
+
     @pytest.mark.parametrize("case", CASES)
     @pytest.mark.parametrize("bq", [4, 16])
     def test_supersets_match_sort_builders(self, case, bq):
