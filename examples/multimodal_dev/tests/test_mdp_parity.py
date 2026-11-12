@@ -886,3 +886,27 @@ def test_g1_one_step_update_parity():
         assert torch.allclose(
             param.float(), native_vision[name].float(), rtol=8e-3, atol=1e-5
         ), name
+
+
+@pytest.mark.parametrize("tp", [1, 2])
+def test_dbg_recompute(request, tp):
+    if tp > 1:
+        request.getfixturevalue("_tp2_parallel")
+    batch = _make_batch()
+    native_model, _ = _seeded(_run_native, _vision_config(dropout=0.0), batch, tp=tp)
+    def run(cfg=None, dropout=0.1):
+        vc = _vision_config(dropout=dropout)
+        if cfg is not None:
+            vc = apply_encoder_recompute_config(vc, cfg)
+        _, loss, ddp = _run_mdp(vc, batch, native_model=native_model, mdp_config=cfg, tp=tp)
+        return loss, {n: p.main_grad.float().clone() for n, p in ddp.module.named_parameters()}
+    sel = MdpConfig(enable=True, encoder_recompute_granularity="selective")
+    runs = {"ref": run(), "ref2": run(), "sel": run(sel), "sel2": run(sel),
+            "nd_ref": run(dropout=0.0), "nd_sel": run(sel, dropout=0.0)}
+    rank = torch.distributed.get_rank()
+    lines = []
+    for a, b in (("ref", "ref2"), ("sel", "sel2"), ("ref", "sel"), ("nd_ref", "nd_sel")):
+        worst = max(((float((runs[a][1][n] - runs[b][1][n]).abs().max()), float(runs[a][1][n].abs().max()), n) for n in runs[a][1]))
+        nbad = sum(1 for n in runs[a][1] if not torch.equal(runs[a][1][n], runs[b][1][n]))
+        lines.append(f"DBG rank{rank} tp{tp} {a}-{b}: loss_eq={bool(torch.equal(runs[a][0], runs[b][0]))} nbad={nbad}/{len(runs[a][1])} worst={worst}")
+    print("\n".join(lines), flush=True)
