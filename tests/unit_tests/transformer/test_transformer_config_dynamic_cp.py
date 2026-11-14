@@ -87,6 +87,25 @@ def test_cp_layout_compatibility(cp_config, overrides, error):
 
 
 @pytest.mark.parametrize("variant", ["gdn", "kda"])
+def test_external_thd_pipeline_supports_contiguous_without_scheduler(variant):
+    config = _make_config(
+        context_parallel_size=2,
+        cp_partition_mode="contiguous",
+        use_packed_sequence=True,
+        experimental_attention_variant=variant,
+    )
+    assert config.sequence_packing_scheduler is None
+    with pytest.raises(ValueError, match="incompatible with GDN-family"):
+        _make_config(
+            context_parallel_size=2,
+            cp_partition_mode="contiguous",
+            use_packed_sequence=True,
+            experimental_attention_variant=variant,
+            linear_cp_mode="headwise",
+        )
+
+
+@pytest.mark.parametrize("variant", ["gdn", "kda"])
 @pytest.mark.parametrize("linear_cp_mode", ["headwise", "chunkwise", "invalid", None])
 def test_gdn_cp_mode(cp_config, variant, linear_cp_mode):
     error = linear_cp_mode not in ("headwise", "chunkwise")

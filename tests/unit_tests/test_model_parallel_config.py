@@ -232,7 +232,7 @@ def test_contiguous_context_parallel_rejects_bshd_inputs():
         )
 
 
-def test_te_cross_entropy_loss_fusion_is_disabled_by_training_args(monkeypatch):
+def test_te_cross_entropy_loss_fusion_is_preserved_by_training_args(monkeypatch):
     monkeypatch.setattr(sys, 'argv', ['test_model_parallel_config.py'])
     args = parse_args()
     args.num_layers = 2
@@ -250,5 +250,8 @@ def test_te_cross_entropy_loss_fusion_is_disabled_by_training_args(monkeypatch):
     args.cross_entropy_loss_fusion = True
     args.cross_entropy_fusion_impl = 'te'
 
-    with pytest.raises(AssertionError, match="Transformer Engine cross entropy loss fusion"):
-        validate_args(args)
+    # dev_mdp enables the TE fusion path for its patched training container.
+    # Validate that argument processing preserves the requested backend.
+    validate_args(args)
+    assert args.cross_entropy_loss_fusion
+    assert args.cross_entropy_fusion_impl == 'te'

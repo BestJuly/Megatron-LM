@@ -65,3 +65,18 @@ Packed absorbed MLA uses the microbatch's actual CP group for RoPE indexing. Its
 frequency table must cover the full sequence even when each rank holds only a
 chunk and the configured CP size is one. QKV up-projection recomputation retains
 the forward microbatch's group after the caller restores or changes its group.
+
+## External THD Data Pipelines
+
+`TransformerConfig.use_packed_sequence=True` declares THD inputs supplied by an
+external collator, such as the multimodal MDP pipeline. It allows contiguous CP
+without selecting a text-only `sequence_packing_scheduler`. Callers must supply
+`PackedSeqParams`, set its `cp_partition_mode` consistently with the decoder
+config, and partition all token tensors and loss/padding masks accordingly.
+This does not enable contiguous BSHD or relax attention-variant constraints.
+
+Zigzag partitions each padded sample into two chunks per CP rank. Contiguous
+partitions the entire physical packed microbatch into one interval per rank,
+including tail padding. Hybrid KDA/GDN and full-attention layers can convert
+between layouts internally, so their per-sample zigzag alignment remains
+required even for contiguous decoder inputs.
