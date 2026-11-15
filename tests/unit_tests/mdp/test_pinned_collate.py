@@ -141,3 +141,28 @@ def test_pinned_path_matches_the_generic_one(lens, total, max_seqlen, monkeypatc
     assert p.pad_between_seqs is g.pad_between_seqs is False
     for field in PACKED_FIELDS:
         assert torch.equal(pinned[field], generic[field]), field
+
+
+@pytest.mark.parametrize(
+    "lens, cu_padded, expected",
+    # cp_size=2 with pad_to_multiple=16: every sample is padded to 32 rows.
+    # lens=[32, 5]: only the last sample is padded, the pack TransformerEngine's
+    # own inference takes for unpadded. lens=[32, 32]: nothing to declare.
+    [((32, 5), [0, 32, 64], True), ((32, 32), [0, 32, 64], None)],
+    ids=["last_sample_padded", "no_padding"],
+)
+def test_pinned_path_declares_padding_under_cp_like_the_generic_one(
+    lens, cu_padded, expected, monkeypatch, pin_requests
+):
+    """Under CP the collator declares per-sample padding. The pinned path reads
+    it off the host lists, the generic one off the broadcast vectors."""
+    monkeypatch.setattr(forward_step.mpu, "get_context_parallel_world_size", lambda: 2)
+    kwargs = dict(monkeypatch=monkeypatch, pin_requests=pin_requests)
+    pinned = _pack(lens, pinned=True, **kwargs)
+    generic = _pack(lens, pinned=False, **kwargs)
+    p, g = pinned["packed_seq_params"], generic["packed_seq_params"]
+
+    assert p.cu_seqlens_q_padded.tolist() == g.cu_seqlens_q_padded.tolist() == cu_padded
+    assert p.pad_between_seqs is g.pad_between_seqs is expected
+    for field in PACKED_FIELDS:
+        assert torch.equal(pinned[field], generic[field]), field

@@ -412,6 +412,23 @@ up to `divisible_by - 1` padded rows per sample, 256 at `cp_size=8` with MXFP8
 and no SP. A total-only variant would be tighter and is not written because
 MDP rejects CP > 1 outright.
 
+Padding under CP is declared. With per-sample alignment and `cp_size > 1` the
+collator sets `pad_between_seqs=True` whenever `cu_seqlens` and
+`cu_seqlens_padded` differ, and leaves it unset otherwise. It must not be left
+to TransformerEngine: `DotProductAttention.forward` infers the flag from
+`cu_seqlens_padded[:-1] != cu_seqlens[:-1]`, the starts of the sequences, so a
+pack in which only the last sample is padded (`[2048, 2047]`) is classified as
+unpadded. The CP attention then takes `cu_seqlens // cp_size` (and
+`// (2 * cp_size)` for the second-half steps) as each rank's length, which
+assumes the valid tokens are spread evenly; the CP split keeps a sample's
+padding in its last chunk, on one rank. Every other rank is told it holds one
+or two tokens fewer than it does: those tokens are skipped as queries (their
+attention output is zero, or assembled from the second-half steps only with
+softmax statistics the kernel never wrote, so it differs between runs) and as
+keys for every later token of the sample. Observed with TE 2.16.0 at CP4 on
+sequences of 2047, 2049 and 1025 tokens; the positions follow from the two
+divisions.
+
 Why `pad_between_seqs=False` is declared, and when it would be wrong. Declaring
 it lets `TEDotProductAttention.forward()`
 (`megatron/core/extensions/transformer_engine.py`) pass `cu_seqlens_q_padded`

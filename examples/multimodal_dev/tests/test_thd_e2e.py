@@ -404,7 +404,7 @@ class TestPackOrPadBatchQuantizedTailPadding:
     def test_context_parallel_keeps_the_per_sample_path(self, monkeypatch):
         """CP hands each rank ``padded_len / cp_size`` rows of every sample, so
         the alignment has to survive the split and the tail-only layout does not
-        apply. ``pad_between_seqs`` stays unset for TE to classify itself."""
+        apply. The per-sample padding is declared to TE."""
         from examples.multimodal_dev import forward_step
 
         monkeypatch.setattr(forward_step.mpu, "get_context_parallel_world_size", lambda: 2)
@@ -412,7 +412,36 @@ class TestPackOrPadBatchQuantizedTailPadding:
         psp = _pack_with_row_alignment(16)["packed_seq_params"]
         assert psp.cu_seqlens_q.tolist() == [0, 5, 8]
         assert psp.cu_seqlens_q_padded.tolist() == [0, 32, 64]
-        assert psp.pad_between_seqs is None
+        assert psp.pad_between_seqs is True
+
+    @pytest.mark.parametrize(
+        "lens, cu, cu_padded, expected",
+        [
+            # Only the last sample is padded: cu_seqlens[:-1] == cu_seqlens_padded[:-1],
+            # which TE's own inference reads as "no padding" and then divides the
+            # real lengths by cp_size. This is the case that must be declared.
+            ((4, 3), [0, 4, 7], [0, 4, 8], True),
+            ((8, 4, 5), [0, 8, 12, 17], [0, 8, 12, 20], True),
+            # Padding in an earlier sample (TE would infer it too).
+            ((3, 4), [0, 3, 7], [0, 4, 8], True),
+            # No sample is padded: nothing to declare, the flag stays unset.
+            ((4, 8), [0, 4, 12], [0, 4, 12], None),
+        ],
+        ids=["last-only", "last-only-of-three", "earlier-sample", "no-padding"],
+    )
+    def test_context_parallel_declares_per_sample_padding(
+        self, monkeypatch, lens, cu, cu_padded, expected
+    ):
+        """The pinned (MDP) path reads the same fact off host lists; that half is
+        in tests/unit_tests/mdp/test_pinned_collate.py."""
+        from examples.multimodal_dev import forward_step
+
+        monkeypatch.setattr(forward_step.mpu, "get_context_parallel_world_size", lambda: 2)
+        # No row multiple: divisible_by = cp_size * 2 = 4.
+        psp = _pack_with_row_alignment(None, lens=lens)["packed_seq_params"]
+        assert psp.cu_seqlens_q.tolist() == cu
+        assert psp.cu_seqlens_q_padded.tolist() == cu_padded
+        assert psp.pad_between_seqs is expected
 
     def test_sequence_parallel_scales_the_alignment(self, monkeypatch):
         """Under SP a column-parallel layer quantizes its ``total / tp_size``

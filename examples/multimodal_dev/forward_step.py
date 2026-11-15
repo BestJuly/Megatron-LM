@@ -746,6 +746,19 @@ def pack_or_pad_batch(
         # boundary. Safe only under the causal decoder mask (tail rows follow
         # every real row and are loss-masked); see knowledge.md.
         pad_between_seqs = False if use_tail_only_alignment_padding else None
+        if cp_size > 1:
+            # Per-sample padding under CP has to be declared. Left unset, TE infers
+            # the flag from cu_seqlens[:-1] against cu_seqlens_padded[:-1] and so
+            # misses padding on the last sample alone; its CP attention then takes
+            # cu_seqlens // cp_size as every rank's length, although the CP split
+            # leaves a sample's padding on one rank. Valid tokens are dropped as
+            # queries and as keys. See knowledge.md, "Padding under CP is declared".
+            if is_src and use_pinned:
+                has_padding = cu_seqlens != cu_seqlens_padded  # host lists, no sync
+            else:
+                has_padding = not torch.equal(cu_seqlens_t, cu_seqlens_padded_t)
+            if has_padding:
+                pad_between_seqs = True
         if static_target_T is not None:
             cu_seqlens_t, cu_seqlens_padded_t, real_cu_seqlens_t = build_static_thd_metadata(
                 cu_seqlens_t,
