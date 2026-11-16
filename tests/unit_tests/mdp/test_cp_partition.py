@@ -1,221 +1,133 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Decoder CP row-partition tests. Pure compute, no torch, no GPU.
+"""Decoder-CP item runs (megatron.core.mdp.cp_partition), pure host arithmetic.
 
-The safety property is that :mod:`megatron.core.mdp.cp_partition` inverts
-exactly the map TransformerEngine applies when the decoder slices its THD
-inputs. ``_te_partition_indices`` below is a line-by-line transcription of
-``thd_partition_indices_kernel`` / ``thd_partition_src_index``
-(``transformer_engine/common/fused_attn/context_parallel.cu``); it is pinned to
-TE's own published expectation vectors in
-``test_transcription_matches_te_published_vectors`` so the transcription cannot
-silently drift from the kernel it stands in for.
+The reference (``cp_reference``) is an independent token-level slicing of the
+packed buffer, written the way the decoder slices it. An item's runs must give
+every CP rank exactly the item rows whose image-token slots that slicing gives
+the rank, in the rank's local token order.
 """
+
+import random
 
 import pytest
 
-from megatron.core.mdp.cp_partition import (
-    CpRowInterval,
-    owner_of_row,
-    split_item,
-    validate_sample_span,
+from megatron.core.mdp.cp_partition import CpRun, cp_item_runs
+from megatron.core.mdp.errors import MdpPlanError
+from tests.unit_tests.mdp.cp_reference import local_positions
+
+
+def _random_item(rng, cp):
+    """A packed buffer (sequences padded to 2*cp) and one item span inside a sample."""
+    lengths = [2 * cp * rng.randint(1, 6) for _ in range(rng.randint(1, 4))]
+    cu = [0]
+    for length in lengths:
+        cu.append(cu[-1] + length)
+    seq = rng.randrange(len(lengths))
+    first = rng.randrange(cu[seq], cu[seq + 1])
+    rows = rng.randint(1, cu[seq + 1] - first)
+    return cu, seq, first, rows
+
+
+@pytest.mark.parametrize("mode", ["zigzag", "contiguous"])
+@pytest.mark.parametrize("cp", [1, 2, 4])
+def test_runs_match_token_level_slicing(mode, cp):
+    rng = random.Random(1000 * cp + len(mode))
+    for _ in range(200):
+        cu, seq, first, rows = _random_item(rng, cp)
+        total = cu[-1]
+        runs = cp_item_runs(
+            first,
+            rows,
+            sample_padded_start=cu[seq],
+            sample_padded_len=cu[seq + 1] - cu[seq],
+            total_rows=total,
+            cp_size=cp,
+            mode=mode,
+        )
+        # The runs tile the item in ascending row order ...
+        cursor = 0
+        for run in runs:
+            assert run.item_row_start == cursor and run.item_rows > 0
+            cursor += run.item_rows
+        assert cursor == rows
+        # ... and give every rank its rows in that rank's local token order.
+        got = {}
+        for run in runs:
+            got.setdefault(run.cp_rank, []).extend(
+                range(run.item_row_start, run.item_row_start + run.item_rows)
+            )
+        expected = {}
+        for rank in range(cp):
+            owned = [
+                position - first
+                for position in local_positions(cu, total, cp, rank, mode)
+                if first <= position < first + rows
+            ]
+            if owned:
+                expected[rank] = owned
+        assert got == expected
+
+
+def _runs(first, rows, cu, seq, cp, mode):
+    return cp_item_runs(
+        first,
+        rows,
+        sample_padded_start=cu[seq],
+        sample_padded_len=cu[seq + 1] - cu[seq],
+        total_rows=cu[-1],
+        cp_size=cp,
+        mode=mode,
+    )
+
+
+def test_block_straddling_both_halves_of_a_sample_zigzag_cp2():
+    # One 16-row sample at CP2: chunks of 4 rows; rank 0 owns [0,4)+[12,16),
+    # rank 1 owns [4,12). An image block over rows 2..13 splits three ways.
+    assert _runs(2, 12, [0, 16], 0, 2, "zigzag") == [
+        CpRun(cp_rank=0, item_row_start=0, item_rows=2),
+        CpRun(cp_rank=1, item_row_start=2, item_rows=8),
+        CpRun(cp_rank=0, item_row_start=10, item_rows=2),
+    ]
+
+
+def test_contiguous_ignores_sequence_boundaries():
+    # Contiguous slices the whole pack: the CP boundary (row 6 of 12) falls
+    # inside the second sample [4, 12), and an item over rows 5..7 straddles it.
+    assert _runs(5, 3, [0, 4, 12], 1, 2, "contiguous") == [CpRun(0, 0, 1), CpRun(1, 1, 2)]
+
+
+def test_item_inside_one_rank_is_one_run():
+    assert _runs(1, 3, [0, 16], 0, 2, "contiguous") == [CpRun(0, 0, 3)]
+    assert _runs(5, 2, [0, 16], 0, 2, "zigzag") == [CpRun(1, 0, 2)]
+
+
+def test_middle_zigzag_chunks_share_one_bridge_slice():
+    # CP4, 64-row sample: chunks 3 and 4 (rows [24, 40)) both belong to rank 3.
+    assert _runs(24, 16, [0, 64], 0, 4, "zigzag") == [CpRun(3, 0, 16)]
+
+
+def test_cp1_is_the_whole_item_and_reads_no_span():
+    assert cp_item_runs(
+        0, 7, sample_padded_start=0, sample_padded_len=0, total_rows=0, cp_size=1, mode="zigzag"
+    ) == [CpRun(0, 0, 7)]
+
+
+@pytest.mark.parametrize(
+    "kwargs,match",
+    [
+        (
+            dict(first=1, rows=1, cu=[0, 6], seq=0, cp=2, mode="zigzag"),
+            "divisible by 2 \\* cp_size",
+        ),
+        (dict(first=1, rows=1, cu=[0, 7], seq=0, cp=2, mode="contiguous"), "divisible by cp_size"),
+        (dict(first=14, rows=4, cu=[0, 16], seq=0, cp=2, mode="zigzag"), "inside"),
+        (dict(first=14, rows=4, cu=[0, 16], seq=0, cp=2, mode="contiguous"), "inside"),
+        (dict(first=1, rows=0, cu=[0, 8], seq=0, cp=2, mode="zigzag"), "rows > 0"),
+        (dict(first=1, rows=1, cu=[0, 8], seq=0, cp=2, mode="bshd"), "cp_partition_mode"),
+        (dict(first=1, rows=1, cu=[0, 8], seq=0, cp=0, mode="zigzag"), "cp_size >= 1"),
+    ],
 )
-from megatron.core.mdp.errors import MdpConfigurationError
-
-
-def _te_partition_indices(cu_seqlens_padded, total_tokens, cp_size, cp_rank):
-    """Transcription of TE's ``thd_partition_indices_kernel``.
-
-    Returns, for one CP rank, the global row index of each of its local rows.
-    """
-    for boundary in cu_seqlens_padded:
-        assert boundary % (cp_size * 2) == 0
-    assert total_tokens % (cp_size * 2) == 0
-    cu_s = [boundary // cp_size for boundary in cu_seqlens_padded]
-    out = []
-    for token_id in range(total_tokens // cp_size):
-        seq_id = max(i for i in range(len(cu_s)) if cu_s[i] <= token_id)
-        seq_len = cu_s[seq_id + 1] - cu_s[seq_id]
-        index = token_id - cu_s[seq_id]
-        offset = cp_rank if index < seq_len // 2 else (cp_size - 1) * 2 - cp_rank
-        out.append(index + cu_s[seq_id] * cp_size + seq_len // 2 * offset)
-    return out
-
-
-# Padded cu_seqlens vectors x CP sizes that keep every sample divisible by 2*cp.
-_CASES = [
-    ([0, 8, 16], 1),
-    ([0, 8, 16], 2),
-    ([0, 16], 4),
-    ([0, 16, 32, 48], 4),
-    ([0, 4, 12, 24], 2),
-    ([0, 24, 40, 88], 2),
-    ([0, 32, 96], 4),
-    ([0, 48, 96, 144, 192], 8),
-    ([0, 96, 192], 8),
-]
-
-
-def test_transcription_matches_te_published_vectors():
-    # transformer_engine tests/pytorch/attention/test_cp_utils.py::
-    # test_thd_get_partitioned_indices_matches_dual_chunk_expected_indices
-    assert _te_partition_indices([0, 8, 16], 16, 2, 0) == [0, 1, 6, 7, 8, 9, 14, 15]
-    assert _te_partition_indices([0, 8, 16], 16, 2, 1) == [2, 3, 4, 5, 10, 11, 12, 13]
-
-
-@pytest.mark.parametrize("cu_padded,cp_size", _CASES)
-def test_owner_of_row_inverts_the_te_forward_map(cu_padded, cp_size):
-    total = cu_padded[-1]
-    for cp_rank in range(cp_size):
-        forward = _te_partition_indices(cu_padded, total, cp_size, cp_rank)
-        for local_row, global_row in enumerate(forward):
-            sample = max(i for i in range(len(cu_padded) - 1) if cu_padded[i] <= global_row)
-            start = cu_padded[sample]
-            length = cu_padded[sample + 1] - start
-            owner, local_offset = owner_of_row(global_row - start, length, cp_size)
-            assert owner == cp_rank
-            assert start // cp_size + local_offset == local_row
-
-
-@pytest.mark.parametrize("cu_padded,cp_size", _CASES)
-def test_split_item_covers_every_row_exactly_once_at_the_right_local_row(cu_padded, cp_size):
-    """Every item span, at every offset and length, reassembles exactly.
-
-    Sweeping all spans is the point: the interesting cases are the ones that
-    straddle a chunk boundary and the ones that reach into both halves, and a
-    hand-picked span set would miss them.
-    """
-    total = cu_padded[-1]
-    local_to_global = {
-        cp_rank: _te_partition_indices(cu_padded, total, cp_size, cp_rank)
-        for cp_rank in range(cp_size)
-    }
-    for sample in range(len(cu_padded) - 1):
-        start = cu_padded[sample]
-        length = cu_padded[sample + 1] - start
-        for offset in range(length):
-            for rows in range(1, length - offset + 1):
-                intervals = split_item(
-                    offset_in_sample=offset,
-                    output_rows=rows,
-                    sample_padded_start=start,
-                    sample_padded_len=length,
-                    cp_size=cp_size,
-                )
-                assert sum(i.rows for i in intervals) == rows
-                # Contiguous, ascending, gapless cover of the item's rows.
-                cursor = 0
-                for interval in intervals:
-                    assert interval.item_row_start == cursor
-                    cursor += interval.rows
-                assert cursor == rows
-                # Coarsest legal decomposition: no two adjacent runs share a
-                # rank and are contiguous in that rank's local sequence.
-                for left, right in zip(intervals, intervals[1:]):
-                    assert not (
-                        left.cp_rank == right.cp_rank
-                        and left.local_row_start + left.rows == right.local_row_start
-                    )
-                # Every row lands where the decoder will actually look for it.
-                for interval in intervals:
-                    for k in range(interval.rows):
-                        global_row = start + offset + interval.item_row_start + k
-                        local_row = interval.local_row_start + k
-                        assert local_to_global[interval.cp_rank][local_row] == global_row
-
-
-def test_cp1_is_the_identity():
-    """One interval, global row == local row: the CP=1 plan must not change.
-
-    The item still crosses the sample's midpoint chunk boundary, so this also
-    covers the merge of the ``cp-1``/``cp`` chunk pair.
-    """
-    intervals = split_item(
-        offset_in_sample=3,
-        output_rows=5,
-        sample_padded_start=16,
-        sample_padded_len=8,
-        cp_size=1,
-    )
-    assert intervals == (
-        CpRowInterval(cp_rank=0, item_row_start=0, rows=5, local_row_start=19),
-    )
-
-
-def test_a_full_sample_span_splits_into_the_coarsest_legal_runs():
-    # cp=2 over a length-8 sample: chunks of 2 -> ranks 0,1,1,0. The middle two
-    # chunks are one rank and locally contiguous, so they fuse; rank 0 keeps two
-    # disjoint runs, which is exactly why a route needs a slice_id.
-    intervals = split_item(
-        offset_in_sample=0,
-        output_rows=8,
-        sample_padded_start=0,
-        sample_padded_len=8,
-        cp_size=2,
-    )
-    assert intervals == (
-        CpRowInterval(cp_rank=0, item_row_start=0, rows=2, local_row_start=0),
-        CpRowInterval(cp_rank=1, item_row_start=2, rows=4, local_row_start=0),
-        CpRowInterval(cp_rank=0, item_row_start=6, rows=2, local_row_start=2),
-    )
-
-
-def test_an_item_inside_one_chunk_is_never_split():
-    # cp=4 over a length-16 sample: chunk size 2, chunks -> ranks 0,1,2,3,3,2,1,0.
-    inside = split_item(
-        offset_in_sample=8,
-        output_rows=2,
-        sample_padded_start=0,
-        sample_padded_len=16,
-        cp_size=4,
-    )
-    assert len(inside) == 1 and inside[0].cp_rank == 3
-    # Rows 9..10 straddle chunks 4 and 5, which are different ranks.
-    straddling = split_item(
-        offset_in_sample=9,
-        output_rows=2,
-        sample_padded_start=0,
-        sample_padded_len=16,
-        cp_size=4,
-    )
-    assert [i.cp_rank for i in straddling] == [3, 2]
-
-
-def test_empty_item_yields_no_intervals():
-    assert (
-        split_item(
-            offset_in_sample=0,
-            output_rows=0,
-            sample_padded_start=0,
-            sample_padded_len=8,
-            cp_size=2,
-        )
-        == ()
-    )
-
-
-def test_span_not_divisible_by_two_cp_is_rejected():
-    with pytest.raises(MdpConfigurationError, match="2 \\* cp_size"):
-        validate_sample_span(6, 4)
-
-
-def test_item_crossing_its_sample_boundary_is_rejected():
-    with pytest.raises(MdpConfigurationError, match="contained in its sample"):
-        split_item(
-            offset_in_sample=6,
-            output_rows=4,
-            sample_padded_start=0,
-            sample_padded_len=8,
-            cp_size=2,
-        )
-
-
-def test_unaligned_sample_start_is_rejected():
-    with pytest.raises(MdpConfigurationError, match="divisible by cp_size"):
-        split_item(
-            offset_in_sample=0,
-            output_rows=2,
-            sample_padded_start=3,
-            sample_padded_len=8,
-            cp_size=2,
-        )
+def test_invalid_inputs_fail_loudly(kwargs, match):
+    with pytest.raises(MdpPlanError, match=match):
+        _runs(**kwargs)

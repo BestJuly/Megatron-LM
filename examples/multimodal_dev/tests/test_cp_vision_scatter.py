@@ -1,25 +1,23 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Vision-embedding scatter under decoder context parallelism.
+"""Vision scatter under decoder CP: split-then-local-scatter == scatter-then-split.
 
-No other test in this repository exercises the vision scatter at CP>1:
-``test_cp_correctness.py`` builds a plain ``GPTModel``, and
-``test_cp_thd_correctness.py`` installs a vision encoder that raises if called
-and strips every image token out of ``input_ids`` before packing. That left the
-one property MDP's decoder-CP routing rests on completely uncovered.
+The native multimodal path used to embed the full sequence, scatter every
+vision row, and CP-split afterwards. ``MultimodalModel`` now splits first and
+each CP rank scatters only the rows whose image-token slots it owns -- taken from
+the full encoder output on the native path (``_cp_local_vision_rows``) or
+delivered as this rank's shard by MDP (``megatron.core.mdp.cp_partition``,
+cut from host decoder positions alone). Both must reproduce the old order
+bit for bit, in both decoder CP input layouts.
 
-The property: MDP delivers each endpoint only its own rows, so it must scatter
-*after* the CP split, while the native path scatters the full vision output into
-the full sequence and splits afterwards. Those two orderings must produce the
-identical ``decoder_input`` — ``masked_scatter`` is pure data movement and
-``index_select`` is a gather, so composing them either way copies the same values
-to the same places, provided the delivered rows are ordered by rank-local
-position. This test is what makes that "provided" checked rather than assumed.
+Rows carry distinct values, so a misrouted row cannot alias into a pass. The
+packs cover an image block inside one chunk, one straddling a chunk boundary,
+one spanning both zigzag halves of a sample, interleaved text, a sample with no
+image, and (contiguous) a block crossing the CP boundary between two samples.
 
 Run with::
 
-    PYTHONPATH=. torchrun --nproc-per-node 8 -m pytest -q \\
-        examples/multimodal_dev/tests/test_cp_vision_scatter.py
+    torchrun --nproc_per_node=4 -m pytest -q examples/multimodal_dev/tests/test_cp_vision_scatter.py
 """
 
 import os
@@ -32,253 +30,181 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../..")
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from examples.multimodal_dev.forward_step import build_vision_sidecar, pack_or_pad_batch
-from examples.multimodal_dev.models.base import MultimodalModel, _thd_cp_partition_index
-from megatron.core.mdp.cp_partition import split_item
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-from megatron.core.parallel_state import get_context_parallel_rank
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.transformer_config import TransformerConfig
+from examples.multimodal_dev.models.base import MultimodalModel, cp_partition_index
+from megatron.core import parallel_state
+from megatron.core.mdp.cp_partition import cp_item_runs
+from megatron.core.packed_seq_params import PackedSeqParams
 from tests.unit_tests.test_utilities import Utils
 
 _WORLD = int(os.environ.get("WORLD_SIZE", "1"))
-pytestmark = pytest.mark.skipif(_WORLD < 2, reason="needs a torchrun world of at least 2")
+pytestmark = pytest.mark.skipif(_WORLD < 2, reason="needs a torchrun world")
 
-IMAGE_TOKEN_ID = 7
-MERGE = 2
-HIDDEN = 128
-VOCAB = 512
+IMAGE = 7
+HIDDEN = 8
 
 
-class _UnusedVisionEncoder(MegatronModule):
-    """Satisfies the constructor; this test supplies embeddings directly."""
+class _Splitter(MultimodalModel):
+    """Just the split/selection methods: no decoder, no encoder."""
 
-    def forward(self, pixel_values, image_grid_thw):
-        """Never called: every call here passes vision_embeddings explicitly."""
-        raise RuntimeError("this test drives the scatter, not the encoder")
-
-
-def _config(cp_size):
-    return TransformerConfig(
-        num_layers=2,
-        hidden_size=HIDDEN,
-        ffn_hidden_size=2 * HIDDEN,
-        num_attention_heads=4,
-        num_query_groups=2,
-        bf16=True,
-        params_dtype=torch.bfloat16,
-        pipeline_dtype=torch.bfloat16,
-        hidden_dropout=0.0,
-        attention_dropout=0.0,
-        tensor_model_parallel_size=1,
-        context_parallel_size=cp_size,
-        sequence_parallel=False,
-    )
+    def __init__(self, mode):  # pylint: disable=super-init-not-called
+        torch.nn.Module.__init__(self)
+        self.image_token_id = IMAGE
+        self.config = type("Cfg", (), {"cp_partition_mode": mode})()
 
 
-def _model(cp_size, max_seq_len):
-    config = _config(cp_size)
-    model = MultimodalModel(
-        language_config=config,
-        language_spec=get_gpt_layer_with_transformer_engine_spec(),
-        vision_encoder=_UnusedVisionEncoder(config),
-        vocab_size=VOCAB,
-        max_sequence_length=max_seq_len,
-        image_token_id=IMAGE_TOKEN_ID,
-        position_embedding_type="rope",
-        parallel_output=False,
-    )
-    return model.cuda()
+def _mdp_shards(positions, cu, cp, mode):
+    """Per-CP-rank vision rows as MDP cuts them from host positions alone.
 
-
-def _samples(grids_per_sample, sample_len, seed=17):
-    """Per-sample dicts whose image-token blocks match their grids exactly."""
-    generator = torch.Generator(device="cpu").manual_seed(seed)
-    samples = []
-    for sample_index, grids in enumerate(grids_per_sample):
-        ids = torch.randint(
-            IMAGE_TOKEN_ID + 1, VOCAB, (sample_len,), generator=generator
-        )
-        cursor = 1  # leave a text token in front so blocks are not at row 0
-        grid_rows = []
-        for (t, h, w) in grids:
-            slots = t * (h // MERGE) * (w // MERGE)
-            ids[cursor : cursor + slots] = IMAGE_TOKEN_ID
-            cursor += slots + 1  # interleave one text token between blocks
-            grid_rows.append([t, h, w])
-        pixels = torch.zeros(sum(t * h * w for t, h, w in grids), 1)
-        samples.append(
-            {
-                "input_ids": ids.cuda(),
-                "labels": ids.clone().cuda(),
-                "loss_mask": torch.ones(sample_len).cuda(),
-                "pixel_values": pixels.cuda(),
-                "image_grid_thw": torch.tensor(
-                    grid_rows, dtype=torch.long
-                ).cuda()
-                if grid_rows
-                else torch.empty(0, 3, dtype=torch.long).cuda(),
-            }
-        )
-    return samples
-
-
-def _pack(samples):
-    packed = pack_or_pad_batch(
-        [dict(s) for s in samples], use_packed_sequence=True, device="cuda"
-    )
-    cu_padded = packed["packed_seq_params"].cu_seqlens_q_padded.tolist()
-    sidecar = build_vision_sidecar(
-        samples, cu_padded, image_token_id=IMAGE_TOKEN_ID, spatial_merge_size=MERGE
-    )
-    return packed, sidecar, cu_padded
-
-
-def _full_vision_rows(sidecar):
-    """Deterministic, per-row-distinct embeddings so a misroute cannot alias."""
-    total = int(sidecar["vision_decoder_positions"].numel())
-    base = torch.arange(total, dtype=torch.float32, device="cuda").unsqueeze(1)
-    return (base * 1000 + torch.arange(HIDDEN, device="cuda").unsqueeze(0)).bfloat16()
-
-
-def _shard_for_rank(sidecar, full_rows, cp_size, cp_rank):
-    """The rows MDP's planner would deliver to one endpoint, in leaf order.
-
-    Mirrors MdpPlanner: split each item, keep the runs owned by this rank, and
-    order them by rank-local row. Built independently here so the test is a
-    check on the planner's ordering rule, not a restatement of it.
+    Every image block (a maximal run of consecutive image slots inside one
+    sample) is one item; ``cp_item_runs`` cuts it into the runs each rank owns.
     """
-    meta = sidecar["vision_item_meta"].tolist()
-    positions = sidecar["vision_decoder_positions"].tolist()
-    entries = []
-    row_cursor = 0
-    for row in meta:
-        _, _, t, h, w, _, sample_start, sample_len = (int(v) for v in row)
-        output_rows = t * (h // MERGE) * (w // MERGE)
-        offset = positions[row_cursor] - sample_start
-        for interval in split_item(
-            offset_in_sample=offset,
-            output_rows=output_rows,
-            sample_padded_start=sample_start,
-            sample_padded_len=sample_len,
-            cp_size=cp_size,
+    shards = [[] for _ in range(cp)]
+    row = 0
+    while row < len(positions):
+        start = positions[row]
+        seq = max(i for i in range(len(cu) - 1) if cu[i] <= start)
+        rows = 1
+        while (
+            row + rows < len(positions)
+            and positions[row + rows] == start + rows
+            and start + rows < cu[seq + 1]
         ):
-            if interval.cp_rank != cp_rank:
-                continue
-            start = row_cursor + interval.item_row_start
-            entries.append(
-                (interval.local_row_start, full_rows[start : start + interval.rows])
-            )
-        row_cursor += output_rows
-    entries.sort(key=lambda e: e[0])
-    if not entries:
-        return torch.empty(0, HIDDEN, dtype=full_rows.dtype, device=full_rows.device)
-    return torch.cat([rows for _, rows in entries])
+            rows += 1
+        for run in cp_item_runs(
+            start,
+            rows,
+            sample_padded_start=cu[seq],
+            sample_padded_len=cu[seq + 1] - cu[seq],
+            total_rows=cu[-1],
+            cp_size=cp,
+            mode=mode,
+        ):
+            first = row + run.item_row_start
+            shards[run.cp_rank].extend(range(first, first + run.item_rows))
+        row += rows
+    return shards
 
 
-def _prepare(model, packed, vision_embeddings):
-    return model._prepare_decoder_inputs(
-        input_ids=packed["input_ids"],
-        position_ids=None,
-        attention_mask=None,
-        labels=packed["labels"],
-        loss_mask=packed["loss_mask"],
-        padding_mask=packed.get("padding_mask"),
-        pixel_values=None,
-        image_grid_thw=None,
-        decoder_input=None,
-        packed_seq_params=packed["packed_seq_params"],
-        vision_embeddings=vision_embeddings,
+def _pack(cp):
+    """Three samples of padded lengths multiple of 2*cp, image blocks laid out
+    to straddle chunk and CP boundaries."""
+    unit = 2 * cp
+    lengths = [8 * unit, 4 * unit, 6 * unit]
+    cu = [0]
+    for length in lengths:
+        cu.append(cu[-1] + length)
+    total = cu[-1]
+    ids = torch.full((1, total), 3, dtype=torch.long)
+    chunk0 = lengths[0] // unit  # zigzag chunk size of sample 0
+    blocks = [
+        (1, 1 + chunk0 // 2),  # inside one chunk
+        (chunk0 - 1, chunk0 + 2),  # straddles a chunk boundary
+        (lengths[0] - 3, lengths[0] - 1),  # last chunk: rank 0's second zigzag half
+        (cu[2] + 1, cu[3] - 1),  # sample 2 end to end (sample 1 has no image)
+    ]
+    for start, end in blocks:
+        ids[0, start:end] = IMAGE
+    params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=torch.tensor(cu, dtype=torch.int32, device="cuda"),
+        cu_seqlens_kv=torch.tensor(cu, dtype=torch.int32, device="cuda"),
+        cu_seqlens_q_padded=torch.tensor(cu, dtype=torch.int32, device="cuda"),
+        cu_seqlens_kv_padded=torch.tensor(cu, dtype=torch.int32, device="cuda"),
+        max_seqlen_q=max(lengths),
+        max_seqlen_kv=max(lengths),
+        total_tokens=total,
     )
+    return ids.cuda(), params, cu
 
 
-# Item layouts chosen to hit the cases that matter: a block inside one chunk, a
-# block straddling a chunk boundary, a block spanning both halves of a sample,
-# and a sample with no vision at all.
-_LAYOUTS = [
-    [[(1, 4, 4)], []],
-    [[(1, 8, 8)], [(1, 4, 4), (1, 4, 4)]],
-    [[(2, 8, 8)], [(1, 4, 4)]],
-]
+@pytest.fixture(params=[2, 4], ids=["cp2", "cp4"])
+def cp_size(request):
+    cp = request.param
+    if _WORLD % cp:
+        pytest.skip(f"world {_WORLD} not divisible by cp={cp}")
+    Utils.initialize_model_parallel(context_parallel_size=cp)
+    yield cp
+    Utils.destroy_model_parallel()
 
 
-@pytest.mark.parametrize("grids_per_sample", _LAYOUTS)
-def test_split_then_scatter_matches_scatter_then_split(grids_per_sample):
-    """The linchpin: the two orderings must agree bit for bit."""
-    cp_size = _WORLD
-    sample_len = 128
-    Utils.initialize_model_parallel(
-        tensor_model_parallel_size=1, context_parallel_size=cp_size
+@pytest.mark.parametrize("mode", ["zigzag", "contiguous"])
+def test_split_then_local_scatter_is_bitwise_equal(cp_size, mode):
+    cp_rank = parallel_state.get_context_parallel_rank()
+    ids, params, cu = _pack(cp_size)
+    params.cp_partition_mode = mode
+    total = ids.shape[1]
+    num_rows = int((ids == IMAGE).sum())
+    vision = torch.arange(num_rows * HIDDEN, dtype=torch.float32, device="cuda").view(
+        num_rows, HIDDEN
     )
-    model_parallel_cuda_manual_seed(1234)
+    text = -torch.arange(total * HIDDEN, dtype=torch.float32, device="cuda").view(total, HIDDEN)
+
+    # Oracle: the old native order -- scatter into the full sequence, then split.
+    full = text.clone()
+    full[(ids[0] == IMAGE)] = vision
+    idx = cp_partition_index(params, total, cp_size, cp_rank)
+    expected = full.index_select(0, idx)
+
+    splitter = _Splitter(mode)
+    cp_index = splitter._cp_index(params, total, ids.device)
+    assert torch.equal(cp_index, idx)
+    local_ids = splitter._cp_split_sequence(ids, 1, cp_index)
+    local_text = text.index_select(0, idx)
+
+    def scatter(rows):
+        out = local_text.clone()
+        out[local_ids[0] == IMAGE] = rows
+        return out
+
+    # Native path: select this rank's rows from the full encoder output.
+    native_rows = splitter._cp_local_vision_rows(ids, vision, cp_index)
+    assert torch.equal(scatter(native_rows), expected)
+
+    # MDP path: the shard cut from host positions alone.
+    positions = (ids[0] == IMAGE).nonzero().view(-1).tolist()
+    shards = _mdp_shards(positions, cu, cp_size, mode)
+    mdp_rows = vision.index_select(
+        0, torch.tensor(shards[cp_rank], dtype=torch.long, device="cuda")
+    )
+    assert torch.equal(mdp_rows, native_rows)
+    assert torch.equal(scatter(mdp_rows), expected)
+
+    # The shards partition the rows, and the layout really splits them.
+    sizes = [len(shard) for shard in shards]
+    assert sum(sizes) == num_rows and sum(1 for n in sizes if n) > 1
+
+
+def test_rank_without_image_tokens_gets_an_empty_shard():
+    if _WORLD % 2:
+        pytest.skip("needs an even world")
+    Utils.initialize_model_parallel(context_parallel_size=2)
     try:
-        model = _model(cp_size, sample_len * len(grids_per_sample))
-        samples = _samples(grids_per_sample, sample_len)
-        packed, sidecar, _ = _pack(samples)
-        full_rows = _full_vision_rows(sidecar)
-        cp_rank = get_context_parallel_rank()
-
-        # Reference: scatter the FULL vision output into the FULL sequence, then
-        # take this rank's shard -- exactly what the native path does.
-        with torch.no_grad():
-            text = model.language_model.embedding(
-                input_ids=packed["input_ids"], position_ids=None
-            )
-            scattered = model._scatter_vision_embeddings(
-                packed["input_ids"], text, full_rows
-            )
-            index = _thd_cp_partition_index(
-                packed["packed_seq_params"].cu_seqlens_q_padded,
-                scattered.shape[0],
-                cp_size,
-                cp_rank,
-            )
-            reference = scattered.index_select(0, index)
-
-            # Under test: hand the model only this rank's rows and let it split
-            # first and scatter into the rank-local stream.
-            shard = _shard_for_rank(sidecar, full_rows, cp_size, cp_rank)
-            produced = _prepare(model, packed, shard)["decoder_input"]
-
-        assert produced.shape == reference.shape
-        assert torch.equal(produced, reference), (
-            f"cp_rank={cp_rank}: split-then-scatter diverged from "
-            f"scatter-then-split at {int((produced != reference).sum())} elements"
+        cp_rank = parallel_state.get_context_parallel_rank()
+        ids, params, cu = _pack(2)
+        params.cp_partition_mode = "contiguous"
+        ids[0, ids.shape[1] // 2 :] = 3  # no image in rank 1's contiguous half
+        positions = (ids[0] == IMAGE).nonzero().view(-1).tolist()
+        shards = _mdp_shards(positions, cu, 2, "contiguous")
+        assert shards[1] == [] and len(shards[0]) == len(positions)
+        splitter = _Splitter("contiguous")
+        rows = splitter._cp_local_vision_rows(
+            ids,
+            torch.zeros(len(positions), HIDDEN, device="cuda"),
+            splitter._cp_index(params, ids.shape[1], ids.device),
         )
+        assert rows.shape[0] == len(shards[cp_rank])
     finally:
         Utils.destroy_model_parallel()
 
 
-def test_an_endpoint_with_no_vision_rows_is_not_an_error():
-    """An empty shard is a designed-for state, not a missing-source failure."""
-    cp_size = _WORLD
-    sample_len = 128
-    Utils.initialize_model_parallel(
-        tensor_model_parallel_size=1, context_parallel_size=cp_size
-    )
-    model_parallel_cuda_manual_seed(1234)
+def test_layout_mismatch_between_collator_and_decoder_fails_loudly():
+    if _WORLD % 2:
+        pytest.skip("needs an even world")
+    Utils.initialize_model_parallel(context_parallel_size=2)
     try:
-        model = _model(cp_size, sample_len)
-        # A single small block near the start of the sample lands inside one
-        # chunk, so at least one rank owns none of it.
-        samples = _samples([[(1, 4, 4)]], sample_len)
-        packed, sidecar, _ = _pack(samples)
-        full_rows = _full_vision_rows(sidecar)
-        cp_rank = get_context_parallel_rank()
-        shard = _shard_for_rank(sidecar, full_rows, cp_size, cp_rank)
-
-        with torch.no_grad():
-            prepared = _prepare(model, packed, shard if shard.numel() else None)
-        assert prepared["decoder_input"] is not None
-
-        owners = torch.zeros(cp_size, dtype=torch.int64, device="cuda")
-        owners[cp_rank] = 1 if shard.numel() else 0
-        torch.distributed.all_reduce(owners)
-        assert int(owners.sum()) >= 1, "some rank must own the item's rows"
-        assert int(owners.sum()) < cp_size, (
-            "this layout is meant to leave at least one rank empty; if every "
-            "rank owns rows the empty-shard path is not being exercised"
-        )
+        ids, params, _ = _pack(2)
+        params.cp_partition_mode = "zigzag"
+        with pytest.raises(RuntimeError, match="cp_partition_mode"):
+            _Splitter("contiguous")._cp_index(params, ids.shape[1], ids.device)
     finally:
         Utils.destroy_model_parallel()

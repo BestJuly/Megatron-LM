@@ -180,6 +180,7 @@ def _view(worker_ids=(0, 1, 2, 3), group=(0, 2, 4, 6), endpoint=0):
         endpoint_rank=endpoint,
         planning_group_ranks=group,
         worker_ids=worker_ids,
+        shard_owners=(endpoint,),
     )
 
 

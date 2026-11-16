@@ -11,6 +11,7 @@ import dataclasses
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
+from megatron.core.mdp.cp_partition import CP_PARTITION_MODES
 from megatron.core.mdp.errors import MdpConfigurationError
 
 if TYPE_CHECKING:
@@ -247,6 +248,10 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "The current MDP support matrix requires TP=1.",
             "1",
         )
+    # Decoder CP > 1 is supported in both CP input layouts: the planner cuts each
+    # vision item into the runs each CP rank owns under the decoder's own
+    # partition (megatron.core.mdp.cp_partition) and routes them straight to
+    # their owners. The encoder stays CP-unaware (encoder_cp == 1).
     if options.context_parallel_size < 1:
         _reject(
             "context_parallel_size",
@@ -255,16 +260,15 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "Decoder context parallelism is supported; the size must be positive.",
             "1",
         )
-    if options.context_parallel_size > 1 and options.cp_partition_mode != "zigzag":
+    if (
+        options.context_parallel_size > 1
+        and options.cp_partition_mode not in CP_PARTITION_MODES
+    ):
         _reject(
             "cp_partition_mode",
             options.cp_partition_mode,
-            "cp_partition_mode == 'zigzag'",
-            "MDP routes each vision item's rows with an integer inverse of the "
-            "zigzag partition (megatron.core.mdp.cp_partition). Under "
-            "'contiguous' the decoder would slice its sequence differently from "
-            "the plan, delivering every embedding to the wrong rank without any "
-            "shape error.",
+            f"cp_partition_mode in {CP_PARTITION_MODES}",
+            "MDP cuts vision rows into CP shards with the decoder's input layout.",
             "zigzag",
         )
     model_parallel = (

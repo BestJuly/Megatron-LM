@@ -27,18 +27,7 @@ from megatron.core.mdp.protocols import VisionDescriptor
 from megatron.core.mdp.rank_mapping import MdpRankSpec, build_rank_map
 
 
-def _descriptor(
-    item_id,
-    mb=0,
-    sample=0,
-    ordinal=0,
-    lane=0,
-    cost=7,
-    grid=(1, 4, 4),
-    sample_padded_start=0,
-    sample_padded_len=0,
-    decoder_offset_in_sample=0,
-):
+def _descriptor(item_id, mb=0, sample=0, ordinal=0, lane=0, cost=7, grid=(1, 4, 4)):
     t, h, w = grid
     return VisionDescriptor(
         global_item_id=item_id,
@@ -51,9 +40,6 @@ def _descriptor(
         output_rows=t * (h // 2) * (w // 2),
         grid_thw=grid,
         owner_worker_id=0,
-        sample_padded_start=sample_padded_start,
-        sample_padded_len=sample_padded_len,
-        decoder_offset_in_sample=decoder_offset_in_sample,
     )
 
 
@@ -61,17 +47,16 @@ def test_record_round_trip_is_lossless():
     descriptors = (
         _descriptor(0, grid=(2, 6, 8)),
         _descriptor(1, mb=1, sample=3, ordinal=2, cost=123, grid=(1, 4, 4)),
-        # The decoder-CP span columns must survive the wire: every planning
-        # group member derives its slice table from them, and a member that
-        # deserializes them wrong builds a different plan.
-        _descriptor(
-            2,
-            mb=2,
-            sample=1,
-            sample_padded_start=4096,
-            sample_padded_len=2048,
-            decoder_offset_in_sample=137,
+        VisionDescriptor(
+            **{
+                **_descriptor(2, grid=(1, 4, 4)).__dict__,
+                "decoder_start": 37,
+                "sample_padded_start": 32,
+                "sample_padded_len": 64,
+                "microbatch_rows": 4096,
+            }
         ),
+        VisionDescriptor(**{**_descriptor(3, grid=(1, 4, 4)).__dict__, "decoder_start": -1}),
     )
     assert records_to_descriptors(descriptors_to_records(descriptors)) == descriptors
 
@@ -181,3 +166,39 @@ def test_broadcast_rejects_misordered_descriptors():
             )
     # Non-endpoint ranks skip; a real run would abort collectively before
     # reaching the broadcast.
+
+
+@pytest.mark.skipif(
+    not _DISTRIBUTED or int(os.environ.get("WORLD_SIZE", "1")) % 2 != 0,
+    reason="needs a torchrun world divisible by CP2",
+)
+def test_decoder_cp_group_is_checked_against_the_rank_map():
+    from megatron.core import parallel_state
+    from megatron.core.mdp.errors import MdpConfigurationError
+    from tests.unit_tests.test_utilities import Utils
+
+    world = torch.distributed.get_world_size()
+    Utils.initialize_model_parallel(context_parallel_size=2)
+    try:
+        rank_map = build_rank_map(
+            MdpRankSpec(world_size=world, tp=1, pp=1, cp=2, ep=1, encoder_cp=1)
+        )
+        view = rank_map.view(torch.distributed.get_rank())
+        install_mdp_process_groups(
+            rank_map,
+            group_registry=MdpGroupRegistry(),
+            decoder_cp_group=parallel_state.get_context_parallel_group(),
+        )
+        # PP=1: every rank runs the first decoder stage, so every rank is a
+        # shard owner and checks its decoder CP group.
+        assert view.is_shard_owner
+        # A wrong CP group describes a different rank order: refuse, do not hang
+        # later. The TP=1 group holds this rank alone, so it never matches.
+        with pytest.raises(MdpConfigurationError, match="disagree about the rank order"):
+            install_mdp_process_groups(
+                rank_map,
+                group_registry=MdpGroupRegistry(),
+                decoder_cp_group=parallel_state.get_tensor_model_parallel_group(),
+            )
+    finally:
+        Utils.destroy_model_parallel()

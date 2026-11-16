@@ -1,252 +1,255 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Planner tests for decoder context parallelism. Pure compute, no CUDA.
+"""Decoder-CP slicing in the planner (direct per-CP-rank routing). Pure compute.
 
-These cover the plan-shaped consequences of the zigzag split that
-``test_cp_partition.py`` verifies arithmetically: how many route slices an item
-produces, which endpoint each lands on, that a rank's leaf rows come out in
-rank-local order, and that a CP rank owning nothing is a normal state.
+Under decoder CP the planner cuts each vision item into the runs of rows each CP
+rank owns and routes every run straight to that CP rank's PP0 rank. These
+tests check the plan against an independent token-level reference
+(``cp_reference``): the owner of every leaf row and each owner's local scatter
+order (ascending decoder position).
 """
+
+import random
 
 import pytest
 
-from megatron.core.mdp.cp_partition import split_item
 from megatron.core.mdp.errors import MdpPlanError
-from megatron.core.mdp.plan import RowCapacityPolicy
-from megatron.core.mdp.planner import MdpPlanner
+from megatron.core.mdp.plan import MdpBatchPlan, RouteSlice, RowCapacityPolicy
+from megatron.core.mdp.planner import MdpPlanner, _validate_plan
 from megatron.core.mdp.protocols import VisionDescriptor
-from megatron.core.mdp.rank_mapping import MdpRankView
-
-# One planning group at tp=1, cp=CP, pp=2: ranks are ordered cp-fastest, so the
-# decoder endpoints are the first CP entries. Mirrors what build_rank_map emits.
-MERGE = 2
+from megatron.core.mdp.rank_mapping import MdpRankSpec, build_rank_map
+from tests.unit_tests.mdp.cp_reference import owner_by_position
 
 
-def _view(cp_size, pp=2):
-    group = tuple(range(cp_size * pp))
-    return MdpRankView(
-        global_rank=0,
-        outer_dp_rank=0,
-        lane_id=0,
-        my_worker_id=0,
-        endpoint_rank=group[0],
-        planning_group_ranks=group,
-        worker_ids=tuple(range(len(group))),
-        decoder_endpoint_ranks=group[:cp_size],
-        my_cp_rank=0,
-        my_pp_rank=0,
+def _view(cp, pp=1):
+    rank_map = build_rank_map(
+        MdpRankSpec(world_size=cp * pp, tp=1, pp=pp, cp=cp, ep=1, encoder_cp=1)
     )
+    return rank_map.view(0)
 
 
-def _descriptor(
-    item_id,
-    *,
-    offset,
-    sample_padded_start,
-    sample_padded_len,
-    grid=(1, 4, 4),
-    mb=0,
-    sample=0,
-    ordinal=0,
-    cost=10,
-):
-    t, h, w = grid
-    return VisionDescriptor(
-        global_item_id=item_id,
-        sample_id=sample,
-        image_ordinal=ordinal,
-        owner_dp_lane=0,
-        microbatch_id=mb,
-        estimated_cost_units=cost,
-        payload_rows=t * h * w,
-        output_rows=t * (h // MERGE) * (w // MERGE),
-        grid_thw=grid,
-        owner_worker_id=0,
-        sample_padded_start=sample_padded_start,
-        sample_padded_len=sample_padded_len,
-        decoder_offset_in_sample=offset,
-    )
-
-
-def _planner(cp_size, pp=2):
+def _planner(view, mode):
     return MdpPlanner(
-        _view(cp_size, pp),
+        view,
         locality_slack_permille=10,
         capacity_policy=RowCapacityPolicy(),
+        cp_partition_mode=mode,
     )
 
 
-def test_cp1_plan_is_byte_identical_to_a_plan_with_no_span_data():
-    """The CP=1 path must not depend on the new descriptor columns at all."""
-    with_span = _descriptor(0, offset=8, sample_padded_start=0, sample_padded_len=64)
-    without_span = VisionDescriptor(
-        global_item_id=0,
-        sample_id=0,
-        image_ordinal=0,
-        owner_dp_lane=0,
-        microbatch_id=0,
-        estimated_cost_units=10,
-        payload_rows=16,
-        output_rows=4,
-        grid_thw=(1, 4, 4),
-        owner_worker_id=0,
-    )
-    a = _planner(1).build_plan(0, [with_span], [0])
-    b = _planner(1).build_plan(0, [without_span], [0])
-    assert a.digest == b.digest
-    assert a.routes == b.routes
-    assert len(a.routes) == 1
-    assert a.routes[0].slice_id == 0
-    assert a.routes[0].item_row_start == 0
-    assert a.routes[0].item_rows == 4
+def _pack(rng, cp, mb):
+    """One packed microbatch: padded sequences (multiples of 2*cp), image items
+    as contiguous slot runs placed anywhere inside their sample."""
+    lengths = [2 * cp * rng.randint(2, 8) for _ in range(rng.randint(1, 4))]
+    cu = [0]
+    for length in lengths:
+        cu.append(cu[-1] + length)
+    items = []
+    for sample, (start, end) in enumerate(zip(cu[:-1], cu[1:])):
+        cursor = start
+        ordinal = 0
+        while cursor < end - 1 and rng.random() < 0.7:
+            first = rng.randint(cursor, end - 1)
+            rows = rng.randint(1, end - first)
+            items.append((mb, sample, ordinal, first, rows, start, end - start, cu[-1]))
+            cursor = first + rows
+            ordinal += 1
+    return items
 
 
-def test_an_item_inside_one_chunk_produces_one_slice():
-    # cp=2 over a 64-row sample: chunks of 16. Rows [16, 20) sit inside chunk 1.
-    descriptor = _descriptor(0, offset=16, sample_padded_start=0, sample_padded_len=64)
-    plan = _planner(2).build_plan(0, [descriptor], [0])
-    assert len(plan.routes) == 1
-    assert plan.routes[0].endpoint_rank == 1  # chunk 1 -> cp_rank 1 -> group[1]
-    assert plan.routes[0].item_rows == 4
-
-
-def test_an_item_spanning_every_chunk_produces_2cp_minus_1_slices():
-    # A 4x16 grid is 32 post-merge rows, exactly one 32-row sample at cp=2:
-    # chunks of 8 -> ranks 0,1,1,0, and the middle pair fuses.
-    descriptor = _descriptor(
-        0, offset=0, sample_padded_start=0, sample_padded_len=32, grid=(2, 8, 8)
-    )
-    assert descriptor.output_rows == 32
-    plan = _planner(2).build_plan(0, [descriptor], [0])
-    assert len(plan.routes) == 2 * 2 - 1
-    assert [r.endpoint_rank for r in plan.routes] == [0, 1, 0]
-    assert [(r.item_row_start, r.item_rows) for r in plan.routes] == [
-        (0, 8),
-        (8, 16),
-        (24, 8),
-    ]
-    # Two disjoint runs of one item on rank 0 -- distinct slice_ids, which is
-    # what keeps their bridge buffer keys apart.
-    on_rank0 = [r for r in plan.routes if r.endpoint_rank == 0]
-    assert len(on_rank0) == 2
-    assert len({r.slice_id for r in on_rank0}) == 2
-
-
-def test_leaf_segments_are_ordered_by_rank_local_row():
-    """The leaf must be consumable by masked_scatter over the local mask.
-
-    Two items in one sample, the second earlier in rank-local order than part of
-    the first, so a naive (sample_id, image_ordinal) sort would be wrong.
-    """
-    cp_size = 2
-    length = 64
-    descriptors = [
-        _descriptor(
-            0, offset=0, sample_padded_start=0, sample_padded_len=length,
-            grid=(1, 8, 8), ordinal=0,
-        ),  # 16 rows, offsets [0, 16)
-        _descriptor(
-            1, offset=48, sample_padded_start=0, sample_padded_len=length,
-            grid=(1, 8, 8), ordinal=1,
-        ),  # 16 rows, offsets [48, 64)
-    ]
-    plan = _planner(cp_size).build_plan(0, descriptors, [0])
-    for endpoint in (0, 1):
-        layout = plan.layout_for_microbatch(0, endpoint)
-        # Recompute each segment's true rank-local start and assert the layout
-        # is sorted by it, gapless from 0.
-        local_rows = []
-        for segment in layout.segments:
-            descriptor = next(
-                d for d in descriptors if d.global_item_id == segment.global_item_id
+def _descriptors(items):
+    out = []
+    for item_id, (mb, sample, ordinal, first, rows, s_start, s_len, total) in enumerate(items):
+        out.append(
+            VisionDescriptor(
+                global_item_id=item_id,
+                sample_id=sample,
+                image_ordinal=ordinal,
+                owner_dp_lane=0,
+                microbatch_id=mb,
+                estimated_cost_units=rows,
+                payload_rows=4 * rows,
+                output_rows=rows,
+                grid_thw=(1, 2, 2 * rows),
+                owner_worker_id=0,
+                decoder_start=first,
+                sample_padded_start=s_start,
+                sample_padded_len=s_len,
+                microbatch_rows=total,
             )
-            interval = split_item(
-                offset_in_sample=descriptor.decoder_offset_in_sample,
-                output_rows=descriptor.output_rows,
-                sample_padded_start=descriptor.sample_padded_start,
-                sample_padded_len=descriptor.sample_padded_len,
-                cp_size=cp_size,
-            )[segment.slice_id]
-            local_rows.append(interval.local_row_start)
-        assert local_rows == sorted(local_rows)
-        assert len(set(local_rows)) == len(local_rows)
+        )
+    return out
 
 
-def test_a_cp_rank_owning_no_rows_gets_a_text_only_layout():
-    """4.8% of (microbatch, cp_rank) pairs are empty; it must not be an error."""
-    # cp=4 over a 64-row sample: chunks of 8. Rows [8, 12) are entirely inside
-    # chunk 1, so only cp_rank 1 owns anything.
-    descriptor = _descriptor(0, offset=8, sample_padded_start=0, sample_padded_len=64)
-    plan = _planner(4).build_plan(0, [descriptor], [0])
-    owners = {r.endpoint_rank for r in plan.routes}
-    assert owners == {1}
-    for endpoint in (0, 2, 3):
-        layout = plan.layout_for_microbatch(0, endpoint)
-        assert layout.text_only
-        assert layout.segments == ()
-        assert layout.total_output_rows == 0
-    assert not plan.layout_for_microbatch(0, 1).text_only
+@pytest.mark.parametrize("mode", ["zigzag", "contiguous"])
+@pytest.mark.parametrize("cp", [2, 4])
+def test_slices_route_every_row_to_its_owner_in_local_order(mode, cp):
+    rng = random.Random(97 * cp + len(mode))
+    view = _view(cp)
+    owners = view.shard_owners
+    assert len(owners) == cp
+    for _ in range(20):
+        items = _pack(rng, cp, 0) + _pack(rng, cp, 1)
+        if not items:
+            continue
+        descriptors = _descriptors(items)
+        plan = _planner(view, mode).build_plan(0, descriptors, [0, 1])
+        by_id = {d.global_item_id: d for d in descriptors}
+
+        # Reference: every image slot's owner from token-level ownership.
+        expected = {}  # (mb, owner_rank) -> [(position, item, row)]
+        for d in descriptors:
+            # Zigzag ownership is per padded sequence; contiguous is over the pack.
+            if mode == "zigzag":
+                base, length = d.sample_padded_start, d.sample_padded_len
+            else:
+                base, length = 0, d.microbatch_rows
+            owner_of = owner_by_position([0, length], length, cp, mode)
+            for row in range(d.output_rows):
+                pos = d.decoder_start + row
+                owner = owner_of[pos - base]
+                expected.setdefault((d.microbatch_id, owners[owner]), []).append(
+                    (pos, d.global_item_id, row)
+                )
+
+        # Plan: expand each owner's leaf back into (position, item, row).
+        routes = {(r.global_item_id, r.slice_id): r for r in plan.routes}
+        got = {}
+        for layout in plan.layouts:
+            if layout.text_only:
+                continue
+            rows_out = []
+            for segment in layout.segments:
+                route = routes[(segment.global_item_id, segment.slice_id)]
+                assert route.endpoint_rank == layout.endpoint_rank
+                d = by_id[segment.global_item_id]
+                for k in range(segment.output_rows):
+                    row = route.item_row_start + k
+                    rows_out.append((d.decoder_start + row, d.global_item_id, row))
+            got[(layout.microbatch_id, layout.endpoint_rank)] = rows_out
+        assert got == {key: sorted(value) for key, value in expected.items()}
+        # Every routed row goes to an owner; every owner's leaf is in local order.
+        for rows_out in got.values():
+            assert rows_out == sorted(rows_out)
+        assert all(r.endpoint_rank in owners for r in plan.routes)
 
 
-def test_every_endpoint_gets_a_layout_for_every_microbatch():
-    descriptor = _descriptor(0, offset=0, sample_padded_start=0, sample_padded_len=32)
-    plan = _planner(2).build_plan(0, [descriptor], [0, 1])
-    assert len(plan.layouts) == 2 * 2  # (mb0, mb1) x (endpoint 0, endpoint 1)
-    for mb_id in (0, 1):
-        for endpoint in (0, 1):
-            assert plan.layout_for_microbatch(mb_id, endpoint) is not None
-    # Ambiguous lookup must raise rather than silently pick cp0.
-    with pytest.raises(MdpPlanError, match="endpoint_rank is required"):
-        plan.layout_for_microbatch(0)
-
-
-def test_routes_and_layouts_agree_slice_for_slice():
-    descriptors = [
-        _descriptor(
-            0, offset=0, sample_padded_start=0, sample_padded_len=32, grid=(2, 8, 8)
-        ),
-        _descriptor(
-            1, offset=8, sample_padded_start=32, sample_padded_len=32, sample=1
-        ),
-    ]
-    plan = _planner(2).build_plan(0, descriptors, [0])
-    route_slices = {(r.global_item_id, r.slice_id) for r in plan.routes}
-    layout_slices = {
-        (s.global_item_id, s.slice_id)
-        for layout in plan.layouts
+def test_cp1_plan_keeps_the_single_slice_shape():
+    rng = random.Random(5)
+    view = _view(cp=1)
+    descriptors = _descriptors(_pack(rng, 1, 0))
+    plan = _planner(view, "zigzag").build_plan(0, descriptors, [0])
+    assert len(plan.routes) == len(descriptors)
+    for route, d in zip(plan.routes, sorted(descriptors, key=lambda x: x.global_item_id)):
+        assert route.slice_id == 0 and route.item_row_start == 0
+        assert route.item_rows == d.output_rows
+        assert route.endpoint_rank == view.endpoint_rank
+    (layout,) = plan.layouts
+    assert layout.endpoint_rank == view.endpoint_rank
+    order = [(d.sample_id, d.image_ordinal) for d in descriptors]
+    by_id = {d.global_item_id: d for d in descriptors}
+    assert [
+        (by_id[s.global_item_id].sample_id, by_id[s.global_item_id].image_ordinal)
         for s in layout.segments
-    }
-    assert route_slices == layout_slices
-    # Row conservation: each item's slices tile its output rows exactly.
-    for descriptor in descriptors:
-        rows = sum(
-            r.item_rows
-            for r in plan.routes_for_item(descriptor.global_item_id)
+    ] == sorted(order)
+
+
+def test_rank_without_rows_gets_no_layout_and_text_only_stays_at_endpoint():
+    view = _view(cp=2)
+    # One item entirely inside rank 0's contiguous half; microbatch 1 is text-only.
+    d = _descriptors([(0, 0, 0, 1, 3, 0, 16, 16)])
+    plan = _planner(view, "contiguous").build_plan(0, d, [0, 1])
+    layouts = {(l.microbatch_id, l.endpoint_rank): l for l in plan.layouts}
+    assert set(layouts) == {(0, view.shard_owners[0]), (1, view.endpoint_rank)}
+    assert layouts[(1, view.endpoint_rank)].text_only
+    assert plan.layouts_for_endpoint(view.shard_owners[1]) == ()
+
+
+def test_plan_fails_without_an_items_decoder_span():
+    view = _view(cp=2)
+    (d,) = _descriptors([(0, 0, 0, 2, 4, 0, 16, 16)])
+    bad = VisionDescriptor(**{**d.__dict__, "decoder_start": -1})
+    with pytest.raises(MdpPlanError, match="decoder span"):
+        _planner(view, "zigzag").build_plan(0, [bad], [0])
+
+
+def test_an_item_that_cannot_be_split_is_named_in_the_error():
+    # Padded sequence length 18 is not a multiple of 2 * cp under zigzag.
+    view = _view(cp=2)
+    (d,) = _descriptors([(0, 0, 0, 1, 3, 0, 18, 18)])
+    with pytest.raises(MdpPlanError, match=r"item 0 \(microbatch 0\).*divisible by 2 \* cp_size"):
+        _planner(view, "zigzag").build_plan(0, [d], [0])
+
+
+def test_decoder_spans_must_ascend_with_the_leaf_order():
+    # A leaf is laid out by (sample_id, image_ordinal) and scattered by decoder
+    # position; an item whose span precedes (or overlaps) its predecessor's would
+    # land on the wrong slots.
+    view = _view(cp=2)
+    descriptors = _descriptors([(0, 0, 0, 8, 4, 0, 16, 16), (0, 0, 1, 2, 4, 0, 16, 16)])
+    with pytest.raises(MdpPlanError, match="ascend"):
+        _planner(view, "zigzag").build_plan(0, descriptors, [0])
+    overlapping = _descriptors([(0, 0, 0, 2, 4, 0, 16, 16), (0, 0, 1, 5, 4, 0, 16, 16)])
+    with pytest.raises(MdpPlanError, match="ascend"):
+        _planner(view, "contiguous").build_plan(0, overlapping, [0])
+
+
+def test_plan_validation_rejects_gaps_and_overlaps():
+    view = _view(cp=2)
+    descriptors = _descriptors([(0, 0, 0, 6, 4, 0, 16, 16)])  # straddles the CP boundary
+    plan = _planner(view, "contiguous").build_plan(0, descriptors, [0])
+    assert len(plan.routes) == 2
+
+    def rebuilt(routes):
+        return MdpBatchPlan(
+            schema_version=plan.schema_version,
+            iteration=0,
+            outer_dp_rank=0,
+            capacity_policy=plan.capacity_policy,
+            routes=tuple(routes),
+            layouts=plan.layouts,
+            encoder_layouts=plan.encoder_layouts,
+            digest=plan.digest,
         )
-        assert rows == descriptor.output_rows
+
+    first, second = plan.routes
+    gap = RouteSlice(**{**second.__dict__, "item_row_start": second.item_row_start + 1})
+    with pytest.raises(MdpPlanError, match="tile"):
+        _validate_plan(rebuilt([first, gap]), view)
+    overlap = RouteSlice(**{**second.__dict__, "item_rows": second.item_rows + 1})
+    with pytest.raises(MdpPlanError, match="tile"):
+        _validate_plan(rebuilt([first, overlap]), view)
+    wrong_endpoint = RouteSlice(**{**second.__dict__, "endpoint_rank": first.endpoint_rank})
+    with pytest.raises(MdpPlanError, match="endpoint"):
+        _validate_plan(rebuilt([first, wrong_endpoint]), view)
 
 
-def test_plans_are_bit_identical_across_builds_at_cp4():
-    descriptors = [
-        _descriptor(
-            i,
-            offset=(i * 4) % 48,
-            sample_padded_start=0,
-            sample_padded_len=64,
-            ordinal=i,
-            cost=10 + (i * 7) % 5,
-        )
-        for i in range(4)
-    ]
-    a = _planner(4).build_plan(3, descriptors, [0])
-    b = _planner(4).build_plan(3, descriptors, [0])
-    assert a.digest == b.digest
-    assert a.routes == b.routes
-    assert a.layouts == b.layouts
+def test_digest_tracks_cp_size_and_layout():
+    view2 = _view(cp=2)
+    descriptors = _descriptors([(0, 0, 0, 6, 4, 0, 16, 16)])
+    zig = _planner(view2, "zigzag").build_plan(0, descriptors, [0])
+    con = _planner(view2, "contiguous").build_plan(0, descriptors, [0])
+    assert zig.digest != con.digest
+    one = _planner(_view(cp=1), "zigzag").build_plan(0, descriptors, [0])
+    assert one.digest not in (zig.digest, con.digest)
 
 
-def test_an_item_straddling_its_sample_is_rejected_as_a_plan_error():
-    # 4 rows starting at offset 62 of a 64-row sample runs past its end.
-    descriptor = _descriptor(0, offset=62, sample_padded_start=0, sample_padded_len=64)
-    with pytest.raises(MdpPlanError, match="cannot be split"):
-        _planner(2).build_plan(0, [descriptor], [0])
+def test_physical_capacity_is_consistent_and_part_of_digest():
+    from dataclasses import replace
+
+    planner = _planner(_view(cp=2), "contiguous")
+    descriptors = _descriptors([(0, 0, 0, 1, 2, 0, 16, 32), (0, 0, 1, 5, 2, 0, 16, 32)])
+    original = planner.build_plan(0, descriptors, [0])
+    larger = [replace(d, microbatch_rows=64) for d in descriptors]
+    changed = planner.build_plan(0, larger, [0])
+    assert original.routes == changed.routes
+    assert original.digest != changed.digest
+    with pytest.raises(MdpPlanError, match="physical rows"):
+        planner.build_plan(0, [descriptors[0], larger[1]], [0])
+
+
+def test_locality_uses_the_cp_owner():
+    view = _view(cp=4)
+    descriptors = _descriptors([(0, 0, 0, 25, 4, 0, 32, 32)])
+    plan = _planner(view, "contiguous").build_plan(0, descriptors, [0])
+    assert plan.routes[0].producer_worker_id == view.shard_owners[3]

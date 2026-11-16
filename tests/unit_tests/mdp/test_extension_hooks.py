@@ -169,12 +169,16 @@ def test_build_ledger_emits_one_entry_per_plan_slice():
         output_rows=32,
         grid_thw=(2, 8, 8),
         owner_worker_id=0,
+        decoder_start=0,
         sample_padded_start=0,
         sample_padded_len=32,
-        decoder_offset_in_sample=0,
+        microbatch_rows=32,
     )
     plan = MdpPlanner(
-        view, locality_slack_permille=10, capacity_policy=RowCapacityPolicy()
+        view,
+        locality_slack_permille=10,
+        capacity_policy=RowCapacityPolicy(),
+        cp_partition_mode="zigzag",
     ).build_plan(0, [descriptor], [0])
 
     assert [(r.slice_id, r.item_row_start, r.item_rows) for r in plan.routes] == [
@@ -183,8 +187,8 @@ def test_build_ledger_emits_one_entry_per_plan_slice():
         (2, 24, 8),
     ]
     endpoints = [r.endpoint_rank for r in plan.routes]
-    assert endpoints == [view.decoder_endpoint_ranks[0], view.decoder_endpoint_ranks[1],
-                         view.decoder_endpoint_ranks[0]]
+    owners = view.shard_owners
+    assert endpoints == [owners[0], owners[1], owners[0]]
 
     bridge = ModalityBridge(DirectBufferAllocator())
     device = torch.device("cuda")

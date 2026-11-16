@@ -308,11 +308,6 @@ def _build_packed_seq_params_from_cu_seqlens(
     )
 
 
-# Columns of ``vision_item_meta``: sample_index, image_ordinal, grid t/h/w,
-# payload_row_start, sample_padded_start, sample_padded_len.
-VISION_ITEM_META_COLUMNS = 8
-
-
 def build_vision_sidecar(
     batch: list[Dict[str, Any]],
     cu_seqlens_padded: list[int],
@@ -322,17 +317,9 @@ def build_vision_sidecar(
     """Build the per-item vision sidecar for a THD-packed batch.
 
     For every vision item, records ``(sample_index, image_ordinal, t, h, w,
-    payload_row_start, sample_padded_start, sample_padded_len)`` plus that
-    item's decoder image-token positions in the packed ``[1, T]`` layout,
-    ordered by ``(sample_index, image_ordinal)``. Both outputs are plain
-    integer tensors so they survive the TP broadcast.
-
-    The last two columns are the enclosing sample's span in
-    ``cu_seqlens_padded``. They are what lets MDP decide, in pure integer host
-    arithmetic and without a device round-trip, which context-parallel rank
-    owns each of the item's decoder rows once the decoder is CP-sharded (see
-    :mod:`megatron.core.mdp.cp_partition`). They are free here because
-    ``cu_seqlens_padded`` is already a host list at this point.
+    payload_row_start)`` plus that item's decoder image-token positions in the
+    packed ``[1, T]`` layout, ordered by ``(sample_index, image_ordinal)``.
+    Both outputs are plain integer tensors so they survive the TP broadcast.
 
     Consistency guards (fail the batch rather than silently degrade):
 
@@ -394,16 +381,7 @@ def build_vision_sidecar(
                     "contiguous"
                 )
             meta_rows.append(
-                [
-                    sample_index,
-                    ordinal,
-                    t,
-                    h,
-                    w,
-                    payload_row_start,
-                    cu_seqlens_padded[sample_index],
-                    cu_seqlens_padded[sample_index + 1] - cu_seqlens_padded[sample_index],
-                ]
+                [sample_index, ordinal, t, h, w, payload_row_start]
             )
             payload_row_start += t * h * w
             position_chunks.append(item_positions.to(torch.int64) + cu_seqlens_padded[sample_index])
@@ -413,7 +391,7 @@ def build_vision_sidecar(
             "vision_decoder_positions": torch.cat(position_chunks),
         }
     return {
-        "vision_item_meta": torch.empty(0, VISION_ITEM_META_COLUMNS, dtype=torch.int64),
+        "vision_item_meta": torch.empty(0, 6, dtype=torch.int64),
         "vision_decoder_positions": torch.empty(0, dtype=torch.int64),
     }
 def seqlen_alignment_factor(tp_size: int, cp_size: int, sequence_parallel: bool) -> int:
@@ -809,6 +787,12 @@ def pack_or_pad_batch(
             pad_between_seqs=pad_between_seqs,
             cp_partition_mode=cp_partition_mode,
         )
+        if cp_size > 1:
+            # Prepare the CP group and layout routes while collating, before the
+            # decoder's CUDA queue grows.
+            from megatron.core.context_parallel_layout import finalize_packed_seq_params
+
+            finalize_packed_seq_params(packed_batch["packed_seq_params"])
         return packed_batch
 
     # ---------- padded (BSHD) branch ----------

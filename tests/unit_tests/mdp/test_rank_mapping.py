@@ -11,6 +11,7 @@ import pytest
 
 from megatron.core.mdp.errors import MdpConfigurationError
 from megatron.core.mdp.rank_mapping import MdpRankSpec, build_rank_map
+from megatron.core.parallel_state import RankGenerator
 
 
 def _spec(**kwargs):
@@ -88,46 +89,11 @@ def test_extension_hook_encoder_cp2():
     assert seen == set(range(16))
 
 
-@pytest.mark.parametrize(
-    "pp,cp,dp",
-    [(2, 2, 2), (1, 2, 4), (4, 2, 1), (2, 4, 1), (1, 4, 2), (1, 8, 1), (2, 1, 4)],
-)
-def test_decoder_endpoints_are_the_pipeline_stage_zero_ranks(pp, cp, dp):
-    """Every PP0 rank runs pre_process, so every PP0 rank consumes vision rows.
-
-    The group's members are ordered cp-fastest, so the endpoints are the first
-    ``cp`` entries. This pins the index formula the whole decoder-CP routing
-    rests on: get it wrong and the plan names ranks that are internally
-    consistent but physically wrong, which surfaces as a bridge hang.
-    """
-    world = pp * cp * dp
-    rank_map = build_rank_map(
-        MdpRankSpec(world_size=world, tp=1, pp=pp, cp=cp, ep=1, encoder_cp=1)
-    )
-    for outer_dp_rank, group in enumerate(rank_map.planning_groups()):
-        endpoints = rank_map.decoder_endpoint_ranks(outer_dp_rank)
-        assert endpoints == group[:cp]
-        assert len(endpoints) == cp
-        assert rank_map.endpoint_rank(outer_dp_rank) == endpoints[0]
-        for index_in_group, rank in enumerate(group):
-            view = rank_map.view(rank)
-            assert view.my_cp_rank == index_in_group % cp
-            assert view.my_pp_rank == index_in_group // cp
-            assert view.is_decoder_endpoint == (index_in_group < cp)
-            assert view.decoder_endpoint_ranks == endpoints
-            # Exactly one rank per group is still the descriptor source.
-            assert (view.lane_id is not None) == (rank == endpoints[0])
-
-
-def test_cp1_leaves_the_endpoint_set_degenerate():
-    rank_map = build_rank_map(
-        MdpRankSpec(world_size=8, tp=1, pp=2, cp=1, ep=1, encoder_cp=1)
-    )
-    for outer_dp_rank, group in enumerate(rank_map.planning_groups()):
-        view = rank_map.view(group[0])
-        assert view.decoder_endpoint_ranks == (view.endpoint_rank,)
-        assert view.is_decoder_endpoint
-        assert rank_map.view(group[1]).is_decoder_endpoint is False
+def test_later_stage_rank_is_not_a_shard_owner():
+    rank_map = build_rank_map(_spec())
+    view = rank_map.view(4)  # rank 4 is PP1
+    assert view.shard_owners == (0,)
+    assert not view.is_shard_owner and view.lane_id is None
 
 
 def test_local_view_has_no_global_lists():
@@ -150,3 +116,28 @@ def test_local_view_has_no_global_lists():
 def test_invalid_specs_rejected(kwargs, match):
     with pytest.raises(MdpConfigurationError, match=match):
         build_rank_map(_spec(**kwargs))
+
+
+@pytest.mark.parametrize("cp,pp", [(2, 1), (2, 2), (4, 1), (4, 2)])
+def test_cp_shard_owners_match_rank_generator(cp, pp):
+    # Cross-check the view's index arithmetic against the decoder's own groups:
+    # the shard owners are the PP0 ranks ordered by cp_rank, which is the CP
+    # group of the endpoint.
+    world = 2 * cp * pp
+    rank_map = build_rank_map(_spec(world_size=world, pp=pp, cp=cp))
+    generator = RankGenerator(
+        tp=1, ep=1, dp=world // (cp * pp), pp=pp, cp=cp, order="tp-cp-ep-dp-pp"
+    )
+    cp_groups = {r: tuple(g) for g in generator.get_ranks("cp") for r in g}
+    pp_groups = {r: tuple(g) for g in generator.get_ranks("pp") for r in g}
+    for group in rank_map.planning_groups():
+        endpoint = group[0]
+        pp0 = {r for r in group if pp_groups[r][0] == r}
+        for rank in group:
+            view = rank_map.view(rank)
+            assert view.shard_owners == cp_groups[endpoint]
+            assert len(view.shard_owners) == cp
+            assert view.is_shard_owner == (rank in pp0)
+            assert (view.lane_id is not None) == (rank == endpoint)
+            # Every rank is an encoder worker.
+            assert rank_map.num_workers_per_group == cp * pp

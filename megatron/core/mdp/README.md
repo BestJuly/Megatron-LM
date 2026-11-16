@@ -58,7 +58,7 @@ schedule model list.
 ## Support matrix (v1)
 
 Supported: Qwen3.5-VL (one vision encoder), `TP=1`, decoder `CP>=1`
-(`cp_partition_mode=zigzag`), `encoder_cp=1`, native PP/VPP/EP, fully replicated encoder with WORLD ZeRO-1,
+(`cp_partition_mode` `zigzag` or `contiguous`), `encoder_cp=1`, native PP/VPP/EP, fully replicated encoder with WORLD ZeRO-1,
 `calculate_per_token_loss=True`, bf16 main path (fp16 covered by
 overflow-union tests), THD packed sequences on both sides, native MCore vision
 Transformer recompute (`selective`/`full`) or Design-Doc whole-encoder replay
@@ -148,11 +148,17 @@ forward FLOPs while leaving encoder backward at one execution. Prefer native
 use complete replay when saving patch embedding, position/RoPE, and patch-merger
 activations justifies the extra complete forward.
 
-Decoder CP is implemented: an item's decoder rows are split across the
-pipeline-stage-0 ranks with the integer inverse of TransformerEngine's zigzag
-partition (`megatron/core/mdp/cp_partition.py`), and each endpoint receives only
-its own rows. Nothing is replicated and no gradient is reduced across CP. See
-the "Decoder context parallelism" section of `knowledge.md`.
+Decoder CP is implemented for both input layouts. The planner cuts each item's
+decoder rows into the runs each CP rank owns
+(`megatron/core/mdp/cp_partition.py`), producers send every run straight to the
+pipeline-stage-0 rank that owns it, and each owner returns its gradients
+straight back. Nothing is replicated and no gradient is reduced across CP. The
+model splits its inputs before the embedding and scatters only the rows its CP
+slice owns. The contiguous layout requires THD inputs: `--use-packed-sequence`
+declares that collator contract. An item whose image-token slots are not one
+contiguous run is rejected under decoder CP, and so is a microbatch whose item
+spans do not ascend with `(sample_id, image_ordinal)`. See the "Decoder context
+parallelism" section of `knowledge.md`.
 
 Registered extension hooks (each exercised by a test at a non-degenerate
 value): logical workers + `worker_ranks()` for encoder CP, the typed encoder

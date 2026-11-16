@@ -40,45 +40,6 @@ def pixel_capture_suppressed() -> bool:
     return owner_worker_id != my_worker_id
 
 
-def _decoder_offset_in_sample(item, microbatch_id: int, output_rows: int) -> int:
-    """Offset of an item's first decoder row inside its packed sample.
-
-    The descriptor carries a start offset and a row count, not the per-row
-    position tuple, so the run must be contiguous and contained in the sample
-    the span columns describe. The collator checks contiguity too; this is the
-    check at the point where the *plan input* is built, because at decoder CP>1
-    a violation here does not fail loudly — it silently routes rows to the wrong
-    context-parallel rank.
-    """
-    where = (
-        f"item (mb={microbatch_id}, sample={item.sample_id}, "
-        f"ordinal={item.image_ordinal})"
-    )
-    positions = item.decoder_positions
-    start = positions[0]
-    if positions[-1] - start != output_rows - 1:
-        raise MdpConfigurationError(
-            f"MDP: {where} violates: decoder positions are contiguous "
-            f"({start}..{positions[-1]} for {output_rows} rows)."
-        )
-    if item.sample_padded_len <= 0:
-        # The adapter did not supply the sample span. That is inert at CP=1,
-        # where the split is the identity and the offset is never read; at CP>1
-        # the planner's split_item rejects a non-positive span, so an adapter
-        # that never learned to emit it fails loudly there rather than routing
-        # rows by a fabricated offset here.
-        return 0
-    offset = start - item.sample_padded_start
-    if offset < 0 or offset + output_rows > item.sample_padded_len:
-        raise MdpConfigurationError(
-            f"MDP: {where} violates: its decoder rows lie inside its sample's "
-            f"padded span [{item.sample_padded_start}, "
-            f"{item.sample_padded_start + item.sample_padded_len}); got "
-            f"[{start}, {start + output_rows})."
-        )
-    return offset
-
-
 @dataclass(frozen=True)
 class MdpMicrobatchVisionRecord:
     """Endpoint-local record of one vision item.
@@ -211,6 +172,15 @@ class MdpIterationWindow:
                 expect_pixels=owns_pixels,
             )
             vision_records = []
+            # Host copy of the padded boundaries, read once per microbatch on the
+            # descriptor source only: the decoder span every rank needs to cut an
+            # item into per-CP-rank slices travels in the descriptor.
+            cu_padded = None
+            if lane_id is not None and captured.vision_items:
+                params = captured.decoder_packed_seq_params
+                cu_tensor = getattr(params, "cu_seqlens_q_padded", None)
+                if cu_tensor is not None:
+                    cu_padded = [int(v) for v in cu_tensor.tolist()]
             for item in captured.vision_items:
                 t, h, w = item.grid_thw
                 output_rows = t * (h // merge) * (w // merge)
@@ -234,9 +204,6 @@ class MdpIterationWindow:
                             f"len(decoder_positions) == output_rows "
                             f"({len(item.decoder_positions)} != {output_rows})."
                         )
-                    offset_in_sample = _decoder_offset_in_sample(
-                        item, microbatch_id, output_rows
-                    )
                     descriptors.append(
                         VisionDescriptor(
                             global_item_id=item_id,
@@ -249,9 +216,7 @@ class MdpIterationWindow:
                             output_rows=output_rows,
                             grid_thw=item.grid_thw,
                             owner_worker_id=owner_worker_id,
-                            sample_padded_start=item.sample_padded_start,
-                            sample_padded_len=item.sample_padded_len,
-                            decoder_offset_in_sample=offset_in_sample,
+                            **_decoder_span(item, cu_padded),
                         )
                     )
                 if owns_pixels:
@@ -368,3 +333,23 @@ def _validate_captured(
                 f"MDP: item {key} in microbatch {microbatch_id} violates: payload rows "
                 f"[{item.payload_row_start}, {end}) lie inside flat_pixel_payload."
             )
+
+
+def _decoder_span(item, cu_padded) -> dict:
+    """The decoder-span descriptor fields of one captured item.
+
+    ``decoder_start`` is ``-1`` when the item's image-token slots are not one
+    contiguous run (the planner rejects such an item only under decoder CP);
+    all fields stay zero without packed decoder metadata.
+    """
+    if cu_padded is None:
+        return {}
+    positions = item.decoder_positions
+    contiguous = positions[-1] - positions[0] + 1 == len(positions)
+    sample = item.sample_id
+    return dict(
+        decoder_start=positions[0] if contiguous else -1,
+        sample_padded_start=cu_padded[sample],
+        sample_padded_len=cu_padded[sample + 1] - cu_padded[sample],
+        microbatch_rows=cu_padded[-1],
+    )

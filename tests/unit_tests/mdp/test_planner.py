@@ -21,6 +21,7 @@ def _view(worker_ids=(0, 1), group=(0, 4), endpoint=0):
         endpoint_rank=endpoint,
         planning_group_ranks=group,
         worker_ids=worker_ids,
+        shard_owners=(endpoint,),
     )
 
 
@@ -105,7 +106,7 @@ def test_endpoint_layout_follows_sample_order_not_lpt_order():
         _descriptor(2, cost=50, sample=2),
     ]
     plan = _planner().build_plan(0, descriptors, [0])
-    layout = plan.layout_for_microbatch(0)
+    layout = plan.find_layout(0, 0)
     assert [s.global_item_id for s in layout.segments] == [0, 1, 2]
     starts = [s.leaf_row_start for s in layout.segments]
     assert starts == [0, 4, 8]
@@ -115,9 +116,9 @@ def test_endpoint_layout_follows_sample_order_not_lpt_order():
 def test_text_only_microbatch_gets_empty_layout():
     descriptors = [_descriptor(0, cost=5, mb=1)]
     plan = _planner().build_plan(0, descriptors, [0, 1])
-    assert plan.layout_for_microbatch(0).text_only
-    assert plan.layout_for_microbatch(0).segments == ()
-    assert not plan.layout_for_microbatch(1).text_only
+    assert plan.find_layout(0, 0).text_only
+    assert plan.find_layout(0, 0).segments == ()
+    assert not plan.find_layout(1, 0).text_only
 
 
 def test_producer_layout_offsets_are_valid_row_cumulative():
@@ -144,8 +145,8 @@ def test_cross_microbatch_packing_in_one_producer():
     layout = plan.encoder_layout_for_producer(0)
     assert {s.microbatch_id for s in layout.segments} == {0, 1}
     # ...but each microbatch layout only consumes its own item.
-    assert [s.global_item_id for s in plan.layout_for_microbatch(0).segments] == [0]
-    assert [s.global_item_id for s in plan.layout_for_microbatch(1).segments] == [1]
+    assert [s.global_item_id for s in plan.find_layout(0, 0).segments] == [0]
+    assert [s.global_item_id for s in plan.find_layout(1, 0).segments] == [1]
 
 
 @pytest.mark.parametrize(
