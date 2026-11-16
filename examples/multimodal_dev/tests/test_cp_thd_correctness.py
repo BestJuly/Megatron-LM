@@ -17,7 +17,7 @@ single ``torchrun`` invocation:
             ``world_size // cp_size`` CP groups (one group when they are
             equal, which is the standalone 4-rank invocation below; two
             groups of 4 under the 8-GPU CI world size). The model's
-            internal ``_cp_split_for_forward`` slices inputs per rank;
+            internal ``_cp_split_sequence`` slices inputs per rank;
             per-rank loss / gradients are aggregated via AllReduce on the
             CP group.
 
