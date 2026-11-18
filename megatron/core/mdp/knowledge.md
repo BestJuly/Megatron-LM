@@ -51,6 +51,13 @@ EMBEDDING: encoder producer -> decoder endpoint
 GRADIENT:  decoder endpoint -> encoder producer
 ```
 
+A *shard owner* is a rank that runs `pre_process` and therefore consumes vision
+rows: every pipeline-stage-0 rank of the planning group
+(`MdpRankView.shard_owners`, indexed by `cp_rank`). At CP=1 that is one rank,
+the endpoint; at CP>1 it is `cp` ranks. Do not confuse it with the *descriptor
+source*, which is always exactly one rank (`group[0]`, the endpoint) because it
+assigns `global_item_id` values and broadcasts the records.
+
 Local routes are copied directly; remote routes are packed into collective
 buffers. Every planning-group member enters every collective, including ranks
 with zero-length splits.
@@ -167,6 +174,9 @@ The collator builds normal decoder tensors plus an MDP vision sidecar:
 - `vision_item_meta`: per-item sample, ordinal, `(t,h,w)`, and payload start;
 - `vision_decoder_positions`: absolute image-token positions in the decoder's
   packed physical layout;
+- `vision_item_meta` also carries each item's enclosing sample span
+  (`sample_padded_start`, `sample_padded_len`) so the decoder-CP owner of every
+  row is derivable in integer host arithmetic without touching the device;
 - `pixel_values`: present only on the owner worker for that microbatch;
 - `image_grid_thw`: present on all workers and used to derive item shapes;
 - `flops_cu_seqlens`: present only under `--thd-static-packing`; the
@@ -223,6 +233,12 @@ background thread and a dedicated CUDA stream. The consumer waits on a CUDA
 event, not a host synchronization, and records captured tensors on the main
 stream before use.
 
+Decoder CP does not change this: at TP=1 the capture path issues no
+collective for any CP size. Under CP>1 the collator also builds the
+microbatch's CP layout route on the prefetch thread (host arithmetic, one
+device-to-host copy on the side stream); the route's index tensors are
+recorded on the main stream with the rest of the window.
+
 The prefetch path is keyed by iterator identity. Evaluation does not consume a
 pending training window. Any change to captured tensor ownership must update the
 `record_stream` traversal in `runtime.py`.
@@ -230,6 +246,76 @@ pending training window. Any change to captured tensor ownership must update the
 The collator also uses a pinned single-buffer path, and bridge receives can land
 directly in final consumer views. Preserve those destination-view contracts
 when changing payload shapes.
+
+## Decoder context parallelism
+
+At CP>1 the decoder shards its packed THD sequence by `cp_partition_mode`:
+
+- `zigzag` (TransformerEngine's per-sample layout): a sample's padded length
+  `L` is cut into `2*cp` chunks of `L // (2*cp)`, and `cp_rank r` takes chunk
+  `r` followed by chunk `2*cp-1-r`. The collator pads every sample to a
+  multiple of `2*cp` (`pack_or_pad_batch`'s `divisible_by`, mirrored by
+  `thd_row_alignment`).
+- `contiguous`: `cp_rank r` takes rows `[r*T/cp, (r+1)*T/cp)` of the whole
+  packed microbatch of `T` physical rows.
+
+A vision item owns one contiguous run of decoder positions. Its descriptor
+carries that span (`decoder_start`, `sample_padded_start`,
+`sample_padded_len`) and the microbatch's physical row count
+(`microbatch_rows`). The window derives them from the captured
+`cu_seqlens_q_padded`, so the collator and the adapter supply nothing extra.
+`cp_partition.cp_item_runs` applies the decoder's layout to that span and
+returns the runs each CP rank owns:
+
+- zigzag: at most `2*cp - 1` runs per item (adjacent chunks of one owner are
+  one run) and at most **2** runs of one item on one rank, which is why the
+  routed unit is a slice with a `slice_id`, not an item;
+- contiguous: at most `cp` runs, one per rank;
+- at `cp=1` the whole item on the endpoint, so the planner has one code path
+  with and without decoder CP.
+
+Consequences that are easy to get wrong:
+
+- **Nothing is replicated and nothing is reduced.** Each vision row lands on
+  exactly one shard owner, so its gradient exists on exactly one rank and the
+  bridge's `copy_` stays correct. An accumulate mode would be wrong, and no
+  CP-scoped process group is needed: slices ride the existing planning-group
+  `all_to_all_single`.
+- **PIXEL is per item, not per slice.** Pixels are CP-invariant; routing them
+  per slice multiplies pixel traffic by up to `2*cp-1`.
+- **A shard owner with zero rows for a vision-bearing microbatch is normal.**
+  Roughly 5% of `(microbatch, cp_rank)` pairs are empty in the mock workload.
+  No layout and no leaf exist for an empty shard. `MdpRuntime.expects_leaf`
+  reads the plan (`MdpBatchPlan.find_layout`, an indexed lookup), and
+  `mdp_forward_step` asks it instead of the microbatch-global `text_only`.
+- **The scatter moves after the CP split.** The model computes one THD token
+  index per forward (`MultimodalModel._cp_index`), splits every token-indexed
+  input with it before the embedding and scatters only the rows its CP slice
+  owns. The native path selects those rows from the full encoder output, so
+  both paths run the same rank-local scatter. `masked_scatter` is pure data
+  movement, so the reordering is bitwise neutral.
+- **A leaf is ordered by decoder position.** A rank's layout orders segments
+  by `(sample_id, image_ordinal)` and an item's runs by row. That is ascending
+  decoder position, the order the rank-local mask enumerates; the planner
+  rejects a microbatch whose item spans do not ascend with
+  `(sample_id, image_ordinal)`.
+- **The split is in the plan digest**, with `cp_size`, the layout and the
+  physical microbatch capacities (plan schema 7). Each member derives its slice
+  table locally, so a divergence would otherwise produce identical digests and
+  then a mismatched `all_to_all_single`. P1 also checks the capacities and the
+  partition mode against each rank's replay metadata.
+- `install_mdp_process_groups` takes the decoder CP group and checks its
+  members against the shard owners the rank map derives, once per job, because
+  a rank map that is self-consistent but names the wrong physical ranks fails
+  as a hang.
+- When pixel locality is disabled, the LPT tie-break prefers the worker that
+  owns most of an item's output rows.
+
+Contiguous CP needs THD inputs: a sequence-packing scheduler, or the collator
+contract `--use-packed-sequence`. That flag is a `TransformerConfig` field
+registered by the core argument factory; the multimodal entry point must not
+register it a second time. The multimodal collator prepares the CP group and
+the THD layout conversion routes while collating, whenever CP > 1.
 
 ## Optimizer and checkpoint semantics
 
@@ -353,6 +439,23 @@ per-sample rule that forces every rank's local row count to be a multiple of
 up to `divisible_by - 1` padded rows per sample, 256 at `cp_size=8` with MXFP8
 and no SP. A total-only variant would be tighter and is not written because
 MDP rejects CP > 1 outright.
+
+Padding under CP is declared. With per-sample alignment and `cp_size > 1` the
+collator sets `pad_between_seqs=True` whenever `cu_seqlens` and
+`cu_seqlens_padded` differ, and leaves it unset otherwise. It must not be left
+to TransformerEngine: `DotProductAttention.forward` infers the flag from
+`cu_seqlens_padded[:-1] != cu_seqlens[:-1]`, the starts of the sequences, so a
+pack in which only the last sample is padded (`[2048, 2047]`) is classified as
+unpadded. The CP attention then takes `cu_seqlens // cp_size` (and
+`// (2 * cp_size)` for the second-half steps) as each rank's length, which
+assumes the valid tokens are spread evenly; the CP split keeps a sample's
+padding in its last chunk, on one rank. Every other rank is told it holds one
+or two tokens fewer than it does: those tokens are skipped as queries (their
+attention output is zero, or assembled from the second-half steps only with
+softmax statistics the kernel never wrote, so it differs between runs) and as
+keys for every later token of the sample. Observed with TE 2.16.0 at CP4 on
+sequences of 2047, 2049 and 1025 tokens; the positions follow from the two
+divisions.
 
 Why `pad_between_seqs=False` is declared, and when it would be wrong. Declaring
 it lets `TEDotProductAttention.forward()`
@@ -506,7 +609,8 @@ Current major constraints:
 
 - Qwen3.5-VL adapter;
 - TP=1;
-- decoder CP=1;
+- decoder CP>=1, zigzag or contiguous input layout; contiguous CP requires THD
+  inputs supplied by a scheduler or `--use-packed-sequence`;
 - encoder CP=1;
 - distributed optimizer enabled;
 - per-token loss enabled;
@@ -556,6 +660,8 @@ python -m pytest -q \
   tests/unit_tests/mdp/test_rank_mapping.py \
   tests/unit_tests/mdp/test_plan.py \
   tests/unit_tests/mdp/test_planner.py \
+  tests/unit_tests/mdp/test_planner_cp.py \
+  tests/unit_tests/mdp/test_cp_partition.py \
   tests/unit_tests/mdp/test_window.py \
   tests/unit_tests/mdp/test_quantized_alignment.py \
   tests/unit_tests/mdp/test_pinned_collate.py

@@ -8,7 +8,7 @@ fixed-width descriptor records inside each planning group.
 """
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Optional, Sequence
 
 import torch
 import torch.distributed as dist
@@ -18,8 +18,10 @@ from megatron.core.mdp.protocols import VisionDescriptor
 from megatron.core.mdp.rank_mapping import MdpRankMap
 
 # int64 slots per descriptor record (see API design 5.6; slot 11 carries
-# owner_worker_id for owner-sharded pixel reading).
-DESCRIPTOR_SLOTS = 12
+# owner_worker_id for owner-sharded pixel reading, and slots 12-15 carry the
+# item's decoder span and the physical capacity of its microbatch, so every
+# member can derive the decoder-CP row split).
+DESCRIPTOR_SLOTS = 16
 
 
 @dataclass(frozen=True)
@@ -76,13 +78,22 @@ class MdpGroupRegistry:
 
 
 def install_mdp_process_groups(
-    rank_map: MdpRankMap, *, group_registry: MdpGroupRegistry
+    rank_map: MdpRankMap,
+    *,
+    group_registry: MdpGroupRegistry,
+    decoder_cp_group: Optional[dist.ProcessGroup] = None,
 ) -> MdpProcessGroups:
     """Install MDP process groups; every rank creates groups in the same order.
 
     One planning group per outer-DP group, in ascending ``outer_dp_rank`` order.
     With ``encoder_cp=1`` the encoder reduction group aliases WORLD; no duplicate
     same-sized group is created.
+
+    With CP > 1 the caller passes this rank's decoder CP group. MDP does not
+    create it; it checks that the group's membership is what the rank map
+    derives, so a decoder/MDP rank-order disagreement fails here instead of
+    hanging or mis-routing later. Every decoder-CP slice travels in the
+    planning-group exchanges, so the group is only checked.
     """
     if rank_map.spec.encoder_cp != 1:
         raise MdpConfigurationError(
@@ -104,11 +115,67 @@ def install_mdp_process_groups(
             f"MDP: rank {my_rank} violates: every rank belongs to exactly one planning "
             "group."
         )
+    _assert_rank_map_matches_mpu(rank_map, my_rank)
+    shard_owners = rank_map.view(my_rank).shard_owners
+    if rank_map.spec.cp > 1 and my_rank in shard_owners:
+        _check_decoder_cp_group(decoder_cp_group, shard_owners)
     return MdpProcessGroups(
         planning_group=my_planning_group,
         encoder_reduction_group=world,
         world_group=world,
     )
+
+
+def _assert_rank_map_matches_mpu(rank_map: MdpRankMap, my_rank: int) -> None:
+    """Cross-check the independently derived rank map against live MPU state.
+
+    MDP rebuilds its own ``RankGenerator`` from arguments and never reads the
+    MPU's groups, so the two can disagree — and with decoder CP the
+    ``index_in_group -> (cp_rank, pp_rank)`` mapping decides which physical rank
+    is a shard owner. A divergence there yields a rank map that is internally
+    consistent but names the wrong ranks, which surfaces as a bridge hang rather
+    than an error. This runs once per job.
+    """
+    from megatron.core import parallel_state
+
+    view = rank_map.view(my_rank)
+    cp = rank_map.spec.cp
+    # Group order is 'tp-cp-pp' with tp == 1: index = cp_rank + cp * pp_rank.
+    index_in_group = view.planning_group_ranks.index(my_rank)
+    mapped = (index_in_group % cp, index_in_group // cp)
+    expected = (
+        parallel_state.get_context_parallel_rank(),
+        parallel_state.get_pipeline_model_parallel_rank(),
+    )
+    if mapped != expected:
+        raise MdpConfigurationError(
+            f"MDP: rank {my_rank} maps to (cp_rank={mapped[0]}, pp_rank={mapped[1]}) "
+            f"violates: the MPU reports (cp_rank={expected[0]}, pp_rank={expected[1]}). "
+            "The MDP rank map and the initialized process groups disagree; every "
+            "route and shard owner derived from it would name the wrong rank."
+        )
+    if view.is_shard_owner != parallel_state.is_pipeline_first_stage(ignore_virtual=True):
+        raise MdpConfigurationError(
+            f"MDP: rank {my_rank} shard-owner status {view.is_shard_owner} violates: "
+            "it equals is_pipeline_first_stage(). Vision embeddings are consumed "
+            "exactly where pre_process runs."
+        )
+
+
+def _check_decoder_cp_group(group: Optional[dist.ProcessGroup], expected: tuple) -> None:
+    """The decoder CP group's members are exactly the shard owners the rank map derives."""
+    if group is None:
+        raise MdpConfigurationError(
+            f"MDP: cp={len(expected)} violates: the decoder CP group is passed "
+            "to install_mdp_process_groups when CP > 1."
+        )
+    members = tuple(dist.get_process_group_ranks(group))
+    if members != expected:
+        raise MdpConfigurationError(
+            f"MDP: decoder CP group {members} violates: equals the CP group "
+            f"{expected} derived from the rank map. The decoder and MDP disagree "
+            "about the rank order."
+        )
 
 
 def descriptors_to_records(descriptors: Sequence[VisionDescriptor]) -> list:
@@ -129,6 +196,10 @@ def descriptors_to_records(descriptors: Sequence[VisionDescriptor]) -> list:
                 d.grid_thw[1],
                 d.grid_thw[2],
                 d.owner_worker_id,
+                d.decoder_start,
+                d.sample_padded_start,
+                d.sample_padded_len,
+                d.microbatch_rows,
             ]
         )
     return records
@@ -151,6 +222,10 @@ def records_to_descriptors(records) -> tuple:
             grid_h,
             grid_w,
             owner_worker_id,
+            decoder_start,
+            sample_padded_start,
+            sample_padded_len,
+            microbatch_rows,
         ) = (int(v) for v in row)
         descriptors.append(
             VisionDescriptor(
@@ -164,6 +239,10 @@ def records_to_descriptors(records) -> tuple:
                 output_rows=output_rows,
                 grid_thw=(grid_t, grid_h, grid_w),
                 owner_worker_id=owner_worker_id,
+                decoder_start=decoder_start,
+                sample_padded_start=sample_padded_start,
+                sample_padded_len=sample_padded_len,
+                microbatch_rows=microbatch_rows,
             )
         )
     return tuple(descriptors)
@@ -181,7 +260,8 @@ def broadcast_descriptors(
     """Broadcast the endpoint's descriptors to its planning group.
 
     Two collectives: a small header (descriptor count and per-microbatch
-    ``text_only`` flags), then the fixed-width ``int64[count, 11]`` payload.
+    ``text_only`` flags), then the fixed-width ``int64[count, DESCRIPTOR_SLOTS]``
+    payload.
     Pickle and object collectives are forbidden. The endpoint emits in
     ``(microbatch_id, sample_id, image_ordinal)`` order, so every member's input
     is byte-identical by construction.

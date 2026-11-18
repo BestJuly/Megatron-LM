@@ -121,9 +121,25 @@ def test_split_rejects_nonpositive_cap():
 # ------------------------- digest -------------------------
 
 
-def _entry(item_id, worker=0, order=0, endpoint=0, grid=(1, 4, 4)):
+def _entry(
+    item_id, worker=0, order=0, endpoint=0, grid=(1, 4, 4), slice_id=0, row_start=0, rows=None
+):
     t, h, w = grid
-    return (item_id, worker, order, endpoint, t * h * w, t * (h // 2) * (w // 2), t, h, w)
+    output_rows = t * (h // 2) * (w // 2)
+    return (
+        item_id,
+        slice_id,
+        worker,
+        order,
+        endpoint,
+        row_start,
+        output_rows if rows is None else rows,
+        t * h * w,
+        output_rows,
+        t,
+        h,
+        w,
+    )
 
 
 def test_digest_is_deterministic_and_16_bytes():
@@ -137,9 +153,9 @@ def test_digest_is_deterministic_and_16_bytes():
 def test_digest_covers_the_minimal_sufficient_set():
     policy = RowCapacityPolicy()
     base = compute_plan_digest(PLAN_SCHEMA_VERSION, policy, [_entry(0)])
-    # Same payload_rows, different grid -> different frame boundaries -> the
+    # Same row counts, different grid -> different frame boundaries -> the
     # digest must change (design doc 7.4).
-    same_rows_other_grid = (0, 0, 0, 0, 16, 4, 1, 2, 8)
+    same_rows_other_grid = (0, 0, 0, 0, 0, 0, 4, 16, 4, 1, 2, 8)
     assert compute_plan_digest(
         PLAN_SCHEMA_VERSION, policy, [same_rows_other_grid]
     ) != base
@@ -151,6 +167,21 @@ def test_digest_covers_the_minimal_sufficient_set():
     )
     # Schema version is part of the digest.
     assert compute_plan_digest(PLAN_SCHEMA_VERSION + 1, policy, [_entry(0)]) != base
+    # Decoder CP: the slice split, the receiving endpoint, the CP size and the
+    # layout each change the digest -- every rank derives the split locally, so a
+    # divergence must fail the digest check rather than hang the bridge.
+    split = [_entry(0, endpoint=0, rows=2), _entry(0, endpoint=2, slice_id=1, row_start=2, rows=2)]
+    split_base = compute_plan_digest(PLAN_SCHEMA_VERSION, policy, split, cp_size=2)
+    assert split_base != base
+    moved = [_entry(0, endpoint=0, rows=3), _entry(0, endpoint=2, slice_id=1, row_start=3, rows=1)]
+    assert compute_plan_digest(PLAN_SCHEMA_VERSION, policy, moved, cp_size=2) != split_base
+    rerouted = [_entry(0, endpoint=0, rows=2), _entry(0, endpoint=4, slice_id=1, row_start=2, rows=2)]
+    assert compute_plan_digest(PLAN_SCHEMA_VERSION, policy, rerouted, cp_size=2) != split_base
+    assert compute_plan_digest(PLAN_SCHEMA_VERSION, policy, split, cp_size=4) != split_base
+    assert (
+        compute_plan_digest(PLAN_SCHEMA_VERSION, policy, split, cp_size=2, cp_layout_code=1)
+        != split_base
+    )
 
 
 # ------------------------- batch plan indexes -------------------------
@@ -158,8 +189,12 @@ def test_digest_covers_the_minimal_sufficient_set():
 
 def _plan():
     routes = (
-        RouteSlice(global_item_id=0, producer_worker_id=1, endpoint_rank=0, owner_worker_id=0),
-        RouteSlice(global_item_id=1, producer_worker_id=0, endpoint_rank=0, owner_worker_id=0),
+        RouteSlice(
+            global_item_id=0, producer_worker_id=1, endpoint_rank=0, owner_worker_id=0, item_rows=16
+        ),
+        RouteSlice(
+            global_item_id=1, producer_worker_id=0, endpoint_rank=0, owner_worker_id=0, item_rows=4
+        ),
     )
     encoder_layouts = (
         EncoderThdLayout(producer_worker_id=0, segments=(_segment(1, (1, 4, 4)),)),
@@ -174,8 +209,11 @@ def _plan():
                 LayoutSegment(global_item_id=0, leaf_row_start=0, output_rows=16),
                 LayoutSegment(global_item_id=1, leaf_row_start=16, output_rows=4),
             ),
+            endpoint_rank=0,
         ),
-        MicrobatchLayout(microbatch_id=1, text_only=True, total_output_rows=0, segments=()),
+        MicrobatchLayout(
+            microbatch_id=1, text_only=True, total_output_rows=0, segments=(), endpoint_rank=0
+        ),
     )
     return MdpBatchPlan(
         schema_version=PLAN_SCHEMA_VERSION,
@@ -194,16 +232,16 @@ def test_plan_indexes_are_dictionaries():
     assert [r.global_item_id for r in plan.routes_for_producer(0)] == [1]
     assert [r.global_item_id for r in plan.routes_for_producer(1)] == [0]
     assert plan.routes_for_producer(9) == ()
-    assert len(plan.routes_for_endpoint(0)) == 2
     assert plan.encoder_layout_for_producer(1).segments[0].global_item_id == 0
     empty = plan.encoder_layout_for_producer(5)
     assert empty.segments == () and empty.producer_worker_id == 5
-    assert plan.layout_for_microbatch(1).text_only
+    assert plan.find_layout(1, 0).text_only
+    assert plan.find_layout(1, 4) is None and plan.find_layout(42, 0) is None
+    assert [layout.microbatch_id for layout in plan.layouts_for_endpoint(0)] == [0, 1]
+    assert plan.layouts_for_endpoint(4) == ()
     assert plan.segment_for_item(0).grid_thw == (1, 8, 8)
     with pytest.raises(MdpPlanError):
         plan.segment_for_item(42)
-    with pytest.raises(MdpPlanError):
-        plan.layout_for_microbatch(42)
 
 
 def test_plan_rejects_duplicate_item_assignment():

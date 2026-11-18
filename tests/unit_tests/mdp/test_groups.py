@@ -16,6 +16,7 @@ import torch
 
 from megatron.core.mdp.errors import MdpBridgeError
 from megatron.core.mdp.groups import (
+    DESCRIPTOR_SLOTS,
     MdpGroupRegistry,
     broadcast_descriptors,
     descriptors_to_records,
@@ -46,8 +47,26 @@ def test_record_round_trip_is_lossless():
     descriptors = (
         _descriptor(0, grid=(2, 6, 8)),
         _descriptor(1, mb=1, sample=3, ordinal=2, cost=123, grid=(1, 4, 4)),
+        VisionDescriptor(
+            **{
+                **_descriptor(2, grid=(1, 4, 4)).__dict__,
+                "decoder_start": 37,
+                "sample_padded_start": 32,
+                "sample_padded_len": 64,
+                "microbatch_rows": 4096,
+            }
+        ),
+        VisionDescriptor(**{**_descriptor(3, grid=(1, 4, 4)).__dict__, "decoder_start": -1}),
     )
     assert records_to_descriptors(descriptors_to_records(descriptors)) == descriptors
+
+
+def test_record_width_matches_the_declared_slot_count():
+    # The broadcast allocates int64[count, DESCRIPTOR_SLOTS]; if the serializer
+    # and the constant drift apart the payload is silently truncated or padded
+    # on every non-source rank.
+    records = descriptors_to_records((_descriptor(0),))
+    assert len(records[0]) == DESCRIPTOR_SLOTS
 
 
 _DISTRIBUTED = int(os.environ.get("WORLD_SIZE", "1")) > 1
@@ -147,3 +166,39 @@ def test_broadcast_rejects_misordered_descriptors():
             )
     # Non-endpoint ranks skip; a real run would abort collectively before
     # reaching the broadcast.
+
+
+@pytest.mark.skipif(
+    not _DISTRIBUTED or int(os.environ.get("WORLD_SIZE", "1")) % 2 != 0,
+    reason="needs a torchrun world divisible by CP2",
+)
+def test_decoder_cp_group_is_checked_against_the_rank_map():
+    from megatron.core import parallel_state
+    from megatron.core.mdp.errors import MdpConfigurationError
+    from tests.unit_tests.test_utilities import Utils
+
+    world = torch.distributed.get_world_size()
+    Utils.initialize_model_parallel(context_parallel_size=2)
+    try:
+        rank_map = build_rank_map(
+            MdpRankSpec(world_size=world, tp=1, pp=1, cp=2, ep=1, encoder_cp=1)
+        )
+        view = rank_map.view(torch.distributed.get_rank())
+        install_mdp_process_groups(
+            rank_map,
+            group_registry=MdpGroupRegistry(),
+            decoder_cp_group=parallel_state.get_context_parallel_group(),
+        )
+        # PP=1: every rank runs the first decoder stage, so every rank is a
+        # shard owner and checks its decoder CP group.
+        assert view.is_shard_owner
+        # A wrong CP group describes a different rank order: refuse, do not hang
+        # later. The TP=1 group holds this rank alone, so it never matches.
+        with pytest.raises(MdpConfigurationError, match="disagree about the rank order"):
+            install_mdp_process_groups(
+                rank_map,
+                group_registry=MdpGroupRegistry(),
+                decoder_cp_group=parallel_state.get_tensor_model_parallel_group(),
+            )
+    finally:
+        Utils.destroy_model_parallel()

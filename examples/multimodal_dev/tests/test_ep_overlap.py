@@ -174,7 +174,10 @@ class _ForwardModel:
 
 def test_mdp_forward_step_switches_only_when_overlap_scheduler_requests_plan(monkeypatch):
     vision_leaf = torch.ones(2, 4, requires_grad=True)
-    runtime = SimpleNamespace(storage=SimpleNamespace(get_leaf=lambda microbatch_id: vision_leaf))
+    runtime = SimpleNamespace(
+        storage=SimpleNamespace(get_leaf=lambda microbatch_id: vision_leaf),
+        expects_leaf=lambda microbatch_id: True,
+    )
     record = SimpleNamespace(
         microbatch_id=5,
         text_only=False,

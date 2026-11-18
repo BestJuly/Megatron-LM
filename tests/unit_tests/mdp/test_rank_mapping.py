@@ -11,6 +11,7 @@ import pytest
 
 from megatron.core.mdp.errors import MdpConfigurationError
 from megatron.core.mdp.rank_mapping import MdpRankSpec, build_rank_map
+from megatron.core.parallel_state import RankGenerator
 
 
 def _spec(**kwargs):
@@ -88,6 +89,13 @@ def test_extension_hook_encoder_cp2():
     assert seen == set(range(16))
 
 
+def test_later_stage_rank_is_not_a_shard_owner():
+    rank_map = build_rank_map(_spec())
+    view = rank_map.view(4)  # rank 4 is PP1
+    assert view.shard_owners == (0,)
+    assert not view.is_shard_owner and view.lane_id is None
+
+
 def test_local_view_has_no_global_lists():
     # O(W^2) guard: a view carries only its own group, not all groups.
     rank_map = build_rank_map(_spec(world_size=8, pp=2))
@@ -108,3 +116,28 @@ def test_local_view_has_no_global_lists():
 def test_invalid_specs_rejected(kwargs, match):
     with pytest.raises(MdpConfigurationError, match=match):
         build_rank_map(_spec(**kwargs))
+
+
+@pytest.mark.parametrize("cp,pp", [(2, 1), (2, 2), (4, 1), (4, 2)])
+def test_cp_shard_owners_match_rank_generator(cp, pp):
+    # Cross-check the view's index arithmetic against the decoder's own groups:
+    # the shard owners are the PP0 ranks ordered by cp_rank, which is the CP
+    # group of the endpoint.
+    world = 2 * cp * pp
+    rank_map = build_rank_map(_spec(world_size=world, pp=pp, cp=cp))
+    generator = RankGenerator(
+        tp=1, ep=1, dp=world // (cp * pp), pp=pp, cp=cp, order="tp-cp-ep-dp-pp"
+    )
+    cp_groups = {r: tuple(g) for g in generator.get_ranks("cp") for r in g}
+    pp_groups = {r: tuple(g) for g in generator.get_ranks("pp") for r in g}
+    for group in rank_map.planning_groups():
+        endpoint = group[0]
+        pp0 = {r for r in group if pp_groups[r][0] == r}
+        for rank in group:
+            view = rank_map.view(rank)
+            assert view.shard_owners == cp_groups[endpoint]
+            assert len(view.shard_owners) == cp
+            assert view.is_shard_owner == (rank in pp0)
+            assert (view.lane_id is not None) == (rank == endpoint)
+            # Every rank is an encoder worker.
+            assert rank_map.num_workers_per_group == cp * pp

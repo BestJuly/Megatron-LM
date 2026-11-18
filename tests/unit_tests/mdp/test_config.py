@@ -142,7 +142,8 @@ def test_invalid_mdp_config_fields_rejected(config_kwargs, match):
     [
         (dict(rank_order="tp-ep-dp-pp-cp"), "rank_order"),
         (dict(tensor_parallel_size=2), "tensor_parallel_size"),
-        (dict(context_parallel_size=2), "context_parallel_size"),
+        (dict(context_parallel_size=0), "context_parallel_size"),
+        (dict(context_parallel_size=2, cp_partition_mode="bshd"), "cp_partition_mode"),
         (dict(world_size=6, pipeline_parallel_size=4), "world_size"),
         (dict(calculate_per_token_loss=False), "calculate_per_token_loss"),
         (dict(use_distributed_optimizer=False), "use_distributed_optimizer"),
@@ -356,6 +357,65 @@ def test_snapshot_takes_the_larger_of_the_train_and_eval_microbatch_sizes():
         _fake_args(micro_batch_size=4, eval_micro_batch_size=16)
     )
     assert options.max_samples_per_microbatch == 16
+
+
+# ---------------------------------------------------------------------------
+# Decoder context parallelism
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("cp_size", [2, 4, 8])
+def test_decoder_context_parallelism_is_accepted(cp_size):
+    validate_mdp_config(
+        MdpConfig(enable=True), _options(world_size=8 * cp_size, context_parallel_size=cp_size)
+    )
+
+
+@pytest.mark.parametrize("cp_partition_mode", ["zigzag", "contiguous"])
+def test_decoder_cp_is_accepted_for_both_layouts(cp_partition_mode):
+    validate_mdp_config(
+        MdpConfig(enable=True),
+        _options(
+            world_size=8,
+            context_parallel_size=2,
+            pipeline_parallel_size=2,
+            cp_partition_mode=cp_partition_mode,
+        ),
+    )
+
+
+def test_static_packing_rejects_an_odd_per_rank_length_under_cp():
+    # build_static_thd_metadata asserts dummy_seq_len % (2*cp) == 0 mid-run;
+    # this must fail at startup instead, and in BOTH packing modes -- the greedy
+    # branch used to be the only place any CP alignment was checked.
+    for greedy in (False, True):
+        with pytest.raises(MdpConfigurationError, match="max_seqlen_per_dp_cp_rank"):
+            validate_mdp_config(
+                MdpConfig(enable=True, greedy_packing=greedy),
+                _options(
+                    world_size=16,
+                    context_parallel_size=2,
+                    thd_static_packing=True,
+                    max_seqlen_per_dp_cp_rank=4097,
+                    thd_max_packed_sequences=8,
+                ),
+            )
+
+
+def test_window_capture_overlap_is_accepted_under_decoder_cp():
+    # The capture path has no collective at TP=1 (only the TP broadcast is one),
+    # so the prefetch thread stays off NCCL whatever the CP size.
+    validate_mdp_config(
+        MdpConfig(enable=True, overlap_window_capture=True),
+        _options(world_size=8, context_parallel_size=2),
+    )
+
+
+def test_encoder_cp_is_still_rejected_under_decoder_cp():
+    with pytest.raises(MdpConfigurationError, match="encoder_cp"):
+        validate_mdp_config(
+            MdpConfig(enable=True, encoder_cp=2), _options(context_parallel_size=2)
+        )
 
 
 # ---------------------------------------------------------------------------

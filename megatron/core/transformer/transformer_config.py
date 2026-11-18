@@ -335,6 +335,14 @@ class TransformerConfig(ModelParallelConfig):
     standard zigzag layout.
     """
 
+    use_packed_sequence: bool = False
+    """The data pipeline supplies THD inputs independently of a packing scheduler.
+
+    Multimodal collators use this contract because the text-only sequence packing
+    scheduler cannot preserve their vision payloads. Callers must supply matching
+    PackedSeqParams and slice token tensors according to cp_partition_mode.
+    """
+
     experimental_attention_variant_loss_scale_func: Optional[Callable[[torch.Tensor], None]] = None
     """Optional hook for experimental attention variants to receive the main loss scale."""
 
@@ -1763,10 +1771,11 @@ class TransformerConfig(ModelParallelConfig):
         if self.cp_partition_mode == "contiguous" and (
             self.context_parallel_size > 1 or self.dynamic_context_parallel
         ):
-            if self.sequence_packing_scheduler is None:
+            if self.sequence_packing_scheduler is None and not self.use_packed_sequence:
                 raise ValueError(
                     "cp_partition_mode='contiguous' with context parallelism requires THD "
-                    "inputs from a sequence_packing_scheduler; BSHD inputs are not supported. "
+                    "inputs from a sequence_packing_scheduler or use_packed_sequence=True; "
+                    "BSHD inputs are not supported. "
                     "The legacy non-scheduler CP batch slicing path only supports zigzag layout."
                 )
             if (

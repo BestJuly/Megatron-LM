@@ -10,6 +10,7 @@ produce a bit-identical plan. Only :func:`assert_consistent_plan` touches
 
 from typing import Sequence
 
+from megatron.core.mdp.cp_partition import CP_PARTITION_MODES, cp_item_runs
 from megatron.core.mdp.errors import MdpPlanError
 from megatron.core.mdp.plan import (
     PLAN_SCHEMA_VERSION,
@@ -35,16 +36,22 @@ class MdpPlanner:
         locality_slack_permille: int,
         capacity_policy: RowCapacityPolicy,
         pixel_locality: bool = False,
+        cp_partition_mode: str = "zigzag",
     ) -> None:
+        # One shard owner per decoder CP rank.
+        self._cp_size = len(rank_view.shard_owners)
+        self.cp_partition_mode = cp_partition_mode
         self._rank_view = rank_view
         self._locality_slack_permille = locality_slack_permille
         self._capacity_policy = capacity_policy
         self._pixel_locality = pixel_locality
-        # The logical worker hosting the owner endpoint, derived purely from the
-        # view: workers partition the group ranks in fixed-width blocks.
+        # The logical worker hosting each shard owner, indexed by decoder cp_rank
+        # and derived purely from the view: workers partition the group ranks in
+        # fixed-width blocks.
         ranks_per_worker = len(rank_view.planning_group_ranks) // len(rank_view.worker_ids)
-        self._endpoint_worker_id = (
-            rank_view.planning_group_ranks.index(rank_view.endpoint_rank) // ranks_per_worker
+        self._worker_of_cp_rank = tuple(
+            rank_view.planning_group_ranks.index(owner) // ranks_per_worker
+            for owner in rank_view.shard_owners
         )
 
     def build_plan(
@@ -56,6 +63,10 @@ class MdpPlanner:
         """Run deterministic LPT and assemble routes, layouts, and the digest."""
         view = self._rank_view
         self._validate_descriptors(descriptors, microbatch_ids)
+        # Every item is cut once into the runs each decoder CP rank owns (the
+        # whole item on the endpoint without decoder CP); the LPT tie-break and
+        # the routed slices below both read this cut.
+        runs_of_item = {d.global_item_id: self._cp_runs(d) for d in descriptors}
 
         # LPT: (cost descending, item_id ascending); integer comparisons only.
         ordered = sorted(
@@ -80,7 +91,9 @@ class MdpPlanner:
                 # owner-sharded.
                 preferred = descriptor.owner_worker_id
             else:
-                preferred = self._endpoint_worker_id
+                preferred = self._preferred_endpoint_worker(
+                    runs_of_item[descriptor.global_item_id]
+                )
             chosen = min(
                 eligible,
                 key=lambda worker_id: (
@@ -128,64 +141,109 @@ class MdpPlanner:
                 EncoderThdLayout(producer_worker_id=worker_id, segments=tuple(segments))
             )
 
-        # Endpoint microbatch layouts, ordered by (sample_id, image_ordinal) only.
-        items_by_microbatch = {mb_id: [] for mb_id in microbatch_ids}
-        for descriptor in descriptors:
-            items_by_microbatch[descriptor.microbatch_id].append(descriptor)
-        layouts = []
-        for mb_id in microbatch_ids:
-            items = sorted(
-                items_by_microbatch[mb_id], key=lambda d: (d.sample_id, d.image_ordinal)
-            )
-            segments = []
-            leaf_offset = 0
-            for descriptor in items:
-                segments.append(
-                    LayoutSegment(
+        # Slices: each run goes straight to the PP0 rank of the CP rank that
+        # owns it -- no rank ever stages another rank's rows. Without decoder CP
+        # that is one whole-item slice to the group endpoint.
+        by_id = sorted(descriptors, key=lambda d: d.global_item_id)
+        routes = []
+        placed = {}  # (microbatch_id, endpoint_rank) -> [(order_key, item_id, slice_id, rows)]
+        for descriptor in by_id:
+            for slice_id, run in enumerate(runs_of_item[descriptor.global_item_id]):
+                endpoint = view.shard_owners[run.cp_rank]
+                routes.append(
+                    RouteSlice(
                         global_item_id=descriptor.global_item_id,
-                        leaf_row_start=leaf_offset,
-                        output_rows=descriptor.output_rows,
+                        producer_worker_id=assignment[descriptor.global_item_id],
+                        endpoint_rank=endpoint,
+                        owner_worker_id=descriptor.owner_worker_id,
+                        item_rows=run.item_rows,
+                        slice_id=slice_id,
+                        item_row_start=run.item_row_start,
                     )
                 )
-                leaf_offset += descriptor.output_rows
-            layouts.append(
-                MicrobatchLayout(
-                    microbatch_id=mb_id,
-                    text_only=not items,
-                    total_output_rows=leaf_offset,
-                    segments=tuple(segments),
+                # An endpoint's local decoder order: items by (sample_id,
+                # image_ordinal), an item's runs by ascending row.
+                order_key = (descriptor.sample_id, descriptor.image_ordinal, slice_id)
+                placed.setdefault((descriptor.microbatch_id, endpoint), []).append(
+                    (order_key, descriptor.global_item_id, slice_id, run.item_rows)
+                )
+
+        # Endpoint leaf layouts in each endpoint's local decoder order -- never
+        # LPT assignment order. A microbatch without items keeps one text-only
+        # layout at the group endpoint.
+        layouts = []
+        for mb_id in microbatch_ids:
+            if not any((mb_id, endpoint) in placed for endpoint in view.shard_owners):
+                layouts.append(
+                    MicrobatchLayout(
+                        microbatch_id=mb_id,
+                        text_only=True,
+                        total_output_rows=0,
+                        segments=(),
+                        endpoint_rank=view.endpoint_rank,
+                    )
+                )
+                continue
+            for endpoint in view.shard_owners:
+                entries = sorted(placed.get((mb_id, endpoint), ()))
+                if not entries:
+                    continue
+                segments = []
+                leaf_offset = 0
+                for _, item_id, slice_id, rows in entries:
+                    segments.append(
+                        LayoutSegment(
+                            global_item_id=item_id,
+                            leaf_row_start=leaf_offset,
+                            output_rows=rows,
+                            slice_id=slice_id,
+                        )
+                    )
+                    leaf_offset += rows
+                layouts.append(
+                    MicrobatchLayout(
+                        microbatch_id=mb_id,
+                        text_only=False,
+                        total_output_rows=leaf_offset,
+                        segments=tuple(segments),
+                        endpoint_rank=endpoint,
+                    )
+                )
+
+        descriptor_by_id = {d.global_item_id: d for d in by_id}
+        digest_entries = []
+        for route in routes:
+            descriptor = descriptor_by_id[route.global_item_id]
+            digest_entries.append(
+                (
+                    route.global_item_id,
+                    route.slice_id,
+                    route.producer_worker_id,
+                    order_in_producer[route.global_item_id],
+                    route.endpoint_rank,
+                    route.item_row_start,
+                    route.item_rows,
+                    descriptor.payload_rows,
+                    descriptor.output_rows,
+                    descriptor.grid_thw[0],
+                    descriptor.grid_thw[1],
+                    descriptor.grid_thw[2],
                 )
             )
-
-        # Routes: one slice per item in v1. The endpoint is single-valued and
-        # owner_worker_id names the owner-sharded PIXEL source.
-        routes = tuple(
-            RouteSlice(
-                global_item_id=descriptor.global_item_id,
-                producer_worker_id=assignment[descriptor.global_item_id],
-                endpoint_rank=view.endpoint_rank,
-                owner_worker_id=descriptor.owner_worker_id,
-            )
-            for descriptor in sorted(descriptors, key=lambda d: d.global_item_id)
-        )
-
-        digest_entries = [
-            (
-                descriptor.global_item_id,
-                assignment[descriptor.global_item_id],
-                order_in_producer[descriptor.global_item_id],
-                view.endpoint_rank,
-                descriptor.payload_rows,
-                descriptor.output_rows,
-                descriptor.grid_thw[0],
-                descriptor.grid_thw[1],
-                descriptor.grid_thw[2],
-            )
-            for descriptor in sorted(descriptors, key=lambda d: d.global_item_id)
-        ]
+        cp = self._cp_size
         digest = compute_plan_digest(
-            PLAN_SCHEMA_VERSION, self._capacity_policy, digest_entries
+            PLAN_SCHEMA_VERSION,
+            self._capacity_policy,
+            digest_entries,
+            cp_size=cp,
+            cp_layout_code=CP_PARTITION_MODES.index(self.cp_partition_mode) if cp > 1 else 0,
+            microbatch_rows=(
+                sorted({(d.microbatch_id, d.microbatch_rows) for d in descriptors})
+                if cp > 1
+                else ()
+            ),
         )
+        routes = tuple(routes)
 
         plan = MdpBatchPlan(
             schema_version=PLAN_SCHEMA_VERSION,
@@ -199,6 +257,37 @@ class MdpPlanner:
         )
         _validate_plan(plan, view)
         return plan
+
+    def _cp_runs(self, descriptor) -> list:
+        """One item's decoder span cut into the runs each decoder CP rank owns."""
+        try:
+            return cp_item_runs(
+                descriptor.decoder_start,
+                descriptor.output_rows,
+                sample_padded_start=descriptor.sample_padded_start,
+                sample_padded_len=descriptor.sample_padded_len,
+                total_rows=descriptor.microbatch_rows,
+                cp_size=self._cp_size,
+                mode=self.cp_partition_mode,
+            )
+        except MdpPlanError as error:
+            raise MdpPlanError(
+                f"MDP: item {descriptor.global_item_id} (microbatch "
+                f"{descriptor.microbatch_id}) cannot be split across "
+                f"cp_size={self._cp_size}: {error}"
+            ) from error
+
+    def _preferred_endpoint_worker(self, runs) -> int:
+        """The worker hosting the shard owner of most of the item's rows.
+
+        Preferred within the LPT slack: its rows then never leave the rank.
+        Without decoder CP that is the endpoint's worker.
+        """
+        rows_by_worker = {}
+        for run in runs:
+            worker = self._worker_of_cp_rank[run.cp_rank]
+            rows_by_worker[worker] = rows_by_worker.get(worker, 0) + run.item_rows
+        return min(rows_by_worker, key=lambda worker: (-rows_by_worker[worker], worker))
 
     def _validate_descriptors(self, descriptors: Sequence, microbatch_ids: Sequence[int]) -> None:
         view = self._rank_view
@@ -247,6 +336,41 @@ class MdpPlanner:
                     f"violates: items never cross outer-DP groups "
                     f"(outer_dp_rank={view.outer_dp_rank})."
                 )
+        if self._cp_size > 1:
+            self._validate_decoder_spans(descriptors)
+
+    @staticmethod
+    def _validate_decoder_spans(descriptors: Sequence) -> None:
+        """Decoder CP cuts items by their decoder span; check the spans are usable."""
+        physical_rows = {}  # microbatch_id -> packed rows
+        span_end = {}  # microbatch_id -> end of the previous item's span
+        for descriptor in sorted(
+            descriptors, key=lambda d: (d.microbatch_id, d.sample_id, d.image_ordinal)
+        ):
+            item_id, mb_id = descriptor.global_item_id, descriptor.microbatch_id
+            if descriptor.decoder_start < 0 or descriptor.microbatch_rows <= 0:
+                raise MdpPlanError(
+                    f"MDP: item {item_id} violates: under decoder CP every item carries "
+                    "its decoder span (one contiguous run of image-token slots and the "
+                    f"packed microbatch rows); got decoder_start={descriptor.decoder_start}, "
+                    f"microbatch_rows={descriptor.microbatch_rows}."
+                )
+            if physical_rows.setdefault(mb_id, descriptor.microbatch_rows) != (
+                descriptor.microbatch_rows
+            ):
+                raise MdpPlanError(
+                    "MDP: inconsistent physical rows within a decoder microbatch."
+                )
+            # A leaf is laid out by (sample_id, image_ordinal) and scattered in
+            # decoder position order; the two orders must be the same one.
+            if descriptor.decoder_start < span_end.get(mb_id, 0):
+                raise MdpPlanError(
+                    f"MDP: item {item_id} violates: decoder spans ascend with "
+                    "(sample_id, image_ordinal) without overlap inside a microbatch "
+                    f"(starts at {descriptor.decoder_start}, previous item ends at "
+                    f"{span_end[mb_id]})."
+                )
+            span_end[mb_id] = descriptor.decoder_start + descriptor.output_rows
 
 
 def _validate_plan(plan: MdpBatchPlan, view: MdpRankView) -> None:
@@ -267,21 +391,63 @@ def _validate_plan(plan: MdpBatchPlan, view: MdpRankView) -> None:
             f"(routes-only={sorted(route_items - layout_items)}, "
             f"layouts-only={sorted(layout_items - route_items)})."
         )
-    endpoint_items = set()
-    for layout in plan.layouts:
-        for segment in layout.segments:
-            if segment.global_item_id in endpoint_items:
-                raise MdpPlanError(
-                    f"MDP: global_item_id={segment.global_item_id} violates: one endpoint "
-                    "layout entry per item."
-                )
-            endpoint_items.add(segment.global_item_id)
-    if endpoint_items != route_items:
-        raise MdpPlanError(
-            "MDP: plan violates: endpoint layouts cover exactly the routed items."
-        )
+    # Every routed slice appears in exactly one endpoint layout -- the one at
+    # its route's endpoint -- and an item's slices tile its rows exactly.
+    route_by_slice = {}
     for route in plan.routes:
-        if route.endpoint_rank not in view.planning_group_ranks:
+        key = (route.global_item_id, route.slice_id)
+        if key in route_by_slice:
+            raise MdpPlanError(f"MDP: slice {key} violates: one route per slice.")
+        route_by_slice[key] = route
+    placed = set()
+    for layout in plan.layouts:
+        cursor = 0
+        for segment in layout.segments:
+            if segment.leaf_row_start != cursor or segment.output_rows <= 0:
+                raise MdpPlanError("MDP: leaf segments must tile without gap or overlap.")
+            cursor += segment.output_rows
+            key = (segment.global_item_id, segment.slice_id)
+            if key in placed:
+                raise MdpPlanError(
+                    f"MDP: slice {key} violates: one endpoint layout entry per slice."
+                )
+            placed.add(key)
+            route = route_by_slice.get(key)
+            if route is None:
+                raise MdpPlanError(f"MDP: slice {key} violates: laid out slices are routed.")
+            if layout.endpoint_rank != route.endpoint_rank:
+                raise MdpPlanError(
+                    f"MDP: slice {key} violates: laid out at its route's endpoint "
+                    f"({layout.endpoint_rank} != {route.endpoint_rank})."
+                )
+            if segment.output_rows != route.item_rows:
+                raise MdpPlanError("MDP: leaf segment and route must tile the same rows.")
+        if cursor != layout.total_output_rows or layout.text_only != (cursor == 0):
+            raise MdpPlanError("MDP: leaf rows and text-only flag must match its segments.")
+    if placed != set(route_by_slice):
+        raise MdpPlanError(
+            "MDP: plan violates: endpoint layouts cover exactly the routed slices."
+        )
+    slices_by_item = {}
+    for (item_id, _), route in route_by_slice.items():
+        slices_by_item.setdefault(item_id, []).append(route)
+    for item_id, routes in slices_by_item.items():
+        item_rows = plan.segment_for_item(item_id).output_rows
+        cursor = 0
+        for route in sorted(routes, key=lambda r: r.item_row_start):
+            if route.item_row_start != cursor or route.item_rows <= 0:
+                raise MdpPlanError(
+                    f"MDP: item {item_id} violates: its slices tile its {item_rows} rows "
+                    "without gap or overlap."
+                )
+            cursor += route.item_rows
+        if cursor != item_rows:
+            raise MdpPlanError(
+                f"MDP: item {item_id} violates: its slices tile its {item_rows} rows "
+                "without gap or overlap."
+            )
+    for route in plan.routes:
+        if route.endpoint_rank not in view.shard_owners:
             raise MdpPlanError(
                 f"MDP: endpoint_rank={route.endpoint_rank} violates: routes never cross an "
                 "outer-DP group boundary."
@@ -344,14 +510,26 @@ def _canonical_plan_payload(plan: MdpBatchPlan):
         plan.outer_dp_rank,
         plan.capacity_policy.alignment_rows,
         tuple(
-            (r.global_item_id, r.producer_worker_id, r.endpoint_rank) for r in plan.routes
+            (
+                r.global_item_id,
+                r.slice_id,
+                r.producer_worker_id,
+                r.endpoint_rank,
+                r.item_row_start,
+                r.item_rows,
+            )
+            for r in plan.routes
         ),
         tuple(
             (
                 l.microbatch_id,
+                l.endpoint_rank,
                 l.text_only,
                 l.total_output_rows,
-                tuple((s.global_item_id, s.leaf_row_start, s.output_rows) for s in l.segments),
+                tuple(
+                    (s.global_item_id, s.slice_id, s.leaf_row_start, s.output_rows)
+                    for s in l.segments
+                ),
             )
             for l in plan.layouts
         ),

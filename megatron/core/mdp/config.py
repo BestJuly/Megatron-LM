@@ -11,6 +11,7 @@ import dataclasses
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
+from megatron.core.mdp.cp_partition import CP_PARTITION_MODES
 from megatron.core.mdp.errors import MdpConfigurationError
 
 if TYPE_CHECKING:
@@ -79,6 +80,7 @@ class MdpCompatibilityOptions:
     fp8_recipe: Optional[str] = None
     fp8_param_gather: bool = False
     sequence_parallel: bool = False
+    cp_partition_mode: str = "zigzag"
     sequence_packing_scheduler: Optional[str] = None
     thd_static_packing: bool = False
     max_seqlen_per_dp_cp_rank: Optional[int] = None
@@ -246,14 +248,28 @@ def validate_mdp_config(config: MdpConfig, options: MdpCompatibilityOptions) -> 
             "The current MDP support matrix requires TP=1.",
             "1",
         )
-    if options.context_parallel_size != 1:
+    # Decoder CP > 1 is supported in both CP input layouts: the planner cuts each
+    # vision item into the runs each CP rank owns under the decoder's own
+    # partition (megatron.core.mdp.cp_partition) and routes them straight to
+    # their owners. The encoder stays CP-unaware (encoder_cp == 1).
+    if options.context_parallel_size < 1:
         _reject(
             "context_parallel_size",
             options.context_parallel_size,
-            "decoder CP == 1",
-            "Decoder context parallelism is a registered extension hook, not an "
-            "implemented capability.",
+            "context_parallel_size >= 1",
+            "Decoder context parallelism is supported; the size must be positive.",
             "1",
+        )
+    if (
+        options.context_parallel_size > 1
+        and options.cp_partition_mode not in CP_PARTITION_MODES
+    ):
+        _reject(
+            "cp_partition_mode",
+            options.cp_partition_mode,
+            f"cp_partition_mode in {CP_PARTITION_MODES}",
+            "MDP cuts vision rows into CP shards with the decoder's input layout.",
+            "zigzag",
         )
     model_parallel = (
         options.tensor_parallel_size
@@ -476,6 +492,26 @@ def _validate_packing(config: MdpConfig, options: MdpCompatibilityOptions) -> No
                 "microbatch would otherwise overflow it inside _pad_cu_seqlens.",
                 str(samples + 1),
             )
+    if (
+        options.thd_static_packing
+        and options.context_parallel_size > 1
+        and options.max_seqlen_per_dp_cp_rank is not None
+        and options.max_seqlen_per_dp_cp_rank % 2 != 0
+    ):
+        # build_static_thd_metadata splits the padding tail with a bare
+        # `dummy_seq_len % (2 * cp) == 0` assert mid-iteration. The static target
+        # is max_seqlen_per_dp_cp_rank * cp, so an odd per-rank length makes that
+        # assert unsatisfiable. Reject at startup, in both packing modes, rather
+        # than a hundred iterations in.
+        _reject(
+            "max_seqlen_per_dp_cp_rank",
+            options.max_seqlen_per_dp_cp_rank,
+            "max_seqlen_per_dp_cp_rank is even under --thd-static-packing with CP > 1",
+            "The static THD target is max_seqlen_per_dp_cp_rank x "
+            "context_parallel_size and its padding tail must still divide by "
+            "2 * context_parallel_size.",
+            str(options.max_seqlen_per_dp_cp_rank + 1),
+        )
     if not config.greedy_packing:
         return
     if (options.save_requested or options.load_requested) and (

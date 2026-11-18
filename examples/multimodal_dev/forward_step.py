@@ -458,6 +458,14 @@ def pack_or_pad_batch(
     except AssertionError:
         has_sp = False
 
+    # The decoder's CP input layout. models/base.py slices the packed THD batch
+    # by it, and the decoder's own layout conversions read it off
+    # PackedSeqParams, so both must see the same value.
+    try:
+        cp_partition_mode = getattr(get_args(), "cp_partition_mode", None) or "zigzag"
+    except AssertionError:
+        cp_partition_mode = "zigzag"
+
     divisible_by = seqlen_alignment_factor(tp_size, cp_size, has_sp)
     if pad_to_multiple is not None:
         # Quantized GEMMs check the rank-local tensor (after the CP slice and,
@@ -724,6 +732,19 @@ def pack_or_pad_batch(
         # boundary. Safe only under the causal decoder mask (tail rows follow
         # every real row and are loss-masked); see knowledge.md.
         pad_between_seqs = False if use_tail_only_alignment_padding else None
+        if cp_size > 1:
+            # Per-sample padding under CP has to be declared. Left unset, TE infers
+            # the flag from cu_seqlens[:-1] against cu_seqlens_padded[:-1] and so
+            # misses padding on the last sample alone; its CP attention then takes
+            # cu_seqlens // cp_size as every rank's length, although the CP split
+            # leaves a sample's padding on one rank. Valid tokens are dropped as
+            # queries and as keys. See knowledge.md, "Padding under CP is declared".
+            if is_src and use_pinned:
+                has_padding = cu_seqlens != cu_seqlens_padded  # host lists, no sync
+            else:
+                has_padding = not torch.equal(cu_seqlens_t, cu_seqlens_padded_t)
+            if has_padding:
+                pad_between_seqs = True
         if static_target_T is not None:
             cu_seqlens_t, cu_seqlens_padded_t, real_cu_seqlens_t = build_static_thd_metadata(
                 cu_seqlens_t,
@@ -731,6 +752,7 @@ def pack_or_pad_batch(
                 target_len=static_target_T,
                 max_num_seqs=static_max_num_seqs,
                 cp_size=cp_size,
+                cp_partition_mode=cp_partition_mode,
             )
             # max_seqlen must be the padded static value: the tail belongs to a
             # sequence now, and a stale (shorter) max silently produces wrong
@@ -763,7 +785,14 @@ def pack_or_pad_batch(
             max_seqlen_kv=max_seqlen_q,
             total_tokens=total_tokens,
             pad_between_seqs=pad_between_seqs,
+            cp_partition_mode=cp_partition_mode,
         )
+        if cp_size > 1:
+            # Prepare the CP group and layout routes while collating, before the
+            # decoder's CUDA queue grows.
+            from megatron.core.context_parallel_layout import finalize_packed_seq_params
+
+            finalize_packed_seq_params(packed_batch["packed_seq_params"])
         return packed_batch
 
     # ---------- padded (BSHD) branch ----------
@@ -996,12 +1025,17 @@ def mdp_forward_step(runtime, data_iterator, model, return_schedule_plan: bool =
     )
 
     vision_embeddings = None
-    if is_pipeline_first_stage() and not record.text_only:
+    # `record.text_only` is a whole-microbatch property; whether THIS rank holds
+    # vision rows is a per-(microbatch, cp_rank) fact only the plan knows. Under
+    # decoder CP an endpoint with no rows for a vision-bearing microbatch is a
+    # normal state, not a routing failure.
+    if is_pipeline_first_stage() and runtime.expects_leaf(record.microbatch_id):
         vision_embeddings = runtime.storage.get_leaf(record.microbatch_id)
         if vision_embeddings is None:
             raise RuntimeError(
-                f"MDP: microbatch {record.microbatch_id} has vision items but no "
-                "leaf in endpoint storage; P3 embedding routing did not complete"
+                f"MDP: microbatch {record.microbatch_id} has vision rows for this "
+                "endpoint but no leaf in endpoint storage; P3 embedding routing "
+                "did not complete"
             )
 
     model_inputs = dict(

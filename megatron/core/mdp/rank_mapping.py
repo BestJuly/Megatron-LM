@@ -41,6 +41,15 @@ class MdpRankView:
     endpoint_rank: int
     planning_group_ranks: tuple
     worker_ids: tuple
+    # The shard owners: the PP0 ranks, one per decoder CP rank and indexed by
+    # cp_rank, so element 0 is the endpoint. Each holds the vision rows of its CP
+    # slice as a trainable leaf and returns their gradient.
+    shard_owners: tuple
+
+    @property
+    def is_shard_owner(self) -> bool:
+        """This rank holds the leaf of its CP shard and returns its gradient."""
+        return self.global_rank in self.shard_owners
 
 
 class MdpRankMap:
@@ -88,7 +97,7 @@ class MdpRankMap:
         return self._groups
 
     def endpoint_rank(self, outer_dp_rank: int) -> int:
-        """The PP0 endpoint rank of one planning group."""
+        """The group's descriptor source: its ``(tp0, cp0, pp0)`` rank."""
         return self._groups[outer_dp_rank][0]
 
     def worker_ranks(self, outer_dp_rank: int, worker_id: int) -> tuple:
@@ -117,6 +126,9 @@ class MdpRankMap:
         outer_dp_rank, index_in_group = self._rank_to_coord[global_rank]
         group = self._groups[outer_dp_rank]
         endpoint = group[0]
+        # Group order is 'tp-cp-pp' with tp == 1: index = cp_rank + cp * pp_rank,
+        # so the indices below cp are the PP0 ranks, one per decoder CP rank.
+        cp = self._spec.cp
         return MdpRankView(
             global_rank=global_rank,
             outer_dp_rank=outer_dp_rank,
@@ -125,6 +137,7 @@ class MdpRankMap:
             endpoint_rank=endpoint,
             planning_group_ranks=group,
             worker_ids=tuple(range(self.num_workers_per_group)),
+            shard_owners=tuple(group[:cp]),
         )
 
 
@@ -144,7 +157,8 @@ def build_rank_map(spec: MdpRankSpec) -> MdpRankMap:
     Planning groups come from ``RankGenerator.get_ranks('tp-cp-pp')``: each group
     holds the ranks that share one decoder ``dp_rank``, ordered with earlier
     dimensions in the rank order changing faster (tp fastest, then cp, then pp),
-    so index 0 in each group is the ``(tp=0, cp=0, pp=0)`` PP0 endpoint.
+    so index 0 in each group is the ``(tp=0, cp=0, pp=0)`` PP0 endpoint and
+    indices ``k < cp`` are the PP0 ranks of the decoder CP ranks.
     """
     if spec.rank_order != SUPPORTED_RANK_ORDER:
         raise MdpConfigurationError(

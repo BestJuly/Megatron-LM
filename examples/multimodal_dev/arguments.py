@@ -124,15 +124,6 @@ def add_multimodal_args(parser):
         ),
     )
     group.add_argument(
-        "--use-packed-sequence",
-        action="store_true",
-        default=False,
-        help=(
-            "Pack variable-length sequences into THD format to eliminate "
-            "padding waste."
-        ),
-    )
-    group.add_argument(
         "--mdp-enable",
         action="store_true",
         default=False,
